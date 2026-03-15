@@ -1,0 +1,96 @@
+# ==========================================
+# Backend (FastAPI / Python)
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.bundles/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# 虚拟环境 (Virtual Environments)
+.venv/
+venv/
+ENV/
+env/
+python_env/
+
+# 测试与覆盖率 (Testing/Coverage)
+.target/
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+
+# FastAPI/SQLAlchemy 产生的本地数据库 (如果是 SQLite)
+*.db
+*.sqlite3
+
+# ==========================================
+# Frontend (Vue.js / Node.js)
+# ==========================================
+node_modules/
+/dist
+/target
+.DS_Store
+
+# 日志文件
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# 编辑器/Vue 相关
+.eslintcache
+.stylelintcache
+*.local
+
+# ==========================================
+# Environment Variables (Secrets - 非常重要)
+# ==========================================
+.env
+.env.local
+.env.*.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# ==========================================
+# IDE / Editors (编辑器设置)
+# ==========================================
+.vscode/
+# 如果你确定团队都用 VSCode 且需要共享调试配置，可以取消注释下面一行
+# !.vscode/launch.json
+
+.idea/
+*.swp
+*.swo
+.project
+.pydevproject
+.settings/
+
+# ==========================================
+# OS (操作系统临时文件)
+# ==========================================
+Thumbs.db
+Desktop.ini
