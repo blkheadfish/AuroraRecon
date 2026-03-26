@@ -1,0 +1,31 @@
+# ============================================
+# 漏洞扫描类工具
+# ============================================
+
+- name: nuclei
+  executor: container
+  command: "nuclei"
+  category: vuln_scan
+  timeout: 600
+  description: "模板驱动漏洞扫描器"
+
+- name: nikto
+  executor: container
+  command: "nikto"
+  category: vuln_scan
+  timeout: 90
+  description: "Web 服务器安全扫描"
+
+- name: sqlmap
+  executor: container
+  command: "sqlmap"
+  category: vuln_scan
+  timeout: 300
+  description: "SQL 注入自动化检测与利用"
+
+- name: wpscan
+  executor: container
+  command: "wpscan"
+  category: vuln_scan
+  timeout: 120
+  description: "WordPress 安全扫描"

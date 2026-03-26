@@ -1,0 +1,74 @@
+# ============================================
+# 侦察类工具
+# 所有工具安装在 toolbox 镜像中，走 docker run --rm 执行
+# ============================================
+
+- name: nmap
+  executor: container
+  command: "nmap"
+  category: recon
+  timeout: 300
+  description: "网络端口扫描与服务识别"
+
+- name: masscan
+  executor: container
+  command: "masscan"
+  category: recon
+  timeout: 120
+  description: "高速端口扫描"
+
+- name: gobuster
+  executor: container
+  command: "gobuster"
+  category: recon
+  timeout: 120
+  description: "Web 目录爆破"
+
+- name: ffuf
+  executor: container
+  command: "ffuf"
+  category: recon
+  timeout: 120
+  description: "Web Fuzzer"
+
+- name: subfinder
+  executor: container
+  command: "subfinder"
+  category: recon
+  timeout: 60
+  description: "子域名枚举"
+
+- name: whatweb
+  executor: container
+  command: "whatweb"
+  category: recon
+  timeout: 30
+  description: "Web 指纹识别"
+
+- name: httpx
+  executor: container
+  command: "httpx"
+  category: recon
+  timeout: 30
+  description: "HTTP 探测与技术检测"
+
+- name: wafw00f
+  executor: container
+  command: "wafw00f"
+  category: recon
+  timeout: 30
+  description: "WAF 检测"
+
+- name: dirb
+  executor: container
+  command: "dirb"
+  category: recon
+  timeout: 120
+  description: "Web 目录扫描"
+
+- name: sslscan
+  executor: container
+  command: "sslscan"
+  category: recon
+  timeout: 30
+  description: "SSL/TLS 扫描"

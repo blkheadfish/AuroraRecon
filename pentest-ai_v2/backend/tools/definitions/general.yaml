@@ -1,0 +1,77 @@
+# ============================================
+# 通用工具（无状态，直接执行）
+# ============================================
+
+- name: curl
+  executor: container
+  command: "curl"
+  category: general
+  timeout: 30
+  description: "HTTP 客户端"
+
+- name: wget
+  executor: container
+  command: "wget"
+  category: general
+  timeout: 30
+  description: "文件下载"
+
+- name: python3
+  executor: container
+  command: "python3"
+  category: general
+  timeout: 60
+  description: "Python 脚本执行"
+
+- name: java
+  executor: container
+  command: "java"
+  category: general
+  timeout: 60
+  description: "Java 程序执行"
+
+- name: socat
+  executor: container
+  command: "socat"
+  category: general
+  timeout: 30
+  description: "网络连接工具"
+
+- name: netcat
+  executor: container
+  command: "nc"
+  category: general
+  timeout: 30
+  description: "网络瑞士军刀"
+
+# ============================================
+# 后渗透工具
+# ============================================
+
+- name: enum4linux
+  executor: container
+  command: "enum4linux"
+  category: post_exploit
+  timeout: 60
+  description: "SMB/LDAP 枚举"
+
+- name: smbclient
+  executor: container
+  command: "smbclient"
+  category: post_exploit
+  timeout: 30
+  description: "SMB 客户端"
+
+- name: tcpdump
+  executor: container
+  command: "tcpdump"
+  category: post_exploit
+  timeout: 60
+  description: "网络抓包"
+
+- name: hping3
+  executor: container
+  command: "hping3"
+  category: general
+  timeout: 30
+  description: "TCP/IP 数据包组装工具"
