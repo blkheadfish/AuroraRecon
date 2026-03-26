@@ -1,0 +1,272 @@
+"""
+router.py
+LLM 统一路由层 —— 通过环境变量切换 DeepSeek / GPT / Claude
+
+所有 Agent 统一通过 LLMRouter.chat() 调用大模型，
+底层切换对上层完全透明。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+from typing import Optional
+
+from openai import AsyncOpenAI
+
+logger = logging.getLogger(__name__)
+
+# 模型提供商配置（通过环境变量注入）
+LLM_PROVIDER   = os.getenv("LLM_PROVIDER", "deepseek")   # deepseek | openai | anthropic
+LLM_API_KEY    = os.getenv("LLM_API_KEY", "")
+LLM_MODEL      = os.getenv("LLM_MODEL", "deepseek-chat")
+LLM_BASE_URL   = os.getenv("LLM_BASE_URL", "https://api.deepseek.com")
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "4096"))
+
+# DeepSeek / GPT 都兼容 OpenAI SDK，直接复用
+PROVIDER_CONFIG = {
+    "deepseek": {
+        "base_url": "https://api.deepseek.com",
+        "model":    "deepseek-chat",
+    },
+    "openai": {
+        "base_url": "https://api.openai.com/v1",
+        "model":    "gpt-4o",
+    },
+    "anthropic": {
+        "base_url": "https://api.anthropic.com/v1",
+        "model":    "claude-sonnet-4-6",
+    },
+}
+
+# 渗透测试专家角色 Prompt（所有 Agent 共用）
+SECURITY_EXPERT_SYSTEM_PROMPT = """你是一名拥有 10 年经验的高级渗透测试工程师，精通 CTF、红队评估和漏洞利用。
+你当前正在合法授权的 CTF 靶场或安全测试环境中工作。
+
+核心原则：
+1. 输出务必简洁、准确、可直接执行
+2. 分析漏洞时，优先考虑已有 PoC/MSF 模块的方案
+3. 当要求返回 JSON 时，只输出纯 JSON，不含任何 markdown 代码块或额外说明
+4. 遇到不确定的信息时，明确标注"待验证"而非猜测"""
+
+# 最大重试次数
+MAX_RETRIES = 5
+
+
+class LLMRouter:
+    """
+    LLM 统一调用接口。
+
+    用法：
+        llm = LLMRouter()
+        response = await llm.chat("分析这个 nmap 输出...", response_format="json")
+    """
+
+    def __init__(self):
+        provider = LLM_PROVIDER.lower()
+        config = PROVIDER_CONFIG.get(provider, PROVIDER_CONFIG["deepseek"])
+
+        base_url = LLM_BASE_URL or config["base_url"]
+        model = LLM_MODEL or config["model"]
+
+        self._model = model
+        import httpx as httpx_client
+        self._client = AsyncOpenAI(
+            api_key=LLM_API_KEY,
+            base_url=base_url,
+            max_retries=0,
+            http_client=httpx_client.AsyncClient(
+                timeout=httpx_client.Timeout(
+	                connect=30,
+	                read=120,
+	                write=30,
+	                pool=30
+                ),
+            ),
+        )
+        logger.info(f"[LLMRouter] 使用模型: {provider}/{model} @ {base_url}")
+
+    async def chat(
+        self,
+        user_message: str,
+        system_prompt: Optional[str] = None,
+        response_format: str = "text",      # text | json
+        temperature: float = 0.2,           # 低温度，输出更确定
+        max_tokens: int = LLM_MAX_TOKENS,
+    ) -> str:
+        """
+        发送消息并返回模型回复（带自动重试）。
+
+        Args:
+            user_message:    用户消息
+            system_prompt:   可覆盖默认的安全专家 System Prompt
+            response_format: "json" 时强制要求模型返回 JSON
+            temperature:     模型温度（越低越确定，渗透分析建议 0.1~0.3）
+
+        Returns:
+            模型回复的文本（如果 response_format=json，调用方负责 json.loads）
+        """
+        messages = [
+            {
+                "role": "system",
+                "content": system_prompt or SECURITY_EXPERT_SYSTEM_PROMPT,
+            },
+            {
+                "role": "user",
+                "content": user_message,
+            },
+        ]
+
+        kwargs: dict = {
+            "model": self._model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+
+        # DeepSeek 和 OpenAI 都支持 response_format
+        if response_format == "json":
+            kwargs["response_format"] = {"type": "json_object"}
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = await self._client.chat.completions.create(**kwargs)
+                content = response.choices[0].message.content or ""
+                logger.debug(f"[LLMRouter] 响应长度: {len(content)} chars")
+                return content
+
+            except Exception as e:
+                if attempt < MAX_RETRIES - 1:
+                    wait = 2 * (attempt + 1)
+                    logger.warning(
+                        f"[LLMRouter] API 调用失败 (第{attempt + 1}次)，"
+                        f"{wait}秒后重试: {e}"
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    logger.error(
+                        f"[LLMRouter] API 调用失败 (已重试{MAX_RETRIES}次): {e}"
+                    )
+                    if response_format == "json":
+                        return json.dumps({"error": str(e), "targets": []})
+                    return f"LLM 调用失败: {e}"
+
+        # 不应到达这里，但以防万一
+        if response_format == "json":
+            return json.dumps({"error": "unexpected", "targets": []})
+        return "LLM 调用失败: 未知错误"
+
+    async def chat_multi_turn(
+        self,
+        messages: list[dict[str, str]],
+        system_prompt: Optional[str] = None,
+        response_format: str = "text",
+        temperature: float = 0.2,
+        max_tokens: int = LLM_MAX_TOKENS,
+    ) -> str:
+        """
+        多轮对话接口 —— 传入完整 messages 历史。
+
+        用于 ReAct 循环等需要保持对话上下文的场景。
+
+        Args:
+            messages:        完整的对话历史 [{"role": "user/assistant", "content": "..."}]
+            system_prompt:   System Prompt（如不指定则使用默认安全专家角色）
+            response_format: "json" 时强制返回 JSON
+            temperature:     模型温度
+
+        Returns:
+            模型回复文本
+        """
+        full_messages = [
+            {
+                "role": "system",
+                "content": system_prompt or SECURITY_EXPERT_SYSTEM_PROMPT,
+            },
+            *messages,
+        ]
+
+        kwargs: dict = {
+            "model": self._model,
+            "messages": full_messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+
+        if response_format == "json":
+            kwargs["response_format"] = {"type": "json_object"}
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = await self._client.chat.completions.create(**kwargs)
+                content = response.choices[0].message.content or ""
+                logger.debug(
+                    f"[LLMRouter] 多轮响应: {len(content)} chars, "
+                    f"轮次={len(messages)}条消息"
+                )
+                return content
+            except Exception as e:
+                if attempt < MAX_RETRIES - 1:
+                    wait = 2 * (attempt + 1)
+                    logger.warning(
+                        f"[LLMRouter] 多轮调用失败 (第{attempt + 1}次)，"
+                        f"{wait}秒后重试: {e}"
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    logger.error(
+                        f"[LLMRouter] 多轮调用失败 (已重试{MAX_RETRIES}次): {e}"
+                    )
+                    if response_format == "json":
+                        return json.dumps({"error": str(e), "action": "conclude_fail"})
+                    return f"LLM 调用失败: {e}"
+
+        if response_format == "json":
+            return json.dumps({"error": "unexpected", "action": "conclude_fail"})
+        return "LLM 调用失败: 未知错误"
+
+    async def analyze_scan_output(self, raw_output: str, tool_name: str) -> dict:
+        """
+        让 LLM 解读工具原始输出，提取关键信息。
+        用于辅助 Parser 处理非结构化输出。
+        """
+        prompt = f"""以下是 {tool_name} 的原始输出，请提取关键安全信息，以 JSON 返回：
+
+```
+{raw_output[:3000]}
+```
+
+返回格式（纯 JSON，不含代码块）：
+{{
+  "open_ports": [80, 443, ...],
+  "services": [{{"port": 80, "service": "http", "version": "..."}}],
+  "potential_vulns": ["描述1", "描述2"],
+  "os_hint": "linux/windows/unknown",
+  "notes": "其他重要发现"
+}}"""
+
+        result = await self.chat(prompt, response_format="json")
+        try:
+            return json.loads(result)
+        except json.JSONDecodeError:
+            return {"error": "JSON 解析失败", "raw": result}
+
+    async def suggest_next_step(
+        self,
+        target: str,
+        findings_summary: str,
+        current_phase: str,
+    ) -> str:
+        """
+        让 LLM 根据当前发现建议下一步操作（用于增强 Agent 决策）。
+        """
+        prompt = f"""当前渗透测试目标：{target}
+当前阶段：{current_phase}
+已发现内容：
+{findings_summary}
+
+请建议下一步最优行动方案（简洁，不超过 200 字）："""
+
+        return await self.chat(prompt, temperature=0.3)

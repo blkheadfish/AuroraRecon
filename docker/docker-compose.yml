@@ -1,0 +1,182 @@
+version: "3.9"
+
+# ===================================================
+# PentestAI v2.0 完整服务编排
+#
+# 架构组件：
+#   - Web 前端（Vue 3 + TypeScript）
+#   - API 网关（FastAPI）
+#   - 主编排 Agent（LangGraph）—— 内置于 API 服务
+#   - 工具执行沙箱（Docker 隔离）
+#   - Metasploit RPC 服务
+#   - 数据持久层：PostgreSQL + Redis + MinIO
+#
+# 启动：docker compose up -d
+# 构建：docker compose build
+# ===================================================
+
+networks:
+  pentest_net:
+    driver: bridge
+
+volumes:
+  msf_data:
+  reports_data:
+  redis_data:
+  postgres_data:
+  minio_data:
+
+services:
+
+#  # ========== 前端（Vue 3）==========
+#  frontend:
+#    build:
+#      context: ..
+#      dockerfile: docker/frontend/Dockerfile
+#    container_name: pentest_frontend
+#    restart: unless-stopped
+#    ports:
+#      - "3000:80"
+#    depends_on:
+#      - api
+#    networks:
+#      - pentest_net
+
+  # ========== API 网关（FastAPI）==========
+  api:
+    build:
+      context: ..
+      dockerfile: docker/api/Dockerfile
+    container_name: pentest_api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      # LLM 配置
+      - LLM_PROVIDER=${LLM_PROVIDER:-deepseek}
+      - LLM_API_KEY=${LLM_API_KEY}
+      - LLM_MODEL=${LLM_MODEL:-deepseek-chat}
+      - LLM_BASE_URL=${LLM_BASE_URL:-https://api.deepseek.com}
+      - LLM_MAX_TOKENS=${LLM_MAX_TOKENS:-4096}
+      # MSF RPC
+      - MSF_HOST=msf
+      - MSF_PORT=55553
+      - MSF_PASSWORD=${MSF_PASSWORD:-pentest123}
+      # PostgreSQL
+      - DATABASE_URL=postgresql+asyncpg://pentest:${POSTGRES_PASSWORD:-pentest123}@postgres:5432/pentestai
+      # Redis
+      - REDIS_URL=redis://redis:6379/0
+      # MinIO
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:-minioadmin}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:-minioadmin}
+      - MINIO_SECURE=false
+      # Docker（工具沙箱）
+      - DOCKER_NETWORK=pentest_net
+      - TOOLBOX_IMAGE=pentest-toolbox:latest
+      - REPORTS_DIR=/reports
+      - DATA_VOLUME=/data
+      # 反弹 Shell
+      - LHOST=${LHOST:-125.70.254.93}
+    volumes:
+      - reports_data:/reports
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp/pentest_data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      msf:
+        condition: service_healthy
+    networks:
+      - pentest_net
+
+  # ========== Metasploit RPC ==========
+  msf:
+    image: metasploitframework/metasploit-framework:latest
+    container_name: pentest_msf
+    restart: unless-stopped
+    # msfrpcd 不在 PATH，需要用完整路径
+    # entrypoint 覆盖镜像自带的 docker/entrypoint.sh，避免它去启动 msfconsole
+    entrypoint: ["sh", "-c"]
+    command: >
+      "/usr/src/metasploit-framework/msfrpcd
+      -P ${MSF_PASSWORD:-pentest123}
+      -S
+      -a 0.0.0.0
+      -p 55553
+      -f"
+    environment:
+      - MSF_DATABASE_CONFIG=/usr/src/metasploit-framework/config/database.yml
+    volumes:
+      - msf_data:/root/.msf4
+    networks:
+      - pentest_net
+    expose:
+      - "55553"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "55553"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  # ========== PostgreSQL（数据持久层）==========
+  postgres:
+    image: postgres:16-alpine
+    container_name: pentest_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: pentestai
+      POSTGRES_USER: pentest
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pentest123}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - pentest_net
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pentest -d pentestai"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ========== Redis（缓存 / 任务队列）==========
+  redis:
+    image: redis:7-alpine
+    container_name: pentest_redis
+    restart: unless-stopped
+    command: redis-server --save 60 1 --loglevel warning --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    networks:
+      - pentest_net
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ========== MinIO（对象存储：报告 / 工具产物）==========
+  minio:
+    image: minio/minio:latest
+    container_name: pentest_minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9001:9001"   # MinIO 控制台（可选）
+    networks:
+      - pentest_net
+    expose:
+      - "9000"        # S3 API（只在内网暴露）

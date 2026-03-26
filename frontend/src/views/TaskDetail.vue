@@ -1,0 +1,383 @@
+<template>
+  <div class="page-wrap" v-loading="pageLoading" element-loading-background="rgba(13,17,23,0.9)">
+    <!-- Back + header -->
+    <div class="detail-header">
+      <el-button link @click="router.back()" class="back-btn">
+        <el-icon><ArrowLeft /></el-icon> 返回
+      </el-button>
+
+      <div class="header-main">
+        <div class="header-left">
+          <h2 class="target-title">{{ task?.target || '...' }}</h2>
+          <code class="task-id">{{ taskId }}</code>
+        </div>
+        <div class="header-right" v-if="task">
+          <StatusBadge :status="task.status" size="large" />
+          <el-button
+              v-if="task.status === 'completed' && task.report_path"
+              type="success"
+              size="small"
+              plain
+              @click="activeTab = 'report'"
+          >
+            <el-icon><Document /></el-icon> 查看报告
+          </el-button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 攻击链进度 + 审批操作 -->
+    <div class="pipeline-card" v-if="task">
+      <PipelineFlow
+          :current-phase="task.current_phase"
+          :status="task.status"
+          :findings-count="task.findings_count || 0"
+          :exploitable-count="exploitableCount"
+          :got-shell="task.got_shell"
+          :needs-approval="needsApproval"
+          :approving="approving"
+          @approve="doApprove(true)"
+          @reject="doApprove(false)"
+      />
+    </div>
+
+    <!-- Main tabs -->
+    <el-card class="main-card">
+      <el-tabs v-model="activeTab" class="detail-tabs">
+
+        <!-- ① 实时日志 -->
+        <el-tab-pane label="实时日志" name="logs">
+          <template #label>
+            <span class="tab-label">
+              <el-icon><Monitor /></el-icon>
+              实时日志
+              <span v-if="isRunning" class="live-dot"></span>
+            </span>
+          </template>
+          <LogTerminal :logs="logs" :running="isRunning" />
+        </el-tab-pane>
+
+        <!-- ② 漏洞发现 -->
+        <el-tab-pane name="findings">
+          <template #label>
+            <span class="tab-label">
+              <el-icon><Warning /></el-icon>
+              漏洞发现
+              <el-badge v-if="findings.length" :value="findings.length" class="tab-badge" />
+            </span>
+          </template>
+          <FindingsPanel :findings="findings" />
+        </el-tab-pane>
+
+        <!-- ③ 侦察数据 -->
+        <el-tab-pane label="侦察数据" name="recon">
+          <template #label>
+            <span class="tab-label">
+              <el-icon><Search /></el-icon>
+              侦察数据
+            </span>
+          </template>
+          <ReconPanel :task="task" />
+        </el-tab-pane>
+
+        <!-- ④ 完整状态 JSON -->
+        <el-tab-pane label="原始数据" name="raw">
+          <template #label>
+            <span class="tab-label">
+              <el-icon><DataLine /></el-icon>
+              原始数据
+            </span>
+          </template>
+          <JsonViewer :data="task" title="任务完整状态" />
+        </el-tab-pane>
+
+        <!-- ⑤ 报告 -->
+        <el-tab-pane label="报告" name="report" v-if="task?.report_path">
+          <template #label>
+            <span class="tab-label">
+              <el-icon><Document /></el-icon>
+              报告
+            </span>
+          </template>
+          <ReportPanel :task-id="taskId" />
+        </el-tab-pane>
+
+      </el-tabs>
+    </el-card>
+  </div>
+</template>
+
+<script setup>
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { api } from '@/api'
+import { useTasksStore } from '@/stores/tasks'
+import StatusBadge from '@/components/StatusBadge.vue'
+import PhaseBadge from '@/components/PhaseBadge.vue'
+import PipelineFlow from '@/components/PipelineFlow.vue'
+import LogTerminal from '@/components/LogTerminal.vue'
+import FindingsPanel from '@/components/FindingsPanel.vue'
+import ReconPanel from '@/components/ReconPanel.vue'
+import JsonViewer from '@/components/JsonViewer.vue'
+import ReportPanel from '@/components/ReportPanel.vue'
+
+const route = useRoute()
+const router = useRouter()
+const store = useTasksStore()
+const taskId = route.params.id
+
+const pageLoading = ref(true)
+const activeTab = ref('logs')
+const logs = ref([])
+const findings = ref([])
+const fullTask = ref(null)
+const approving = ref(false)
+
+const needsApproval = computed(() => task.value?.current_phase === 'awaiting_approval')
+const exploitableCount = computed(() => findings.value.filter(f => f.exploitable).length)
+
+async function doApprove(approved) {
+  approving.value = true
+  try {
+    await api.approveTask(taskId, approved)
+    logs.value.push(`[审批] ${approved ? '✅ 已授权，继续利用' : '⚠ 已拒绝，跳过利用'}`)
+  } catch (e) {
+    logs.value.push(`[审批] 操作失败: ${e?.response?.data?.detail || e.message}`)
+  } finally {
+    approving.value = false
+  }
+}
+
+let pollTimer = null  // 轮询定时器
+
+const task = computed(() => {
+  return fullTask.value || store.tasks.find(t => t.task_id === taskId) || null
+})
+const isRunning = computed(() => task.value?.status === 'running' || task.value?.status === 'pending')
+
+// Watch for task completion to refresh findings
+watch(() => task.value?.findings_count, async (count, oldCount) => {
+  if (count > 0 && count !== oldCount) {
+    await refreshFullTask()
+  }
+})
+
+// 任务结束时停止轮询
+watch(isRunning, (running) => {
+  if (!running) {
+    stopPolling()
+    refreshFullTask()
+  }
+})
+
+async function refreshFullTask() {
+  try {
+    const t = await api.getTask(taskId)
+    fullTask.value = t
+    store.updateTask(t)
+    findings.value = t.findings || []
+    if (t.phase_log?.length) {
+      logs.value = t.phase_log
+    }
+  } catch {}
+}
+
+// ── 轮询：每 3 秒拉最新日志和状态 ──────────────────────
+async function pollLogs() {
+  if (!isRunning.value) return
+  try {
+    // 拉最新日志
+    const logsRes = await api.getLogs(taskId)
+    const newLogs = logsRes.logs || []
+    if (newLogs.length > logs.value.length) {
+      logs.value = newLogs
+    }
+
+    // 拉最新任务状态（更新阶段、findings 数等）
+    const t = await api.getTask(taskId)
+    fullTask.value = t
+    store.updateTask(t)
+    if (t.findings?.length > findings.value.length) {
+      findings.value = t.findings
+    }
+  } catch {
+    // 网络错误静默忽略，下次重试
+  }
+}
+
+function startPolling() {
+  stopPolling()
+  pollTimer = setInterval(pollLogs, 3000)
+}
+
+function stopPolling() {
+  if (pollTimer) {
+    clearInterval(pollTimer)
+    pollTimer = null
+  }
+}
+
+// 带重试的 getTask
+async function getTaskWithRetry(id, maxRetries = 5, delay = 1000) {
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await api.getTask(id)
+    } catch (e) {
+      const status = e?.response?.status
+      if (status === 404 && i < maxRetries - 1) {
+        await new Promise(resolve => setTimeout(resolve, delay))
+        continue
+      }
+      throw e
+    }
+  }
+}
+
+onMounted(async () => {
+  try {
+    const t = await getTaskWithRetry(taskId)
+    fullTask.value = t
+    store.updateTask(t)
+    findings.value = t.findings || []
+    logs.value = t.phase_log || []
+
+    try {
+      const logsRes = await api.getLogs(taskId)
+      if (logsRes.logs?.length) logs.value = logsRes.logs
+    } catch {}
+  } catch (e) {
+    console.error('加载任务失败:', e)
+  } finally {
+    pageLoading.value = false
+  }
+
+  // WebSocket 实时更新
+  store.subscribeTask(taskId, (data) => {
+    if (data.type === 'phase_update') {
+      // 同步更新 fullTask，确保 needsApproval / current_phase 等 computed 实时响应
+      if (fullTask.value) {
+        fullTask.value = {
+          ...fullTask.value,
+          current_phase:  data.phase,
+          status:         data.status || fullTask.value.status,
+          findings_count: data.findings_count ?? fullTask.value.findings_count,
+          got_shell:      data.got_shell ?? fullTask.value.got_shell,
+        }
+      }
+      if (data.logs?.length) logs.value.push(...data.logs)
+    }
+    if (data.type === 'approval_required') {
+      // 审批事件：直接更新 fullTask，让审批栏立即出现
+      if (fullTask.value) {
+        fullTask.value = {
+          ...fullTask.value,
+          current_phase: 'awaiting_approval',
+          status:        'running',
+        }
+      }
+    }
+    if (data.type === 'log') {
+      logs.value.push(data.data)
+    }
+    if (data.type === 'done') {
+      refreshFullTask()
+    }
+  })
+})
+
+onUnmounted(() => {
+  stopPolling()
+})
+</script>
+
+<style scoped>
+.page-wrap {
+  padding: 24px 32px;
+  min-height: 100%;
+}
+
+.detail-header {
+  margin-bottom: 20px;
+}
+
+.back-btn {
+  color: var(--text-secondary) !important;
+  font-size: 13px !important;
+  margin-bottom: 12px;
+}
+
+.header-main {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.header-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.target-title {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+}
+
+.task-id {
+  font-size: 11px;
+  color: var(--text-muted);
+  background: var(--bg-elevated);
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+}
+
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.pipeline-card {
+  margin-bottom: 20px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 20px 24px;
+}
+
+.main-card {
+  border-radius: var(--radius-lg) !important;
+}
+
+.detail-tabs :deep(.el-tabs__header) {
+  margin-bottom: 0;
+  padding: 0 4px;
+}
+
+.tab-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.tab-badge {
+  margin-left: 2px;
+}
+
+.live-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent-blue);
+  animation: pulse 1.5s infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+</style>

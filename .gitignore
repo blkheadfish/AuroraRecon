@@ -1,0 +1,27 @@
+.idea/
+**/__pycache__/
+# 依赖库
+node_modules/
+
+# 压缩包
+*.zip
+*.tar.gz
+*.rar
+*.jar
+
+# 日志文件
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# 环境变量文件（包含敏感信息）
+.env
+.env.local
+
+# 构建产物（根据你的框架而定，比如 Vue/React）
+dist/
+build/
+
+# 系统文件
+.DS_Store
+Thumbs.db

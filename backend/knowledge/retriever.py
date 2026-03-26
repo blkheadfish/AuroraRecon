@@ -1,0 +1,262 @@
+"""
+knowledge/retriever.py
+知识检索器 —— 从 ExploitKB 检索并格式化利用知识供 LLM 消费
+
+核心职责:
+  1. 根据漏洞信息检索匹配的知识条目
+  2. 根据环境约束（NAT/公网）标注不可用的方案
+  3. 格式化为 LLM 可理解的文本
+  4. 将 {TARGET} 占位符替换为实际目标地址
+"""
+from __future__ import annotations
+
+import logging
+import os
+from typing import Optional
+
+from backend.knowledge.exploit_kb import ExploitEntry, ExploitKB
+
+logger = logging.getLogger(__name__)
+
+
+class EnvironmentProfile:
+    """运行环境特征，影响可用的利用方案"""
+
+    def __init__(self):
+        self.lhost: str = os.getenv("LHOST", "")
+        self.can_reverse: bool = self._check_reverse()
+
+    def _check_reverse(self) -> bool:
+        if not self.lhost:
+            return False
+        if self.lhost in ("127.0.0.1", "0.0.0.0", "localhost"):
+            return False
+        return True
+
+    def format_constraints(self) -> str:
+        lines = []
+        if self.can_reverse:
+            lines.append(f"- 攻击机IP: {self.lhost}，目标可回连此地址")
+            lines.append("- 可使用反弹shell、JNDI回连等方案")
+        else:
+            reason = "LHOST未配置" if not self.lhost else f"LHOST={self.lhost}(NAT/本地地址)"
+            lines.append(f"- 攻击机处于NAT环境（{reason}），目标无法回连攻击机")
+            lines.append("- 禁止使用: JNDI注入、反弹shell、DNS OOB等需要目标主动连接攻击机的方案")
+            lines.append("- 只能使用: 直接回显型exploit（发HTTP请求，在响应中获得命令执行结果）")
+        return "\n".join(lines)
+
+
+class KnowledgeRetriever:
+    """
+    知识检索器。
+
+    用法:
+        retriever = KnowledgeRetriever()
+        text = retriever.retrieve_for_exploit(
+            vuln_name="Fastjson 反序列化",
+            cve="CVE-2017-18349",
+            target_url="http://192.168.1.100:8090",
+        )
+    """
+
+    def __init__(self, kb: Optional[ExploitKB] = None):
+        self.kb = kb or ExploitKB()
+        self.env = EnvironmentProfile()
+
+    def retrieve_for_exploit(
+        self,
+        vuln_name: str = "",
+        cve: str = "",
+        fingerprint: str = "",
+        target_url: str = "",
+        evidence: str = "",
+        max_entries: int = 3,
+    ) -> str:
+        """
+        检索并格式化利用知识（同步，关键词检索）。
+        """
+        entries = self.kb.search(
+            vuln_name=vuln_name,
+            cve=cve,
+            fingerprint=fingerprint,
+        )
+
+        if not entries:
+            logger.info(f"[Retriever] 未找到匹配知识: name={vuln_name}, cve={cve}")
+            return self._fallback(vuln_name, cve)
+
+        entries = entries[:max_entries]
+        logger.info(
+            f"[Retriever] 找到 {len(entries)} 条匹配知识: "
+            f"{[e.vuln_id for e in entries]}"
+        )
+
+        sections = []
+        for entry in entries:
+            sections.append(self._format_entry(entry, target_url))
+        return "\n\n".join(sections)
+
+    async def retrieve_for_exploit_async(
+        self,
+        vuln_name: str = "",
+        cve: str = "",
+        fingerprint: str = "",
+        target_url: str = "",
+        evidence: str = "",
+        max_entries: int = 3,
+    ) -> str:
+        """
+        检索并格式化利用知识（异步，混合检索）。
+        优先向量检索，不可用时降级为关键词。
+        """
+        query = f"{vuln_name} {cve} {fingerprint} {evidence[:200]}"
+        entries = await self.kb.search_async(
+            query=query,
+            vuln_name=vuln_name,
+            cve=cve,
+            fingerprint=fingerprint,
+            top_k=max_entries,
+        )
+
+        if not entries:
+            # 向量检索没结果，降级关键词
+            entries = self.kb.search(
+                vuln_name=vuln_name,
+                cve=cve,
+                fingerprint=fingerprint,
+            )
+
+        if not entries:
+            logger.info(f"[Retriever] 未找到匹配知识: name={vuln_name}, cve={cve}")
+            return self._fallback(vuln_name, cve)
+
+        entries = entries[:max_entries]
+        mode = "向量+关键词" if self.kb.vector_ready else "关键词"
+        logger.info(
+            f"[Retriever] [{mode}] 找到 {len(entries)} 条: "
+            f"{[e.vuln_id for e in entries]}"
+        )
+
+        entries = entries[:max_entries]
+        logger.info(
+            f"[Retriever] 找到 {len(entries)} 条匹配知识: "
+            f"{[e.vuln_id for e in entries]}"
+        )
+
+        return "\n\n".join(self._format_entry(e, target_url) for e in entries)
+
+    async def retrieve_hybrid(
+        self,
+        vuln_name: str = "",
+        cve: str = "",
+        fingerprint: str = "",
+        evidence: str = "",
+        target_url: str = "",
+        max_entries: int = 3,
+    ) -> str:
+        """
+        混合检索（异步，关键词 + 向量语义）。
+
+        如果 embedding 不可用，自动 fallback 到纯关键词。
+        """
+        query = " ".join(filter(None, [vuln_name, cve, fingerprint, evidence[:200]]))
+
+        entries = await self.kb.search_hybrid(
+            query=query,
+            vuln_name=vuln_name,
+            cve=cve,
+            fingerprint=fingerprint,
+            top_k=max_entries,
+        )
+
+        if not entries:
+            logger.info(f"[Retriever] 混合检索未找到: {query[:100]}")
+            return self._fallback(vuln_name, cve)
+
+        logger.info(
+            f"[Retriever] 混合检索命中 {len(entries)} 条: "
+            f"{[e.vuln_id for e in entries]}"
+        )
+
+        return "\n\n".join(self._format_entry(e, target_url) for e in entries)
+
+        entries = entries[:max_entries]
+        logger.info(
+            f"[Retriever] 找到 {len(entries)} 条匹配知识: "
+            f"{[e.vuln_id for e in entries]}"
+        )
+
+        sections = []
+        for entry in entries:
+            sections.append(self._format_entry(entry, target_url))
+
+        return "\n\n".join(sections)
+
+    def _format_entry(self, entry: ExploitEntry, target_url: str = "") -> str:
+        """将知识条目格式化为 LLM 可读文本"""
+        # 推断 TARGET 占位符的替换值
+        target_placeholder = target_url or "http://TARGET"
+
+        lines = [
+            f"### {entry.description}",
+            f"分类: {entry.category}",
+            f"CVE: {', '.join(entry.match_cves) or 'N/A'}",
+            f"受影响版本: {entry.affected_versions}",
+        ]
+
+        if entry.common_endpoints:
+            lines.append(f"常见触发路径: {', '.join(entry.common_endpoints)}")
+
+        if entry.default_port:
+            lines.append(f"默认端口: {entry.default_port}")
+
+        # 回连约束标注
+        if entry.requires_callback:
+            if self.env.can_reverse:
+                lines.append(f"⚠️ 此漏洞需要目标回连攻击机。攻击机IP: {self.env.lhost}")
+            else:
+                lines.append(
+                    f"🚫 此漏洞原本需要目标回连攻击机，但当前处于NAT环境无法回连。"
+                )
+                if entry.callback_note:
+                    lines.append(f"   替代方案: {entry.callback_note}")
+
+        # 检测方法
+        if entry.detection_method:
+            lines.append(f"\n**漏洞检测方法:**")
+            lines.append(f"  {entry.detection_method}")
+
+        # 利用步骤（核心）
+        if entry.exploit_steps:
+            lines.append(f"\n**利用步骤 ({len(entry.exploit_steps)} 步):**")
+            for step in entry.exploit_steps:
+                lines.append(f"\n  步骤{step.step}: {step.description}")
+                if step.command:
+                    # 替换 TARGET 占位符
+                    cmd = step.command.replace("{TARGET}", target_placeholder)
+                    lines.append(f"  命令: {cmd}")
+                if step.expected_result:
+                    lines.append(f"  预期结果: {step.expected_result}")
+                if step.notes:
+                    lines.append(f"  注意: {step.notes}")
+
+        # 验证命令
+        if entry.verification_command:
+            cmd = entry.verification_command.replace("{TARGET}", target_placeholder)
+            lines.append(f"\n**RCE验证命令:** {cmd}")
+        if entry.verification_success_sign:
+            lines.append(f"**成功标志:** {entry.verification_success_sign}")
+
+        return "\n".join(lines)
+
+    def _fallback(self, vuln_name: str, cve: str) -> str:
+        return (
+            f"知识库中未找到 {vuln_name or cve} 的专项利用知识。\n"
+            f"请根据你的安全知识和扫描证据自行推理利用方案:\n"
+            f"- 仔细分析证据中的版本号、框架名、错误信息\n"
+            f"- 优先尝试直接回显型exploit（curl/wget发请求看响应）\n"
+            f"- 如果是Web应用，尝试常见路径和默认凭据\n"
+        )
+
+    def get_environment_constraints(self) -> str:
+        return self.env.format_constraints()
