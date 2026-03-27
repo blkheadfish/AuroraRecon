@@ -103,6 +103,7 @@ async def node_vuln_scan(state: PentestState) -> PentestState:
     )
     state.findings = result.get("findings", [])
     state.raw_vuln = result
+    state.fingerprints = result.get("fingerprints", {})
     exploitable = [f for f in state.findings if f.exploitable]
     state.log(f"漏洞扫描完成: {len(state.findings)} 发现, {len(exploitable)} 可利用")
     return state
@@ -179,6 +180,7 @@ async def node_exploit(state: PentestState) -> PentestState:
             ),
             "web_paths": ", ".join(state.web_paths[:20]) if state.web_paths else "无",
             "fingerprint": state.raw_recon.get("raw_nmap", "")[:500],
+            "fingerprints": state.fingerprints,  # VulnAgent 的完整指纹数据
         }
         results = await agent.run(
             target=state.target,
@@ -358,6 +360,21 @@ class Orchestrator:
         # ainvoke({"approved": ...}) 是错的——LangGraph 会把字典当新初始 state 从头跑
         await self._graph.aupdate_state(config, {"approved": approved})
         await self._graph.ainvoke(None, config=config)
+
+    async def resume_stream(self, task_id: str, approved: bool = True):
+        """
+        流式恢复执行（审批后继续 exploit → post → report）。
+
+        与 resume() 的区别：用 astream 代替 ainvoke，
+        每个节点完成后 yield 状态更新，供 API 层实时推送。
+        """
+        await self._ensure_graph()
+        config = {"configurable": {"thread_id": task_id}}
+        await self._graph.aupdate_state(config, {"approved": approved})
+
+        async for event in self._graph.astream(None, config=config):
+            for node_name, state in event.items():
+                yield node_name, state
 
     async def get_state(self, task_id: str) -> Optional[PentestState]:
         await self._ensure_graph()

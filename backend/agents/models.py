@@ -74,6 +74,8 @@ class PentestState(BaseModel):
 	
 	findings: list[VulnFinding] = Field(default_factory=list)
 	raw_vuln: dict = Field(default_factory=dict)
+	# VulnAgent 指纹识别结果：{port: {summary, whatweb, httpx, json_probe, ...}}
+	fingerprints: dict = Field(default_factory=dict)
 	
 	exploit_results: list[ExploitResult] = Field(default_factory=list)
 	got_shell: bool = False

