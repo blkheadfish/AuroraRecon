@@ -9,7 +9,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class TaskStatus(str, Enum):
@@ -85,7 +85,7 @@ class PentestState(BaseModel):
 	
 	report_path: str = ""
 	report_md: str = ""
-
+	
 	# 人工审批标志（由 resume() 注入，默认 False）
 	approved: bool = False
 	
@@ -95,3 +95,11 @@ class PentestState(BaseModel):
 		entry = f"[{ts}] [{self.current_phase}] {msg}"
 		self.phase_log.append(entry)
 		logging.getLogger(__name__).info(entry)
+	
+	@field_validator("fingerprints", mode="before")
+	@classmethod
+	def _coerce_fingerprint_keys(cls, v: dict) -> dict:
+		"""确保 fingerprints 的 key 全部是 str，兼容 msgpack strict_map_key"""
+		if isinstance(v, dict):
+			return {str(k): val for k, val in v.items()}
+		return v

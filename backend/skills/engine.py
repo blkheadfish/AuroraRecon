@@ -200,7 +200,6 @@ class SkillEngine:
         result = await self.executor.run_script(
             script_content=command,
             timeout=timeout,
-            task_id=task_id,
         )
 
         # 记录
@@ -270,7 +269,6 @@ class SkillEngine:
             exec_result = await self.executor.run_script(
                 script_content=command,
                 timeout=step.timeout,
-                task_id=task_id,
             )
 
             # 记录

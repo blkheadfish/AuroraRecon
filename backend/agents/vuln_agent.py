@@ -65,7 +65,7 @@ class VulnAgent:
         all_findings: list[VulnFinding] = []
 
         # ── Phase 1: 指纹识别（各端口并发）───────────────
-        fingerprints: dict[int, dict] = {}
+        fingerprints: dict[str, dict] = {}
         fp_tasks = []
         for wp in web_ports:
             scheme = "https" if wp.port in (443, 8443) else "http"
@@ -76,9 +76,9 @@ class VulnAgent:
         for wp, fp_result in zip(web_ports, fp_results):
             if isinstance(fp_result, Exception):
                 logger.warning(f"[VulnAgent] 指纹识别异常 :{wp.port}: {fp_result}")
-                fingerprints[wp.port] = {"url": f"http://{target}:{wp.port}", "summary": "unknown"}
+                fingerprints[str(wp.port)] = {"url": f"http://{target}:{wp.port}", "summary": "unknown"}
             else:
-                fingerprints[wp.port] = fp_result
+                fingerprints[str(wp.port)] = fp_result
                 logger.info(f"[VulnAgent] 指纹 :{wp.port} -> {fp_result.get('summary', 'unknown')}")
 
         # ── Phase 2: LLM 分析指纹 → 扫描策略 ────────────

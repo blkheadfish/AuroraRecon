@@ -21,7 +21,7 @@ import functools
 import json
 import logging
 import uuid
-from typing import Optional
+from typing import Any, Optional
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
@@ -79,10 +79,10 @@ async def node_recon(state: PentestState) -> PentestState:
     agent = ReconAgent()
     result = await agent.run(state.target, task_id=state.task_id)
     state.open_ports = result.get("ports", [])
-    state.os_info = result.get("os_info", {})
+    state.os_info = _stringify_dict_keys(result.get("os_info", {}))
     state.web_paths = result.get("web_paths", [])
     state.subdomains = result.get("subdomains", [])
-    state.raw_recon = result
+    state.raw_recon = _stringify_dict_keys(result)
     state.target_os = _infer_os(state.open_ports, state.os_info)
     state.log(f"侦察完成: {len(state.open_ports)} 端口, OS={state.target_os}")
     return state
@@ -102,8 +102,10 @@ async def node_vuln_scan(state: PentestState) -> PentestState:
         task_id=state.task_id,
     )
     state.findings = result.get("findings", [])
-    state.raw_vuln = result
-    state.fingerprints = result.get("fingerprints", {})
+    # msgpack (LangGraph checkpoint) 不允许 int 作 dict key
+    # raw_vuln 和 fingerprints 都可能含 int key（端口号），必须递归转换
+    state.raw_vuln = _stringify_dict_keys(result)
+    state.fingerprints = _stringify_dict_keys(result.get("fingerprints", {}))
     exploitable = [f for f in state.findings if f.exploitable]
     state.log(f"漏洞扫描完成: {len(state.findings)} 发现, {len(exploitable)} 可利用")
     return state
@@ -391,6 +393,21 @@ class Orchestrator:
 # ───────────────────────────────────────────────────────────
 # 辅助函数
 # ───────────────────────────────────────────────────────────
+
+def _stringify_dict_keys(obj: Any) -> Any:
+    """
+    递归将 dict 的所有 key 转为 str。
+
+    LangGraph 的 MemorySaver 使用 msgpack 序列化 checkpoint，
+    msgpack 默认 strict_map_key=True 不允许 int/float 作为 dict key。
+    VulnAgent 的 fingerprints 用端口号(int)做 key，必须转换。
+    """
+    if isinstance(obj, dict):
+        return {str(k): _stringify_dict_keys(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_stringify_dict_keys(item) for item in obj]
+    return obj
+
 
 def _infer_os(ports: list[PortInfo], os_info: dict) -> str:
     port_nums = {p.port for p in ports}

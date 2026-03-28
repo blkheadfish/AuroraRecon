@@ -2,10 +2,15 @@
 skills/registry.py
 Skill 注册表
 
-职责：
-  - 维护所有已加载 Skill 的索引
-  - 根据漏洞信息匹配最适用的 Skill
-  - 支持多 Skill 匹配时按优先级排序
+匹配策略（v2 评分制）：
+  CVE 精确命中    +100  （最强信号，明确就是这个漏洞）
+  漏洞名称命中    +60   （VulnAgent 已经识别了漏洞名）
+  json_probe 命中 +40   （主动探测确认）
+  指纹关键词命中  +20   （框架级匹配，可能是宿主而非漏洞本身）
+  证据关键词命中  +10   （最弱信号，容易误触发）
+
+  多个 Skill 匹配时，选评分最高的。
+  同分时，category 越具体越优先（java_deserialization > server_misconfig）。
 """
 from __future__ import annotations
 
@@ -14,30 +19,26 @@ from typing import Optional
 
 from backend.agents.models import VulnFinding
 from backend.skills.loader import load_all_skills
-from backend.skills.models import Skill
+from backend.skills.models import MatchRule, Skill
 
 logger = logging.getLogger(__name__)
 
+# 类别优先级：越具体越优先（同分时的 tiebreaker）
+_CATEGORY_PRIORITY = {
+    "java_deserialization": 10,
+    "web_rce": 9,
+    "web_inject": 8,
+    "server_misconfig": 5,   # 宿主级匹配，优先级最低
+    "credential": 4,
+}
+
 
 class SkillRegistry:
-    """
-    Skill 注册表。
-
-    启动时加载所有 YAML，运行时根据漏洞信息匹配。
-
-    用法：
-        registry = SkillRegistry()
-        skill = registry.match(finding)
-        if skill:
-            # 交给 SkillEngine 执行
-    """
-
     def __init__(self):
         self._skills: list[Skill] = []
         self._loaded = False
 
     def ensure_loaded(self) -> None:
-        """延迟加载：首次调用时加载所有 Skill"""
         if self._loaded:
             return
         self._skills = load_all_skills()
@@ -56,23 +57,13 @@ class SkillRegistry:
         json_probe: str = "",
     ) -> Optional[Skill]:
         """
-        根据漏洞发现匹配最适用的 Skill。
-
-        匹配信息来源：
-          - finding.name         漏洞名称
-          - finding.cve          CVE 编号
-          - finding.evidence     扫描证据
-          - finding.description  漏洞描述
-          - finding.tool         发现工具
-          - fingerprint          VulnAgent 的指纹识别结果
-          - json_probe           VulnAgent 的 JSON 探测结果
+        根据漏洞发现匹配最适用的 Skill（评分制）。
 
         Returns:
-            匹配到的 Skill，未匹配返回 None
+            评分最高的 Skill，未匹配返回 None
         """
         self.ensure_loaded()
 
-        # 构建匹配用的综合文本
         combined_fp = " ".join(filter(None, [
             fingerprint,
             finding.name,
@@ -80,30 +71,41 @@ class SkillRegistry:
             finding.evidence[:500],
         ]))
 
-        candidates: list[Skill] = []
+        scored: list[tuple[int, Skill]] = []
 
         for skill in self._skills:
-            if self._matches_skill(
-                skill, finding, combined_fp, json_probe
-            ):
-                candidates.append(skill)
+            score = self._score_skill(skill, finding, combined_fp, json_probe)
+            if score > 0:
+                scored.append((score, skill))
 
-        if not candidates:
+        if not scored:
             logger.debug(
                 f"[SkillRegistry] 无匹配 Skill: {finding.name} ({finding.cve})"
             )
             return None
 
-        if len(candidates) > 1:
+        # 按分数降序，同分按类别优先级降序
+        scored.sort(
+            key=lambda x: (
+                x[0],
+                _CATEGORY_PRIORITY.get(x[1].category, 0),
+            ),
+            reverse=True,
+        )
+
+        if len(scored) > 1:
+            top3 = [
+                f"{s.skill_id}({score}分)"
+                for score, s in scored[:3]
+            ]
             logger.info(
-                f"[SkillRegistry] 多个 Skill 匹配: "
-                f"{[s.skill_id for s in candidates]}，选择第一个"
+                f"[SkillRegistry] 匹配评分: {', '.join(top3)}"
             )
 
-        chosen = candidates[0]
+        best_score, chosen = scored[0]
         logger.info(
-            f"[SkillRegistry] 匹配到 Skill: {chosen.skill_id} "
-            f"← {finding.name} ({finding.cve})"
+            f"[SkillRegistry] ✅ 选择 Skill: {chosen.skill_id} "
+            f"(得分={best_score}) ← {finding.name} ({finding.cve})"
         )
         return chosen
 
@@ -113,23 +115,24 @@ class SkillRegistry:
         fingerprint: str = "",
         json_probe: str = "",
     ) -> list[Skill]:
-        """返回所有匹配的 Skill（按加载顺序）"""
+        """返回所有匹配的 Skill（按评分排序）"""
         self.ensure_loaded()
 
         combined_fp = " ".join(filter(None, [
-            fingerprint,
-            finding.name,
-            finding.description,
+            fingerprint, finding.name, finding.description,
             finding.evidence[:500],
         ]))
 
-        return [
-            s for s in self._skills
-            if self._matches_skill(s, finding, combined_fp, json_probe)
-        ]
+        scored = []
+        for s in self._skills:
+            score = self._score_skill(s, finding, combined_fp, json_probe)
+            if score > 0:
+                scored.append((score, s))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [s for _, s in scored]
 
     def get_by_id(self, skill_id: str) -> Optional[Skill]:
-        """按 ID 精确查找"""
         self.ensure_loaded()
         for s in self._skills:
             if s.skill_id == skill_id:
@@ -137,7 +140,6 @@ class SkillRegistry:
         return None
 
     def list_all(self) -> list[dict]:
-        """列出所有已注册 Skill（用于 API / 调试）"""
         self.ensure_loaded()
         return [
             {
@@ -152,21 +154,34 @@ class SkillRegistry:
         ]
 
     def reload(self) -> None:
-        """重新加载所有 Skill（开发调试用）"""
         self._loaded = False
         self.ensure_loaded()
 
     # ─────────────────────────────────────────────────────
 
     @staticmethod
-    def _matches_skill(
+    def _score_skill(
         skill: Skill,
         finding: VulnFinding,
         fingerprint: str,
         json_probe: str,
-    ) -> bool:
-        """检查单个 Skill 是否匹配"""
+    ) -> int:
+        """
+        计算 Skill 的匹配得分。0 = 不匹配。
+
+        评分维度（每条规则独立打分，取最高分）：
+          CVE 精确匹配    +100
+          漏洞名称命中    +60
+          json_probe 命中 +40
+          指纹关键词命中  +20
+          证据关键词命中  +10
+        """
         match_cfg = skill.match
+        fp_lower = fingerprint.lower()
+        name_lower = finding.name.lower() if finding.name else ""
+        cve_lower = (finding.cve or "").lower()
+        ev_lower = (finding.evidence or "").lower()
+        jp_lower = json_probe.lower()
 
         # 排除规则优先
         for ex_rule in match_cfg.exclude:
@@ -178,18 +193,43 @@ class SkillRegistry:
                 service="",
                 port=finding.port,
             ):
-                return False
+                return 0
 
-        # 匹配规则：满足 ANY 一条即可
+        best_score = 0
+
         for rule in match_cfg.rules:
-            if rule.matches(
-                fingerprint=fingerprint,
-                cve=finding.cve or "",
-                evidence=finding.evidence,
-                json_probe=json_probe,
-                service="",
-                port=finding.port,
-            ):
-                return True
+            rule_score = 0
 
-        return False
+            # CVE 精确匹配（最强信号）
+            if rule.cve_matches and cve_lower:
+                if any(c.lower() == cve_lower for c in rule.cve_matches):
+                    rule_score += 100
+
+            # 漏洞名称命中 Skill 关键词
+            # 比如 finding.name="Apache Shiro 反序列化" 命中 shiro skill 的
+            # fingerprint_contains=["shiro"]
+            if rule.fingerprint_contains:
+                if any(kw.lower() in name_lower for kw in rule.fingerprint_contains):
+                    rule_score += 60
+                # 指纹匹配（比名称弱——"tomcat" 出现在指纹里可能只是宿主）
+                elif any(kw.lower() in fp_lower for kw in rule.fingerprint_contains):
+                    rule_score += 20
+
+            # JSON 探测结果
+            if rule.json_probe_result and jp_lower:
+                if rule.json_probe_result.lower() in jp_lower:
+                    rule_score += 40
+
+            # 证据关键词（最弱信号）
+            if rule.evidence_contains:
+                if any(kw.lower() in ev_lower for kw in rule.evidence_contains):
+                    rule_score += 10
+
+            # 端口/服务匹配（辅助信号）
+            if rule.port_is and finding.port:
+                if finding.port in rule.port_is:
+                    rule_score += 5
+
+            best_score = max(best_score, rule_score)
+
+        return best_score
