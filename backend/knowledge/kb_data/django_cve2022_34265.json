@@ -39,7 +39,7 @@
       "notes": "使用单引号闭合SQL语句触发注入"
     }
   ],
-  "verification_command": "curl -s 'http://{TARGET}:8000/?date=xxxx\\'xxxx'",
+  "verification_command": "curl -s \"http://{TARGET}:8000/?date=xxxx%27xxxx\"",
   "verification_success_sign": "响应中包含SQL错误信息或数据库错误提示",
   "requires_callback": false,
   "callback_note": "此漏洞为SQL注入，不需要目标回连攻击机。可通过SQL注入获取数据库信息或执行进一步操作",

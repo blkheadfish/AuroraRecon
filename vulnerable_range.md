@@ -2,3 +2,4 @@
 - Vulhub/thinkphp/2rce
 - Vulhub/thinkphp/5rce
 - Vulhub/fastjson
+- Vulhub/flask-SSTI

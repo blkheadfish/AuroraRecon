@@ -171,6 +171,9 @@ class ExploitStep:
     command: str = ""
     timeout: int = 30
 
+    # 端口映射（用于反连回调）
+    publish_ports: list[int] = field(default_factory=list)
+
     # 成功判定
     success_criteria: SuccessCriteria = field(default_factory=SuccessCriteria)
 

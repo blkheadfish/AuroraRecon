@@ -200,6 +200,7 @@ class ToolExecutor:
         workdir: str = "/tmp",
         log_callback: LogCallback = None,
         task_id: Optional[str] = None,
+        publish_ports: list[int] | None = None,
     ) -> ExecuteResult:
         tool_def = self._registry.get_or_default(tool)
         effective_timeout = timeout or tool_def.timeout
@@ -236,7 +237,7 @@ class ToolExecutor:
                     log_callback=log_callback,
                 )
             else:
-                cmd = self._build_docker_run_cmd(tool_def, args, env, workdir)
+                cmd = self._build_docker_run_cmd(tool_def, args, env, workdir, publish_ports)
                 backend_label = "container-run"
 
         # ── subprocess 执行（local 和 container-run 共用）──
@@ -289,7 +290,7 @@ class ToolExecutor:
 
     # ── docker run --rm（临时容器）────────────────────────
 
-    def _build_docker_run_cmd(self, tool_def, args, env, workdir) -> list[str]:
+    def _build_docker_run_cmd(self, tool_def, args, env, workdir, publish_ports=None) -> list[str]:
         docker_cmd = [
             "docker", "run", "--rm", "-i",
             "--network", DOCKER_NETWORK,   # pentest_net：与 msf/postgres/redis 同网，Docker DNS 可解析
@@ -297,6 +298,10 @@ class ToolExecutor:
             "-v", f"{DATA_VOLUME}:/data",
             "--privileged",
         ]
+        # 端口映射（用于反连回调，如 Shiro 利用）
+        if publish_ports:
+            for port in publish_ports:
+                docker_cmd.extend(["-p", f"{port}:{port}"])
         lhost = os.getenv("LHOST", "")
         if lhost:
             docker_cmd.extend(["-e", f"LHOST={lhost}"])
@@ -402,11 +407,17 @@ class ToolExecutor:
         timeout: int = 60,
         shell: str = "/bin/bash",
         log_callback: LogCallback = None,
+        publish_ports: list[int] | None = None,
     ) -> ExecuteResult:
-        """执行 shell 脚本片段"""
+        """执行 shell 脚本片段
+
+        Args:
+            publish_ports: 需要映射到宿主机的端口列表（用于反连回调）
+        """
         return await self.run(
             tool=shell, args=["-s"], timeout=timeout,
             input_data=script_content, log_callback=log_callback,
+            publish_ports=publish_ports,
         )
 
     # ── 容器生命周期快捷方法（供 orchestrator 调用）──────

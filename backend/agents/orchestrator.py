@@ -133,9 +133,21 @@ async def node_exploit_decision(state: PentestState) -> PentestState:
             if finding.vuln_id in priority_map:
                 rec = priority_map[finding.vuln_id]
                 if not rec.get("should_exploit", True):
-                    finding.exploitable = False
+                    # 只允许 LLM 禁用 low/info 级别的漏洞
+                    # high/critical 级别的漏洞必须保留，避免 LLM 误判
+                    if finding.severity in ("low", "info"):
+                        finding.exploitable = False
+                        logger.info(
+                            f"[ExploitDecision] 禁用低优先级: {finding.name} ({finding.severity})"
+                        )
+                    else:
+                        logger.info(
+                            f"[ExploitDecision] 保留 {finding.severity} 级别: {finding.name}"
+                            f"（LLM 建议跳过但级别过高，强制保留）"
+                        )
 
-        state.log("LLM 决策完成")
+        remaining = sum(1 for f in state.findings if f.exploitable)
+        state.log(f"LLM 决策完成，保留 {remaining} 个可利用漏洞")
     except Exception as e:
         state.log(f"LLM 决策异常（保留原始可利用标记）: {e}")
     return state
@@ -214,7 +226,6 @@ async def node_post_exploit(state: PentestState) -> PentestState:
         result = await agent.run(
             exploit_results=state.exploit_results,
             target_os=state.target_os,
-            task_id=state.task_id,
         )
         state.post_findings = result
         state.privilege_level = result.get("final_privilege", state.privilege_level)

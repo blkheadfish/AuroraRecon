@@ -150,5 +150,21 @@ RUN if [ -f /usr/share/wordlists/rockyou.txt.gz ]; then \
         > /usr/share/wordlists/rockyou-top100.txt; \
     fi
 
+# ── 安装 JDK 8（专给 ysoserial）──────────────────────────
+# Kali/Debian 系：
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends openjdk-8-jdk-headless && \
+    rm -rf /var/lib/apt/lists/*
+
+# 如果 apt 里没有 openjdk-8（某些新版 Kali），用 Adoptium Temurin：
+# RUN mkdir -p /usr/lib/jvm/java-8 && \
+#     curl -sL "https://github.com/adoptium/temurin8-binaries/releases/download/jdk8u422-b05/OpenJDK8U-jdk_x64_linux_hotspot_8u422b05.tar.gz" \
+#     | tar xz --strip-components=1 -C /usr/lib/jvm/java-8
+
+ENV JAVA8=/usr/lib/jvm/java-8/bin/java
+
+# 验证两个 JDK 共存
+RUN ${JAVA8} -version 2>&1 | head -1 && java -version 2>&1 | head -1
+
 WORKDIR /workspace
 CMD ["/bin/bash"]

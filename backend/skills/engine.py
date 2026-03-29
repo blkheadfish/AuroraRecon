@@ -105,26 +105,34 @@ class SkillEngine:
         for path in sorted_paths:
             # LLM 兜底路径
             if path.mode == "react_freeform":
-                logger.info("[SkillEngine] 进入 LLM 自由推理兜底")
+                logger.info(
+                    f"[SkillEngine] 🤖 所有确定性路径已尝试，进入 LLM 自由推理兜底 "
+                    f"(限定在 {skill.name} 范围内，最多 {path.max_rounds} 轮)"
+                )
                 return await self._react_freeform(
                     skill, finding, ctx, path.max_rounds
                 )
 
             # 条件检查
             if path.conditions and not ctx.check(path.conditions):
+                unmet = {k: v for k, v in path.conditions.items()
+                         if not ctx.check({k: v})}
                 logger.info(
-                    f"[SkillEngine] 路径 {path.path_id} 条件不满足，跳过"
+                    f"[SkillEngine] ⏭ 路径 [{path.path_id}] {path.name} — "
+                    f"条件不满足: {unmet}"
                 )
                 continue
 
             if path.skip_if and ctx.check(path.skip_if):
                 logger.info(
-                    f"[SkillEngine] 路径 {path.path_id} 命中排除条件，跳过"
+                    f"[SkillEngine] ⏭ 路径 [{path.path_id}] {path.name} — "
+                    f"命中排除条件: {path.skip_if}"
                 )
                 continue
 
             logger.info(
-                f"[SkillEngine] 尝试路径: {path.path_id} ({path.name})"
+                f"[SkillEngine] ▶ 执行路径 [{path.path_id}] {path.name} "
+                f"(优先级={path.priority}, {len(path.steps)}步)"
             )
 
             result = await self._execute_path(path, ctx, finding, task_id)
@@ -172,16 +180,15 @@ class SkillEngine:
                 logger.debug(f"[SkillEngine] 探测 {probe.id} 环境不满足，跳过")
                 continue
 
-            logger.info(f"[SkillEngine] 执行探测: {probe.id}")
+            logger.info(f"[SkillEngine] 执行探测: {probe.id} — {probe.description[:60]}")
 
             if probe.steps:
-                # 多步骤探测
-                for step in probe.steps:
+                for i, step in enumerate(probe.steps):
+                    logger.info(f"[SkillEngine]   探测子步骤 {i+1}/{len(probe.steps)}")
                     await self._run_probe_command(
                         step.command, step.parse_rules, step.timeout, ctx, task_id
                     )
             elif probe.command:
-                # 单命令探测
                 await self._run_probe_command(
                     probe.command, probe.parse_rules, probe.timeout, ctx, task_id
                 )
@@ -197,10 +204,24 @@ class SkillEngine:
         """执行单条探测命令并应用解析规则"""
         command = ctx.substitute(command_template)
 
+        # 日志：显示命令摘要（去掉多余空白）
+        cmd_preview = " ".join(command.split())[:150]
+        logger.info(f"[SkillEngine]   命令: {cmd_preview}...")
+
         result = await self.executor.run_script(
             script_content=command,
             timeout=timeout,
         )
+
+        # 日志：显示输出摘要
+        stdout_preview = result.stdout.strip().replace('\n', ' ')[:200]
+        logger.info(
+            f"[SkillEngine]   输出: exit={result.exit_code}, "
+            f"{len(result.stdout)}B: {stdout_preview}"
+        )
+        if result.stderr.strip():
+            stderr_preview = result.stderr.strip().replace('\n', ' ')[:100]
+            logger.info(f"[SkillEngine]   stderr: {stderr_preview}")
 
         # 记录
         ctx.probe_records.append({
@@ -210,20 +231,24 @@ class SkillEngine:
             "exit_code": result.exit_code,
         })
 
-        # 解析 HTTP 状态码（如果命令输出中包含）
-        status_code = result.exit_code  # 粗略近似
-        # 尝试从 stdout 提取 HTTP 状态码
+        # 解析 HTTP 状态码
+        status_code = result.exit_code
         stdout = result.stdout.strip()
         if stdout.isdigit() and len(stdout) == 3:
             status_code = int(stdout)
 
         # 应用解析规则
+        any_triggered = False
         for rule in parse_rules:
             updates = rule.evaluate(result.stdout, result.stderr, status_code)
             if updates:
+                any_triggered = True
                 for k, v in updates.items():
                     ctx.set_var(k, v)
-                    logger.info(f"[SkillEngine] 探测设置: {k} = {v}")
+                    logger.info(f"[SkillEngine]   ✓ 设置变量: {k} = {v}")
+
+        if not any_triggered and parse_rules:
+            logger.info(f"[SkillEngine]   ✗ 无解析规则触发")
 
     # ================================================================
     # Phase 2: 路径执行
@@ -259,16 +284,21 @@ class SkillEngine:
             step = steps[current_idx]
 
             logger.info(
-                f"[SkillEngine]   步骤 {step.id}: {step.description[:80]}"
+                f"[SkillEngine]   📌 步骤 [{step.id}]: {step.description}"
             )
 
             # 执行命令
             command = ctx.substitute(step.command)
             ctx.commands_run.append(command)
 
+            # 日志：命令摘要
+            cmd_preview = " ".join(command.split())[:200]
+            logger.info(f"[SkillEngine]      命令: {cmd_preview}...")
+
             exec_result = await self.executor.run_script(
                 script_content=command,
                 timeout=step.timeout,
+                publish_ports=step.publish_ports or None,
             )
 
             # 记录
@@ -284,15 +314,34 @@ class SkillEngine:
             }
             ctx.step_records.append(record)
 
+            # 日志：输出摘要
+            stdout_preview = exec_result.stdout.strip().replace('\n', ' ')[:300]
+            logger.info(
+                f"[SkillEngine]      输出: exit={exec_result.exit_code}, "
+                f"{len(exec_result.stdout)}B, {exec_result.elapsed:.1f}s"
+            )
+            logger.info(f"[SkillEngine]      预览: {stdout_preview}")
+            if exec_result.stderr.strip():
+                stderr_preview = exec_result.stderr.strip().replace('\n', ' ')[:150]
+                logger.info(f"[SkillEngine]      stderr: {stderr_preview}")
+
             # 判定成功/失败
             success = step.success_criteria.evaluate(
                 exec_result.stdout, exec_result.stderr, exec_result.exit_code
             )
 
+            # 日志：判定细节
+            sc = step.success_criteria
+            criteria_desc = []
+            if sc.stdout_contains_any:
+                criteria_desc.append(f"contains_any={sc.stdout_contains_any}")
+            if sc.stdout_not_empty:
+                criteria_desc.append("not_empty")
+            if sc.stdout_regex:
+                criteria_desc.append(f"regex={sc.stdout_regex[:30]}")
             logger.info(
-                f"[SkillEngine]   结果: {'成功' if success else '失败'} "
-                f"(exit={exec_result.exit_code}, "
-                f"stdout={len(exec_result.stdout)}B)"
+                f"[SkillEngine]      判定: {'✅ 成功' if success else '❌ 失败'} "
+                f"(条件: {', '.join(criteria_desc) or '无'})"
             )
 
             if success:
@@ -420,18 +469,33 @@ class SkillEngine:
         )
 
         system_prompt = (
-            "你是一名资深渗透测试工程师，正在合法授权的 CTF 靶场中测试。\n"
-            "之前的自动化利用路径全部失败，现在需要你根据上下文信息自由推理。\n"
-            "每次只生成一条命令，返回 JSON：\n"
+            f"你是一名资深渗透测试工程师，正在合法授权的 CTF 靶场中测试。\n"
+            f"你正在利用的漏洞是：{skill.name}（{finding.name}）。\n\n"
+            f"【严格限制】\n"
+            f"- 你只能尝试与 {skill.name} 相关的利用方法\n"
+            f"- 禁止尝试其他类型的漏洞（如目标是 Shiro 就不要试 ThinkPHP/Struts/SSTI）\n"
+            f"- 禁止做端口扫描、目录爆破等侦察操作（已经完成了）\n"
+            f"- 每次只生成一条命令\n"
+            f"- 如果你认为该漏洞在当前环境下无法利用，直接 conclude_fail\n\n"
+            f"返回严格 JSON（不含 markdown）：\n"
             '{"action":"execute","command":"...","purpose":"..."}\n'
             '或 {"action":"conclude_success","evidence":"...","current_user":"..."}\n'
             '或 {"action":"conclude_fail","reason":"..."}\n'
-            "不要重复已经失败的命令。"
         )
 
         conversation = [
-            {"role": "user", "content": context_for_llm + "\n\n请分析情况，生成第一条利用命令。"},
+            {"role": "user", "content": (
+                context_for_llm +
+                f"\n\n之前的自动化路径全部失败。请基于上述漏洞原理和探测结果，"
+                f"只在 [{skill.name}] 这个漏洞范围内推理下一步利用命令。"
+            )},
         ]
+
+        logger.info(
+            f"[SkillEngine] 🤖 LLM 兜底开始: 漏洞={skill.name}, "
+            f"已知变量={list(ctx.variables.keys())}, "
+            f"已执行={len(ctx.commands_run)}条命令"
+        )
 
         for round_num in range(max_rounds):
             try:
@@ -457,8 +521,15 @@ class SkillEngine:
                 continue
 
             action = decision.get("action", "")
+            purpose = decision.get("purpose", "")
+
+            logger.info(
+                f"[SkillEngine] 🤖 LLM 第{round_num+1}轮: action={action}, "
+                f"purpose={purpose[:80]}"
+            )
 
             if action == "conclude_success":
+                logger.info(f"[SkillEngine] 🤖 LLM 判定利用成功")
                 return ExploitResult(
                     vuln_id=finding.vuln_id,
                     success=True,
@@ -474,6 +545,8 @@ class SkillEngine:
                 )
 
             if action == "conclude_fail":
+                reason = decision.get("reason", "未知")
+                logger.info(f"[SkillEngine] 🤖 LLM 判定利用失败: {reason[:200]}")
                 break
 
             if action != "execute":
@@ -487,8 +560,17 @@ class SkillEngine:
             if not cmd:
                 continue
 
+            cmd_preview = " ".join(cmd.split())[:200]
+            logger.info(f"[SkillEngine] 🤖 执行: {cmd_preview}...")
+
             ctx.commands_run.append(cmd)
             exec_result = await self.executor.run_script(cmd, timeout=60)
+
+            stdout_preview = exec_result.stdout.strip().replace('\n', ' ')[:200]
+            logger.info(
+                f"[SkillEngine] 🤖 结果: exit={exec_result.exit_code}, "
+                f"{len(exec_result.stdout)}B: {stdout_preview}"
+            )
 
             ctx.step_records.append({
                 "path_id": "llm_freeform",
