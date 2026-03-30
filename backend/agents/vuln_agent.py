@@ -58,8 +58,11 @@ class VulnAgent:
 
         web_ports = [
             p for p in ports
-            if p.service in ("http", "https", "opsmessaging")
-            or p.port in (80, 443, 8080, 8081, 8090, 8443, 8888, 9000, 9090, 9200)
+            if p.service in ("http", "https", "http-proxy", "http-alt",
+                              "opsmessaging", "jetty", "sun-answerbook")
+            or p.port in (80, 443, 3000, 7001, 7002,
+                          8000, 8008, 8080, 8081, 8090, 8161,
+                          8443, 8888, 9000, 9001, 9090, 9200, 9443, 10000)
         ]
 
         all_findings: list[VulnFinding] = []
@@ -598,8 +601,10 @@ class VulnAgent:
                 "geoserver": ["geoserver"], "wordpress": ["wordpress", "wp-"],
                 "jenkins": ["jenkins"], "spring": ["spring", "springframework"],
                 "fastjson": ["fastjson", "alibaba"], "php": ["php/"],
+                "php-fpm": ["php-fpm", "php/fpm"],
                 "nginx": ["nginx"], "apache": ["apache"],
                 "gunicorn": ["gunicorn"], "jinja2": ["jinja2"],
+                "jetty": ["jetty"],
             }
             for signal_name, keywords in fp_keywords.items():
                 for kw in keywords:
@@ -628,17 +633,30 @@ class VulnAgent:
             # Java 服务器 → 搜索常见 Java 漏洞
             ("java",):       ["fastjson", "shiro", "struts", "spring"],
             ("tomcat",):     ["tomcat", "java", "shiro", "struts"],
-            # PHP → ThinkPHP 等
-            ("php",):        ["thinkphp", "wordpress"],
+            # PHP → ThinkPHP 等 + PHP-FPM（Nginx+PHP 组合是 CVE-2019-11043 的前提）
+            ("php",):        ["thinkphp", "wordpress", "php-fpm"],
             # Shiro 相关
             ("rememberme",): ["shiro"],
             ("deleteme",):   ["shiro"],
         }
 
+        # ── 组合推理规则（需要多个信号同时存在）──────────
+        # 先放到下面，在 signals_to_add 初始化之后执行
+
         signals_to_add = set()
         for trigger_signals, inferred in inference_rules.items():
             if any(s.lower() in {x.lower() for x in search_signals} for s in trigger_signals):
                 signals_to_add.update(inferred)
+
+        # 组合推理（多信号同时存在才触发）
+        signals_lower = {s.lower() for s in search_signals}
+        # Nginx + PHP → 强烈暗示 PHP-FPM 配置，CVE-2019-11043
+        if "nginx" in signals_lower and "php" in signals_lower:
+            signals_to_add.update(["php-fpm", "fastcgi", "cve-2019-11043"])
+        # ActiveMQ 端口信号补充
+        if "activemq" in signals_lower:
+            signals_to_add.update(["jolokia", "cve-2022-41678"])
+
         search_signals.update(signals_to_add)
 
         # 已发现的漏洞名也是信号

@@ -229,14 +229,21 @@ class ToolExecutor:
 
         else:
             # container 模式：有持久容器用 exec，否则用 run --rm
+            # 例外: publish_ports 需要端口映射，docker exec 不支持运行时加 -p，
+            #       必须走 docker run --rm 让容器创建时带上端口映射
             container_name = TaskContainerManager.get_container(task_id) if task_id else None
-            if container_name:
+            if container_name and not publish_ports:
                 return await self._run_docker_exec(
                     tool, args, container_name,
                     timeout=effective_timeout, env=env, workdir=workdir,
                     log_callback=log_callback,
                 )
             else:
+                if publish_ports and container_name:
+                    logger.info(
+                        f"[Executor] publish_ports={publish_ports}，"
+                        f"绕过持久容器 {container_name}，使用临时容器"
+                    )
                 cmd = self._build_docker_run_cmd(tool_def, args, env, workdir, publish_ports)
                 backend_label = "container-run"
 

