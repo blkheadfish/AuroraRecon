@@ -343,6 +343,7 @@ class SkillContext:
     # 环境信息
     lhost: str = ""
     can_reverse: bool = False
+    task_id: Optional[str] = None  # 任务 ID，用于持久容器执行
 
     # 动态变量（探测阶段设置，决策树使用）
     variables: dict[str, Any] = field(default_factory=dict)

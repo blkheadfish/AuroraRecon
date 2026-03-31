@@ -237,6 +237,7 @@ class ToolExecutor:
                     tool, args, container_name,
                     timeout=effective_timeout, env=env, workdir=workdir,
                     log_callback=log_callback,
+                    input_data=input_data,
                 )
             else:
                 if publish_ports and container_name:
@@ -267,6 +268,7 @@ class ToolExecutor:
         env: Optional[dict],
         workdir: str,
         log_callback: LogCallback,
+        input_data: Optional[str] = None,
     ) -> ExecuteResult:
         tool_def = self._registry.get_or_default(tool)
         env_args: list[str] = []
@@ -274,15 +276,37 @@ class ToolExecutor:
             env_args += ["-e", f"{k}={v}"]
 
         import shlex
+        import base64 as _b64
         # docker exec 不自动加载镜像 ENV，需要显式注入 PATH
-        # 路径覆盖 Kali 所有工具安装位置
+        # 同时注入 LHOST（Shiro/JNDI 利用需要）
         kali_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         path_args = ["-e", f"PATH={kali_path}"]
+        lhost_val = os.getenv("LHOST", "")
+        if lhost_val:
+            path_args += ["-e", f"LHOST={lhost_val}"]
+
         cmd_parts = tool_def.command.split()
-        inner_cmd = shlex.join(cmd_parts + args)
-        cmd = (["docker", "exec", "-w", workdir]
-               + path_args + env_args
-               + [container_name, "bash", "-c", inner_cmd])
+
+        if input_data:
+            # ── 关键修复: 不走 stdin，把脚本内容 base64 编码嵌入命令行 ──
+            # docker exec 的 stdin 管道在嵌套 bash 中不可靠（race condition
+            # 导致内层 bash 收到 EOF，0B 输出）。
+            # 方案: echo '<base64>' | base64 -d | /bin/bash -s
+            # base64 字符集 [A-Za-z0-9+/=] 不含 shell 特殊字符，安全嵌入。
+            b64_script = _b64.b64encode(input_data.encode("utf-8")).decode("ascii")
+            tool_cmd = shlex.join(cmd_parts + args)
+            inner_cmd = f"echo '{b64_script}' | base64 -d | {tool_cmd}"
+            cmd = (["docker", "exec", "-w", workdir]
+                   + path_args + env_args
+                   + [container_name, "bash", "-c", inner_cmd])
+            # stdin 数据已编码进命令行，不再通过 pipe 传递
+            effective_input = None
+        else:
+            inner_cmd = shlex.join(cmd_parts + args)
+            cmd = (["docker", "exec", "-w", workdir]
+                   + path_args + env_args
+                   + [container_name, "bash", "-c", inner_cmd])
+            effective_input = None
 
         log_msg = f"🔧 {tool} [exec→{container_name[:20]}]: {' '.join(args[:4])}"
         logger.info(f"[Executor] {log_msg}")
@@ -292,7 +316,7 @@ class ToolExecutor:
 
         return await self._run_subprocess(
             tool, cmd, "container-exec",
-            timeout=timeout, input_data=None, log_callback=log_callback,
+            timeout=timeout, input_data=effective_input, log_callback=log_callback,
         )
 
     # ── docker run --rm（临时容器）────────────────────────
@@ -415,16 +439,19 @@ class ToolExecutor:
         shell: str = "/bin/bash",
         log_callback: LogCallback = None,
         publish_ports: list[int] | None = None,
+        task_id: Optional[str] = None,
     ) -> ExecuteResult:
         """执行 shell 脚本片段
 
         Args:
             publish_ports: 需要映射到宿主机的端口列表（用于反连回调）
+            task_id: 任务 ID，传入后命令在持久容器中执行（保留进程状态）
         """
         return await self.run(
             tool=shell, args=["-s"], timeout=timeout,
             input_data=script_content, log_callback=log_callback,
             publish_ports=publish_ports,
+            task_id=task_id,
         )
 
     # ── 容器生命周期快捷方法（供 orchestrator 调用）──────

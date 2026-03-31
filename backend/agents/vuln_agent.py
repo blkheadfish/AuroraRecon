@@ -633,6 +633,8 @@ class VulnAgent:
             # Java 服务器 → 搜索常见 Java 漏洞
             ("java",):       ["fastjson", "shiro", "struts", "spring"],
             ("tomcat",):     ["tomcat", "java", "shiro", "struts"],
+            ("jboss",):      ["jboss", "java", "jmxinvoker"],
+            ("weblogic",):   ["weblogic", "java", "t3"],
             # PHP → ThinkPHP 等 + PHP-FPM（Nginx+PHP 组合是 CVE-2019-11043 的前提）
             ("php",):        ["thinkphp", "wordpress", "php-fpm"],
             # Shiro 相关
@@ -851,6 +853,11 @@ class VulnAgent:
                     "builtin_tomcat_put_detect": ["201", "204"],
                     "builtin_tomcat_weak_detect": ["tomcat_manager_confirmed", "ok - listed applications"],
                     "builtin_tomcat_weak_html_detect": ["tomcat_manager_html_confirmed"],
+                    "builtin_php_fpm_detect": ["php_fpm_502_detected"],
+                    "builtin_activemq_detect": ["activemq_admin_confirmed"],
+                    "builtin_jboss_detect": ["jboss_jmxinvoker_found"],
+                    "builtin_weblogic_detect": ["weblogic_console_found"],
+                    "builtin_django_sqli_detect": ["django_sqli_detected"],
                 }
 
                 # 通用 RCE 证据（任何探针都算确认）
@@ -1033,6 +1040,61 @@ class VulnAgent:
                 f'else echo "NOT_MANAGER_HTML: $(echo "$body" | head -1 | cut -c1-80)"; fi; '
                 f'else echo "HTTP_${{code}}"; fi',
                 "builtin_tomcat_weak_html_detect"
+            ))
+
+        # ── PHP-FPM CVE-2019-11043 检测 ──────────────
+        if "php-fpm" in keywords or ("php" in keywords and "fpm" in keywords) or "11043" in keywords:
+            # %0a 路径触发 502 = PHP-FPM 可能存在缓冲区溢出漏洞
+            probes.append((
+                f'code=$(curl -s -o /dev/null -w "%{{http_code}}" '
+                f'"{target_url}/index.php/%0a" --max-time 10); '
+                f'echo "PHP_FPM_0A_STATUS:$code"; '
+                f'if [ "$code" = "502" ]; then echo "PHP_FPM_502_DETECTED"; fi',
+                "builtin_php_fpm_detect"
+            ))
+
+        # ── ActiveMQ 默认凭据检测 ────────────────────
+        if "activemq" in keywords or "jolokia" in keywords or "41678" in keywords:
+            from urllib.parse import urlparse
+            parsed = urlparse(target_url)
+            ip = parsed.hostname or ""
+            # 试当前端口
+            probes.append((
+                f'resp=$(curl -s -u admin:admin -D - -o /dev/null {target_url}/admin/ --max-time 10); '
+                f'if echo "$resp" | grep -qi "activemq"; then echo "ACTIVEMQ_ADMIN_CONFIRMED"; fi; '
+                # 也试 8161
+                f'resp2=$(curl -s -u admin:admin -D - -o /dev/null "http://{ip}:8161/admin/" --max-time 10); '
+                f'if echo "$resp2" | grep -qi "activemq"; then echo "ACTIVEMQ_ADMIN_CONFIRMED"; fi',
+                "builtin_activemq_detect"
+            ))
+
+        # ── JBoss JMXInvokerServlet 检测 ─────────────
+        if "jboss" in keywords or "7504" in keywords or "12149" in keywords:
+            probes.append((
+                f'for path in /invoker/JMXInvokerServlet /invoker/EJBInvokerServlet; do '
+                f'code=$(curl -s -o /dev/null -w "%{{http_code}}" "{target_url}${{path}}" --max-time 10 2>/dev/null); '
+                f'if [ "$code" = "200" ] || [ "$code" = "500" ]; then echo "JBOSS_JMXINVOKER_FOUND"; break; fi; '
+                f'done',
+                "builtin_jboss_detect"
+            ))
+
+        # ── WebLogic Console 检测 ────────────────────
+        if "weblogic" in keywords or "21839" in keywords:
+            probes.append((
+                f'code=$(curl -s -o /dev/null -w "%{{http_code}}" '
+                f'"{target_url}/console/login/LoginForm.jsp" --max-time 10 2>/dev/null); '
+                f'echo "WEBLOGIC_CONSOLE_STATUS:$code"; '
+                f'if [ "$code" = "200" ] || [ "$code" = "302" ]; then echo "WEBLOGIC_CONSOLE_FOUND"; fi',
+                "builtin_weblogic_detect"
+            ))
+
+        # ── Django SQL 注入检测 ──────────────────────
+        if "django" in keywords and ("sql" in keywords or "34265" in keywords or "trunc" in keywords):
+            probes.append((
+                f'resp=$(curl -s "{target_url}/?date=year%27" --max-time 10 2>/dev/null); '
+                f'if echo "$resp" | grep -qi "ProgrammingError\\|django.db"; then '
+                f'echo "DJANGO_SQLI_DETECTED"; fi',
+                "builtin_django_sqli_detect"
             ))
 
         return probes

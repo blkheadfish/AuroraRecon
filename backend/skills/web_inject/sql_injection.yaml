@@ -50,7 +50,6 @@ match:
     - evidence_contains: ["sqlmap", "syntax error", "SQL syntax"]
     - evidence_contains: ["mysql_fetch", "pg_query", "ORA-", "sqlite3"]
     - fingerprint_contains: ["sql injection"]
-    - cve_matches: ["CVE-2022-34265"]  # Django SQL injection
 
 probes:
   - id: confirm_sqli

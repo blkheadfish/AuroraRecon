@@ -84,6 +84,7 @@ class SkillEngine:
             target_os=target_os,
             lhost=lhost,
             can_reverse=env_can_reverse,
+            task_id=task_id,
         )
 
         logger.info(
@@ -205,22 +206,23 @@ class SkillEngine:
         command = ctx.substitute(command_template)
 
         # 日志：显示命令摘要（去掉多余空白）
-        cmd_preview = " ".join(command.split())[:150]
+        cmd_preview = " ".join(command.split())[:500]
         logger.info(f"[SkillEngine]   命令: {cmd_preview}...")
 
         result = await self.executor.run_script(
             script_content=command,
             timeout=timeout,
+            task_id=ctx.task_id,
         )
 
         # 日志：显示输出摘要
-        stdout_preview = result.stdout.strip().replace('\n', ' ')[:200]
+        stdout_preview = result.stdout.strip().replace('\n', ' ')[:1000]
         logger.info(
             f"[SkillEngine]   输出: exit={result.exit_code}, "
             f"{len(result.stdout)}B: {stdout_preview}"
         )
         if result.stderr.strip():
-            stderr_preview = result.stderr.strip().replace('\n', ' ')[:100]
+            stderr_preview = result.stderr.strip().replace('\n', ' ')[:500]
             logger.info(f"[SkillEngine]   stderr: {stderr_preview}")
 
         # 记录
@@ -292,13 +294,14 @@ class SkillEngine:
             ctx.commands_run.append(command)
 
             # 日志：命令摘要
-            cmd_preview = " ".join(command.split())[:200]
+            cmd_preview = " ".join(command.split())[:500]
             logger.info(f"[SkillEngine]      命令: {cmd_preview}...")
 
             exec_result = await self.executor.run_script(
                 script_content=command,
                 timeout=step.timeout,
                 publish_ports=step.publish_ports or None,
+                task_id=ctx.task_id,
             )
 
             # 记录
@@ -315,14 +318,14 @@ class SkillEngine:
             ctx.step_records.append(record)
 
             # 日志：输出摘要
-            stdout_preview = exec_result.stdout.strip().replace('\n', ' ')[:300]
+            stdout_preview = exec_result.stdout.strip().replace('\n', ' ')[:1000]
             logger.info(
                 f"[SkillEngine]      输出: exit={exec_result.exit_code}, "
                 f"{len(exec_result.stdout)}B, {exec_result.elapsed:.1f}s"
             )
             logger.info(f"[SkillEngine]      预览: {stdout_preview}")
             if exec_result.stderr.strip():
-                stderr_preview = exec_result.stderr.strip().replace('\n', ' ')[:150]
+                stderr_preview = exec_result.stderr.strip().replace('\n', ' ')[:500]
                 logger.info(f"[SkillEngine]      stderr: {stderr_preview}")
 
             # 判定成功/失败
@@ -525,7 +528,7 @@ class SkillEngine:
 
             logger.info(
                 f"[SkillEngine] 🤖 LLM 第{round_num+1}轮: action={action}, "
-                f"purpose={purpose[:80]}"
+                f"purpose={purpose}"
             )
 
             if action == "conclude_success":
@@ -546,7 +549,7 @@ class SkillEngine:
 
             if action == "conclude_fail":
                 reason = decision.get("reason", "未知")
-                logger.info(f"[SkillEngine] 🤖 LLM 判定利用失败: {reason[:200]}")
+                logger.info(f"[SkillEngine] 🤖 LLM 判定利用失败: {reason}")
                 break
 
             if action != "execute":
@@ -560,13 +563,13 @@ class SkillEngine:
             if not cmd:
                 continue
 
-            cmd_preview = " ".join(cmd.split())[:200]
+            cmd_preview = " ".join(cmd.split())[:500]
             logger.info(f"[SkillEngine] 🤖 执行: {cmd_preview}...")
 
             ctx.commands_run.append(cmd)
-            exec_result = await self.executor.run_script(cmd, timeout=60)
+            exec_result = await self.executor.run_script(cmd, timeout=60, task_id=ctx.task_id)
 
-            stdout_preview = exec_result.stdout.strip().replace('\n', ' ')[:200]
+            stdout_preview = exec_result.stdout.strip().replace('\n', ' ')[:1000]
             logger.info(
                 f"[SkillEngine] 🤖 结果: exit={exec_result.exit_code}, "
                 f"{len(exec_result.stdout)}B: {stdout_preview}"

