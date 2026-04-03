@@ -47,6 +47,10 @@
                   <div class="detail-label">证据 / PoC</div>
                   <pre class="evidence-code">{{ row.evidence }}</pre>
                 </div>
+                <div class="detail-item" v-if="row.evidence">
+                  <div class="detail-label">最小复现片段</div>
+                  <code class="mini-poc">{{ minimalRepro(row.evidence) }}</code>
+                </div>
               </div>
             </div>
           </template>
@@ -82,6 +86,12 @@
           <template #default="{ row }">
             <el-icon v-if="row.exploitable" class="exploitable-yes"><CircleCheckFilled /></el-icon>
             <el-icon v-else class="exploitable-no"><Remove /></el-icon>
+          </template>
+        </el-table-column>
+
+        <el-table-column label="利用评分" width="120">
+          <template #default="{ row }">
+            <span class="exploit-score" :class="{ high: row.exploitable }">{{ exploitabilityScore(row) }}</span>
           </template>
         </el-table-column>
 
@@ -133,6 +143,20 @@ function countBySeverity(sev) {
 
 function handleExpand(row, rows) {
   expandedRows.value = rows.map(r => r.vuln_id)
+}
+
+function minimalRepro(evidence) {
+  return String(evidence || '')
+    .split('\n')
+    .map(line => line.trim())
+    .find(Boolean) || '-'
+}
+
+function exploitabilityScore(row) {
+  const sevWeight = { critical: 40, high: 30, medium: 20, low: 10, info: 5 }[row.severity] || 10
+  const exploitWeight = row.exploitable ? 45 : 10
+  const evidenceWeight = row.evidence ? 15 : 5
+  return `${Math.min(100, sevWeight + exploitWeight + evidenceWeight)} / 100`
 }
 </script>
 
@@ -264,5 +288,30 @@ function handleExpand(row, rows) {
   word-break: break-all;
   max-height: 200px;
   overflow-y: auto;
+}
+
+.mini-poc {
+  display: inline-block;
+  max-width: 100%;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--accent-blue);
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  background: rgba(56,139,253,0.08);
+  border: 1px solid rgba(56,139,253,0.2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.exploit-score {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+.exploit-score.high {
+  color: var(--accent-red);
+  font-weight: 600;
 }
 </style>

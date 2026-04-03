@@ -96,6 +96,10 @@ class VulnAgent:
 
             # 3a: LLM 推荐标签专扫（最精准，优先跑）
             llm_tags = scan_strategy.get("nuclei_tags", [])
+            # 过滤掉会触发 LockOutRealm 的凭据测试标签
+            # 凭据爆破留给 ExploitAgent 的 Skill 统一处理
+            BLACKLISTED_TAGS = {"default-login", "default-credentials", "brute-force"}
+            llm_tags = [t for t in llm_tags if t.lower() not in BLACKLISTED_TAGS]
             if llm_tags:
                 r = await self._nuclei_tag_scan(web_url, target, llm_tags)
                 port_findings.extend(r.get("findings", []))
@@ -124,6 +128,12 @@ class VulnAgent:
                 logger.warning(f"[VulnAgent] 端口扫描异常: {r}")
             elif isinstance(r, list):
                 all_findings.extend(r)
+
+        # ── Phase 3.1: CVE 专项直检（无条件对所有 Web 端口）──
+        # 某些 CVE 的检测不依赖指纹，直接发探测请求即可判断
+        # CVE-2019-11043: 对所有 Web 端口发 %0a 路径注入请求
+        cve_direct_findings = await self._cve_direct_checks(target, web_ports, fingerprints)
+        all_findings.extend(cve_direct_findings)
 
         # ── Phase 3.5: 知识库驱动精准检测 ────────────────
         # 用指纹信息查知识库，用知识库里的具体检测命令验证漏洞
@@ -428,7 +438,7 @@ class VulnAgent:
             fallback_tags = set()
             for port, fp in fingerprints.items():
                 summary = fp.get("summary", "").lower()
-                tag_map = {"thinkphp": ["thinkphp", "php"], "fastjson": ["fastjson", "java"], "tomcat": ["tomcat", "default-login"], "spring": ["spring", "java"], "shiro": ["shiro", "java"], "weblogic": ["weblogic", "java"], "wordpress": ["wordpress"], "jenkins": ["jenkins"], "jboss": ["jboss", "java"], "struts": ["struts", "java"], "laravel": ["laravel", "php"], "django": ["django", "python"], "flask": ["flask", "python"], "nacos": ["nacos"], }
+                tag_map = {"thinkphp": ["thinkphp", "php"], "fastjson": ["fastjson", "java"], "tomcat": ["tomcat"], "spring": ["spring", "java"], "shiro": ["shiro", "java"], "weblogic": ["weblogic", "java"], "wordpress": ["wordpress"], "jenkins": ["jenkins"], "jboss": ["jboss", "java"], "struts": ["struts", "java"], "laravel": ["laravel", "php"], "django": ["django", "python"], "flask": ["flask", "python"], "nacos": ["nacos"], }
                 for kw, tags in tag_map.items():
                     if kw in summary:
                         fallback_tags.update(tags)
@@ -448,6 +458,7 @@ class VulnAgent:
                 "-t", "http/vulnerabilities/",
                 "-t", "http/misconfiguration/",
                 "-severity", "critical,high,medium",
+                "-etags", "default-login",
                 "-jsonl",
                 "-silent",
                 "-rate-limit", "150",
@@ -477,6 +488,7 @@ class VulnAgent:
             args=[
                 "-u", web_url,
                 "-tags", tag_str,
+                "-etags", "default-login",
                 "-jsonl",
                 "-silent",
                 "-timeout", "10",
@@ -514,6 +526,7 @@ class VulnAgent:
                 "-t", "http/misconfiguration/",
                 "-t", "http/exposures/",
                 "-severity", "critical,high,medium,low",
+                "-etags", "default-login",
                 "-jsonl",
                 "-silent",
                 "-timeout", "10",
@@ -621,6 +634,36 @@ class VulnAgent:
                         "gunicorn", "werkzeug", "python", "apache"]:
                 if kw in svc:
                     search_signals.add(kw)
+
+        # ── 端口推理规则 ─────────────────────────────
+        # 某些端口高概率对应特定服务，即使指纹未明确识别
+        open_ports = {p.port for p in ports}
+        port_inference = {
+            8080: ["tomcat", "java"],           # Tomcat 默认端口
+            8009: ["tomcat", "java"],           # Tomcat AJP
+            8443: ["tomcat", "java"],           # Tomcat HTTPS
+            7001: ["weblogic", "java"],         # WebLogic
+            7002: ["weblogic", "java"],         # WebLogic
+            8161: ["activemq", "jolokia"],      # ActiveMQ Console
+            61616: ["activemq"],                # ActiveMQ OpenWire
+            9090: ["jenkins"],                  # Jenkins
+            8888: ["java"],                     # 常见 Java Web 端口
+        }
+        for port_num, inferred_signals in port_inference.items():
+            if port_num in open_ports:
+                for sig in inferred_signals:
+                    if sig not in search_signals:
+                        search_signals.add(sig)
+                        logger.debug(f"[VulnAgent] 端口推理: :{port_num} → {sig}")
+
+        # 同时检查 nmap 的 service 字段中 "http-proxy" / "ajp13" 等
+        for p in ports:
+            if p.service in ("ajp13", "ajp"):
+                search_signals.add("tomcat")
+                search_signals.add("java")
+            if "coyote" in f"{p.version} {p.banner}".lower():
+                search_signals.add("tomcat")
+                search_signals.add("java")
 
         # ── Web 框架推理规则 ─────────────────────────
         # 根据已有信号推断可能的框架和漏洞类型
@@ -853,7 +896,7 @@ class VulnAgent:
                     "builtin_tomcat_put_detect": ["201", "204"],
                     "builtin_tomcat_weak_detect": ["tomcat_manager_confirmed", "ok - listed applications"],
                     "builtin_tomcat_weak_html_detect": ["tomcat_manager_html_confirmed"],
-                    "builtin_php_fpm_detect": ["php_fpm_502_detected"],
+                    "builtin_php_fpm_detect": ["php_fpm_502_detected", "php_fpm_anomaly_detected"],
                     "builtin_activemq_detect": ["activemq_admin_confirmed"],
                     "builtin_jboss_detect": ["jboss_jmxinvoker_found"],
                     "builtin_weblogic_detect": ["weblogic_console_found"],
@@ -1019,37 +1062,35 @@ class VulnAgent:
             ))
 
         # ── Tomcat 弱口令 检测 ────────────────────────
+        # 重要: 只检测 Manager 是否存在（401），不试凭据！
+        # Tomcat 8+ 有 LockOutRealm，5 次失败锁 5 分钟
+        # 凭据爆破留给 ExploitAgent 的 Skill 一次性完成
         if "tomcat" in keywords and ("weak" in keywords or "弱口令" in keywords or "password" in keywords):
-            # 用 text 接口检测 —— 正确的 Manager text 接口返回 "OK - Listed applications"
-            # 不能只看 HTTP 200，因为其他应用可能也返回 200
-            probes.append((
-                f'response=$(curl -s -u tomcat:tomcat {target_url}/manager/text/list --max-time 10); '
-                f'if echo "$response" | grep -q "OK - Listed applications"; then '
-                f'echo "TOMCAT_MANAGER_CONFIRMED"; echo "$response"; '
-                f'else echo "NOT_MANAGER: $(echo "$response" | head -1 | cut -c1-100)"; fi',
-                "builtin_tomcat_weak_detect"
-            ))
-            # 也试 html 接口
-            probes.append((
-                f'code=$(curl -s -o /dev/null -w "%{{http_code}}" -u tomcat:tomcat '
-                f'{target_url}/manager/html --max-time 10); '
-                f'if [ "$code" = "200" ]; then '
-                f'body=$(curl -s -u tomcat:tomcat {target_url}/manager/html --max-time 10 | head -5); '
-                f'if echo "$body" | grep -qi "manager\\|application\\|deploy\\|undeploy"; then '
-                f'echo "TOMCAT_MANAGER_HTML_CONFIRMED"; '
-                f'else echo "NOT_MANAGER_HTML: $(echo "$body" | head -1 | cut -c1-80)"; fi; '
-                f'else echo "HTTP_${{code}}"; fi',
-                "builtin_tomcat_weak_html_detect"
-            ))
-
-        # ── PHP-FPM CVE-2019-11043 检测 ──────────────
-        if "php-fpm" in keywords or ("php" in keywords and "fpm" in keywords) or "11043" in keywords:
-            # %0a 路径触发 502 = PHP-FPM 可能存在缓冲区溢出漏洞
             probes.append((
                 f'code=$(curl -s -o /dev/null -w "%{{http_code}}" '
-                f'"{target_url}/index.php/%0a" --max-time 10); '
-                f'echo "PHP_FPM_0A_STATUS:$code"; '
-                f'if [ "$code" = "502" ]; then echo "PHP_FPM_502_DETECTED"; fi',
+                f'"{target_url}/manager/html" --max-time 8); '
+                f'echo "MANAGER_STATUS:$code"; '
+                f'if [ "$code" = "401" ] || [ "$code" = "403" ]; then '
+                f'echo "TOMCAT_MANAGER_CONFIRMED"; fi',
+                "builtin_tomcat_weak_detect"
+            ))
+
+        # ── PHP-FPM CVE-2019-11043 检测（增强版）──────
+        # 扩展触发条件：php/nginx/fastcgi 任一信号就检测
+        if ("php-fpm" in keywords or ("php" in keywords and "fpm" in keywords)
+            or "11043" in keywords or "fastcgi" in keywords
+            or ("php" in keywords and "nginx" in keywords)):
+            probes.append((
+                f'baseline=$(curl -s -o /dev/null -w "%{{http_code}}" '
+                f'"{target_url}/index.php" --max-time 5 2>/dev/null); '
+                f'anomaly=$(curl -s -o /dev/null -w "%{{http_code}}" '
+                f'"{target_url}/index.php/%0a" --max-time 5 2>/dev/null); '
+                f'long_a=$(curl -s -o /dev/null -w "%{{http_code}}" '
+                f'"{target_url}/index.php/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA%0a" --max-time 5 2>/dev/null); '
+                f'echo "BASELINE:$baseline 0A:$anomaly LONG:$long_a"; '
+                f'if [ "$anomaly" = "502" ] || [ "$anomaly" = "500" ]; then echo "PHP_FPM_502_DETECTED"; '
+                f'elif [ "$long_a" = "502" ] || [ "$long_a" = "500" ]; then echo "PHP_FPM_502_DETECTED"; '
+                f'elif [ "$anomaly" != "$baseline" ] && [ "$anomaly" != "404" ] && [ -n "$anomaly" ]; then echo "PHP_FPM_ANOMALY_DETECTED"; fi',
                 "builtin_php_fpm_detect"
             ))
 
@@ -1258,6 +1299,142 @@ class VulnAgent:
         return findings
 
     # ================================================================
+    # Phase 3.1: CVE 专项直检（无条件，不依赖指纹信号）
+    # ================================================================
+
+    async def _cve_direct_checks(
+        self,
+        target: str,
+        web_ports: list[PortInfo],
+        fingerprints: dict[int, dict],
+    ) -> list[VulnFinding]:
+        """
+        对所有 Web 端口执行特定 CVE 的无条件直接检测。
+
+        这些检测不依赖指纹/KB 信号，直接用探测请求判断漏洞存在性。
+        成本极低（每个 CVE 只需 2-3 个 curl），适合对所有端口无差别执行。
+        """
+        findings: list[VulnFinding] = []
+
+        for wp in web_ports:
+            scheme = "https" if wp.port in (443, 8443) else "http"
+            web_url = f"{scheme}://{target}:{wp.port}"
+
+            # ── CVE-2019-11043: PHP-FPM %0a 路径注入 ──
+            try:
+                fpm_finding = await self._check_cve_2019_11043(web_url, target, wp.port)
+                if fpm_finding:
+                    findings.append(fpm_finding)
+            except Exception as e:
+                logger.warning(f"[VulnAgent] CVE-2019-11043 检测异常 :{wp.port}: {e}")
+
+        return findings
+
+    async def _check_cve_2019_11043(
+        self, web_url: str, target: str, port: int
+    ) -> VulnFinding | None:
+        """
+        CVE-2019-11043 无条件直接检测。
+
+        检测逻辑（修复版 — 不依赖 502 状态码）:
+          1. GET /index.php → 基线（状态码 + body 长度）
+          2. GET /index.php/%0a → 对比状态码和 body
+          3. 判定: 502/500 = 确认
+                  body 含 "File not found"/"No input file specified"/"Primary script unknown" = 确认
+                  状态码或 body 长度与基线显著不同 = 疑似
+        """
+        # 步骤 1: 基线请求
+        baseline_result: ExecuteResult = await self.executor.run(
+            tool="curl",
+            args=["-s", "-w", "\n%{http_code}", f"{web_url}/index.php", "--max-time", "8"],
+            timeout=12,
+        )
+        baseline_raw = baseline_result.stdout.strip()
+        baseline_lines = baseline_raw.rsplit("\n", 1)
+        baseline_body = baseline_lines[0] if len(baseline_lines) > 1 else ""
+        baseline_code = baseline_lines[-1].strip() if baseline_lines else ""
+
+        if baseline_code not in ("200", "301", "302", "403"):
+            return None  # 不是 PHP 环境
+
+        # 步骤 2: %0a 路径注入
+        anomaly_result: ExecuteResult = await self.executor.run(
+            tool="curl",
+            args=["-s", "-w", "\n%{http_code}", f"{web_url}/index.php/%0a", "--max-time", "8"],
+            timeout=12,
+        )
+        anomaly_raw = anomaly_result.stdout.strip()
+        anomaly_lines = anomaly_raw.rsplit("\n", 1)
+        anomaly_body = anomaly_lines[0] if len(anomaly_lines) > 1 else ""
+        anomaly_code = anomaly_lines[-1].strip() if anomaly_lines else ""
+
+        logger.info(
+            f"[VulnAgent] CVE-2019-11043 直检 :{port}: "
+            f"baseline={baseline_code}({len(baseline_body)}B), "
+            f"0a={anomaly_code}({len(anomaly_body)}B), "
+            f"0a_body_preview={anomaly_body[:120]}"
+        )
+
+        # 步骤 3: 判定
+        confirmed = False
+        likely = False
+        evidence_parts = [
+            f"baseline /index.php → {baseline_code} ({len(baseline_body)}B)",
+            f"/index.php/%0a → {anomaly_code} ({len(anomaly_body)}B)",
+        ]
+
+        anomaly_body_lower = anomaly_body.lower()
+
+        # 最强信号: 502/500
+        if anomaly_code in ("502", "500"):
+            confirmed = True
+            evidence_parts.append("判定: 502/500 状态码确认")
+
+        # 次强信号: PHP-FPM 特征错误消息
+        elif any(sig in anomaly_body_lower for sig in [
+            "file not found", "no input file specified",
+            "primary script unknown", "unable to open primary script",
+        ]):
+            confirmed = True
+            evidence_parts.append(f"判定: FPM 错误消息确认 ({anomaly_body[:80]})")
+
+        # 疑似信号: 状态码不同
+        elif anomaly_code != baseline_code and anomaly_code not in ("404", "000", ""):
+            likely = True
+            evidence_parts.append(f"判定: 状态码差异 ({baseline_code} → {anomaly_code})")
+
+        # 疑似信号: body 长度剧变（基线有内容但 %0a 为空，或反之）
+        elif len(baseline_body) > 100 and len(anomaly_body) < 50:
+            likely = True
+            evidence_parts.append(f"判定: body 长度剧变 ({len(baseline_body)} → {len(anomaly_body)})")
+
+        if not confirmed and not likely:
+            return None
+
+        severity = "high" if confirmed else "medium"
+        logger.info(
+            f"[VulnAgent] ✅ CVE-2019-11043 {'确认' if confirmed else '疑似'} "
+            f"@ {web_url}"
+        )
+
+        return VulnFinding(
+            name="PHP-FPM CVE-2019-11043 路径注入 RCE",
+            severity=severity,
+            cve="CVE-2019-11043",
+            target=web_url,
+            port=port,
+            description=(
+                f"PHP-FPM Nginx 缓冲区溢出 RCE。"
+                f"{'已确认' if confirmed else '疑似'}: "
+                f"/index.php/%0a → {anomaly_code} "
+                f"(body: {anomaly_body[:60]})"
+            ),
+            evidence="\n".join(evidence_parts),
+            exploitable=True,
+            tool="cve-direct-check",
+        )
+
+    # ================================================================
     # Nikto + Hydra
     # ================================================================
 
@@ -1386,31 +1563,37 @@ class VulnAgent:
             port_primary = port_fp.get("primary_tech", "").lower()
             port_apps = [t.lower() for t in port_fp.get("app_frameworks", [])]
 
-            # ── 规则 1: 基础设施漏洞 + 应用框架存在 → 降级 ──
+            # ── 规则 1: 基础设施漏洞 + 同端口有应用框架 → 降级 ──
+            # 关键修复: 只看同端口的指纹，不看全局
+            # 场景: Struts2 在 8080 → 该端口的 Tomcat 弱口令降级
+            # 场景: Tomcat8 靶场（裸 Tomcat）→ 不降级（本端口无应用框架）
             should_downgrade = False
             for infra_name, vuln_keywords in infra_vuln_keywords.items():
                 if infra_name in name_lower:
-                    # finding 是 tomcat/nginx/apache 的漏洞
                     if any(kw in name_lower for kw in vuln_keywords):
-                        # 是弱口令/配置类漏洞
-                        if port_apps or (all_app_frameworks - {infra_name}):
-                            # 但该端口（或全局）检测到了应用框架
-                            actual_app = port_primary or (list(primary_techs)[0] if primary_techs else "")
+                        # 只看同端口是否有应用框架
+                        if port_apps:
+                            actual_app = port_primary or port_apps[0]
                             logger.info(
                                 f"[VulnAgent] ⚠ 降级 Finding: '{finding.name}' "
-                                f"→ 端口主要技术是 {actual_app}，"
-                                f"'{infra_name}' 只是容器/服务器"
+                                f"→ 同端口({port})主要技术是 {actual_app}，"
+                                f"'{infra_name}' 只是容器"
                             )
                             should_downgrade = True
                             break
+                        # 其他端口有应用框架但本端口没有 → 不降级
+                        elif all_app_frameworks - {infra_name}:
+                            logger.info(
+                                f"[VulnAgent] 保留 Finding: '{finding.name}' "
+                                f"（本端口 {port} 无应用框架，不降级）"
+                            )
 
             if should_downgrade:
-                # 不是删除，而是降低优先级
                 finding.exploitable = False
                 finding.severity = "info"
                 finding.description = (
                     f"[降级] {finding.description} "
-                    f"（指纹显示主要技术为 {port_primary or list(primary_techs)[0] if primary_techs else '未知'}，"
+                    f"（同端口指纹显示主要技术为 {port_primary or '应用框架'}，"
                     f"此漏洞可能是误判）"
                 )
 

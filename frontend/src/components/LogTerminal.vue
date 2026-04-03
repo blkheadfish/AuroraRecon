@@ -25,6 +25,13 @@
     </div>
 
     <div class="terminal-body" ref="terminalRef">
+      <div v-if="keyEvents.length" class="key-events">
+        <span class="key-title">关键事件</span>
+        <div class="key-list">
+          <span v-for="(event, idx) in keyEvents" :key="idx" class="key-chip">{{ event }}</span>
+        </div>
+      </div>
+
       <div v-if="!displayLogs.length" class="empty-terminal">
         <span class="cursor-blink">█</span>
         <span class="wait-text">等待任务输出...</span>
@@ -70,6 +77,13 @@ const autoScroll = ref(true)
 const cleared = ref(false)
 
 const displayLogs = computed(() => cleared.value ? [] : props.logs)
+const keyEvents = computed(() =>
+  props.logs
+    .filter(line =>
+      /approval|required|authorized|利用成功|利用失败|report|报告生成|done|error|failed/i.test(line),
+    )
+    .slice(-5),
+)
 
 watch(() => props.logs.length, async () => {
   if (autoScroll.value) {
@@ -196,6 +210,33 @@ function clearView() {
   overflow-y: auto;
   padding: 12px 0;
   background: var(--hljs-bg);
+}
+
+.key-events {
+  padding: 0 16px 10px;
+}
+.key-title {
+  display: inline-block;
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+.key-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.key-chip {
+  font-size: 11px;
+  color: var(--accent-blue);
+  border: 1px solid rgba(56,139,253,0.35);
+  background: rgba(56,139,253,0.08);
+  border-radius: 999px;
+  padding: 2px 8px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .empty-terminal {

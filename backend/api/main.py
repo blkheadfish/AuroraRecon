@@ -18,9 +18,11 @@ from __future__ import annotations
 import os
 import asyncio
 import logging
+import re
 import uuid
+from collections import defaultdict
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,6 +38,7 @@ logger = logging.getLogger(__name__)
 _tasks: dict[str, PentestState] = {}
 _ws_connections: dict[str, list[WebSocket]] = {}
 _running_tasks: set[str] = set()
+_approval_inflight: set[str] = set()
 
 # ── 基础设施可用性 ────────────────────────────────────────
 _db_available = False
@@ -44,6 +47,8 @@ _msf_available = False
 
 # ── 全局单例 Orchestrator（MemorySaver 必须共享同一实例）──
 _orchestrator: Orchestrator | None = None
+_TOOL_START_RE = re.compile(r"执行\s+([^\s]+)\s+\[([^\]]+)\]")
+_TOOL_DONE_RE = re.compile(r"(?:✅|❌)\s+([^\s]+)\s+完成:\s+exit=([-]?\d+),.*?耗时=([\d.]+)s")
 
 def get_orchestrator() -> Orchestrator:
     global _orchestrator
@@ -192,6 +197,160 @@ async def health_check():
         "msf": "connected" if _msf_available else "unavailable",
         "active_tasks": len(_running_tasks),
         "timestamp": datetime.utcnow().isoformat(),
+    }
+
+
+def _safe_rate(numerator: int, denominator: int) -> float:
+    if denominator <= 0:
+        return 0.0
+    return round((numerator / denominator) * 100.0, 2)
+
+
+def _parse_iso_ts(raw: str | None) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def _build_system_overview(tasks: list[PentestState]) -> dict:
+    return {
+        "api_status": "ok",
+        "database": "connected" if _db_available else "unavailable",
+        "redis": "connected" if _redis_available else "unavailable",
+        "msf": "connected" if _msf_available else "unavailable",
+        "version": app.version,
+        "total_tasks": len(tasks),
+        "running_tasks": sum(1 for t in tasks if t.status == TaskStatus.RUNNING),
+        "completed_tasks": sum(1 for t in tasks if t.status == TaskStatus.COMPLETED),
+        "failed_tasks": sum(1 for t in tasks if t.status == TaskStatus.FAILED),
+        "active_task_ids": len(_running_tasks),
+    }
+
+
+def _build_tool_overview() -> dict:
+    try:
+        from backend.tools.tool_registry import ToolRegistry
+
+        registry = ToolRegistry()
+        by_executor: dict[str, int] = defaultdict(int)
+        tools = []
+        for td in registry.list_all():
+            by_executor[td.executor] += 1
+            tools.append({
+                "name": td.name,
+                "category": td.category,
+                "executor": td.executor,
+                "timeout": td.timeout,
+            })
+
+        tools.sort(key=lambda item: (item["category"], item["name"]))
+        return {
+            "total_tools": registry.size,
+            "by_category": registry.summary(),
+            "by_executor": dict(by_executor),
+            "tools": tools,
+        }
+    except Exception as e:
+        logger.warning(f"[Metrics] 工具概览构建失败: {e}")
+        return {
+            "total_tools": 0,
+            "by_category": {},
+            "by_executor": {},
+            "tools": [],
+            "error": str(e),
+        }
+
+
+def _build_tool_invocation_overview(tasks: list[PentestState]) -> dict:
+    calls_by_tool: dict[str, int] = defaultdict(int)
+    backend_calls: dict[str, int] = defaultdict(int)
+    done_by_tool: dict[str, int] = defaultdict(int)
+    success_by_tool: dict[str, int] = defaultdict(int)
+    elapsed_sum_by_tool: dict[str, float] = defaultdict(float)
+    backend_by_tool: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+
+    total_calls = 0
+    success_calls = 0
+    failed_calls = 0
+    total_elapsed = 0.0
+    done_count = 0
+
+    for state in tasks:
+        for entry in state.phase_log:
+            start_match = _TOOL_START_RE.search(entry)
+            if start_match:
+                tool_name = start_match.group(1).strip()
+                backend = start_match.group(2).strip()
+                calls_by_tool[tool_name] += 1
+                backend_calls[backend] += 1
+                backend_by_tool[tool_name][backend] += 1
+                total_calls += 1
+
+            done_match = _TOOL_DONE_RE.search(entry)
+            if done_match:
+                tool_name = done_match.group(1).strip()
+                exit_code = int(done_match.group(2))
+                elapsed = float(done_match.group(3))
+                done_by_tool[tool_name] += 1
+                elapsed_sum_by_tool[tool_name] += elapsed
+                total_elapsed += elapsed
+                done_count += 1
+                if exit_code == 0:
+                    success_by_tool[tool_name] += 1
+                    success_calls += 1
+                else:
+                    failed_calls += 1
+
+    top_tools = []
+    for tool_name, calls in sorted(calls_by_tool.items(), key=lambda item: item[1], reverse=True):
+        completed = done_by_tool.get(tool_name, 0)
+        succeeded = success_by_tool.get(tool_name, 0)
+        avg_elapsed_ms = 0.0
+        if completed > 0:
+            avg_elapsed_ms = round((elapsed_sum_by_tool[tool_name] / completed) * 1000.0, 2)
+        top_tools.append({
+            "tool": tool_name,
+            "calls": calls,
+            "completed_calls": completed,
+            "success_rate": _safe_rate(succeeded, completed),
+            "avg_elapsed_ms": avg_elapsed_ms,
+            "backends": dict(backend_by_tool.get(tool_name, {})),
+        })
+
+    return {
+        "total_calls": total_calls,
+        "completed_calls": done_count,
+        "success_calls": success_calls,
+        "failed_calls": failed_calls,
+        "success_rate": _safe_rate(success_calls, done_count),
+        "avg_elapsed_ms": round((total_elapsed / done_count) * 1000.0, 2) if done_count > 0 else 0.0,
+        "by_backend": dict(sorted(backend_calls.items(), key=lambda item: item[1], reverse=True)),
+        "top_tools": top_tools[:10],
+    }
+
+
+@app.get("/metrics/overview")
+async def get_metrics_overview(window_hours: int = 24):
+    bounded_window = max(1, min(window_hours, 168))
+    now = datetime.utcnow()
+    cutoff = now - timedelta(hours=bounded_window)
+
+    all_tasks = list(_tasks.values())
+    scoped_tasks = []
+    for state in all_tasks:
+        task_ts = _parse_iso_ts(state.created_at)
+        if task_ts is None or task_ts >= cutoff:
+            scoped_tasks.append(state)
+
+    return {
+        "generated_at": now.isoformat(),
+        "window_hours": bounded_window,
+        "system_overview": _build_system_overview(all_tasks),
+        "tool_overview": _build_tool_overview(),
+        "tool_invocation_overview": _build_tool_invocation_overview(scoped_tasks),
     }
 
 
@@ -609,8 +768,10 @@ def _to_detail(state: PentestState) -> dict:
 
 import json
 from pathlib import Path
+import yaml
 
 SETTINGS_FILE = Path(os.getenv("REPORTS_DIR", "/tmp/pentest_reports")) / "settings.json"
+PROFILE_FILE = Path(os.getenv("REPORTS_DIR", "/tmp/pentest_reports")) / "profile.json"
 
 DEFAULT_SETTINGS = {
     "llm": {
@@ -634,6 +795,12 @@ DEFAULT_SETTINGS = {
     },
 }
 
+DEFAULT_PROFILE = {
+    "nickname": "安全研究员",
+    "avatar": "",
+    "updated_at": "",
+}
+
 
 def _load_settings() -> dict:
     if SETTINGS_FILE.exists():
@@ -649,6 +816,26 @@ def _save_settings_to_file(data: dict) -> None:
     SETTINGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2))
 
 
+def _load_profile() -> dict:
+    if PROFILE_FILE.exists():
+        try:
+            raw = json.loads(PROFILE_FILE.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                return {
+                    "nickname": str(raw.get("nickname") or DEFAULT_PROFILE["nickname"]),
+                    "avatar": str(raw.get("avatar") or ""),
+                    "updated_at": str(raw.get("updated_at") or ""),
+                }
+        except Exception:
+            pass
+    return DEFAULT_PROFILE.copy()
+
+
+def _save_profile(data: dict) -> None:
+    PROFILE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PROFILE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 # ── 审批端点 ──────────────────────────────────────────────
 
 class ApproveRequest(BaseModel):
@@ -660,6 +847,8 @@ async def approve_task(task_id: str, req: ApproveRequest):
     state = _tasks.get(task_id)
     if not state:
         raise HTTPException(status_code=404, detail="任务不存在")
+    if task_id in _approval_inflight:
+        raise HTTPException(status_code=409, detail="审批已提交，任务正在继续执行")
     if state.current_phase != "awaiting_approval":
         raise HTTPException(
             status_code=400,
@@ -670,6 +859,9 @@ async def approve_task(task_id: str, req: ApproveRequest):
     state.current_phase = "exploit" if req.approved else "report"
     state.log(f"[审批] {'已授权，继续利用' if req.approved else '已拒绝，跳过利用'}")
     _tasks[task_id] = state
+
+    # 标记审批已提交，防止重复触发 resume。
+    _approval_inflight.add(task_id)
 
     # 用 _resume_task 代替 fire-and-forget，确保后续阶段的状态更新能推送到前端
     asyncio.create_task(_resume_task(task_id, req.approved))
@@ -756,6 +948,7 @@ async def _resume_task(task_id: str, approved: bool):
                     pass
     finally:
         _running_tasks.discard(task_id)
+        _approval_inflight.discard(task_id)
 
     # 最终状态持久化
     state = _tasks.get(task_id)
@@ -803,7 +996,53 @@ async def test_llm_connection():
         raise HTTPException(status_code=502, detail=str(e))
 
 
+class ProfileUpdateRequest(BaseModel):
+    nickname: str
+    avatar: str = ""
+
+
+class PasswordChangeRequest(BaseModel):
+    old_password: str
+    new_password: str
+
+
+@app.get("/profile")
+async def get_profile():
+    return _load_profile()
+
+
+@app.put("/profile")
+async def update_profile(req: ProfileUpdateRequest):
+    nickname = req.nickname.strip()
+    if not nickname:
+        raise HTTPException(status_code=400, detail="昵称不能为空")
+    profile = {
+        "nickname": nickname[:32],
+        "avatar": req.avatar.strip()[:1024],
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+    _save_profile(profile)
+    return {"status": "ok", "profile": profile}
+
+
+@app.post("/profile/change-password")
+async def change_password(req: PasswordChangeRequest):
+    old_password = req.old_password.strip()
+    new_password = req.new_password.strip()
+    if not old_password or not new_password:
+        raise HTTPException(status_code=400, detail="旧密码和新密码不能为空")
+    if len(new_password) < 8:
+        raise HTTPException(status_code=400, detail="新密码至少 8 位")
+    if old_password == new_password:
+        raise HTTPException(status_code=400, detail="新旧密码不能相同")
+    # 最小化实现：当前版本不接入真实鉴权，仅返回成功占位响应。
+    return {"status": "ok", "updated_at": datetime.utcnow().isoformat()}
+
+
 # ── Skill 系统接口 ────────────────────────────────────────
+
+class SkillRawUpdateRequest(BaseModel):
+    yaml: str
 
 @app.get("/skills")
 async def list_skills():
@@ -828,11 +1067,81 @@ async def reload_skills():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/skills/{skill_id}/raw")
+async def get_skill_raw(skill_id: str):
+    """读取指定 Skill 的 YAML 原文"""
+    try:
+        from backend.skills.registry import SkillRegistry
+        registry = SkillRegistry()
+        skill = registry.get_by_id(skill_id)
+        if not skill:
+            raise HTTPException(status_code=404, detail=f"Skill 不存在: {skill_id}")
+        source_path = Path(skill.source_file)
+        if not source_path.exists():
+            raise HTTPException(status_code=404, detail=f"Skill 文件不存在: {skill.source_file}")
+        return {
+            "skill_id": skill.skill_id,
+            "source": str(source_path),
+            "yaml": source_path.read_text(encoding="utf-8"),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/skills/{skill_id}/raw")
+async def update_skill_raw(skill_id: str, req: SkillRawUpdateRequest):
+    """更新指定 Skill 的 YAML 并立即重载"""
+    try:
+        from backend.skills.registry import SkillRegistry
+
+        registry = SkillRegistry()
+        skill = registry.get_by_id(skill_id)
+        if not skill:
+            raise HTTPException(status_code=404, detail=f"Skill 不存在: {skill_id}")
+
+        source_path = Path(skill.source_file).resolve()
+        skills_root = (Path(__file__).resolve().parents[1] / "skills").resolve()
+        try:
+            source_path.relative_to(skills_root)
+        except Exception:
+            raise HTTPException(status_code=403, detail="Skill 文件路径非法，拒绝写入")
+
+        # 基础 YAML 校验，避免写入不可解析内容
+        try:
+            parsed = yaml.safe_load(req.yaml)
+        except yaml.YAMLError as ye:
+            raise HTTPException(status_code=400, detail=f"YAML 语法错误: {ye}")
+
+        if not isinstance(parsed, dict):
+            raise HTTPException(status_code=400, detail="YAML 顶层必须是对象")
+        file_skill_id = parsed.get("skill_id")
+        if not file_skill_id:
+            raise HTTPException(status_code=400, detail="YAML 缺少 skill_id 字段")
+        if str(file_skill_id) != skill_id:
+            raise HTTPException(
+                status_code=400,
+                detail=f"skill_id 不一致: path={skill_id}, yaml={file_skill_id}",
+            )
+
+        source_path.write_text(req.yaml, encoding="utf-8")
+        registry.reload()
+        return {"status": "ok", "skill_id": skill_id, "source": str(source_path)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ── 团队协作预留接口（阶段二实现）────────────────────────
 
 @app.get("/team/members")
 async def list_members():
-    raise HTTPException(status_code=501, detail="团队功能阶段二实现")
+    # 最小化实现：仅返回当前可渲染的团队占位数据，避免前端依赖 501。
+    return [
+        {"user_id": "local-owner", "email": "owner@aurorarecon.local", "role": "owner"},
+    ]
 
 
 @app.post("/team/members")

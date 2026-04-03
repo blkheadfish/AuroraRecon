@@ -39,6 +39,9 @@ logger = logging.getLogger(__name__)
 
 TOOLBOX_IMAGE  = os.getenv("TOOLBOX_IMAGE", "pentest-toolbox:latest")
 DOCKER_NETWORK = os.getenv("DOCKER_NETWORK", "pentest_net")
+# 工具容器网络：默认 host，让工具用宿主机 IP 出去
+# 解决 RemoteAddrValve 等基于源 IP 的访问控制
+TOOLBOX_NETWORK = os.getenv("TOOLBOX_NETWORK", "host")
 USE_HOST_TOOLS = os.getenv("USE_HOST_TOOLS", "false").lower() == "true"
 DATA_VOLUME    = os.getenv("DATA_VOLUME", "/tmp/pentest_data")
 REPORTS_DIR    = os.getenv("REPORTS_DIR", "/tmp/pentest_reports")
@@ -92,7 +95,7 @@ class TaskContainerManager:
             cmd = [
                 "docker", "run", "-d",
                 "--name", name,
-                "--network", DOCKER_NETWORK,
+                "--network", TOOLBOX_NETWORK,
                 "--rm",
                 "-v", f"{DATA_VOLUME}:/data",
                 "-v", f"{REPORTS_DIR}:/reports",
@@ -324,7 +327,7 @@ class ToolExecutor:
     def _build_docker_run_cmd(self, tool_def, args, env, workdir, publish_ports=None) -> list[str]:
         docker_cmd = [
             "docker", "run", "--rm", "-i",
-            "--network", DOCKER_NETWORK,   # pentest_net：与 msf/postgres/redis 同网，Docker DNS 可解析
+            "--network", TOOLBOX_NETWORK,   # host 模式：工具用宿主机 IP 出去
             "-w", workdir,
             "-v", f"{DATA_VOLUME}:/data",
             "--privileged",

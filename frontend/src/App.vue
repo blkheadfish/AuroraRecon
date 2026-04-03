@@ -1,10 +1,14 @@
 <template>
-  <el-container class="app-layout">
+  <div v-if="isStartPage" class="start-layout">
+    <router-view />
+  </div>
+
+  <el-container v-else class="app-layout">
     <!-- Sidebar -->
     <el-aside width="220px" class="sidebar">
       <div class="sidebar-logo">
         <el-icon class="logo-icon"><Monitor /></el-icon>
-        <span class="logo-text">PentestAI</span>
+        <span class="logo-text">AuroraRecon</span>
       </div>
 
       <el-menu
@@ -14,11 +18,23 @@
       >
         <el-menu-item index="/dashboard">
           <el-icon><DataLine /></el-icon>
-          <span>仪表盘</span>
+          <span>工作台</span>
         </el-menu-item>
         <el-menu-item index="/tasks">
           <el-icon><List /></el-icon>
           <span>任务列表</span>
+        </el-menu-item>
+        <el-menu-item index="/skills">
+          <el-icon><Tools /></el-icon>
+          <span>技能管理</span>
+        </el-menu-item>
+        <el-menu-item index="/prompts">
+          <el-icon><ChatDotRound /></el-icon>
+          <span>提示词管理</span>
+        </el-menu-item>
+        <el-menu-item index="/profile">
+          <el-icon><User /></el-icon>
+          <span>个人空间</span>
         </el-menu-item>
         <el-menu-item index="/settings">
           <el-icon><Setting /></el-icon>
@@ -60,8 +76,10 @@ import { api } from '@/api'
 import { useTheme } from '@/composables/useTheme'
 
 const route = useRoute()
+const isStartPage = computed(() => route.path === '/start')
 const activeMenu = computed(() => {
   if (route.path.startsWith('/tasks/')) return '/tasks'
+  if (route.path.startsWith('/reports/')) return '/tasks'
   return route.path === '/' ? '/dashboard' : route.path
 })
 
@@ -89,6 +107,12 @@ onMounted(() => {
 </script>
 
 <style scoped>
+.start-layout {
+  height: 100vh;
+  overflow: hidden;
+  background: var(--bg-base);
+}
+
 .app-layout {
   height: 100vh;
   overflow: hidden;

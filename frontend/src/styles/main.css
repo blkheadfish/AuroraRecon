@@ -3,7 +3,7 @@
    Theme: Dark (default) + Light mode
    ========================================== */
 
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&family=Orbitron:wght@500;600;700&display=swap');
 
 /* ── Dark Theme (default) ────────────────────────── */
 :root,
@@ -19,12 +19,12 @@
     --text-secondary: #8b949e;
     --text-muted:     #484f58;
 
-    --accent-green:  #3fb950;
-    --accent-blue:   #388bfd;
-    --accent-yellow: #d29922;
-    --accent-red:    #f85149;
-    --accent-orange: #db6d28;
-    --accent-purple: #bc8cff;
+    --accent-green:  #57a68d;
+    --accent-blue:   #4c7fae;
+    --accent-yellow: #b08f54;
+    --accent-red:    #c66d74;
+    --accent-orange: #b27b52;
+    --accent-purple: #9a8dbb;
 
     --status-pending:   #8b949e;
     --status-running:   #388bfd;
@@ -61,6 +61,36 @@
 
     --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
     --font-sans: 'Inter', -apple-system, sans-serif;
+    --font-display: 'Space Grotesk', 'Inter', -apple-system, sans-serif;
+    --font-orbitron: 'Orbitron', 'Space Grotesk', 'Inter', -apple-system, sans-serif;
+    --start-grid-line: rgba(139, 148, 158, 0.2);
+    --start-scanline: rgba(56, 139, 253, 0.14);
+    --start-panel-bg: rgba(22, 27, 34, 0.72);
+    --start-panel-border: rgba(139, 148, 158, 0.3);
+    --start-panel-highlight: rgba(230, 237, 243, 0.08);
+    --start-panel-shadow: rgba(0, 0, 0, 0.45);
+    --start-hacker-cyan: #6faec8;
+    --start-hacker-green: #7eaa9a;
+    --start-hacker-line: rgba(111, 174, 200, 0.24);
+    --start-hacker-muted-line: rgba(126, 170, 154, 0.18);
+    --el-color-primary: var(--accent-blue);
+    --el-color-success: var(--accent-green);
+    --el-color-warning: var(--accent-yellow);
+    --el-color-danger: var(--accent-red);
+    --el-fill-color-blank: var(--bg-elevated);
+    --el-fill-color-light: var(--bg-hover);
+    --el-fill-color-lighter: color-mix(in srgb, var(--bg-hover) 86%, var(--bg-elevated));
+    --el-bg-color: var(--bg-surface);
+    --el-bg-color-page: var(--bg-base);
+    --el-bg-color-overlay: var(--bg-elevated);
+    --el-text-color-primary: var(--text-primary);
+    --el-text-color-regular: var(--text-secondary);
+    --el-text-color-secondary: var(--text-muted);
+    --el-text-color-placeholder: var(--text-muted);
+    --el-border-color: var(--border);
+    --el-border-color-light: var(--border-muted);
+    --el-border-color-lighter: color-mix(in srgb, var(--border-muted) 78%, transparent);
+    --el-mask-color: rgba(13, 17, 23, 0.74);
 
     --radius-sm: 4px;
     --radius-md: 6px;
@@ -82,12 +112,12 @@
     --text-secondary: #656d76;
     --text-muted:     #8b949e;
 
-    --accent-green:  #1a7f37;
-    --accent-blue:   #0969da;
-    --accent-yellow: #9a6700;
-    --accent-red:    #cf222e;
-    --accent-orange: #bc4c00;
-    --accent-purple: #8250df;
+    --accent-green:  #2f7b5f;
+    --accent-blue:   #356b99;
+    --accent-yellow: #9b7d4f;
+    --accent-red:    #b45e68;
+    --accent-orange: #9b6d49;
+    --accent-purple: #6f6ca1;
 
     --status-pending:   #656d76;
     --status-running:   #0969da;
@@ -121,6 +151,34 @@
     --hljs-name:      #116329;
     --hljs-selector:  #cf222e;
     --hljs-literal:   #0550ae;
+    --start-grid-line: rgba(101, 109, 118, 0.2);
+    --start-scanline: rgba(9, 105, 218, 0.12);
+    --start-panel-bg: rgba(255, 255, 255, 0.74);
+    --start-panel-border: rgba(208, 215, 222, 0.72);
+    --start-panel-highlight: rgba(255, 255, 255, 0.68);
+    --start-panel-shadow: rgba(15, 23, 42, 0.12);
+    --start-hacker-cyan: #4f7fa2;
+    --start-hacker-green: #5f8d7f;
+    --start-hacker-line: rgba(79, 127, 162, 0.2);
+    --start-hacker-muted-line: rgba(95, 141, 127, 0.16);
+    --el-color-primary: var(--accent-blue);
+    --el-color-success: var(--accent-green);
+    --el-color-warning: var(--accent-yellow);
+    --el-color-danger: var(--accent-red);
+    --el-fill-color-blank: #ffffff;
+    --el-fill-color-light: var(--bg-elevated);
+    --el-fill-color-lighter: color-mix(in srgb, var(--bg-elevated) 64%, #ffffff);
+    --el-bg-color: var(--bg-surface);
+    --el-bg-color-page: var(--bg-base);
+    --el-bg-color-overlay: #ffffff;
+    --el-text-color-primary: var(--text-primary);
+    --el-text-color-regular: var(--text-secondary);
+    --el-text-color-secondary: var(--text-muted);
+    --el-text-color-placeholder: var(--text-muted);
+    --el-border-color: var(--border);
+    --el-border-color-light: var(--border-muted);
+    --el-border-color-lighter: color-mix(in srgb, var(--border-muted) 70%, #ffffff);
+    --el-mask-color: rgba(240, 244, 248, 0.72);
 
     color-scheme: light;
 }
@@ -235,6 +293,19 @@ html, body, #app {
 .el-input__wrapper.is-focus {
     box-shadow: 0 0 0 1px var(--accent-blue) !important;
 }
+.el-select__wrapper {
+    background: var(--bg-elevated) !important;
+    box-shadow: 0 0 0 1px var(--border) !important;
+}
+.el-select__wrapper:hover {
+    box-shadow: 0 0 0 1px var(--text-muted) !important;
+}
+.el-select__wrapper.is-focused {
+    box-shadow: 0 0 0 1px var(--accent-blue) !important;
+}
+.el-select__placeholder {
+    color: var(--text-muted) !important;
+}
 .el-input__inner {
     color: var(--text-primary) !important;
     background: transparent !important;
@@ -253,12 +324,23 @@ html, body, #app {
     border-radius: var(--radius-md) !important;
     font-weight: 500 !important;
 }
+.el-button:not(.el-button--primary):not(.el-button--danger):not(.is-text):not(.is-link) {
+    background: var(--bg-elevated) !important;
+    border-color: var(--border) !important;
+    color: var(--text-primary) !important;
+}
+.el-button:not(.el-button--primary):not(.el-button--danger):not(.is-text):not(.is-link):hover {
+    background: var(--bg-hover) !important;
+    border-color: var(--text-muted) !important;
+}
 .el-button--primary {
-    background: var(--accent-blue) !important;
-    border-color: var(--accent-blue) !important;
+    background: color-mix(in srgb, var(--accent-blue) 84%, var(--bg-surface)) !important;
+    border-color: color-mix(in srgb, var(--accent-blue) 90%, var(--bg-surface)) !important;
 }
 .el-button--primary:hover {
-    opacity: 0.85;
+    background: color-mix(in srgb, var(--accent-blue) 94%, var(--bg-surface)) !important;
+    border-color: color-mix(in srgb, var(--accent-blue) 98%, var(--bg-surface)) !important;
+    opacity: 1;
 }
 .el-button--danger {
     background: transparent !important;
@@ -322,6 +404,30 @@ html, body, #app {
     background: var(--bg-elevated) !important;
     border-color: var(--border) !important;
     color: var(--text-primary) !important;
+}
+.el-select-dropdown,
+.el-dropdown-menu {
+    background: var(--bg-surface) !important;
+    border-color: var(--border) !important;
+}
+.el-select-dropdown__item {
+    color: var(--text-primary) !important;
+}
+.el-select-dropdown__item.hover,
+.el-select-dropdown__item:hover {
+    background: var(--bg-hover) !important;
+}
+.el-dropdown-menu__item {
+    color: var(--text-primary) !important;
+}
+.el-dropdown-menu__item:hover {
+    background: var(--bg-hover) !important;
+}
+.el-loading-mask {
+    background-color: var(--el-mask-color) !important;
+}
+.el-skeleton__item {
+    background: var(--bg-hover) !important;
 }
 
 /* Severity badges */

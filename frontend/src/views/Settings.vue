@@ -39,6 +39,7 @@
                   placeholder="sk-..."
                   class="mono-input"
               />
+              <div class="form-tip error" v-if="validationErrors.apiKey">{{ validationErrors.apiKey }}</div>
             </el-form-item>
 
             <el-form-item label="模型名称">
@@ -47,6 +48,7 @@
 
             <el-form-item label="Base URL">
               <el-input v-model="llm.base_url" class="mono-input" placeholder="https://api.deepseek.com" />
+              <div class="form-tip error" v-if="validationErrors.baseUrl">{{ validationErrors.baseUrl }}</div>
             </el-form-item>
 
             <el-form-item label="Max Tokens">
@@ -112,6 +114,7 @@
             </el-form-item>
             <el-form-item label="LHOST（反弹 Shell）">
               <el-input v-model="executor.lhost" class="mono-input" placeholder="你的公网IP" />
+              <div class="form-tip error" v-if="validationErrors.lhost">{{ validationErrors.lhost }}</div>
             </el-form-item>
           </el-form>
         </el-card>
@@ -228,6 +231,7 @@ import {
   Check, Cpu, Connection, Monitor, Refresh, Loading,
   Setting, UserFilled, Plus,
 } from '@element-plus/icons-vue'
+import { trackEvent } from '@/metrics/tracker'
 
 const activeTab   = ref('llm')
 const saving      = ref(false)
@@ -301,6 +305,10 @@ async function testLLM() {
 }
 
 async function saveAll() {
+  if (validationErrors.value.apiKey || validationErrors.value.baseUrl || validationErrors.value.lhost) {
+    ElMessage.error('请先修正配置校验错误后再保存')
+    return
+  }
   saving.value = true
   try {
     await api.saveSettings({
@@ -308,6 +316,7 @@ async function saveAll() {
       executor: executor.value,
       workflow: workflow.value,
     })
+    trackEvent('settings.save', { provider: llm.value.provider })
     ElMessage.success('设置已保存')
   } catch (e) {
     ElMessage.error('保存失败：' + (e?.response?.data?.detail || e.message))
@@ -315,6 +324,25 @@ async function saveAll() {
     saving.value = false
   }
 }
+
+const validationErrors = computed(() => {
+  const errors = {
+    apiKey: '',
+    baseUrl: '',
+    lhost: '',
+  }
+
+  if (llm.value.api_key && !/^sk-[a-zA-Z0-9\-_]{8,}/.test(llm.value.api_key)) {
+    errors.apiKey = 'API Key 格式不合法，通常应以 sk- 开头。'
+  }
+  if (llm.value.base_url && !/^https?:\/\/[\w.-]+/.test(llm.value.base_url)) {
+    errors.baseUrl = 'Base URL 必须是合法的 http/https 地址。'
+  }
+  if (executor.value.lhost && !/^\d{1,3}(\.\d{1,3}){3}$/.test(executor.value.lhost)) {
+    errors.lhost = 'LHOST 建议填写合法 IPv4 地址。'
+  }
+  return errors
+})
 
 async function loadSettings() {
   try {
@@ -370,6 +398,7 @@ onMounted(async () => {
 }
 
 .form-tip { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+.form-tip.error { color: var(--accent-red); }
 
 .test-result {
   margin-left: 12px;

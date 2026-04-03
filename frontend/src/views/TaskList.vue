@@ -1,132 +1,120 @@
 <template>
   <div class="page-wrap">
-    <!-- Page header -->
     <div class="page-header">
       <div>
-        <h1 class="page-title">渗透测试任务</h1>
-        <p class="page-sub">管理和监控所有渗透测试任务</p>
+        <h1 class="page-title">渗透任务中心</h1>
+        <p class="page-sub">创建任务、管理队列、跟踪审批与利用状态</p>
       </div>
-      <el-button type="primary" @click="showCreate = true" size="large">
-        <el-icon>
-          <Plus/>
-        </el-icon>
+      <el-button type="primary" size="large" @click="showCreate = true">
+        <el-icon><Plus /></el-icon>
         新建任务
       </el-button>
     </div>
 
-    <!-- Stats bar -->
     <div class="stats-bar">
       <div class="stat-item">
-        <span class="stat-num">{{ tasks.length }}</span>
+        <span class="stat-num">{{ listStore.stats.total }}</span>
         <span class="stat-label">全部任务</span>
       </div>
       <div class="stat-item">
-        <span class="stat-num running">{{ countByStatus('running') }}</span>
+        <span class="stat-num running">{{ listStore.stats.running }}</span>
         <span class="stat-label">运行中</span>
       </div>
       <div class="stat-item">
-        <span class="stat-num completed">{{ countByStatus('completed') }}</span>
+        <span class="stat-num completed">{{ listStore.stats.completed }}</span>
         <span class="stat-label">已完成</span>
       </div>
       <div class="stat-item">
-        <span class="stat-num failed">{{ countByStatus('failed') }}</span>
+        <span class="stat-num failed">{{ listStore.stats.failed }}</span>
         <span class="stat-label">失败</span>
+      </div>
+      <div class="stat-item">
+        <span class="stat-num warn">{{ awaitingApprovalCount }}</span>
+        <span class="stat-label">待审批</span>
       </div>
     </div>
 
-    <!-- Task table -->
-    <el-card class="table-card" v-loading="loading" element-loading-background="rgba(22,27,34,0.8)">
-      <el-empty v-if="!loading && tasks.length === 0" description="暂无任务，点击「新建任务」开始"/>
+    <el-card class="table-card">
+      <div class="toolbar">
+        <el-select v-model="filterStatus" placeholder="状态筛选" clearable style="width: 140px">
+          <el-option label="运行中" value="running" />
+          <el-option label="已完成" value="completed" />
+          <el-option label="失败" value="failed" />
+          <el-option label="待处理" value="pending" />
+        </el-select>
+        <el-select v-model="filterPhase" placeholder="阶段筛选" clearable style="width: 160px">
+          <el-option label="侦察" value="recon" />
+          <el-option label="漏洞扫描" value="vuln_scan" />
+          <el-option label="利用决策" value="exploit_decision" />
+          <el-option label="等待审批" value="awaiting_approval" />
+          <el-option label="漏洞利用" value="exploit" />
+          <el-option label="后渗透" value="post_exploit" />
+          <el-option label="报告生成" value="report" />
+        </el-select>
+        <el-switch
+          v-model="onlyShell"
+          active-text="仅看 Shell"
+          inactive-text="全部"
+        />
+        <el-button link @click="clearFilters">清除筛选</el-button>
+      </div>
+
+      <div class="batch-actions" v-if="selectedRows.length">
+        <span>已选 {{ selectedRows.length }} 项</span>
+        <el-button size="small" @click="openBatchReport">批量查看报告</el-button>
+        <el-button size="small" type="danger" plain @click="batchDelete">批量删除</el-button>
+      </div>
+
+      <el-empty v-if="!listStore.loading && !filteredTasks.length" description="暂无匹配任务" />
 
       <el-table
-          v-else
-          :data="tasks"
-          row-class-name="task-row"
-          @row-click="(row) => goDetail(row.task_id)"
-          style="cursor: pointer;"
+        v-else
+        :data="filteredTasks"
+        v-loading="listStore.loading"
+        @selection-change="onSelectionChange"
+        @row-click="(row) => goDetail(row.task_id)"
       >
-        <el-table-column label="目标" min-width="180">
+        <el-table-column type="selection" width="44" />
+        <el-table-column label="目标" min-width="220">
           <template #default="{ row }">
-            <span class="target-text">{{ row.target }}</span>
+            <code class="target">{{ row.target }}</code>
           </template>
         </el-table-column>
-
         <el-table-column label="状态" width="120">
           <template #default="{ row }">
-            <StatusBadge :status="row.status"/>
+            <StatusBadge :status="row.status" />
           </template>
         </el-table-column>
-
-        <el-table-column label="当前阶段" width="150">
+        <el-table-column label="阶段" width="140">
           <template #default="{ row }">
-            <PhaseBadge :phase="row.current_phase"/>
+            <PhaseBadge :phase="row.current_phase" />
           </template>
         </el-table-column>
-
-        <el-table-column label="漏洞发现" width="110" align="center">
+        <el-table-column label="漏洞" width="90" align="center">
           <template #default="{ row }">
-            <span class="findings-count" :class="row.findings_count > 0 ? 'has-findings' : ''">
-              {{ row.findings_count }}
-            </span>
+            <span class="mono">{{ row.findings_count || 0 }}</span>
           </template>
         </el-table-column>
-
-        <el-table-column label="Shell" width="90" align="center">
+        <el-table-column label="Shell" width="80" align="center">
           <template #default="{ row }">
-            <el-icon v-if="row.got_shell" class="shell-icon got">
-              <CircleCheckFilled/>
-            </el-icon>
-            <el-icon v-else class="shell-icon none">
-              <Remove/>
-            </el-icon>
+            <el-icon v-if="row.got_shell" class="shell yes"><CircleCheckFilled /></el-icon>
+            <el-icon v-else class="shell no"><Remove /></el-icon>
           </template>
         </el-table-column>
-
         <el-table-column label="报告" width="90" align="center">
           <template #default="{ row }">
             <el-tag v-if="row.report_path" type="success" size="small">已生成</el-tag>
-            <span v-else class="text-muted">—</span>
+            <span v-else class="text-muted">-</span>
           </template>
         </el-table-column>
-
-        <!-- 操作列：宽度扩大以容纳两个按钮 -->
-        <el-table-column label="操作" width="160" align="center">
+        <el-table-column label="操作" width="180" align="center">
           <template #default="{ row }">
-            <div class="action-cell" @click.stop>
-              <el-button
-                  link
-                  type="primary"
-                  size="small"
-                  @click="goDetail(row.task_id)"
-              >
-                详情
-              </el-button>
-
-              <!-- 运行中：显示"取消"（发送停止请求，标记为 failed） -->
-              <el-popconfirm
-                  v-if="row.status === 'running' || row.status === 'pending'"
-                  title="确认取消该任务？"
-                  confirm-button-text="取消任务"
-                  cancel-button-text="保留"
-                  confirm-button-type="danger"
-                  @confirm="handleCancel(row)"
-              >
+            <div class="actions" @click.stop>
+              <el-button link type="primary" @click="goDetail(row.task_id)">详情</el-button>
+              <el-button v-if="row.report_path" link type="success" @click="goReport(row.task_id)">报告</el-button>
+              <el-popconfirm title="确认删除该任务？" @confirm="handleDelete(row)">
                 <template #reference>
-                  <el-button link type="warning" size="small">取消</el-button>
-                </template>
-              </el-popconfirm>
-
-              <!-- 非运行中：显示"删除"（从列表移除） -->
-              <el-popconfirm
-                  v-else
-                  title="确认删除该任务记录？"
-                  confirm-button-text="删除"
-                  cancel-button-text="取消"
-                  confirm-button-type="danger"
-                  @confirm="handleDelete(row)"
-              >
-                <template #reference>
-                  <el-button link type="danger" size="small">删除</el-button>
+                  <el-button link type="danger">删除</el-button>
                 </template>
               </el-popconfirm>
             </div>
@@ -135,225 +123,166 @@
       </el-table>
     </el-card>
 
-    <!-- Create task dialog -->
-    <el-dialog v-model="showCreate" title="新建渗透测试任务" width="500px" :close-on-click-modal="false">
-      <el-form :model="form" label-position="top" :rules="rules" ref="formRef">
+    <el-dialog v-model="showCreate" title="创建渗透测试任务" width="560px" :close-on-click-modal="false">
+      <el-form :model="form" :rules="rules" ref="formRef" label-position="top">
         <el-form-item label="目标地址" prop="target">
-          <el-input
-              v-model="form.target"
-              placeholder="IP地址 / 域名 / URL，例：192.168.1.100"
-              :prefix-icon="Aim"
-              clearable
-          />
-          <div class="form-tip">支持 IP、域名、含端口的 URL，请确保已获得授权</div>
+          <el-input v-model="form.target" placeholder="IP / 域名 / URL" clearable />
+          <div class="form-tip">仅在合法授权范围内使用。</div>
         </el-form-item>
-
-        <el-form-item label="授权说明 / 测试备注" prop="scopeNote">
-          <el-input
-              v-model="form.scopeNote"
-              type="textarea"
-              :rows="3"
-              placeholder="例：CTF 靶场测试 / 已获授权的内网渗透测试"
-          />
+        <el-form-item label="执行模式">
+          <el-radio-group v-model="uiPrefs.executionMode">
+            <el-radio-button label="manual">手动审核</el-radio-button>
+            <el-radio-button label="auto">全自动</el-radio-button>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item label="授权说明">
+          <el-input v-model="form.scopeNote" type="textarea" :rows="3" />
         </el-form-item>
       </el-form>
-
       <template #footer>
         <el-button @click="showCreate = false">取消</el-button>
-        <el-button type="primary" @click="handleCreate" :loading="creating">
-          创建并开始
-        </el-button>
+        <el-button type="primary" :loading="creating" @click="handleCreate">创建并开始</el-button>
       </template>
     </el-dialog>
   </div>
 </template>
 
 <script setup>
-import {ref, computed, onMounted} from 'vue'
-import {useRouter} from 'vue-router'
-import {ElMessage} from 'element-plus'
-import {Aim} from '@element-plus/icons-vue'
-import {useTasksStore} from '@/stores/tasks'
-import {api} from '@/api'
+import { computed, onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
+import { useTaskListStore } from '@/stores/taskList'
+import { useUiPrefsStore } from '@/stores/uiPrefs'
+import { trackEvent } from '@/metrics/tracker'
 import StatusBadge from '@/components/StatusBadge.vue'
 import PhaseBadge from '@/components/PhaseBadge.vue'
 
 const router = useRouter()
-const store = useTasksStore()
-const tasks = computed(() => store.tasks)
-const loading = computed(() => store.loading)
+const listStore = useTaskListStore()
+const uiPrefs = useUiPrefsStore()
 
 const showCreate = ref(false)
 const creating = ref(false)
 const formRef = ref()
+const selectedRows = ref([])
 
-const form = ref({target: '', scopeNote: 'CTF/授权靶场测试'})
+const form = ref({
+  target: '',
+  scopeNote: 'CTF/授权靶场测试',
+})
+
 const rules = {
-  target: [{required: true, message: '请输入目标地址', trigger: 'blur'}],
+  target: [{ required: true, message: '请输入目标地址', trigger: 'blur' }],
 }
 
-const countByStatus = (s) => tasks.value.filter(t => t.status === s).length
+const filterStatus = ref('')
+const filterPhase = ref('')
+const onlyShell = ref(false)
 
-function goDetail(id) {
-  router.push(`/tasks/${id}`)
+const filteredTasks = computed(() => {
+  return listStore.tasks.filter((task) => {
+    if (filterStatus.value && task.status !== filterStatus.value) return false
+    if (filterPhase.value && task.current_phase !== filterPhase.value) return false
+    if (onlyShell.value && !task.got_shell) return false
+    return true
+  })
+})
+
+const awaitingApprovalCount = computed(() =>
+  listStore.tasks.filter((task) => task.current_phase === 'awaiting_approval').length,
+)
+
+function clearFilters() {
+  filterStatus.value = ''
+  filterPhase.value = ''
+  onlyShell.value = false
+}
+
+function onSelectionChange(rows) {
+  selectedRows.value = rows
+}
+
+function goDetail(taskId) {
+  router.push(`/tasks/${taskId}`)
+}
+
+function goReport(taskId) {
+  router.push(`/reports/${taskId}`)
 }
 
 async function handleCreate() {
   await formRef.value.validate()
   creating.value = true
   try {
-    const task = await store.createTask(form.value.target, form.value.scopeNote)
-    ElMessage.success(`任务已创建，正在扫描 ${task.target}`)
+    const task = await listStore.createTask(form.value.target, form.value.scopeNote)
+    trackEvent('task.create', {
+      target: form.value.target,
+      mode: uiPrefs.executionMode,
+      taskId: task.task_id,
+    })
+    ElMessage.success(`任务已创建：${task.target}`)
     showCreate.value = false
-    form.value = {target: '', scopeNote: 'CTF/授权靶场测试'}
+    form.value = { target: '', scopeNote: 'CTF/授权靶场测试' }
     router.push(`/tasks/${task.task_id}`)
   } catch (e) {
-    ElMessage.error('创建失败：' + (e?.response?.data?.detail || e.message))
+    ElMessage.error(e?.response?.data?.detail || e.message || '创建失败')
   } finally {
     creating.value = false
   }
 }
 
-// 取消运行中的任务
-async function handleCancel(row) {
-  try {
-    await api.cancelTask(row.task_id)
-    store.updateTask({task_id: row.task_id, status: 'failed', current_phase: row.current_phase})
-    ElMessage.warning(`任务 ${row.target} 已取消`)
-  } catch (e) {
-    // 后端如果尚未实现 cancel 接口，直接在前端标记
-    store.updateTask({task_id: row.task_id, status: 'failed'})
-    ElMessage.warning(`任务已在前端标记为取消（后端可能不支持强制停止）`)
-  }
-}
-
-// 删除已完成/失败的任务
-async function handleDelete(row) {
-  try {
-    await api.deleteTask(row.task_id)
-  } catch {
-    // 后端无 delete 接口时静默忽略，只做前端移除
-  }
-  store.removeTask(row.task_id)
+function handleDelete(row) {
+  listStore.removeTask(row.task_id)
+  trackEvent('task.delete', { taskId: row.task_id })
   ElMessage.success('任务已删除')
 }
 
-onMounted(() => store.fetchTasks())
+function batchDelete() {
+  selectedRows.value.forEach((item) => listStore.removeTask(item.task_id))
+  trackEvent('task.batch_delete', { count: selectedRows.value.length })
+  ElMessage.success(`已删除 ${selectedRows.value.length} 个任务`)
+  selectedRows.value = []
+}
+
+function openBatchReport() {
+  const withReport = selectedRows.value.filter((item) => item.report_path)
+  if (!withReport.length) {
+    ElMessage.warning('所选任务没有可用报告')
+    return
+  }
+  router.push(`/reports/${withReport[0].task_id}`)
+}
+
+onMounted(() => {
+  listStore.fetchTasks()
+})
 </script>
 
 <style scoped>
-.page-wrap {
-  padding: 28px 32px;
-  min-height: 100%;
-}
+.page-wrap { padding: 24px 32px; min-height: 100%; }
+.page-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 18px; }
+.page-title { font-size: 22px; color: var(--text-primary); font-weight: 700; }
+.page-sub { margin-top: 4px; color: var(--text-secondary); font-size: 13px; }
 
-.page-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  margin-bottom: 24px;
-}
+.stats-bar { display: flex; gap: 22px; margin-bottom: 14px; padding: 14px 18px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--bg-surface); }
+.stat-item { display: flex; flex-direction: column; gap: 2px; }
+.stat-num { font-family: var(--font-mono); font-size: 22px; color: var(--text-primary); font-weight: 700; }
+.stat-num.running { color: var(--accent-blue); }
+.stat-num.completed { color: var(--accent-green); }
+.stat-num.failed { color: var(--accent-red); }
+.stat-num.warn { color: var(--accent-yellow); }
+.stat-label { font-size: 12px; color: var(--text-muted); }
 
-.page-title {
-  font-size: 22px;
-  font-weight: 700;
-  color: var(--text-primary);
-  margin-bottom: 4px;
-}
+.table-card { border-radius: var(--radius-lg) !important; }
+.toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; }
+.batch-actions { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; color: var(--text-secondary); font-size: 12px; }
 
-.page-sub {
-  font-size: 13px;
-  color: var(--text-secondary);
-}
-
-.stats-bar {
-  display: flex;
-  gap: 24px;
-  margin-bottom: 20px;
-  padding: 16px 24px;
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-}
-
-.stat-item {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.stat-num {
-  font-family: var(--font-mono);
-  font-size: 24px;
-  font-weight: 600;
-  color: var(--text-secondary);
-}
-
-.stat-num.running {
-  color: var(--accent-blue);
-}
-
-.stat-num.completed {
-  color: var(--accent-green);
-}
-
-.stat-num.failed {
-  color: var(--accent-red);
-}
-
-.stat-label {
-  font-size: 12px;
-  color: var(--text-muted);
-}
-
-.table-card {
-  border-radius: var(--radius-lg) !important;
-}
-
-.target-text {
-  font-family: var(--font-mono);
-  font-size: 13px;
-  color: var(--accent-blue);
-}
-
-.findings-count {
-  font-family: var(--font-mono);
-  font-size: 13px;
-  color: var(--text-muted);
-}
-
-.findings-count.has-findings {
-  color: var(--accent-yellow);
-  font-weight: 600;
-}
-
-.shell-icon {
-  font-size: 16px;
-}
-
-.shell-icon.got {
-  color: var(--accent-green);
-}
-
-.shell-icon.none {
-  color: var(--text-muted);
-}
-
-.text-muted {
-  color: var(--text-muted);
-  font-size: 13px;
-}
-
-.form-tip {
-  font-size: 12px;
-  color: var(--text-muted);
-  margin-top: 4px;
-}
-
-.action-cell {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 4px;
-}
+.target { font-family: var(--font-mono); color: var(--accent-blue); font-size: 12px; }
+.mono { font-family: var(--font-mono); }
+.shell { font-size: 15px; }
+.shell.yes { color: var(--accent-green); }
+.shell.no { color: var(--text-muted); }
+.text-muted { color: var(--text-muted); }
+.actions { display: flex; justify-content: center; align-items: center; gap: 2px; }
+.form-tip { margin-top: 4px; color: var(--text-muted); font-size: 12px; }
 </style>
