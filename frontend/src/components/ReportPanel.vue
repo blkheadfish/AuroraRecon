@@ -114,7 +114,11 @@ const renderedHtml = computed(() => {
     }
     return `<pre><code class="hljs language-${language || ''}">${highlighted}</code></pre>`
   }
-  const raw = marked.parse(draft.value, { renderer, breaks: true })
+  const raw = marked.parse(draft.value, {
+    renderer,
+    gfm: true,
+    breaks: false,
+  })
   return sanitizeHtml(raw)
 })
 

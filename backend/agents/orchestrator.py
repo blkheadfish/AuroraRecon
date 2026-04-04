@@ -77,7 +77,9 @@ async def node_recon(state: PentestState) -> PentestState:
 
     state.log(f"开始侦察目标: {state.target}")
     agent = ReconAgent()
-    result = await agent.run(state.target, task_id=state.task_id)
+    async def _on_tool_log(line: str):
+        state.log(line)
+    result = await agent.run(state.target, task_id=state.task_id, log_callback=_on_tool_log)
     state.open_ports = result.get("ports", [])
     state.os_info = _stringify_dict_keys(result.get("os_info", {}))
     state.web_paths = result.get("web_paths", [])
@@ -94,12 +96,15 @@ async def node_vuln_scan(state: PentestState) -> PentestState:
     state.current_phase = "vuln_scan"
     state.log("开始漏洞扫描...")
     agent = VulnAgent()
+    async def _on_tool_log(line: str):
+        state.log(line)
     result = await agent.run(
         target=state.target,
         ports=state.open_ports,
         web_paths=state.web_paths,
         target_os=state.target_os,
         task_id=state.task_id,
+        log_callback=_on_tool_log,
     )
     state.findings = result.get("findings", [])
     # msgpack (LangGraph checkpoint) 不允许 int 作 dict key
@@ -195,13 +200,19 @@ async def node_exploit(state: PentestState) -> PentestState:
             "web_paths": ", ".join(state.web_paths[:20]) if state.web_paths else "无",
             "fingerprint": state.raw_recon.get("raw_nmap", "")[:500],
             "fingerprints": state.fingerprints,  # VulnAgent 的完整指纹数据
+            "extra_hint": state.extra_hint,
+            "user_prompt": state.user_prompt,
+            "workflow_mode": state.workflow_mode,
         }
+        async def _on_tool_log(line: str):
+            state.log(line)
         results = await agent.run(
             target=state.target,
             findings=exploitable,
             target_os=state.target_os,
             context=exploit_context,
             task_id=state.task_id,
+            log_callback=_on_tool_log,
         )
         state.exploit_results = results
         successes = [r for r in results if r.success]
@@ -338,12 +349,18 @@ class Orchestrator:
         self,
         target: str,
         scope_note: str = "CTF/授权靶场测试",
+        extra_hint: str = "",
+        user_prompt: str = "",
+        workflow_mode: str = "standard",
         task_id: Optional[str] = None,
     ) -> PentestState:
         await self._ensure_graph()
         initial_state = PentestState(
             target=target,
             scope_note=scope_note,
+            extra_hint=extra_hint,
+            user_prompt=user_prompt,
+            workflow_mode=workflow_mode,
             task_id=task_id or str(uuid.uuid4()),
         )
         config = {"configurable": {"thread_id": initial_state.task_id}}
@@ -355,11 +372,21 @@ class Orchestrator:
         self,
         target: str,
         scope_note: str = "CTF/授权靶场测试",
+        extra_hint: str = "",
+        user_prompt: str = "",
+        workflow_mode: str = "standard",
         task_id: Optional[str] = None,
     ):
         await self._ensure_graph()
         task_id = task_id or str(uuid.uuid4())
-        initial_state = PentestState(target=target, scope_note=scope_note, task_id=task_id)
+        initial_state = PentestState(
+            target=target,
+            scope_note=scope_note,
+            extra_hint=extra_hint,
+            user_prompt=user_prompt,
+            workflow_mode=workflow_mode,
+            task_id=task_id,
+        )
         config = {"configurable": {"thread_id": task_id}}
 
         async for event in self._graph.astream(initial_state, config=config):
@@ -468,6 +495,9 @@ def _build_exploit_decision_prompt(state: PentestState) -> str:
 - 地址: {state.target}
 - 操作系统: {state.target_os}
 - 开放端口: {ports_json}
+- 任务模式: {state.workflow_mode}
+- 用户附加提示: {state.extra_hint or '无'}
+- 用户偏好 Prompt: {state.user_prompt or '无'}
 
 发现的可利用漏洞:
 {findings_json}

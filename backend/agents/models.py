@@ -59,6 +59,9 @@ class PentestState(BaseModel):
 	target: str = ""
 	target_os: str = "unknown"
 	scope_note: str = ""
+	extra_hint: str = ""
+	user_prompt: str = ""
+	workflow_mode: str = "standard"
 	created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
 	
 	status: TaskStatus = TaskStatus.PENDING

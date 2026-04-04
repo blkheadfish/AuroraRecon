@@ -71,6 +71,70 @@ def severity_label(severity: str) -> str:
     return {"critical": "严重", "high": "高危", "medium": "中危", "low": "低危", "info": "信息"}.get(severity, severity)
 
 
+def _get_attr(obj, key: str, default=None):
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def command_count(result) -> int:
+    command_results = _get_attr(result, "command_results", None)
+    if command_results:
+        return len(command_results)
+    commands_run = _get_attr(result, "commands_run", None)
+    if commands_run:
+        return len(commands_run)
+    return 0
+
+
+def table_text(raw: str | None, limit: int = 72) -> str:
+    text = re.sub(r"\s+", " ", str(raw or "")).strip()
+    if not text:
+        return "无"
+    text = text.replace("|", " / ").replace("`", "'")
+    if len(text) > limit:
+        return text[:limit] + "..."
+    return text
+
+
+def normalize_markdown_whitespace(content: str) -> str:
+    if not content:
+        return ""
+
+    lines = content.replace("\r\n", "\n").split("\n")
+    output: list[str] = []
+    in_fence = False
+    blank_count = 0
+
+    for raw_line in lines:
+        line = raw_line.rstrip()
+        if line.startswith("```"):
+            in_fence = not in_fence
+            blank_count = 0
+            output.append(line)
+            continue
+
+        if in_fence:
+            output.append(line)
+            continue
+
+        if not line:
+            blank_count += 1
+            if blank_count <= 1:
+                output.append("")
+            continue
+
+        blank_count = 0
+        output.append(line)
+
+    while output and output[0] == "":
+        output.pop(0)
+    while output and output[-1] == "":
+        output.pop()
+
+    return "\n".join(output) + "\n"
+
+
 # ── 报告模板 ─────────────────────────────────────────────
 
 MD_TEMPLATE = """# 渗透测试报告
@@ -186,6 +250,13 @@ MD_TEMPLATE = """# 渗透测试报告
 ## 四、漏洞利用结果
 
 {% if state.exploit_results %}
+### 利用结果摘要
+
+| 漏洞 ID | 状态 | Shell 类型 | 命令数 | 结论摘要 |
+|---------|------|------------|--------|----------|
+{% for r in state.exploit_results %}| `{{ r.vuln_id }}` | {{ "✅ 成功" if r.success else "❌ 失败" }} | {{ r.shell_type or "N/A" }} | {{ cmd_count(r) }} | {{ table_text(r.evidence, 78) }} |
+{% endfor %}
+
 {% for r in state.exploit_results %}
 ### {{ loop.index }}. 漏洞 `{{ r.vuln_id }}`
 
@@ -261,21 +332,20 @@ MD_TEMPLATE = """# 渗透测试报告
 
 ## 六、修复建议
 
-{% for f in state.findings if f.severity in ('critical', 'high') %}
-### {{ sev_emoji(f.severity) }} {{ f.name }}（{{ sev_label(f.severity) }}）
-
-- **立即行动：** 升级到最新版本并应用安全补丁
-- **参考：** {{ f.cve or '厂商安全公告' }}
-- **临时缓解：** 部署 WAF 规则，限制相关接口访问
-
+{% set remediation_items = [] %}
+{% for f in state.findings %}
+{% if f.severity in ('critical', 'high', 'medium') %}
+{% set _ = remediation_items.append(f) %}
+{% endif %}
 {% endfor %}
-{% for f in state.findings if f.severity == 'medium' %}
-### {{ sev_emoji(f.severity) }} {{ f.name }}（中危）
-
-- **建议在下一个维护周期内修复**
-- 审查相关配置，加固安全策略
-
+{% if remediation_items %}
+| 漏洞 | 优先级 | 立即行动 | 参考 | 临时缓解 |
+|------|--------|----------|------|----------|
+{% for f in remediation_items %}| {{ table_text(f.name, 44) }} | {{ sev_emoji(f.severity) }} {{ sev_label(f.severity) }} | {{ "立即升级并应用官方补丁" if f.severity in ('critical', 'high') else "维护窗口内修复并完成回归验证" }} | {{ f.cve or "厂商安全公告" }} | {{ "部署 WAF 规则并限制高风险入口暴露" if f.severity in ('critical', 'high') else "审查配置并加强访问控制策略" }} |
 {% endfor %}
+{% else %}
+当前未发现需要立即处置的高/中危漏洞，建议保持基线巡检与补丁更新节奏。
+{% endif %}
 
 ---
 
@@ -311,11 +381,13 @@ class ReportGenerator:
         self._env.globals["fmt_evidence"] = format_evidence
         self._env.globals["sev_emoji"] = severity_emoji
         self._env.globals["sev_label"] = severity_label
+        self._env.globals["cmd_count"] = command_count
+        self._env.globals["table_text"] = table_text
 
     async def generate(self, state) -> tuple[str, str]:
         template = self._env.from_string(MD_TEMPLATE)
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-        md_content = template.render(state=state, now=now)
+        md_content = normalize_markdown_whitespace(template.render(state=state, now=now))
 
         timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         filename = f"report_{state.task_id[:8]}_{timestamp}.md"

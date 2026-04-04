@@ -144,6 +144,9 @@ app.add_middleware(
 class CreateTaskRequest(BaseModel):
     target: str
     scope_note: str = "CTF/授权靶场测试"
+    extra_hint: str = ""
+    user_prompt: str = ""
+    workflow_mode: str = "standard"
 
 
 class TaskSummary(BaseModel):
@@ -192,6 +195,8 @@ async def health_check():
     return {
         "status": "ok",
         "version": "2.0.0",
+        "metrics_overview": True,
+        "metrics_paths": ["/metrics/overview", "/api/metrics/overview"],
         "database": "connected" if _db_available else "unavailable",
         "redis": "connected" if _redis_available else "unavailable",
         "msf": "connected" if _msf_available else "unavailable",
@@ -333,6 +338,7 @@ def _build_tool_invocation_overview(tasks: list[PentestState]) -> dict:
 
 
 @app.get("/metrics/overview")
+@app.get("/api/metrics/overview")
 async def get_metrics_overview(window_hours: int = 24):
     bounded_window = max(1, min(window_hours, 168))
     now = datetime.utcnow()
@@ -357,7 +363,14 @@ async def get_metrics_overview(window_hours: int = 24):
 @app.post("/tasks", response_model=TaskSummary)
 async def create_task(req: CreateTaskRequest, background_tasks: BackgroundTasks):
     task_id = str(uuid.uuid4())
-    state = PentestState(task_id=task_id, target=req.target, scope_note=req.scope_note)
+    state = PentestState(
+        task_id=task_id,
+        target=req.target,
+        scope_note=req.scope_note,
+        extra_hint=req.extra_hint,
+        user_prompt=req.user_prompt,
+        workflow_mode=req.workflow_mode or "standard",
+    )
     _tasks[task_id] = state
 
     if _db_available:
@@ -367,7 +380,15 @@ async def create_task(req: CreateTaskRequest, background_tasks: BackgroundTasks)
         except Exception as e:
             logger.warning(f"[DB] 保存失败: {e}")
 
-    background_tasks.add_task(_run_task, task_id, req.target, req.scope_note)
+    background_tasks.add_task(
+        _run_task,
+        task_id,
+        req.target,
+        req.scope_note,
+        req.extra_hint,
+        req.user_prompt,
+        req.workflow_mode or "standard",
+    )
     return _to_summary(state)
 
 
@@ -580,13 +601,25 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
 
 # ── 后台任务执行 ──────────────────────────────────────────
 
-async def _run_task(task_id: str, target: str, scope_note: str):
+async def _run_task(
+    task_id: str,
+    target: str,
+    scope_note: str,
+    extra_hint: str = "",
+    user_prompt: str = "",
+    workflow_mode: str = "standard",
+):
     _running_tasks.add(task_id)
     orchestrator = get_orchestrator()   # 使用全局单例，MemorySaver checkpoint 共享
 
     try:
         async for node_name, raw_state in orchestrator.run_stream(
-            target=target, scope_note=scope_note, task_id=task_id,
+            target=target,
+            scope_note=scope_note,
+            extra_hint=extra_hint,
+            user_prompt=user_prompt,
+            workflow_mode=workflow_mode,
+            task_id=task_id,
         ):
             # 检查取消
             if _redis_available:
@@ -728,6 +761,94 @@ async def _broadcast(task_id: str, data: dict):
         connections.remove(ws)
 
 
+def _extract_phase_log(log_entry: str) -> tuple[str, str, str]:
+    """
+    Parse log line: [HH:MM:SS] [phase] message
+    Return: (timestamp, phase, message)
+    """
+    match = re.match(r"^\[(?P<ts>[^\]]+)\]\s+\[(?P<phase>[^\]]+)\]\s+(?P<msg>.*)$", log_entry or "")
+    if not match:
+        return "", "", log_entry or ""
+    return match.group("ts"), match.group("phase"), match.group("msg")
+
+
+def _build_decision_events(state: PentestState) -> list[dict]:
+    events: list[dict] = []
+
+    # 1) phase_log 事件
+    for idx, entry in enumerate(state.phase_log or []):
+        ts, phase, msg = _extract_phase_log(entry)
+        tone = "info"
+        action = "log"
+        tool = ""
+        backend = ""
+        exit_code = None
+        elapsed_ms = None
+
+        start_match = _TOOL_START_RE.search(msg)
+        if start_match:
+            tool = start_match.group(1).strip()
+            backend = start_match.group(2).strip()
+            action = "tool_start"
+            tone = "primary"
+
+        done_match = _TOOL_DONE_RE.search(msg)
+        if done_match:
+            tool = done_match.group(1).strip()
+            exit_code = int(done_match.group(2))
+            elapsed_ms = int(float(done_match.group(3)) * 1000.0)
+            action = "tool_result"
+            tone = "success" if exit_code == 0 else "danger"
+
+        if "审批" in msg or "授权" in msg:
+            action = "approval"
+            tone = "warning"
+
+        events.append({
+            "id": f"log-{idx}",
+            "timestamp": ts,
+            "phase": phase,
+            "action": action,
+            "tool": tool,
+            "backend": backend,
+            "exit_code": exit_code,
+            "elapsed_ms": elapsed_ms,
+            "message": msg,
+            "raw": entry,
+            "tone": tone,
+        })
+
+    # 2) exploit_results 命令执行明细
+    for ridx, result in enumerate(state.exploit_results or []):
+        result_payload = result.model_dump() if hasattr(result, "model_dump") else result
+        vuln_id = result_payload.get("vuln_id", "")
+        records = result_payload.get("command_records") or result_payload.get("command_results") or []
+        for cidx, record in enumerate(records):
+            cmd = str(record.get("command") or "")
+            stdout = str(record.get("stdout") or "")
+            stderr = str(record.get("stderr") or "")
+            exit_code = record.get("exit_code")
+            elapsed = record.get("elapsed")
+            events.append({
+                "id": f"cmd-{ridx}-{cidx}",
+                "timestamp": "",
+                "phase": "exploit",
+                "action": "command_exec",
+                "tool": "shell",
+                "backend": "",
+                "poc_or_vuln": vuln_id,
+                "command": cmd,
+                "stdout": stdout[:3000],
+                "stderr": stderr[:1200],
+                "exit_code": exit_code,
+                "elapsed_ms": int(float(elapsed) * 1000.0) if elapsed is not None else None,
+                "message": f"命令执行: {cmd[:120]}",
+                "tone": "success" if exit_code == 0 else "danger",
+            })
+
+    return events
+
+
 def _to_summary(state: PentestState) -> TaskSummary:
     return TaskSummary(
         task_id=state.task_id,
@@ -749,6 +870,9 @@ def _to_detail(state: PentestState) -> dict:
     base.update({
         "target_os": state.target_os,
         "scope_note": state.scope_note,
+        "extra_hint": state.extra_hint,
+        "user_prompt": state.user_prompt,
+        "workflow_mode": state.workflow_mode,
         "error_msg": state.error_msg,
         "open_ports": [p.model_dump() for p in state.open_ports],
         "os_info": state.os_info,
@@ -756,6 +880,7 @@ def _to_detail(state: PentestState) -> dict:
         "subdomains": state.subdomains,
         "findings": [f.model_dump() for f in state.findings],
         "exploit_results": [r.model_dump() for r in state.exploit_results],
+        "decision_events": _build_decision_events(state),
         "post_findings": state.post_findings,
         "report_md": state.report_md,
         "phase_log": state.phase_log,

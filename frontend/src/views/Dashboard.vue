@@ -17,12 +17,6 @@
       </div>
     </div>
 
-    <div class="quick-actions">
-      <el-button @click="router.push('/tasks')">任务列表</el-button>
-      <el-button @click="router.push('/skills')">技能管理</el-button>
-      <el-button @click="router.push('/prompts')">提示词管理</el-button>
-    </div>
-
     <el-card class="panel">
       <template #header>
         <div class="card-header">
@@ -153,12 +147,10 @@
 
 <script setup>
 import { computed, onMounted, onUnmounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { api } from '@/api'
 import { trackEvent } from '@/metrics/tracker'
 
-const router = useRouter()
 const autoRefresh = ref(true)
 const loading = ref(false)
 const windowHours = ref(24)
@@ -230,6 +222,7 @@ async function refresh(trigger = 'manual') {
   try {
     metrics.value = await api.getMetricsOverview(windowHours.value)
     metricsEndpointMissing.value = false
+    metricsMissingToastShown.value = false
   } catch (e) {
     const status = e?.response?.status ?? null
     if (status === 404) {
@@ -237,7 +230,7 @@ async function refresh(trigger = 'manual') {
       autoRefresh.value = false
       if (!metricsMissingToastShown.value) {
         metricsMissingToastShown.value = true
-        ElMessage.warning('后端未提供 metrics/overview 接口，已停止自动刷新。重启后端后可手动刷新重试。')
+        ElMessage.warning('后端未提供可用的 Metrics Overview 接口，已停止自动刷新。重启后端后可手动刷新重试。')
       }
     } else {
       ElMessage.error(e?.response?.data?.detail || e.message || '读取仪表盘数据失败')
@@ -266,7 +259,6 @@ onUnmounted(() => {
 .page-title { font-size: 24px; color: var(--text-primary); font-weight: 700; }
 .page-sub { margin-top: 4px; font-size: 13px; color: var(--text-secondary); }
 .header-actions { display: flex; gap: 10px; align-items: center; }
-.quick-actions { display: flex; gap: 8px; margin-bottom: 12px; }
 
 .panel { border-radius: var(--radius-lg) !important; margin-bottom: 12px; }
 .card-header { display: flex; justify-content: space-between; align-items: center; font-weight: 600; }

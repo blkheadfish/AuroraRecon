@@ -24,13 +24,17 @@
           <el-icon><List /></el-icon>
           <span>任务列表</span>
         </el-menu-item>
+        <el-menu-item index="/tools">
+          <el-icon><Grid /></el-icon>
+          <span>工具管理</span>
+        </el-menu-item>
         <el-menu-item index="/skills">
           <el-icon><Tools /></el-icon>
-          <span>技能管理</span>
+          <span>Skill管理</span>
         </el-menu-item>
         <el-menu-item index="/prompts">
           <el-icon><ChatDotRound /></el-icon>
-          <span>提示词管理</span>
+          <span>Prompt管理</span>
         </el-menu-item>
         <el-menu-item index="/profile">
           <el-icon><User /></el-icon>

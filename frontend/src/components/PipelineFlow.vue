@@ -66,6 +66,13 @@
       <span class="progress-pct">{{ overallProgress }}%</span>
     </div>
 
+    <div v-if="showLegend" class="legend-row">
+      <span class="legend-item"><i class="legend-dot done"></i>已完成</span>
+      <span class="legend-item"><i class="legend-dot active"></i>进行中</span>
+      <span class="legend-item"><i class="legend-dot waiting"></i>待审批</span>
+      <span class="legend-item"><i class="legend-dot failed"></i>失败</span>
+    </div>
+
     <!-- 审批操作栏 -->
     <transition name="slide-down">
       <div v-if="needsApproval" class="approval-bar">
@@ -106,6 +113,7 @@ const props = defineProps({
   gotShell:        { type: Boolean, default: false },
   needsApproval:   { type: Boolean, default: false },
   approving:       { type: Boolean, default: false },
+  showLegend:      { type: Boolean, default: true },
 })
 
 defineEmits(['approve', 'reject'])
@@ -382,6 +390,32 @@ function getBadgeClass(key) {
   font-size: 11px;
   color: var(--text-muted);
 }
+.legend-row {
+  border-top: 1px solid var(--border-muted);
+  padding: 8px 24px 10px;
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-family: var(--font-mono);
+}
+.legend-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.legend-dot.done { background: var(--accent-blue); }
+.legend-dot.active { background: var(--accent-blue); box-shadow: 0 0 8px color-mix(in srgb, var(--accent-blue) 58%, transparent); }
+.legend-dot.waiting { background: var(--accent-yellow); }
+.legend-dot.failed { background: var(--accent-red); }
 
 .dot-running, .dot-done, .dot-fail {
   width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0;

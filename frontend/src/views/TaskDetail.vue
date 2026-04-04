@@ -41,6 +41,10 @@
     </div>
 
     <div class="pipeline-card" v-if="task">
+      <div class="pipeline-head">
+        <h3>Kill Chain 可视化</h3>
+        <p>实时展示阶段流转、审批状态与整体进度</p>
+      </div>
       <PipelineFlow
         :current-phase="task.current_phase"
         :status="task.status"
@@ -49,6 +53,7 @@
         :got-shell="task.got_shell"
         :needs-approval="false"
         :approving="approving"
+        :show-legend="true"
       />
     </div>
 
@@ -169,6 +174,20 @@ const decisionItems = computed(() => {
     desc: needsApproval.value ? '系统检测到可利用路径，等待人工审批。' : '系统正在执行当前阶段决策。',
   })
 
+  if (task.value?.extra_hint || task.value?.user_prompt || task.value?.workflow_mode) {
+    events.push({
+      id: 'task-pref',
+      time: new Date().toLocaleTimeString(),
+      tone: 'info',
+      title: '任务偏好与策略',
+      desc: [
+        `workflow_mode: ${task.value.workflow_mode || 'standard'}`,
+        `extra_hint: ${task.value.extra_hint || '无'}`,
+        `user_prompt: ${task.value.user_prompt || '无'}`,
+      ].join('\n'),
+    })
+  }
+
   const evidenceFinding = findings.value.find((item) => item.evidence)
   if (evidenceFinding?.evidence) {
     events.push({
@@ -185,21 +204,100 @@ const decisionItems = computed(() => {
     })
   }
 
-  const payloadLogs = logs.value.filter((line) => /payload|poc|webshell|cmd|curl|python|bash/i.test(line)).slice(-4)
-  payloadLogs.forEach((line, idx) => {
-    events.push({
-      id: `log-${idx}`,
-      time: new Date().toLocaleTimeString(),
-      tone: /failed|error|denied|401|403/i.test(line) ? 'danger' : 'success',
-      title: '执行轨迹',
-      desc: line,
-      payload: {
-        title: '执行命令片段',
-        language: inferPayloadLang(line),
-        code: line,
-      },
-    })
+  const structuredEvents = Array.isArray(task.value?.decision_events) ? task.value.decision_events : []
+  structuredEvents.slice(-80).forEach((entry, idx) => {
+    const time = entry.timestamp || new Date().toLocaleTimeString()
+    if (entry.action === 'tool_start') {
+      events.push({
+        id: `tool-start-${idx}`,
+        time,
+        tone: 'primary',
+        title: `工具调用 · ${entry.tool || 'unknown'}`,
+        desc: `阶段 ${entry.phase || '-'} ｜ 后端 ${entry.backend || '-'}\n${entry.message || ''}`.trim(),
+      })
+      return
+    }
+    if (entry.action === 'tool_result') {
+      const elapsedText = entry.elapsed_ms ? `${entry.elapsed_ms}ms` : '-'
+      const exitText = entry.exit_code ?? '-'
+      events.push({
+        id: `tool-res-${idx}`,
+        time,
+        tone: Number(exitText) === 0 ? 'success' : 'danger',
+        title: `调用结果 · ${entry.tool || 'unknown'}`,
+        desc: `exit=${exitText} ｜ elapsed=${elapsedText}\n${entry.message || ''}`.trim(),
+      })
+      return
+    }
+    if (entry.action === 'command_exec') {
+      const command = entry.command || '(empty command)'
+      const stdout = entry.stdout || ''
+      const stderr = entry.stderr || ''
+      events.push({
+        id: `cmd-${idx}`,
+        time,
+        tone: (entry.exit_code ?? -1) === 0 ? 'success' : 'danger',
+        title: `命令执行 · ${entry.poc_or_vuln || 'unknown vuln'}`,
+        desc: `exit=${entry.exit_code ?? '-'} ｜ elapsed=${entry.elapsed_ms ?? '-'}ms`,
+        payload: {
+          title: 'Command / Result',
+          language: inferPayloadLang(command),
+          code: `# command\n${command}\n\n# stdout\n${stdout || '(empty)'}\n\n# stderr\n${stderr || '(empty)'}`,
+        },
+      })
+      return
+    }
+    if (entry.action === 'approval') {
+      events.push({
+        id: `approve-${idx}`,
+        time,
+        tone: 'warning',
+        title: '审批节点',
+        desc: entry.message || entry.raw || '',
+      })
+    }
   })
+
+  const hasStructuredCommands = structuredEvents.some((entry) => entry?.action === 'command_exec')
+  const exploitResults = Array.isArray(task.value?.exploit_results) ? task.value.exploit_results : []
+  if (!hasStructuredCommands) {
+    exploitResults.forEach((result, ridx) => {
+      const records = result.command_records || result.command_results || []
+      records.forEach((record, cidx) => {
+        const command = record.command || ''
+        events.push({
+          id: `exploit-${ridx}-${cidx}`,
+          time: new Date().toLocaleTimeString(),
+          tone: record.exit_code === 0 ? 'success' : 'danger',
+          title: `命令执行 · ${result.vuln_id || 'unknown vuln'}`,
+          desc: `purpose=${record.purpose || '-'} ｜ exit=${record.exit_code ?? '-'} ｜ elapsed=${record.elapsed ?? '-'}s`,
+          payload: {
+            title: 'Command / Result',
+            language: inferPayloadLang(command),
+            code: `# command\n${command}\n\n# stdout\n${record.stdout || '(empty)'}\n\n# stderr\n${record.stderr || '(empty)'}`,
+          },
+        })
+      })
+    })
+  }
+
+  if (!structuredEvents.length && !hasStructuredCommands) {
+    const payloadLogs = logs.value.filter((line) => /payload|poc|webshell|cmd|curl|python|bash|执行|完成|exit=/i.test(line)).slice(-12)
+    payloadLogs.forEach((line, idx) => {
+      events.push({
+        id: `log-${idx}`,
+        time: new Date().toLocaleTimeString(),
+        tone: /failed|error|denied|401|403|❌/i.test(line) ? 'danger' : 'success',
+        title: '执行轨迹',
+        desc: line,
+        payload: {
+          title: '执行命令片段',
+          language: inferPayloadLang(line),
+          code: line,
+        },
+      })
+    })
+  }
 
   return events
 })
@@ -306,6 +404,20 @@ onUnmounted(() => {
 .summary-value.evidence { font-family: var(--font-mono); font-size: 12px; }
 
 .pipeline-card { margin-bottom: 12px; }
+.pipeline-head {
+  margin-bottom: 8px;
+  padding: 0 4px;
+}
+.pipeline-head h3 {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+.pipeline-head p {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
 .approval-composer { margin-bottom: 12px; }
 .main-card { border-radius: var(--radius-lg) !important; }
 .tab-label { display: inline-flex; align-items: center; gap: 5px; }

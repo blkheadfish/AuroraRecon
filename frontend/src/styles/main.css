@@ -19,12 +19,12 @@
     --text-secondary: #8b949e;
     --text-muted:     #484f58;
 
-    --accent-green:  #57a68d;
-    --accent-blue:   #4c7fae;
-    --accent-yellow: #b08f54;
-    --accent-red:    #c66d74;
-    --accent-orange: #b27b52;
-    --accent-purple: #9a8dbb;
+    --accent-green:  #63c3a0;
+    --accent-blue:   #5b99d1;
+    --accent-yellow: #be9a59;
+    --accent-red:    #d67880;
+    --accent-orange: #bf8357;
+    --accent-purple: #a293c8;
 
     --status-pending:   #8b949e;
     --status-running:   #388bfd;
@@ -69,10 +69,10 @@
     --start-panel-border: rgba(139, 148, 158, 0.3);
     --start-panel-highlight: rgba(230, 237, 243, 0.08);
     --start-panel-shadow: rgba(0, 0, 0, 0.45);
-    --start-hacker-cyan: #6faec8;
-    --start-hacker-green: #7eaa9a;
-    --start-hacker-line: rgba(111, 174, 200, 0.24);
-    --start-hacker-muted-line: rgba(126, 170, 154, 0.18);
+    --start-hacker-cyan: #82cce8;
+    --start-hacker-green: #7fe0bd;
+    --start-hacker-line: rgba(109, 196, 177, 0.35);
+    --start-hacker-muted-line: rgba(127, 224, 189, 0.31);
     --el-color-primary: var(--accent-blue);
     --el-color-success: var(--accent-green);
     --el-color-warning: var(--accent-yellow);
@@ -112,12 +112,12 @@
     --text-secondary: #656d76;
     --text-muted:     #8b949e;
 
-    --accent-green:  #2f7b5f;
-    --accent-blue:   #356b99;
-    --accent-yellow: #9b7d4f;
-    --accent-red:    #b45e68;
-    --accent-orange: #9b6d49;
-    --accent-purple: #6f6ca1;
+    --accent-green:  #2e9472;
+    --accent-blue:   #3984bf;
+    --accent-yellow: #a68753;
+    --accent-red:    #c36672;
+    --accent-orange: #a8764d;
+    --accent-purple: #7773ad;
 
     --status-pending:   #656d76;
     --status-running:   #0969da;
@@ -157,10 +157,10 @@
     --start-panel-border: rgba(208, 215, 222, 0.72);
     --start-panel-highlight: rgba(255, 255, 255, 0.68);
     --start-panel-shadow: rgba(15, 23, 42, 0.12);
-    --start-hacker-cyan: #4f7fa2;
-    --start-hacker-green: #5f8d7f;
-    --start-hacker-line: rgba(79, 127, 162, 0.2);
-    --start-hacker-muted-line: rgba(95, 141, 127, 0.16);
+    --start-hacker-cyan: #4f98c8;
+    --start-hacker-green: #4cb18f;
+    --start-hacker-line: rgba(76, 177, 143, 0.27);
+    --start-hacker-muted-line: rgba(95, 188, 161, 0.26);
     --el-color-primary: var(--accent-blue);
     --el-color-success: var(--accent-green);
     --el-color-warning: var(--accent-yellow);
@@ -334,18 +334,24 @@ html, body, #app {
     border-color: var(--text-muted) !important;
 }
 .el-button--primary {
-    background: color-mix(in srgb, var(--accent-blue) 84%, var(--bg-surface)) !important;
-    border-color: color-mix(in srgb, var(--accent-blue) 90%, var(--bg-surface)) !important;
+    background: color-mix(in srgb, var(--accent-blue) 88%, var(--bg-surface)) !important;
+    border-color: color-mix(in srgb, var(--accent-blue) 94%, var(--bg-surface)) !important;
 }
 .el-button--primary:hover {
-    background: color-mix(in srgb, var(--accent-blue) 94%, var(--bg-surface)) !important;
-    border-color: color-mix(in srgb, var(--accent-blue) 98%, var(--bg-surface)) !important;
+    background: color-mix(in srgb, var(--accent-blue) 97%, var(--bg-surface)) !important;
+    border-color: color-mix(in srgb, var(--accent-blue) 100%, var(--bg-surface)) !important;
     opacity: 1;
 }
 .el-button--danger {
     background: transparent !important;
     border-color: var(--accent-red) !important;
     color: var(--accent-red) !important;
+}
+.el-button.is-link {
+    color: color-mix(in srgb, var(--accent-blue) 84%, var(--text-primary)) !important;
+}
+.el-button.is-link:hover {
+    color: color-mix(in srgb, var(--accent-blue) 92%, #ffffff) !important;
 }
 
 .el-table {
@@ -395,6 +401,26 @@ html, body, #app {
     border-radius: var(--radius-sm) !important;
     font-family: var(--font-mono) !important;
     font-size: 11px !important;
+}
+.el-tag--success {
+    background: color-mix(in srgb, var(--accent-green) 24%, var(--bg-elevated)) !important;
+    border-color: color-mix(in srgb, var(--accent-green) 52%, var(--border)) !important;
+    color: color-mix(in srgb, var(--accent-green) 86%, var(--text-primary)) !important;
+}
+.el-tag--warning {
+    background: color-mix(in srgb, var(--accent-yellow) 20%, var(--bg-elevated)) !important;
+    border-color: color-mix(in srgb, var(--accent-yellow) 48%, var(--border)) !important;
+    color: color-mix(in srgb, var(--accent-yellow) 84%, var(--text-primary)) !important;
+}
+.el-tag--danger {
+    background: color-mix(in srgb, var(--accent-red) 20%, var(--bg-elevated)) !important;
+    border-color: color-mix(in srgb, var(--accent-red) 48%, var(--border)) !important;
+    color: color-mix(in srgb, var(--accent-red) 86%, var(--text-primary)) !important;
+}
+.el-tag--info {
+    background: color-mix(in srgb, var(--bg-hover) 86%, var(--bg-elevated)) !important;
+    border-color: var(--border) !important;
+    color: var(--text-secondary) !important;
 }
 .el-empty__description p {
     color: var(--text-muted) !important;

@@ -123,11 +123,18 @@
       </el-table>
     </el-card>
 
-    <el-dialog v-model="showCreate" title="创建渗透测试任务" width="560px" :close-on-click-modal="false">
+    <el-dialog v-model="showCreate" title="创建渗透测试任务" width="700px" :close-on-click-modal="false">
       <el-form :model="form" :rules="rules" ref="formRef" label-position="top">
         <el-form-item label="目标地址" prop="target">
-          <el-input v-model="form.target" placeholder="IP / 域名 / URL" clearable />
+          <el-input v-model="form.target" placeholder="IP / 域名 / IP:端口 / URL" clearable />
           <div class="form-tip">仅在合法授权范围内使用。</div>
+        </el-form-item>
+        <el-form-item label="任务角色模式（预留）">
+          <el-radio-group v-model="form.workflowMode">
+            <el-radio-button label="standard">标准模式</el-radio-button>
+            <el-radio-button label="poc_only" disabled>PoC验证（即将支持）</el-radio-button>
+            <el-radio-button label="ctf_flag" disabled>CTF拿Flag（即将支持）</el-radio-button>
+          </el-radio-group>
         </el-form-item>
         <el-form-item label="执行模式">
           <el-radio-group v-model="uiPrefs.executionMode">
@@ -137,6 +144,22 @@
         </el-form-item>
         <el-form-item label="授权说明">
           <el-input v-model="form.scopeNote" type="textarea" :rows="3" />
+        </el-form-item>
+        <el-form-item label="附加提示（Extra Hint）">
+          <el-input
+            v-model="form.extraHint"
+            type="textarea"
+            :rows="2"
+            placeholder="例如：优先验证 Web RCE，避免长时间暴力破解"
+          />
+        </el-form-item>
+        <el-form-item label="用户 Prompt 偏好（User Prompt）">
+          <el-input
+            v-model="form.userPrompt"
+            type="textarea"
+            :rows="4"
+            placeholder="告诉系统你的偏好策略，例如先验证 PoC 再尝试利用、优先低噪声命令等"
+          />
         </el-form-item>
       </el-form>
       <template #footer>
@@ -169,10 +192,46 @@ const selectedRows = ref([])
 const form = ref({
   target: '',
   scopeNote: 'CTF/授权靶场测试',
+  extraHint: '',
+  userPrompt: '',
+  workflowMode: 'standard',
 })
 
+function isValidIPv4(host) {
+  const parts = host.split('.')
+  if (parts.length !== 4) return false
+  return parts.every((item) => {
+    if (!/^\d{1,3}$/.test(item)) return false
+    const n = Number(item)
+    return n >= 0 && n <= 255
+  })
+}
+
+function isValidTarget(value) {
+  const raw = String(value || '').trim()
+  if (!raw) return false
+  if (/^https?:\/\/[^\s/$.?#].[^\s]*$/i.test(raw)) return true
+  const hostPortPattern = /^([a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)*|localhost|\d{1,3}(\.\d{1,3}){3})(:\d{1,5})?$/
+  if (!hostPortPattern.test(raw)) return false
+  const [host, port] = raw.split(':')
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host) && !isValidIPv4(host)) return false
+  if (port) {
+    const p = Number(port)
+    if (!Number.isFinite(p) || p < 1 || p > 65535) return false
+  }
+  return true
+}
+
+function validateTarget(_rule, value, callback) {
+  if (!isValidTarget(value)) {
+    callback(new Error('请输入有效目标：IP / 域名 / IP:端口 / URL'))
+    return
+  }
+  callback()
+}
+
 const rules = {
-  target: [{ required: true, message: '请输入目标地址', trigger: 'blur' }],
+  target: [{ validator: validateTarget, trigger: 'blur' }],
 }
 
 const filterStatus = ref('')
@@ -214,15 +273,28 @@ async function handleCreate() {
   await formRef.value.validate()
   creating.value = true
   try {
-    const task = await listStore.createTask(form.value.target, form.value.scopeNote)
+    const task = await listStore.createTask(
+      form.value.target,
+      form.value.scopeNote,
+      form.value.extraHint,
+      form.value.userPrompt,
+      form.value.workflowMode,
+    )
     trackEvent('task.create', {
       target: form.value.target,
       mode: uiPrefs.executionMode,
+      workflowMode: form.value.workflowMode,
       taskId: task.task_id,
     })
     ElMessage.success(`任务已创建：${task.target}`)
     showCreate.value = false
-    form.value = { target: '', scopeNote: 'CTF/授权靶场测试' }
+    form.value = {
+      target: '',
+      scopeNote: 'CTF/授权靶场测试',
+      extraHint: '',
+      userPrompt: '',
+      workflowMode: 'standard',
+    }
     router.push(`/tasks/${task.task_id}`)
   } catch (e) {
     ElMessage.error(e?.response?.data?.detail || e.message || '创建失败')

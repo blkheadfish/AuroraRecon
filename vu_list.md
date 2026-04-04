@@ -17,7 +17,7 @@
 | Vulhub | CVE-2019-11043 | https://github.com/vulhub/vulhub/blob/master/php/CVE-2019-11043 | 简单 | ❌ | ❌ |
 | Vulhub | CVE-2022-41678 | https://github.com/vulhub/vulhub/blob/master/activemq/CVE-2022-41678 | 简单 | ✅ | ✅ |
 | Vulhub | CVE-2017-7504 | https://github.com/vulhub/vulhub/blob/master/jboss/CVE-2017-7504 | 简单 | ✅ | ✅ |
-| Vulhub | Tomcat8 | https://github.com/vulhub/vulhub/tree/master/tomcat/tomcat8 | 简单 | ✅ | ❌ |
+| Vulhub | Tomcat8 | https://github.com/vulhub/vulhub/tree/master/tomcat/tomcat8 | 简单 | ✅ | ✅ |
 | Vulhub | CVE-2016-4437 | https://github.com/vulhub/vulhub/blob/master/shiro/CVE-2016-4437 | 简单 | ✅ | ✅ |
 | Vulhub | fastjson-1.2.24-rce | https://github.com/vulhub/vulhub/tree/master/fastjson/1.2.24-rce | 简单 | ✅ | ✅ |
 | Vulhub | fastjson-1.2.47-rce | https://github.com/vulhub/vulhub/tree/master/fastjson/1.2.47-rce | 简单 | ✅ | ✅ |

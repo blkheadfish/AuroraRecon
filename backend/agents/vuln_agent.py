@@ -14,11 +14,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any
+from typing import Any, Optional
 
 from backend.agents.models import PortInfo, VulnFinding
 from backend.knowledge.exploit_kb import ExploitKB, ExploitEntry
-from backend.tools.executor import ToolExecutor, ExecuteResult
+from backend.tools.executor import ToolExecutor, ExecuteResult, LogCallback
 from backend.tools.parsers.nuclei_parser import NucleiParser
 from backend.tools.parsers.nikto_parser import NiktoParser
 from backend.llm.router import LLMRouter
@@ -53,8 +53,24 @@ class VulnAgent:
         web_paths: list[str],
         target_os: str = "unknown",
         task_id: Optional[str] = None,
+        log_callback: LogCallback = None,
     ) -> dict[str, Any]:
         logger.info(f"[VulnAgent] 开始漏洞扫描: {target}")
+
+        if log_callback:
+            origin_run = self.executor.run
+            origin_run_script = self.executor.run_script
+
+            async def _run_with_log(*args, **kwargs):
+                kwargs.setdefault("log_callback", log_callback)
+                return await origin_run(*args, **kwargs)
+
+            async def _run_script_with_log(*args, **kwargs):
+                kwargs.setdefault("log_callback", log_callback)
+                return await origin_run_script(*args, **kwargs)
+
+            self.executor.run = _run_with_log
+            self.executor.run_script = _run_script_with_log
 
         web_ports = [
             p for p in ports
