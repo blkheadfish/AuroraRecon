@@ -41,13 +41,13 @@
     --code-bg:        #161b22;
     --code-header-bg: #1c2128;
     --code-border:    #30363d;
-    --code-text:      #8b949e;
+    --code-text:      #c9d1d9;
     --code-inline-bg: #161b22;
     --code-inline-fg: #f0883e;
 
     /* highlight.js overrides */
-    --hljs-bg:        #0d1117;
-    --hljs-fg:        #e6edf3;
+    --hljs-bg:        #161b22;
+    --hljs-fg:        #c9d1d9;
     --hljs-comment:   #8b949e;
     --hljs-keyword:   #ff7b72;
     --hljs-string:    #a5d6ff;
@@ -324,14 +324,35 @@ html, body, #app {
     border-radius: var(--radius-md) !important;
     font-weight: 500 !important;
 }
-.el-button:not(.el-button--primary):not(.el-button--danger):not(.is-text):not(.is-link) {
+.el-button:not(.el-button--primary):not(.el-button--danger):not(.is-text):not(.is-link):not(.btn-approve) {
     background: var(--bg-elevated) !important;
     border-color: var(--border) !important;
     color: var(--text-primary) !important;
 }
-.el-button:not(.el-button--primary):not(.el-button--danger):not(.is-text):not(.is-link):hover {
+.el-button:not(.el-button--primary):not(.el-button--danger):not(.is-text):not(.is-link):not(.btn-approve):hover {
     background: var(--bg-hover) !important;
     border-color: var(--text-muted) !important;
+}
+/* Force custom pale-green approval button, overriding generic button skin. */
+.approval-wrap .right .el-button.btn-approve:not(.el-button--primary):not(.el-button--danger):not(.is-text):not(.is-link) {
+    background: color-mix(in srgb, var(--accent-green) 18%, var(--bg-elevated)) !important;
+    border-color: color-mix(in srgb, var(--accent-green) 52%, var(--border)) !important;
+    color: color-mix(in srgb, var(--accent-green) 84%, var(--text-primary)) !important;
+    font-weight: 600 !important;
+}
+.approval-wrap .right .el-button.btn-approve:not(.el-button--primary):not(.el-button--danger):not(.is-text):not(.is-link):hover,
+.approval-wrap .right .el-button.btn-approve:not(.el-button--primary):not(.el-button--danger):not(.is-text):not(.is-link):focus-visible,
+.approval-wrap .right .el-button.btn-approve:not(.el-button--primary):not(.el-button--danger):not(.is-text):not(.is-link):active {
+    background: color-mix(in srgb, var(--accent-green) 28%, var(--bg-hover)) !important;
+    border-color: color-mix(in srgb, var(--accent-green) 70%, var(--border)) !important;
+    color: color-mix(in srgb, var(--accent-green) 92%, var(--text-primary)) !important;
+}
+.approval-wrap .right .el-button.btn-approve.is-disabled,
+.approval-wrap .right .el-button.btn-approve.is-loading {
+    background: color-mix(in srgb, var(--accent-green) 12%, var(--bg-elevated)) !important;
+    border-color: color-mix(in srgb, var(--accent-green) 40%, var(--border)) !important;
+    color: color-mix(in srgb, var(--accent-green) 64%, var(--text-muted)) !important;
+    opacity: 0.9;
 }
 .el-button--primary {
     background: color-mix(in srgb, var(--accent-blue) 88%, var(--bg-surface)) !important;

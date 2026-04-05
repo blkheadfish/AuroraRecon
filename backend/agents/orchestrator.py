@@ -6,6 +6,7 @@ orchestrator.py  ── 改进版
   3. human_approval 节点        → 利用前强制人工确认（竞赛演示亮点）
   4. interrupt_before=["exploit"] → LangGraph 原生中断机制
   5. task_id 透传               → 所有 agent.run() 都传入 task_id
+  6. parse_target 统一解析       → 创建 state 后立即解析，全链路使用 target_host/target_port
 
 流程：
   START → recon → vuln_scan → exploit_decision
@@ -21,19 +22,74 @@ import functools
 import json
 import logging
 import uuid
+from datetime import datetime
 from typing import Any, Optional
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
-from backend.agents.models import ExploitResult, PentestState, PortInfo, TaskStatus, VulnFinding
+from backend.agents.models import (
+    CommandExecutionRecord, ExploitResult, ParsedTarget, PentestState,
+    PortInfo, TaskStatus, VulnFinding, parse_target,
+)
 
 logger = logging.getLogger(__name__)
 
 
-# ───────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────
+# 目标解析 → 写入 state
+# ───────────────────────────────────────────────────────
+
+def _apply_parsed_target(state: PentestState) -> None:
+    """
+    在任务创建后、recon 前，将用户原始 target 统一解析并写回 state。
+
+    之后所有 agent 都通过 state.target_host / state.target_port 使用，
+    不再各自解析 state.target，确保单一真相。
+    """
+    parsed: ParsedTarget = parse_target(state.target)
+    state.target_host = parsed.host
+    state.target_port = parsed.port
+    state.target_scheme = parsed.scheme
+    state.target_path = parsed.path
+    state.target_raw = parsed.raw or state.target
+
+    # 如果 target 本身含协议/端口/路径，把 target 归一化为纯 host
+    # 以确保 nmap 等工具拿到的是干净的扫描目标
+    # （state.target 保持不变，仍然是用户原始输入）
+    if parsed.host:
+        port_info = f":{parsed.port}" if parsed.port else ""
+        scheme_info = f" (scheme={parsed.scheme})" if parsed.scheme else ""
+        state.log(
+            f"目标解析: host={parsed.host}{port_info}{scheme_info}"
+        )
+    else:
+        state.log(f"⚠ 目标解析失败，原始输入: {state.target}")
+
+
+def _append_tool_record(
+    state: PentestState,
+    record: dict,
+    *,
+    default_phase: str,
+) -> None:
+    """将执行器结构化记录写入 state.tool_records（去重）。"""
+    payload = dict(record or {})
+    payload.setdefault("phase", default_phase)
+    payload.setdefault("timestamp", datetime.utcnow().isoformat())
+    payload.setdefault("id", uuid.uuid4().hex[:16])
+    payload.setdefault("truncated", False)
+    if payload.get("total_len") is None:
+        payload["total_len"] = len(str(payload.get("stdout") or "")) + len(str(payload.get("stderr") or ""))
+    rec = CommandExecutionRecord(**payload)
+    if rec.id and any(item.id == rec.id for item in state.tool_records):
+        return
+    state.tool_records.append(rec)
+
+
+# ───────────────────────────────────────────────────────
 # retry 装饰器
-# ───────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────
 
 def retry_node(max_attempts: int = 3, delay: float = 2.0):
     def decorator(fn):
@@ -55,9 +111,9 @@ def retry_node(max_attempts: int = 3, delay: float = 2.0):
     return decorator
 
 
-# ───────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────
 # 节点函数
-# ───────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────
 
 @retry_node(max_attempts=3, delay=2.0)
 async def node_recon(state: PentestState) -> PentestState:
@@ -75,11 +131,19 @@ async def node_recon(state: PentestState) -> PentestState:
         # 容器启动失败不阻断流程，降级为 docker run --rm 模式
         state.log(f"⚠ 工具容器启动失败，降级为临时容器模式: {_ce}")
 
-    state.log(f"开始侦察目标: {state.target}")
+    state.log(f"开始侦察目标: {state.target_host or state.target}")
     agent = ReconAgent()
     async def _on_tool_log(line: str):
         state.log(line)
-    result = await agent.run(state.target, task_id=state.task_id, log_callback=_on_tool_log)
+    async def _on_exec_record(record: dict):
+        _append_tool_record(state, record, default_phase="recon")
+    result = await agent.run(
+        target=state.target_host or state.target,
+        target_port=state.target_port,
+        task_id=state.task_id,
+        log_callback=_on_tool_log,
+        record_callback=_on_exec_record,
+    )
     state.open_ports = result.get("ports", [])
     state.os_info = _stringify_dict_keys(result.get("os_info", {}))
     state.web_paths = result.get("web_paths", [])
@@ -98,13 +162,18 @@ async def node_vuln_scan(state: PentestState) -> PentestState:
     agent = VulnAgent()
     async def _on_tool_log(line: str):
         state.log(line)
+    async def _on_exec_record(record: dict):
+        _append_tool_record(state, record, default_phase="vuln_scan")
     result = await agent.run(
-        target=state.target,
+        target=state.target_host or state.target,
         ports=state.open_ports,
         web_paths=state.web_paths,
         target_os=state.target_os,
+        target_port=state.target_port,
+        target_scheme=state.target_scheme,
         task_id=state.task_id,
         log_callback=_on_tool_log,
+        record_callback=_on_exec_record,
     )
     state.findings = result.get("findings", [])
     # msgpack (LangGraph checkpoint) 不允许 int 作 dict key
@@ -190,6 +259,24 @@ async def node_exploit(state: PentestState) -> PentestState:
     from backend.agents.exploit_agent import ExploitAgent
     state.current_phase = "exploit"
     exploitable = [f for f in state.findings if f.exploitable]
+
+    php_fpm = [
+        f for f in state.findings
+        if "11043" in (f.cve or "").lower() or "php-fpm" in (f.name or "").lower()
+    ]
+    if php_fpm:
+        php_exploitable = [f for f in php_fpm if f.exploitable]
+        logger.info(
+            f"[Orchestrator] PHP-FPM findings: "
+            f"total={len(php_fpm)}, exploitable={len(php_exploitable)}, "
+            f"names={[f.name for f in php_fpm]}"
+        )
+        if not php_exploitable:
+            state.log(
+                f"PHP-FPM 发现 {len(php_fpm)} 个但均未确认可利用"
+                f"（tool={php_fpm[0].tool}）"
+            )
+
     state.log(f"开始利用 {len(exploitable)} 个漏洞...")
     try:
         agent = ExploitAgent()
@@ -206,13 +293,16 @@ async def node_exploit(state: PentestState) -> PentestState:
         }
         async def _on_tool_log(line: str):
             state.log(line)
+        async def _on_exec_record(record: dict):
+            _append_tool_record(state, record, default_phase="exploit")
         results = await agent.run(
-            target=state.target,
+            target=state.target_host or state.target,
             findings=exploitable,
             target_os=state.target_os,
             context=exploit_context,
             task_id=state.task_id,
             log_callback=_on_tool_log,
+            record_callback=_on_exec_record,
         )
         state.exploit_results = results
         successes = [r for r in results if r.success]
@@ -274,9 +364,9 @@ async def node_report(state: PentestState) -> PentestState:
     return state
 
 
-# ───────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────
 # 条件边
-# ───────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────
 
 def edge_should_exploit(state: PentestState) -> str:
     return "human_approval" if any(f.exploitable for f in state.findings) else "report"
@@ -290,9 +380,9 @@ def edge_should_post(state: PentestState) -> str:
     return "post_exploit" if state.got_shell else "report"
 
 
-# ───────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────
 # 构建图
-# ───────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────
 
 def build_graph(checkpointer=None):
     graph = StateGraph(PentestState)
@@ -330,9 +420,9 @@ def build_graph(checkpointer=None):
     )
 
 
-# ───────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────
 # Orchestrator 对外接口
-# ───────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────
 
 class Orchestrator:
     def __init__(self):
@@ -345,6 +435,28 @@ class Orchestrator:
             checkpointer = MemorySaver()
             self._graph = build_graph(checkpointer=checkpointer)
 
+    def _prepare_state(
+        self,
+        target: str,
+        scope_note: str,
+        extra_hint: str,
+        user_prompt: str,
+        workflow_mode: str,
+        task_id: Optional[str],
+    ) -> PentestState:
+        """创建并解析 PentestState，统一入口。"""
+        state = PentestState(
+            target=target,
+            scope_note=scope_note,
+            extra_hint=extra_hint,
+            user_prompt=user_prompt,
+            workflow_mode=workflow_mode,
+            task_id=task_id or str(uuid.uuid4()),
+        )
+        # ── 关键：在 recon 之前统一解析目标 ──────────────
+        _apply_parsed_target(state)
+        return state
+
     async def run(
         self,
         target: str,
@@ -355,13 +467,8 @@ class Orchestrator:
         task_id: Optional[str] = None,
     ) -> PentestState:
         await self._ensure_graph()
-        initial_state = PentestState(
-            target=target,
-            scope_note=scope_note,
-            extra_hint=extra_hint,
-            user_prompt=user_prompt,
-            workflow_mode=workflow_mode,
-            task_id=task_id or str(uuid.uuid4()),
+        initial_state = self._prepare_state(
+            target, scope_note, extra_hint, user_prompt, workflow_mode, task_id,
         )
         config = {"configurable": {"thread_id": initial_state.task_id}}
         initial_state.log(f"任务启动，目标: {target}")
@@ -378,16 +485,10 @@ class Orchestrator:
         task_id: Optional[str] = None,
     ):
         await self._ensure_graph()
-        task_id = task_id or str(uuid.uuid4())
-        initial_state = PentestState(
-            target=target,
-            scope_note=scope_note,
-            extra_hint=extra_hint,
-            user_prompt=user_prompt,
-            workflow_mode=workflow_mode,
-            task_id=task_id,
+        initial_state = self._prepare_state(
+            target, scope_note, extra_hint, user_prompt, workflow_mode, task_id,
         )
-        config = {"configurable": {"thread_id": task_id}}
+        config = {"configurable": {"thread_id": initial_state.task_id}}
 
         async for event in self._graph.astream(initial_state, config=config):
             for node_name, state in event.items():
@@ -428,9 +529,9 @@ class Orchestrator:
         return None
 
 
-# ───────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────
 # 辅助函数
-# ───────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────
 
 def _stringify_dict_keys(obj: Any) -> Any:
     """

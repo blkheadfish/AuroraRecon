@@ -18,7 +18,7 @@ from typing import Any, Optional
 
 from backend.agents.models import PortInfo, VulnFinding
 from backend.knowledge.exploit_kb import ExploitKB, ExploitEntry
-from backend.tools.executor import ToolExecutor, ExecuteResult, LogCallback
+from backend.tools.executor import ToolExecutor, ExecuteResult, LogCallback, RecordCallback
 from backend.tools.parsers.nuclei_parser import NucleiParser
 from backend.tools.parsers.nikto_parser import NiktoParser
 from backend.llm.router import LLMRouter
@@ -52,21 +52,32 @@ class VulnAgent:
         ports: list[PortInfo],
         web_paths: list[str],
         target_os: str = "unknown",
+        target_port: Optional[int] = None,
+        target_scheme: str = "",
         task_id: Optional[str] = None,
         log_callback: LogCallback = None,
+        record_callback: RecordCallback = None,
     ) -> dict[str, Any]:
         logger.info(f"[VulnAgent] 开始漏洞扫描: {target}")
 
-        if log_callback:
+        if log_callback or record_callback:
             origin_run = self.executor.run
             origin_run_script = self.executor.run_script
 
             async def _run_with_log(*args, **kwargs):
-                kwargs.setdefault("log_callback", log_callback)
+                if log_callback:
+                    kwargs.setdefault("log_callback", log_callback)
+                if record_callback:
+                    kwargs.setdefault("record_callback", record_callback)
+                    kwargs.setdefault("record_phase", "vuln_scan")
                 return await origin_run(*args, **kwargs)
 
             async def _run_script_with_log(*args, **kwargs):
-                kwargs.setdefault("log_callback", log_callback)
+                if log_callback:
+                    kwargs.setdefault("log_callback", log_callback)
+                if record_callback:
+                    kwargs.setdefault("record_callback", record_callback)
+                    kwargs.setdefault("record_phase", "vuln_scan")
                 return await origin_run_script(*args, **kwargs)
 
             self.executor.run = _run_with_log
@@ -81,13 +92,31 @@ class VulnAgent:
                           8443, 8888, 9000, 9001, 9090, 9200, 9443, 10000)
         ]
 
+        # 如果用户显式指定了端口，确保它在 web_ports 中
+        if target_port:
+            existing_web_port_nums = {p.port for p in web_ports}
+            if target_port not in existing_web_port_nums:
+                for p in ports:
+                    if p.port == target_port:
+                        web_ports.insert(0, p)
+                        break
+                else:
+                    # 端口不在 nmap 扫描结果中（可能扫描遗漏），手动补充
+                    web_ports.insert(0, PortInfo(port=target_port, service="http"))
+
+        # 用户指定的 scheme 作为全局默认（未指定时按端口号推断）
+        _user_scheme = target_scheme.lower() if target_scheme else ""
+
         all_findings: list[VulnFinding] = []
 
         # ── Phase 1: 指纹识别（各端口并发）───────────────
         fingerprints: dict[int, dict] = {}
         fp_tasks = []
         for wp in web_ports:
-            scheme = "https" if wp.port in (443, 8443) else "http"
+            if _user_scheme and wp.port == target_port:
+                scheme = _user_scheme
+            else:
+                scheme = "https" if wp.port in (443, 8443) else "http"
             web_url = f"{scheme}://{target}:{wp.port}"
             fp_tasks.append(self._fingerprint(web_url, wp))
 
@@ -106,9 +135,13 @@ class VulnAgent:
 
         # ── Phase 3: 按端口并发，端口内串行扫描 ──────────
         async def _scan_one_port(wp: PortInfo) -> list[VulnFinding]:
-            scheme = "https" if wp.port in (443, 8443) else "http"
+            if _user_scheme and wp.port == target_port:
+                scheme = _user_scheme
+            else:
+                scheme = "https" if wp.port in (443, 8443) else "http"
             web_url = f"{scheme}://{target}:{wp.port}"
             port_findings: list[VulnFinding] = []
+            port_fp = fingerprints.get(wp.port, {})
 
             # 3a: LLM 推荐标签专扫（最精准，优先跑）
             llm_tags = scan_strategy.get("nuclei_tags", [])
@@ -132,6 +165,16 @@ class VulnAgent:
             # 3d: Nikto 补充
             r = await self._nikto_scan(web_url)
             port_findings.extend(r.get("findings", []))
+
+            # 3e: 命中 PHP/PHP-FPM 信号时，主动触发 phuip 探针
+            phuip_finding = await self._phuip_probe_if_php_signal(
+                web_url=web_url,
+                target=target,
+                port=wp.port,
+                fingerprint=port_fp,
+            )
+            if phuip_finding:
+                port_findings.append(phuip_finding)
 
             return port_findings
 
@@ -178,6 +221,144 @@ class VulnAgent:
 
         return {"findings": all_findings, "raw_nuclei": "", "raw_nikto": "", "fingerprints": fingerprints}
 
+    _PHUIP_STRONG_SIGNALS = ("attack params found", "was able to execute", "php_value")
+    _PHUIP_WEAK_SIGNALS = (
+        "success", "status code 500", "status code 502",
+        "possible qsl", "qsl",
+    )
+
+    async def _phuip_probe_if_php_signal(
+        self,
+        web_url: str,
+        target: str,
+        port: int,
+        fingerprint: dict,
+    ) -> VulnFinding | None:
+        """
+        PHP 信号门控 → 短超时多轮 phuip 探针。
+
+        返回:
+          - VulnFinding(exploitable=True)  仅当强阳性
+          - None                           所有其他情况（reason 写入日志）
+        """
+        signal_text = " ".join([
+            str(fingerprint.get("summary") or ""),
+            str(fingerprint.get("whatweb") or ""),
+            str(fingerprint.get("httpx") or ""),
+            str(fingerprint.get("nmap_service") or ""),
+            str(fingerprint.get("nmap_version") or ""),
+            str(fingerprint.get("nmap_banner") or ""),
+        ]).lower()
+        if not any(sig in signal_text for sig in ("php", "php-fpm", "fastcgi", "fpm")):
+            return None
+
+        logger.info(f"[VulnAgent] PHP 信号命中，触发 phuip 探针 :{port}")
+
+        max_attempts = 3
+        per_attempt_timeout = 60
+        best_output = ""
+        best_exit = -1
+        reason = "no_attempt"
+
+        for attempt in range(1, max_attempts + 1):
+            probe_script = f"""
+if command -v phuip-fpizdam >/dev/null 2>&1; then
+  PHUIP="phuip-fpizdam"
+elif [ -x /opt/phuip-fpizdam ]; then
+  PHUIP="/opt/phuip-fpizdam"
+else
+  echo "__PHUIP_MISSING__"
+  exit 0
+fi
+$PHUIP "{web_url}/index.php" 2>&1
+"""
+            result: ExecuteResult = await self.executor.run_script(
+                script_content=probe_script,
+                timeout=per_attempt_timeout,
+                record_purpose=f"phuip_probe_attempt_{attempt}",
+            )
+            output = f"{result.stdout or ''}\n{result.stderr or ''}".strip()
+            out_lower = output.lower()
+
+            logger.info(
+                f"[VulnAgent] phuip 探针 #{attempt} :{port} "
+                f"exit={result.exit_code} len={len(output)}"
+            )
+
+            if "__phuip_missing__" in out_lower:
+                reason = "phuip_missing"
+                logger.info("[VulnAgent] phuip-fpizdam 不可用，跳过")
+                break
+
+            timed_out = result.exit_code is None or (
+                result.exit_code != 0 and len(output) == 0
+            )
+
+            strong = [s for s in self._PHUIP_STRONG_SIGNALS if s in out_lower]
+            weak = [s for s in self._PHUIP_WEAK_SIGNALS if s in out_lower]
+
+            if strong:
+                best_output = output
+                best_exit = result.exit_code or 0
+                reason = "phuip_positive"
+                logger.info(
+                    f"[VulnAgent] ✅ phuip 强阳性 :{port} "
+                    f"signals={strong}"
+                )
+                break
+
+            if weak:
+                best_output = output
+                best_exit = result.exit_code or 0
+                reason = "phuip_weak_signal"
+                logger.info(
+                    f"[VulnAgent] phuip 弱信号 :{port} "
+                    f"signals={weak}, 继续重试"
+                )
+
+            if timed_out:
+                reason = "phuip_timeout"
+                logger.info(
+                    f"[VulnAgent] phuip 探针 #{attempt} 超时 :{port}"
+                )
+                if not best_output:
+                    best_output = output
+                    best_exit = result.exit_code or -1
+                continue
+
+            if not strong and not weak:
+                if not best_output:
+                    best_output = output
+                    best_exit = result.exit_code or 0
+                reason = "phuip_no_signal"
+
+        logger.info(
+            f"[VulnAgent] phuip 探针结论 :{port} reason={reason} "
+            f"exit={best_exit} output_len={len(best_output)}"
+        )
+
+        if reason != "phuip_positive":
+            return None
+
+        evidence_lines = [
+            f"Command\nphuip-fpizdam {web_url}/index.php",
+            f"Stdout\n{best_output.strip() or '(empty)'}",
+        ]
+        return VulnFinding(
+            name="PHP-FPM phuip 探针命中",
+            severity="high",
+            cve="CVE-2019-11043",
+            target=web_url,
+            port=port,
+            description=(
+                "命中 PHP/PHP-FPM 信号后自动执行 phuip-fpizdam 探针，"
+                "已确认可利用参数。"
+            ),
+            evidence="\n\n".join(evidence_lines),
+            exploitable=True,
+            tool="phuip-probe",
+        )
+
     # ================================================================
     # Phase 1: 指纹识别
     # ================================================================
@@ -203,7 +384,7 @@ class VulnAgent:
             timeout=30,
         )
         if whatweb_result.success and whatweb_result.stdout:
-            fp["whatweb"] = whatweb_result.stdout.strip()[:2000]
+            fp["whatweb"] = whatweb_result.stdout.strip()
 
         # httpx
         httpx_result: ExecuteResult = await self.executor.run(
@@ -218,7 +399,7 @@ class VulnAgent:
             timeout=20,
         )
         if httpx_result.success and httpx_result.stdout:
-            fp["httpx"] = httpx_result.stdout.strip()[:1000]
+            fp["httpx"] = httpx_result.stdout.strip()
 
         # ── 获取首页 HTML 内容用于框架识别 ─────────────────
         # whatweb/httpx 只看 header，很多框架特征在 HTML body 中
@@ -230,7 +411,7 @@ class VulnAgent:
         )
         html_body = ""
         if html_body_result.success and html_body_result.stdout:
-            html_body = html_body_result.stdout[:5000]
+            html_body = html_body_result.stdout
             fp["html_body_preview"] = html_body[:1000]
 
         # 基础关键词匹配（增加 HTML body）
@@ -380,22 +561,22 @@ class VulnAgent:
                 techs.append("Fastjson")
             if "Java" not in techs:
                 techs.append("Java")
-            fp["json_probe"] = f"FASTJSON_DETECTED: {json_probe_body.stdout[:500]}"
+            fp["json_probe"] = f"FASTJSON_DETECTED: {json_probe_body.stdout}"
         elif "jackson" in probe_output or "com.fasterxml.jackson" in probe_output:
             if "Jackson" not in techs:
                 techs.append("Jackson")
             if "Java" not in techs:
                 techs.append("Java")
-            fp["json_probe"] = f"JACKSON_DETECTED: {json_probe_body.stdout[:500]}"
+            fp["json_probe"] = f"JACKSON_DETECTED: {json_probe_body.stdout}"
         elif "springframework" in probe_output or "spring" in probe_output:
             if "Spring" not in techs:
                 techs.append("Spring")
             if "Java" not in techs:
                 techs.append("Java")
-            fp["json_probe"] = f"SPRING_DETECTED: {json_probe_body.stdout[:500]}"
+            fp["json_probe"] = f"SPRING_DETECTED: {json_probe_body.stdout}"
         elif json_probe_status.success and json_probe_status.stdout.strip() in ("400", "500", "415"):
             # 后端解析了 JSON 请求，可能是 Java 框架
-            fp["json_probe"] = f"JSON_ENDPOINT: status={json_probe_status.stdout.strip()}, body={json_probe_body.stdout[:300]}"
+            fp["json_probe"] = f"JSON_ENDPOINT: status={json_probe_status.stdout.strip()}, body={json_probe_body.stdout}"
             if "application/json" in normal_output and "Java" not in techs:
                 techs.append("Java")
 
@@ -935,8 +1116,12 @@ class VulnAgent:
                     )
 
             if confirmed:
-                evidence = f"命令: {cmd[:200]}\n输出: {stdout[:3000]}"
-                return evidence
+                evidence_lines = [
+                    f"Command\n{cmd}",
+                    f"Stdout\n{stdout or '(empty)'}",
+                    f"Stderr\n{stderr or '(empty)'}",
+                ]
+                return "\n\n".join(evidence_lines)
 
         return ""
 
@@ -1183,7 +1368,11 @@ class VulnAgent:
                     entry.description, cmd, result.stdout[:2000], result.stderr[:500]
                 )
                 if verified:
-                    return f"命令: {cmd[:200]}\n输出: {result.stdout[:3000]}"
+                    return "\n\n".join([
+                        f"Command\n{cmd}",
+                        f"Stdout\n{result.stdout.strip() or '(empty)'}",
+                        f"Stderr\n{result.stderr.strip() or '(empty)'}",
+                    ])
         except Exception as e:
             logger.warning(f"[VulnAgent] KB LLM检测失败: {e}")
 
@@ -1306,7 +1495,11 @@ class VulnAgent:
                     target=f"http://{target}:{port}" if port else target,
                     port=port,
                     description=description,
-                    evidence=exec_result.stdout[:5000],
+                    evidence="\n\n".join([
+                        f"Command\n{command}",
+                        f"Stdout\n{exec_result.stdout.strip() or '(empty)'}",
+                        f"Stderr\n{exec_result.stderr.strip() or '(empty)'}",
+                    ]),
                     exploitable=analysis.get("exploitable", False),
                     tool="llm-discovery",
                 ))
@@ -1446,7 +1639,7 @@ class VulnAgent:
                 f"(body: {anomaly_body[:60]})"
             ),
             evidence="\n".join(evidence_parts),
-            exploitable=True,
+            exploitable=confirmed,
             tool="cve-direct-check",
         )
 

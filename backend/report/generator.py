@@ -263,29 +263,28 @@ MD_TEMPLATE = """# 渗透测试报告
 **状态：** {{ "✅ 利用成功" if r.success else "❌ 利用失败" }}
 {% if r.shell_type %}**Shell 类型：** {{ r.shell_type }}{% endif %}
 
-{% if r.command_results %}
-**执行过程（{{ r.command_results | length }} 条命令）：**
+{% set rec_list = r.command_records if r.command_records else r.command_results %}
+{% if rec_list %}
+**执行过程（{{ rec_list | length }} 条命令）：**
 
-{% for rec in r.command_results %}
+{% for rec in rec_list %}
 **第 {{ rec.round }} 轮{% if rec.purpose %} — {{ rec.purpose }}{% endif %}：**
 
 ```bash
 {{ rec.command }}
 ```
 
-{% if rec.stdout %}
 输出（exit={{ rec.exit_code }}，耗时{{ rec.elapsed }}s）：
 
+```text
+{{ rec.stdout if rec.stdout else '(empty)' }}
 ```
-{{ rec.stdout[:3000] }}
-```
-{% endif %}
 
-{% if rec.stderr and rec.exit_code != 0 %}
+{% if rec.stderr %}
 错误输出：
 
-```
-{{ rec.stderr[:1000] }}
+```text
+{{ rec.stderr }}
 ```
 {% endif %}
 

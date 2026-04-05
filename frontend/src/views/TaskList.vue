@@ -107,14 +107,21 @@
             <span v-else class="text-muted">-</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="180" align="center">
+        <el-table-column label="操作" width="220" align="center">
           <template #default="{ row }">
             <div class="actions" @click.stop>
-              <el-button link type="primary" @click="goDetail(row.task_id)">详情</el-button>
-              <el-button v-if="row.report_path" link type="success" @click="goReport(row.task_id)">报告</el-button>
+              <el-button class="action-detail" size="small" type="primary" @click="goDetail(row.task_id)">详情</el-button>
+              <el-button
+                v-if="row.report_path"
+                class="action-report"
+                size="small"
+                text
+                type="success"
+                @click="goReport(row.task_id)"
+              >报告</el-button>
               <el-popconfirm title="确认删除该任务？" @confirm="handleDelete(row)">
                 <template #reference>
-                  <el-button link type="danger">删除</el-button>
+                  <el-button class="action-delete" size="small" type="danger">删除</el-button>
                 </template>
               </el-popconfirm>
             </div>
@@ -207,14 +214,42 @@ function isValidIPv4(host) {
   })
 }
 
+function parseHostPort(raw) {
+  const match = raw.match(/:(\d{1,5})$/)
+  if (!match) return { host: raw, port: '' }
+  return {
+    host: raw.slice(0, -match[0].length),
+    port: match[1],
+  }
+}
+
+function isValidHost(host) {
+  if (!host) return false
+  if (host === 'localhost') return true
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return isValidIPv4(host)
+  const label = '[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?'
+  const hostnamePattern = new RegExp(`^${label}(\\.${label})*$`)
+  return hostnamePattern.test(host)
+}
+
 function isValidTarget(value) {
   const raw = String(value || '').trim()
   if (!raw) return false
-  if (/^https?:\/\/[^\s/$.?#].[^\s]*$/i.test(raw)) return true
-  const hostPortPattern = /^([a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)*|localhost|\d{1,3}(\.\d{1,3}){3})(:\d{1,5})?$/
-  if (!hostPortPattern.test(raw)) return false
-  const [host, port] = raw.split(':')
-  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host) && !isValidIPv4(host)) return false
+  try {
+    const u = new URL(raw)
+    if (!['http:', 'https:'].includes(u.protocol)) return false
+    if (!isValidHost(u.hostname)) return false
+    if (u.port) {
+      const p = Number(u.port)
+      if (!Number.isFinite(p) || p < 1 || p > 65535) return false
+    }
+    return true
+  } catch {
+    // fall through to host / host:port validation
+  }
+
+  const { host, port } = parseHostPort(raw)
+  if (!isValidHost(host) || host.includes(':')) return false
   if (port) {
     const p = Number(port)
     if (!Number.isFinite(p) || p < 1 || p > 65535) return false
@@ -349,12 +384,45 @@ onMounted(() => {
 .toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; }
 .batch-actions { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; color: var(--text-secondary); font-size: 12px; }
 
-.target { font-family: var(--font-mono); color: var(--accent-blue); font-size: 12px; }
+.target {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: color-mix(in srgb, var(--accent-blue) 78%, #b8d4f0);
+  font-weight: 500;
+}
 .mono { font-family: var(--font-mono); }
 .shell { font-size: 15px; }
 .shell.yes { color: var(--accent-green); }
 .shell.no { color: var(--text-muted); }
 .text-muted { color: var(--text-muted); }
-.actions { display: flex; justify-content: center; align-items: center; gap: 2px; }
+.actions { display: flex; justify-content: center; align-items: center; flex-wrap: wrap; gap: 8px; }
+:deep(.action-detail.el-button) {
+  font-weight: 600;
+  color: #f0f7ff !important;
+  box-shadow: 0 2px 10px color-mix(in srgb, var(--accent-blue) 28%, transparent);
+}
+:deep(.action-delete.el-button--danger) {
+  font-weight: 600;
+  color: #fff5f5 !important;
+  border-color: color-mix(in srgb, var(--accent-red) 72%, #8b2d2d) !important;
+  background: linear-gradient(
+    155deg,
+    color-mix(in srgb, var(--accent-red) 58%, #3a1218),
+    color-mix(in srgb, var(--accent-red) 42%, #240c10)
+  ) !important;
+  box-shadow:
+    0 3px 12px color-mix(in srgb, var(--accent-red) 35%, transparent),
+    inset 0 0 0 1px color-mix(in srgb, #ffffff 12%, transparent);
+}
+:deep(.action-delete.el-button--danger:hover),
+:deep(.action-delete.el-button--danger:focus-visible) {
+  color: #ffffff !important;
+  border-color: color-mix(in srgb, var(--accent-red) 85%, #c44) !important;
+  background: linear-gradient(
+    155deg,
+    color-mix(in srgb, var(--accent-red) 68%, #4a1820),
+    color-mix(in srgb, var(--accent-red) 50%, #2a0c12)
+  ) !important;
+}
 .form-tip { margin-top: 4px; color: var(--text-muted); font-size: 12px; }
 </style>

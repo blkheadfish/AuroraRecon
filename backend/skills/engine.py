@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from datetime import datetime
 from typing import Any, Optional
 from urllib.parse import urlparse
 
@@ -213,6 +214,7 @@ class SkillEngine:
             script_content=command,
             timeout=timeout,
             task_id=ctx.task_id,
+            record_purpose="probe",
         )
 
         # 日志：显示输出摘要
@@ -226,12 +228,16 @@ class SkillEngine:
             logger.info(f"[SkillEngine]   stderr: {stderr_preview}")
 
         # 记录
-        ctx.probe_records.append({
-            "command": command[:200],
-            "stdout": result.stdout[:2000],
-            "stderr": result.stderr[:500],
-            "exit_code": result.exit_code,
-        })
+        ctx.probe_records.append(self._build_exec_record(
+            command=command,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            exit_code=result.exit_code,
+            elapsed=result.elapsed,
+            purpose="probe",
+            path_id="probe",
+            step_id="probe",
+        ))
 
         # 解析 HTTP 状态码
         status_code = result.exit_code
@@ -302,20 +308,20 @@ class SkillEngine:
                 timeout=step.timeout,
                 publish_ports=step.publish_ports or None,
                 task_id=ctx.task_id,
+                record_purpose=step.description,
             )
 
             # 记录
-            record = {
-                "path_id": path.path_id,
-                "step_id": step.id,
-                "command": command[:500],
-                "purpose": step.description,
-                "stdout": exec_result.stdout[:5000],
-                "stderr": exec_result.stderr[:2000],
-                "exit_code": exec_result.exit_code,
-                "elapsed": round(exec_result.elapsed, 1),
-            }
-            ctx.step_records.append(record)
+            ctx.step_records.append(self._build_exec_record(
+                command=command,
+                stdout=exec_result.stdout,
+                stderr=exec_result.stderr,
+                exit_code=exec_result.exit_code,
+                elapsed=round(exec_result.elapsed, 1),
+                purpose=step.description,
+                path_id=path.path_id,
+                step_id=step.id,
+            ))
 
             # 日志：输出摘要
             stdout_preview = exec_result.stdout.strip().replace('\n', ' ')[:1000]
@@ -358,7 +364,7 @@ class SkillEngine:
                 evidence_data = {}
                 for key, source in step.evidence_capture.items():
                     if source == "stdout":
-                        evidence_data[key] = exec_result.stdout.strip()[:500]
+                        evidence_data[key] = exec_result.stdout.strip()
                     else:
                         evidence_data[key] = source
 
@@ -375,9 +381,8 @@ class SkillEngine:
                         "skill_id": path.path_id,
                     },
                     evidence=(
-                        f"Skill 路径 [{path.name}] 利用成功\n"
-                        f"命令: {command[:300]}\n"
-                        f"输出: {exec_result.stdout[:3000]}"
+                        f"Skill 路径 [{path.name}] 利用成功\n\n"
+                        f"{self._format_exec_evidence(command, exec_result.stdout, exec_result.stderr)}"
                     ),
                     commands_run=ctx.commands_run,
                     command_records=ctx.step_records,
@@ -542,7 +547,7 @@ class SkillEngine:
                         "current_user": decision.get("current_user", ""),
                         "rounds": round_num + 1,
                     },
-                    evidence=decision.get("evidence", "")[:3000],
+                    evidence=decision.get("evidence", ""),
                     commands_run=ctx.commands_run,
                     command_records=ctx.step_records,
                 )
@@ -567,7 +572,13 @@ class SkillEngine:
             logger.info(f"[SkillEngine] 🤖 执行: {cmd_preview}...")
 
             ctx.commands_run.append(cmd)
-            exec_result = await self.executor.run_script(cmd, timeout=60, task_id=ctx.task_id)
+            exec_result = await self.executor.run_script(
+                cmd,
+                timeout=60,
+                task_id=ctx.task_id,
+                record_purpose=decision.get("purpose", ""),
+                record_round=round_num + 1,
+            )
 
             stdout_preview = exec_result.stdout.strip().replace('\n', ' ')[:1000]
             logger.info(
@@ -575,16 +586,17 @@ class SkillEngine:
                 f"{len(exec_result.stdout)}B: {stdout_preview}"
             )
 
-            ctx.step_records.append({
-                "path_id": "llm_freeform",
-                "step_id": f"llm_round_{round_num + 1}",
-                "command": cmd[:500],
-                "purpose": decision.get("purpose", ""),
-                "stdout": exec_result.stdout[:5000],
-                "stderr": exec_result.stderr[:2000],
-                "exit_code": exec_result.exit_code,
-                "elapsed": round(exec_result.elapsed, 1),
-            })
+            ctx.step_records.append(self._build_exec_record(
+                command=cmd,
+                stdout=exec_result.stdout,
+                stderr=exec_result.stderr,
+                exit_code=exec_result.exit_code,
+                elapsed=round(exec_result.elapsed, 1),
+                purpose=decision.get("purpose", ""),
+                path_id="llm_freeform",
+                step_id=f"llm_round_{round_num + 1}",
+                round_no=round_num + 1,
+            ))
 
             conversation.append({
                 "role": "user",
@@ -624,3 +636,40 @@ class SkillEngine:
                     f"→ exit={rec['exit_code']}"
                 )
         return "\n".join(lines)
+
+    @staticmethod
+    def _format_exec_evidence(command: str, stdout: str, stderr: str) -> str:
+        return "\n\n".join([
+            f"Command\n{command or '(empty command)'}",
+            f"Stdout\n{stdout.strip() or '(empty)'}",
+            f"Stderr\n{stderr.strip() or '(empty)'}",
+        ])
+
+    @staticmethod
+    def _build_exec_record(
+        *,
+        command: str,
+        stdout: str,
+        stderr: str,
+        exit_code: Optional[int],
+        elapsed: Optional[float],
+        purpose: str = "",
+        path_id: str = "",
+        step_id: str = "",
+        round_no: Optional[int] = None,
+    ) -> dict:
+        total_len = len(stdout or "") + len(stderr or "")
+        return {
+            "path_id": path_id,
+            "step_id": step_id,
+            "round": round_no,
+            "purpose": purpose or "",
+            "timestamp": datetime.utcnow().isoformat(),
+            "command": command or "",
+            "stdout": stdout or "",
+            "stderr": stderr or "",
+            "exit_code": exit_code,
+            "elapsed": elapsed,
+            "truncated": False,
+            "total_len": total_len,
+        }

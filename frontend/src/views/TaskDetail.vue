@@ -196,18 +196,18 @@ const decisionItems = computed(() => {
       tone: evidenceFinding.exploitable ? 'danger' : 'info',
       title: `发现：${evidenceFinding.name}`,
       desc: evidenceFinding.description || '命中漏洞证据。',
-      payload: {
-        title: 'PoC / Payload',
-        language: inferPayloadLang(evidenceFinding.evidence),
-        code: evidenceFinding.evidence,
-      },
+      payloads: splitEvidencePayloads(evidenceFinding.evidence),
     })
   }
 
-  const structuredEvents = Array.isArray(task.value?.decision_events) ? task.value.decision_events : []
+  const liveDecisionEvents = Array.isArray(state.value?.decisionEvents) ? state.value.decisionEvents : []
+  const storedDecisionEvents = Array.isArray(task.value?.decision_events) ? task.value.decision_events : []
+  const structuredEvents = liveDecisionEvents.length ? liveDecisionEvents : storedDecisionEvents
+  const hasCommandExec = structuredEvents.some((entry) => entry?.action === 'command_exec')
   structuredEvents.slice(-80).forEach((entry, idx) => {
     const time = entry.timestamp || new Date().toLocaleTimeString()
     if (entry.action === 'tool_start') {
+      if (hasCommandExec) return
       events.push({
         id: `tool-start-${idx}`,
         time,
@@ -218,6 +218,7 @@ const decisionItems = computed(() => {
       return
     }
     if (entry.action === 'tool_result') {
+      if (hasCommandExec) return
       const elapsedText = entry.elapsed_ms ? `${entry.elapsed_ms}ms` : '-'
       const exitText = entry.exit_code ?? '-'
       events.push({
@@ -231,19 +232,27 @@ const decisionItems = computed(() => {
     }
     if (entry.action === 'command_exec') {
       const command = entry.command || '(empty command)'
+      const runtimeCommand = entry.runtime_command || ''
       const stdout = entry.stdout || ''
       const stderr = entry.stderr || ''
+      const purposeText = entry.purpose ? ` ｜ purpose=${entry.purpose}` : ''
+      const roundText = entry.round !== undefined && entry.round !== null ? ` ｜ round=${entry.round}` : ''
+      const phaseTextInfo = entry.phase ? ` ｜ phase=${entry.phase}` : ''
+      const backendText = entry.backend ? ` ｜ backend=${entry.backend}` : ''
+      const titleText = entry.poc_or_vuln
+        ? `命令执行 · ${entry.poc_or_vuln}`
+        : `命令执行 · ${entry.tool || 'shell'}`
       events.push({
         id: `cmd-${idx}`,
         time,
         tone: (entry.exit_code ?? -1) === 0 ? 'success' : 'danger',
-        title: `命令执行 · ${entry.poc_or_vuln || 'unknown vuln'}`,
-        desc: `exit=${entry.exit_code ?? '-'} ｜ elapsed=${entry.elapsed_ms ?? '-'}ms`,
-        payload: {
-          title: 'Command / Result',
-          language: inferPayloadLang(command),
-          code: `# command\n${command}\n\n# stdout\n${stdout || '(empty)'}\n\n# stderr\n${stderr || '(empty)'}`,
-        },
+        title: titleText,
+        desc: `exit=${entry.exit_code ?? '-'} ｜ elapsed=${entry.elapsed_ms ?? '-'}ms${phaseTextInfo}${backendText}${roundText}${purposeText}`,
+        payloads: buildExecPayloads(command, stdout, stderr, {
+          runtimeCommand,
+          truncated: Boolean(entry.truncated),
+          totalLen: Number(entry.total_len || 0),
+        }),
       })
       return
     }
@@ -258,7 +267,7 @@ const decisionItems = computed(() => {
     }
   })
 
-  const hasStructuredCommands = structuredEvents.some((entry) => entry?.action === 'command_exec')
+  const hasStructuredCommands = hasCommandExec
   const exploitResults = Array.isArray(task.value?.exploit_results) ? task.value.exploit_results : []
   if (!hasStructuredCommands) {
     exploitResults.forEach((result, ridx) => {
@@ -271,11 +280,11 @@ const decisionItems = computed(() => {
           tone: record.exit_code === 0 ? 'success' : 'danger',
           title: `命令执行 · ${result.vuln_id || 'unknown vuln'}`,
           desc: `purpose=${record.purpose || '-'} ｜ exit=${record.exit_code ?? '-'} ｜ elapsed=${record.elapsed ?? '-'}s`,
-          payload: {
-            title: 'Command / Result',
-            language: inferPayloadLang(command),
-            code: `# command\n${command}\n\n# stdout\n${record.stdout || '(empty)'}\n\n# stderr\n${record.stderr || '(empty)'}`,
-          },
+          payloads: buildExecPayloads(command, record.stdout || '', record.stderr || '', {
+            runtimeCommand: record.runtime_command || '',
+            truncated: Boolean(record.truncated),
+            totalLen: Number(record.total_len || 0),
+          }),
         })
       })
     })
@@ -290,11 +299,11 @@ const decisionItems = computed(() => {
         tone: /failed|error|denied|401|403|❌/i.test(line) ? 'danger' : 'success',
         title: '执行轨迹',
         desc: line,
-        payload: {
+        payloads: [{
           title: '执行命令片段',
           language: inferPayloadLang(line),
           code: line,
-        },
+        }],
       })
     })
   }
@@ -305,8 +314,135 @@ const decisionItems = computed(() => {
 function inferPayloadLang(text) {
   if (/^\s*\{[\s\S]*\}\s*$/.test(text)) return 'json'
   if (/GET\s+\/|POST\s+\/|HTTP\/1\.1/i.test(text)) return 'http'
+  if (/^\s*<\?xml|^\s*<\/?[a-zA-Z][\w:-]*[\s>]/.test(String(text || ''))) return 'xml'
   if (/python|def |import /.test(text)) return 'python'
   return 'bash'
+}
+
+function inferOutputLang(text) {
+  const raw = String(text || '').trim()
+  if (!raw) return 'text'
+  if (/^\s*[\[{][\s\S]*[\]}]\s*$/.test(raw)) return 'json'
+  if (/^(HTTP\/\d\.\d\s+\d{3}|GET\s+\/|POST\s+\/|PUT\s+\/|DELETE\s+\/|PATCH\s+\/|HEAD\s+\/|OPTIONS\s+\/)/im.test(raw)) {
+    return 'http'
+  }
+  if (/^\s*<\?xml|^\s*<\/?[a-zA-Z][\w:-]*[\s>]/.test(raw)) return 'xml'
+  return 'auto'
+}
+
+function buildExecPayloads(command, stdout, stderr, meta = {}) {
+  const truncated = Boolean(meta?.truncated)
+  const totalLen = Number(meta?.totalLen || 0)
+  const runtimeCommand = String(meta?.runtimeCommand || '').trim()
+  const outputMeta = {
+    truncated,
+    totalLen,
+  }
+  const blocks = [{
+    title: 'Command',
+    language: inferPayloadLang(command || ''),
+    code: command || '(empty command)',
+  }]
+  if (runtimeCommand && runtimeCommand !== String(command || '').trim()) {
+    blocks.push({
+      title: 'Backend Command',
+      language: 'bash',
+      code: runtimeCommand,
+    })
+  }
+  if (stdout) {
+    blocks.push({
+      title: 'Stdout',
+      language: inferOutputLang(stdout),
+      code: stdout,
+      ...outputMeta,
+    })
+  }
+  if (stderr) {
+    blocks.push({
+      title: 'Stderr',
+      language: inferOutputLang(stderr),
+      code: stderr,
+      ...outputMeta,
+    })
+  }
+  if (!stdout && !stderr) {
+    blocks.push({
+      title: 'Output',
+      language: 'text',
+      code: '(empty)',
+      ...outputMeta,
+    })
+  }
+  return blocks
+}
+
+function splitEvidencePayloads(evidence) {
+  const raw = String(evidence || '').trim()
+  if (!raw) return []
+  const segments = []
+  const lines = raw.split(/\r?\n/)
+  const sectionHeader = /^\s*(?:#{1,6}\s*|[-*]\s*)?(command|cmd|poc|payload|stdout|stderr|response|output|result|命令|输出|响应|错误|回显)\s*[:：]?\s*$/i
+  const inlineHeader = /^\s*(command|cmd|poc|payload|stdout|stderr|response|output|result|命令|输出|响应|错误|回显)\s*[:：]\s*(.*)$/i
+
+  let currentType = ''
+  let buffer = []
+
+  const flush = () => {
+    const content = buffer.join('\n').trim()
+    if (!content) {
+      buffer = []
+      return
+    }
+    if (/(command|cmd|poc|payload|命令)/i.test(currentType)) {
+      segments.push({
+        title: 'PoC / Command',
+        language: inferPayloadLang(content),
+        code: content,
+      })
+    } else if (/(stderr|error|错误)/i.test(currentType)) {
+      segments.push({
+        title: 'Error Output',
+        language: inferOutputLang(content),
+        code: content,
+      })
+    } else if (/(stdout|response|output|result|输出|响应|回显)/i.test(currentType)) {
+      segments.push({
+        title: 'Response / Output',
+        language: inferOutputLang(content),
+        code: content,
+      })
+    }
+    buffer = []
+  }
+
+  lines.forEach((line) => {
+    const inline = line.match(inlineHeader)
+    if (inline) {
+      flush()
+      currentType = String(inline[1] || '')
+      const tail = String(inline[2] || '').trim()
+      if (tail) buffer.push(tail)
+      return
+    }
+    const section = line.match(sectionHeader)
+    if (section) {
+      flush()
+      currentType = String(section[1] || '')
+      return
+    }
+    buffer.push(line)
+  })
+  flush()
+
+  if (!segments.length) {
+    segments.push({
+      title: 'PoC / Payload',
+      language: inferPayloadLang(raw),
+      code: raw,
+    })
+  }
+  return segments
 }
 
 function phaseText(phase) {

@@ -26,9 +26,9 @@ from datetime import datetime, timedelta
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
-from backend.agents.models import PentestState, TaskStatus
+from backend.agents.models import PentestState, TaskStatus, parse_target
 from backend.agents.orchestrator import Orchestrator
 
 logging.basicConfig(level=logging.INFO)
@@ -147,6 +147,61 @@ class CreateTaskRequest(BaseModel):
     extra_hint: str = ""
     user_prompt: str = ""
     workflow_mode: str = "standard"
+
+    @field_validator("target")
+    @classmethod
+    def validate_target(cls, v: str) -> str:
+        """
+        服务端目标地址校验（与前端 isValidTarget 对齐）。
+
+        接受格式:
+          192.168.1.1
+          192.168.1.1:8080
+          example.com
+          example.com:443
+          http(s)://host:port/path
+
+        拒绝: 空字符串、含空格/分号/管道等注入字符、非法端口
+        """
+        raw = v.strip()
+        if not raw:
+            raise ValueError("目标地址不能为空")
+
+        # 拒绝明显的命令注入字符
+        if re.search(r'[;\|`$&<>(){}\[\]!]', raw):
+            raise ValueError("目标地址包含非法字符")
+
+        parsed = parse_target(raw)
+
+        if not parsed.host:
+            raise ValueError("无法解析目标主机地址")
+
+        # 端口范围检查
+        if parsed.port is not None and not (1 <= parsed.port <= 65535):
+            raise ValueError(f"端口号超出范围: {parsed.port}")
+
+        # 协议检查（如果带协议，只允许 http/https）
+        if parsed.scheme and parsed.scheme not in ("http", "https"):
+            raise ValueError(f"不支持的协议: {parsed.scheme}")
+
+        # 主机名基本格式检查（IP 或域名）
+        host = parsed.host
+        # IPv4
+        ipv4_match = re.match(r'^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$', host)
+        if ipv4_match:
+            octets = [int(g) for g in ipv4_match.groups()]
+            if not all(0 <= o <= 255 for o in octets):
+                raise ValueError(f"无效的 IPv4 地址: {host}")
+        elif host != "localhost":
+            # 域名格式检查
+            if not re.match(
+                r'^[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?'
+                r'(\.[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?)*$',
+                host,
+            ):
+                raise ValueError(f"无效的主机名: {host}")
+
+        return raw
 
 
 class TaskSummary(BaseModel):
@@ -542,9 +597,15 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
     try:
         # 发送已有日志
         state = _tasks.get(task_id)
+        sent_decision_ids: set[str] = set()
         if state:
             for log_entry in state.phase_log:
                 await websocket.send_json({"type": "log", "data": log_entry})
+            existing_events = _build_decision_events(state)
+            snapshot = existing_events[-120:] if len(existing_events) > 120 else existing_events
+            for event in snapshot:
+                await websocket.send_json({"type": "decision_event", "data": event})
+                sent_decision_ids.add(str(event.get("id") or ""))
 
         # 主动推送循环
         last_log_count = len(state.phase_log) if state else 0
@@ -561,6 +622,19 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
                 for entry in state.phase_log[last_log_count:]:
                     await websocket.send_json({"type": "log", "data": entry})
                 last_log_count = current_count
+
+            # 推送结构化 decision_event（增量）
+            decision_events = _build_decision_events(state)
+            for event in decision_events:
+                event_id = str(event.get("id") or "")
+                if event_id and event_id in sent_decision_ids:
+                    continue
+                if event_id:
+                    sent_decision_ids.add(event_id)
+                try:
+                    await websocket.send_json({"type": "decision_event", "data": event})
+                except Exception:
+                    break
 
             # awaiting_approval：只推送一次
             if state.current_phase == "awaiting_approval" and not approval_sent:
@@ -774,6 +848,7 @@ def _extract_phase_log(log_entry: str) -> tuple[str, str, str]:
 
 def _build_decision_events(state: PentestState) -> list[dict]:
     events: list[dict] = []
+    seen_exec_keys: set[tuple[str, str, str]] = set()
 
     # 1) phase_log 事件
     for idx, entry in enumerate(state.phase_log or []):
@@ -811,40 +886,131 @@ def _build_decision_events(state: PentestState) -> list[dict]:
             "action": action,
             "tool": tool,
             "backend": backend,
+            "poc_or_vuln": "",
+            "command": "",
+            "runtime_command": "",
+            "stdout": "",
+            "stderr": "",
             "exit_code": exit_code,
             "elapsed_ms": elapsed_ms,
+            "purpose": "",
+            "round": None,
+            "truncated": False,
+            "total_len": 0,
             "message": msg,
             "raw": entry,
             "tone": tone,
         })
 
-    # 2) exploit_results 命令执行明细
+    # 2) 全阶段结构化执行记录（recon/vuln/exploit）
+    for ridx, record in enumerate(state.tool_records or []):
+        payload = record.model_dump() if hasattr(record, "model_dump") else dict(record or {})
+        cmd = str(payload.get("command") or "")
+        runtime_cmd = str(payload.get("runtime_command") or "")
+        stdout = str(payload.get("stdout") or "")
+        stderr = str(payload.get("stderr") or "")
+        timestamp = str(payload.get("timestamp") or "")
+        phase = str(payload.get("phase") or "")
+        tool = str(payload.get("tool") or "shell")
+        backend = str(payload.get("backend") or "")
+        exit_code = payload.get("exit_code")
+        elapsed = payload.get("elapsed")
+        purpose = str(payload.get("purpose") or "")
+        round_no = payload.get("round")
+        truncated = bool(payload.get("truncated") or False)
+        total_len = payload.get("total_len")
+        if total_len is None:
+            total_len = len(stdout) + len(stderr)
+        try:
+            total_len_val = int(total_len)
+        except Exception:
+            total_len_val = len(stdout) + len(stderr)
+
+        dedupe_key = (timestamp, phase, cmd)
+        if dedupe_key in seen_exec_keys:
+            continue
+        seen_exec_keys.add(dedupe_key)
+
+        rec_id = str(payload.get("id") or f"tool-rec-{ridx}")
+        events.append({
+            "id": f"exec-{rec_id}",
+            "timestamp": timestamp,
+            "phase": phase or "unknown",
+            "action": "command_exec",
+            "tool": tool,
+            "backend": backend,
+            "poc_or_vuln": "",
+            "command": cmd,
+            "runtime_command": runtime_cmd,
+            "stdout": stdout,
+            "stderr": stderr,
+            "exit_code": exit_code,
+            "elapsed_ms": int(float(elapsed) * 1000.0) if elapsed is not None else None,
+            "purpose": purpose,
+            "round": round_no,
+            "truncated": truncated,
+            "total_len": total_len_val,
+            "message": f"命令执行: {tool} {cmd[:120]}".strip(),
+            "raw": "",
+            "tone": "success" if exit_code == 0 else "danger",
+        })
+
+    # 3) exploit_results 命令执行明细（兼容旧任务，无全阶段 tool_records 时仍可展示）
     for ridx, result in enumerate(state.exploit_results or []):
         result_payload = result.model_dump() if hasattr(result, "model_dump") else result
         vuln_id = result_payload.get("vuln_id", "")
         records = result_payload.get("command_records") or result_payload.get("command_results") or []
         for cidx, record in enumerate(records):
             cmd = str(record.get("command") or "")
+            runtime_cmd = str(record.get("runtime_command") or "")
             stdout = str(record.get("stdout") or "")
             stderr = str(record.get("stderr") or "")
             exit_code = record.get("exit_code")
             elapsed = record.get("elapsed")
+            timestamp = str(record.get("timestamp") or "")
+            purpose = str(record.get("purpose") or "")
+            round_no = record.get("round")
+            truncated = bool(record.get("truncated") or False)
+            total_len = record.get("total_len")
+            if total_len is None:
+                total_len = len(stdout) + len(stderr)
+            try:
+                total_len_val = int(total_len)
+            except Exception:
+                total_len_val = len(stdout) + len(stderr)
+            dedupe_key = (timestamp, "exploit", cmd)
+            if dedupe_key in seen_exec_keys:
+                continue
+            seen_exec_keys.add(dedupe_key)
             events.append({
                 "id": f"cmd-{ridx}-{cidx}",
-                "timestamp": "",
-                "phase": "exploit",
+                "timestamp": timestamp,
+                "phase": str(record.get("phase") or "exploit"),
                 "action": "command_exec",
-                "tool": "shell",
-                "backend": "",
+                "tool": str(record.get("tool") or "shell"),
+                "backend": str(record.get("backend") or ""),
                 "poc_or_vuln": vuln_id,
                 "command": cmd,
-                "stdout": stdout[:3000],
-                "stderr": stderr[:1200],
+                "runtime_command": runtime_cmd,
+                "stdout": stdout,
+                "stderr": stderr,
                 "exit_code": exit_code,
                 "elapsed_ms": int(float(elapsed) * 1000.0) if elapsed is not None else None,
+                "purpose": purpose,
+                "round": round_no,
+                "truncated": truncated,
+                "total_len": total_len_val,
                 "message": f"命令执行: {cmd[:120]}",
+                "raw": "",
                 "tone": "success" if exit_code == 0 else "danger",
             })
+
+    for event in events:
+        event.setdefault("purpose", "")
+        event.setdefault("round", None)
+        event.setdefault("truncated", False)
+        event.setdefault("total_len", 0)
+        event.setdefault("runtime_command", "")
 
     return events
 
@@ -880,6 +1046,7 @@ def _to_detail(state: PentestState) -> dict:
         "subdomains": state.subdomains,
         "findings": [f.model_dump() for f in state.findings],
         "exploit_results": [r.model_dump() for r in state.exploit_results],
+        "tool_records": [r.model_dump() for r in state.tool_records],
         "decision_events": _build_decision_events(state),
         "post_findings": state.post_findings,
         "report_md": state.report_md,

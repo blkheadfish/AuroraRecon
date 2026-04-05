@@ -30,6 +30,8 @@ import asyncio
 import logging
 import os
 import time
+import uuid
+from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Awaitable
 
@@ -47,6 +49,7 @@ DATA_VOLUME    = os.getenv("DATA_VOLUME", "/tmp/pentest_data")
 REPORTS_DIR    = os.getenv("REPORTS_DIR", "/tmp/pentest_reports")
 
 LogCallback = Optional[Callable[[str], Awaitable[None]]]
+RecordCallback = Optional[Callable[[dict], Awaitable[None]]]
 
 
 @dataclass
@@ -202,11 +205,18 @@ class ToolExecutor:
         env: Optional[dict[str, str]] = None,
         workdir: str = "/tmp",
         log_callback: LogCallback = None,
+        record_callback: RecordCallback = None,
+        record_phase: str = "",
+        record_purpose: str = "",
+        record_round: Optional[int] = None,
+        record_command: Optional[str] = None,
+        record_runtime_command: Optional[str] = None,
         task_id: Optional[str] = None,
         publish_ports: list[int] | None = None,
     ) -> ExecuteResult:
         tool_def = self._registry.get_or_default(tool)
         effective_timeout = timeout or tool_def.timeout
+        effective_record_command = record_command or " ".join([tool_def.command, *args]).strip()
 
         # ── 路由 ──────────────────────────────────────────
         executor_type = tool_def.executor  # "local" | "container" | "remote"
@@ -222,6 +232,12 @@ class ToolExecutor:
                     tool, args, timeout=effective_timeout,
                     env=env, workdir=workdir,
                     log_callback=log_callback, task_id=task_id,
+                    record_callback=record_callback,
+                    record_phase=record_phase,
+                    record_purpose=record_purpose,
+                    record_round=record_round,
+                    record_command=effective_record_command,
+                    record_runtime_command=record_runtime_command,
                 )
             except NotImplementedError:
                 logger.error(f"[Executor] remote 后端未实现，无法执行 {tool}")
@@ -241,6 +257,12 @@ class ToolExecutor:
                     timeout=effective_timeout, env=env, workdir=workdir,
                     log_callback=log_callback,
                     input_data=input_data,
+                    record_callback=record_callback,
+                    record_phase=record_phase,
+                    record_purpose=record_purpose,
+                    record_round=record_round,
+                    record_command=effective_record_command,
+                    record_runtime_command=record_runtime_command,
                 )
             else:
                 if publish_ports and container_name:
@@ -257,6 +279,12 @@ class ToolExecutor:
             timeout=effective_timeout,
             input_data=input_data,
             log_callback=log_callback,
+            record_callback=record_callback,
+            record_phase=record_phase,
+            record_purpose=record_purpose,
+            record_round=record_round,
+            record_command=effective_record_command,
+            record_runtime_command=record_runtime_command,
         )
 
     # ── docker exec（持久容器）────────────────────────────
@@ -271,6 +299,12 @@ class ToolExecutor:
         env: Optional[dict],
         workdir: str,
         log_callback: LogCallback,
+        record_callback: RecordCallback,
+        record_phase: str = "",
+        record_purpose: str = "",
+        record_round: Optional[int] = None,
+        record_command: Optional[str] = None,
+        record_runtime_command: Optional[str] = None,
         input_data: Optional[str] = None,
     ) -> ExecuteResult:
         tool_def = self._registry.get_or_default(tool)
@@ -311,7 +345,11 @@ class ToolExecutor:
                    + [container_name, "bash", "-c", inner_cmd])
             effective_input = None
 
-        log_msg = f"🔧 {tool} [exec→{container_name[:20]}]: {' '.join(args[:4])}"
+        runtime_display_cmd = " ".join(
+            ["docker", "exec", "-w", workdir] + path_args + env_args + [container_name] + cmd_parts + args
+        ).strip()
+
+        log_msg = f"🔧 {tool} [exec→{container_name[:20]}]: {runtime_display_cmd}"
         logger.info(f"[Executor] {log_msg}")
         if log_callback:
             try: await log_callback(log_msg)
@@ -320,6 +358,12 @@ class ToolExecutor:
         return await self._run_subprocess(
             tool, cmd, "container-exec",
             timeout=timeout, input_data=effective_input, log_callback=log_callback,
+            record_callback=record_callback,
+            record_phase=record_phase,
+            record_purpose=record_purpose,
+            record_round=record_round,
+            record_command=record_command,
+            record_runtime_command=record_runtime_command or runtime_display_cmd,
         )
 
     # ── docker run --rm（临时容器）────────────────────────
@@ -349,7 +393,23 @@ class ToolExecutor:
 
     # ── remote 后端（阶段二）─────────────────────────────
 
-    async def _run_remote(self, tool, args, *, timeout, env, workdir, log_callback, task_id):
+    async def _run_remote(
+        self,
+        tool,
+        args,
+        *,
+        timeout,
+        env,
+        workdir,
+        log_callback,
+        task_id,
+        record_callback: RecordCallback = None,
+        record_phase: str = "",
+        record_purpose: str = "",
+        record_round: Optional[int] = None,
+        record_command: Optional[str] = None,
+        record_runtime_command: Optional[str] = None,
+    ):
         await _remote_stub.execute(args, timeout=timeout, env=env, workdir=workdir, task_id=task_id)
 
     # ── 通用 subprocess 执行 ──────────────────────────────
@@ -363,8 +423,14 @@ class ToolExecutor:
         timeout: int,
         input_data: Optional[str],
         log_callback: LogCallback,
+        record_callback: RecordCallback = None,
+        record_phase: str = "",
+        record_purpose: str = "",
+        record_round: Optional[int] = None,
+        record_command: Optional[str] = None,
+        record_runtime_command: Optional[str] = None,
     ) -> ExecuteResult:
-        cmd_display = " ".join(cmd[:8]) + ("..." if len(cmd) > 8 else "")
+        cmd_display = " ".join(cmd)
         log_msg = f"🔧 执行 {tool} [{backend_label}]: {cmd_display}"
         logger.info(f"[Executor] {log_msg}")
         if log_callback:
@@ -394,6 +460,26 @@ class ToolExecutor:
                 if log_callback:
                     try: await log_callback(msg)
                     except Exception: pass
+                await self._emit_record(
+                    record_callback=record_callback,
+                    record={
+                        "id": uuid.uuid4().hex[:16],
+                        "phase": record_phase or "",
+                        "tool": tool,
+                        "backend": backend_label,
+                        "round": record_round,
+                        "purpose": record_purpose or "",
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "command": record_command or "",
+                        "runtime_command": record_runtime_command or cmd_display,
+                        "stdout": "",
+                        "stderr": f"执行超时（{timeout}秒）",
+                        "exit_code": -1,
+                        "elapsed": round(elapsed, 3),
+                        "truncated": False,
+                        "total_len": len(f"执行超时（{timeout}秒）"),
+                    },
+                )
                 return ExecuteResult(
                     success=False, stdout="", stderr=f"执行超时（{timeout}秒）",
                     exit_code=-1, elapsed=elapsed,
@@ -412,6 +498,26 @@ class ToolExecutor:
             if log_callback:
                 try: await log_callback(log_msg)
                 except Exception: pass
+            await self._emit_record(
+                record_callback=record_callback,
+                record={
+                    "id": uuid.uuid4().hex[:16],
+                    "phase": record_phase or "",
+                    "tool": tool,
+                    "backend": backend_label,
+                    "round": record_round,
+                    "purpose": record_purpose or "",
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "command": record_command or "",
+                    "runtime_command": record_runtime_command or cmd_display,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "exit_code": exit_code,
+                    "elapsed": round(elapsed, 3),
+                    "truncated": False,
+                    "total_len": len(stdout) + len(stderr),
+                },
+            )
 
             return ExecuteResult(
                 success=success, stdout=stdout, stderr=stderr,
@@ -423,6 +529,26 @@ class ToolExecutor:
             elapsed = time.monotonic() - start
             msg = f"命令未找到: {cmd[0]}"
             logger.error(f"[Executor] {msg}")
+            await self._emit_record(
+                record_callback=record_callback,
+                record={
+                    "id": uuid.uuid4().hex[:16],
+                    "phase": record_phase or "",
+                    "tool": tool,
+                    "backend": backend_label,
+                    "round": record_round,
+                    "purpose": record_purpose or "",
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "command": record_command or "",
+                    "runtime_command": record_runtime_command or cmd_display,
+                    "stdout": "",
+                    "stderr": msg,
+                    "exit_code": 127,
+                    "elapsed": round(elapsed, 3),
+                    "truncated": False,
+                    "total_len": len(msg),
+                },
+            )
             return ExecuteResult(
                 success=False, stdout="", stderr=msg, exit_code=127,
                 elapsed=elapsed, command=" ".join(cmd), tool_name=tool, backend=backend_label,
@@ -430,8 +556,29 @@ class ToolExecutor:
         except Exception as e:
             elapsed = time.monotonic() - start
             logger.error(f"[Executor] 未预期异常: {e}")
+            err = str(e)
+            await self._emit_record(
+                record_callback=record_callback,
+                record={
+                    "id": uuid.uuid4().hex[:16],
+                    "phase": record_phase or "",
+                    "tool": tool,
+                    "backend": backend_label,
+                    "round": record_round,
+                    "purpose": record_purpose or "",
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "command": record_command or "",
+                    "runtime_command": record_runtime_command or cmd_display,
+                    "stdout": "",
+                    "stderr": err,
+                    "exit_code": -1,
+                    "elapsed": round(elapsed, 3),
+                    "truncated": False,
+                    "total_len": len(err),
+                },
+            )
             return ExecuteResult(
-                success=False, stdout="", stderr=str(e), exit_code=-1,
+                success=False, stdout="", stderr=err, exit_code=-1,
                 elapsed=elapsed, command=" ".join(cmd), tool_name=tool, backend=backend_label,
             )
 
@@ -441,6 +588,11 @@ class ToolExecutor:
         timeout: int = 60,
         shell: str = "/bin/bash",
         log_callback: LogCallback = None,
+        record_callback: RecordCallback = None,
+        record_phase: str = "",
+        record_purpose: str = "",
+        record_round: Optional[int] = None,
+        record_runtime_command: Optional[str] = None,
         publish_ports: list[int] | None = None,
         task_id: Optional[str] = None,
     ) -> ExecuteResult:
@@ -453,9 +605,24 @@ class ToolExecutor:
         return await self.run(
             tool=shell, args=["-s"], timeout=timeout,
             input_data=script_content, log_callback=log_callback,
+            record_callback=record_callback,
+            record_phase=record_phase,
+            record_purpose=record_purpose,
+            record_round=record_round,
+            record_command=script_content,
+            record_runtime_command=record_runtime_command,
             publish_ports=publish_ports,
             task_id=task_id,
         )
+
+    @staticmethod
+    async def _emit_record(*, record_callback: RecordCallback, record: dict) -> None:
+        if not record_callback:
+            return
+        try:
+            await record_callback(record)
+        except Exception:
+            pass
 
     # ── 容器生命周期快捷方法（供 orchestrator 调用）──────
 

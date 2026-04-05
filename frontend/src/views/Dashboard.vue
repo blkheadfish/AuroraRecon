@@ -123,10 +123,18 @@
         </div>
 
         <div class="backend-row">
-          <span class="label">按执行后端：</span>
-          <el-tag v-for="item in backendRows" :key="item.name" size="small" class="backend-tag">
-            {{ item.name }}: {{ item.count }}
-          </el-tag>
+          <span class="label backend-row-title">工具调用按执行后端分布（本时间窗）</span>
+          <el-tooltip
+            v-for="item in backendRows"
+            :key="item.name"
+            :content="backendTip(item.name)"
+            placement="top"
+          >
+            <el-tag size="small" type="info" effect="plain" class="backend-tag">
+              <span class="backend-name">{{ item.name }}</span>
+              <span class="backend-count mono">{{ item.count }} 次</span>
+            </el-tag>
+          </el-tooltip>
           <span v-if="!backendRows.length" class="empty-tip">暂无数据</span>
         </div>
 
@@ -192,8 +200,21 @@ const executorRows = computed(() =>
 )
 
 const backendRows = computed(() =>
-  Object.entries(invocation.value.by_backend || {}).map(([name, count]) => ({ name, count })),
+  Object.entries(invocation.value.by_backend || {})
+    .map(([name, count]) => ({ name, count: Number(count || 0) }))
+    .sort((a, b) => b.count - a.count),
 )
+
+function backendTip(name) {
+  const key = String(name || '').toLowerCase()
+  if (key === 'container-run') {
+    return 'container-run: 以运行容器任务方式调用工具，常用于完整扫描流程。'
+  }
+  if (key === 'container-exec') {
+    return 'container-exec: 在现有容器中执行命令，常用于短命令探测与补充校验。'
+  }
+  return `${name}: 按执行后端统计的工具调用次数。`
+}
 
 function statusTagType(status) {
   if (status === 'ok' || status === 'connected') return 'success'
@@ -299,11 +320,32 @@ onUnmounted(() => {
 
 .backend-row {
   display: flex;
-  gap: 6px;
+  gap: 8px;
   align-items: center;
   margin-bottom: 8px;
   flex-wrap: wrap;
+  padding: 8px 10px;
+  border: 1px dashed color-mix(in srgb, var(--border) 70%, var(--accent-blue));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--bg-base) 82%, transparent);
 }
-.backend-tag { margin-right: 4px; }
+.backend-row-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+:deep(.backend-tag.el-tag) {
+  margin-right: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border-color: color-mix(in srgb, var(--border) 72%, var(--accent-blue));
+  background: color-mix(in srgb, var(--bg-surface) 88%, transparent);
+}
+.backend-name { color: var(--text-secondary); }
+.backend-count {
+  color: var(--text-primary);
+  font-weight: 700;
+}
 .empty-tip { color: var(--text-muted); font-size: 12px; }
 </style>

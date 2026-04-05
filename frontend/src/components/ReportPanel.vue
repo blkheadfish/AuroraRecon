@@ -96,6 +96,19 @@ function sanitizeHtml(input) {
     .replace(/\son\w+='[^']*'/g, '')
 }
 
+function wrapTables(input) {
+  return String(input || '')
+    .replace(/<table>/g, '<div class="table-scroll"><table>')
+    .replace(/<\/table>/g, '</table></div>')
+}
+
+function escapeHtml(text) {
+  return String(text || '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+}
+
 const renderedHtml = computed(() => {
   if (!draft.value) return ''
   const renderer = new marked.Renderer()
@@ -110,7 +123,7 @@ const renderedHtml = computed(() => {
         highlighted = hljs.highlightAuto(text).value
       }
     } catch {
-      highlighted = text
+      highlighted = escapeHtml(text)
     }
     return `<pre><code class="hljs language-${language || ''}">${highlighted}</code></pre>`
   }
@@ -119,7 +132,7 @@ const renderedHtml = computed(() => {
     gfm: true,
     breaks: false,
   })
-  return sanitizeHtml(raw)
+  return sanitizeHtml(wrapTables(raw))
 })
 
 const isDirty = computed(() => draft.value !== lastSavedDraft.value)
