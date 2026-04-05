@@ -345,7 +345,7 @@ $PHUIP "{web_url}/index.php" 2>&1
             f"Stdout\n{best_output.strip() or '(empty)'}",
         ]
         return VulnFinding(
-            name="PHP-FPM phuip 探针命中",
+            name="PHP-FPM CVE-2019-11043",
             severity="high",
             cve="CVE-2019-11043",
             target=web_url,

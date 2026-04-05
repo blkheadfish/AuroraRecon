@@ -609,9 +609,8 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
 
         # 主动推送循环
         last_log_count = len(state.phase_log) if state else 0
-        approval_sent = False  # 防止每 2 秒重复发送 approval_required
         while True:
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(0.8)
             state = _tasks.get(task_id)
             if not state:
                 break
@@ -636,8 +635,8 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
                 except Exception:
                     break
 
-            # awaiting_approval：只推送一次
-            if state.current_phase == "awaiting_approval" and not approval_sent:
+            # awaiting_approval：每轮都推送，前端通过 upsertTask 幂等去重
+            if state.current_phase == "awaiting_approval":
                 await websocket.send_json({
                     "type":           "approval_required",
                     "phase":          "awaiting_approval",
@@ -646,9 +645,6 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
                     "exploitable_count": sum(1 for f in state.findings if f.exploitable),
                     "got_shell":      state.got_shell,
                 })
-                approval_sent = True
-            elif state.current_phase != "awaiting_approval":
-                approval_sent = False  # 阶段变了，重置
 
             # 任务完成/失败则通知并退出
             if state.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
