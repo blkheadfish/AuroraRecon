@@ -32,6 +32,10 @@
           <el-icon><Tools /></el-icon>
           <span>Skill管理</span>
         </el-menu-item>
+        <el-menu-item index="/knowledge">
+          <el-icon><Reading /></el-icon>
+          <span>知识库</span>
+        </el-menu-item>
         <el-menu-item index="/prompts">
           <el-icon><ChatDotRound /></el-icon>
           <span>Prompt管理</span>

@@ -13,10 +13,17 @@
         </div>
         <div class="title-actions" v-if="task">
           <StatusBadge :status="task.status" size="large" />
-          <el-button plain @click="activeTab = 'decision'">决策视图</el-button>
+          <el-button plain @click="router.push(`/tasks/${taskId}/decision`)">决策视图</el-button>
           <el-button v-if="task.report_path" type="success" plain @click="router.push(`/reports/${taskId}`)">
             报告中心
           </el-button>
+          <el-button
+            v-if="isRunning"
+            type="danger"
+            plain
+            :loading="cancelling"
+            @click="doCancel"
+          >取消任务</el-button>
         </div>
       </div>
     </div>
@@ -40,22 +47,21 @@
       </el-card>
     </div>
 
-    <div class="pipeline-card" v-if="task">
-      <div class="pipeline-head">
-        <h3>Kill Chain 可视化</h3>
-        <p>实时展示阶段流转、审批状态与整体进度</p>
-      </div>
-      <PipelineFlow
-        :current-phase="task.current_phase"
-        :status="task.status"
-        :findings-count="findings.length"
-        :exploitable-count="exploitableCount"
-        :got-shell="task.got_shell"
-        :needs-approval="false"
-        :approving="approving"
-        :show-legend="true"
-      />
-    </div>
+    <TaskProgressMermaid
+      v-if="task"
+      :current-phase="task.current_phase"
+      :status="task.status"
+      :findings-count="findings.length"
+      :exploitable-count="exploitableCount"
+      :got-shell="task.got_shell || false"
+      :needs-approval="needsApproval"
+      :chain-visited="task.chain_visited || []"
+      :secondary-elided="task.secondary_elided || false"
+      :foothold-status="task.foothold_status || 'none'"
+      :privilege-level="task.privilege_level || ''"
+      :privesc-attempt-count="task.privesc_attempt_count || 0"
+      class="progress-mermaid"
+    />
 
     <ApprovalComposer
       :needs-approval="showApprovalActions"
@@ -111,7 +117,7 @@ import { useTaskListStore } from '@/stores/taskList'
 import { useTaskLiveStore } from '@/stores/taskLive'
 import { trackEvent } from '@/metrics/tracker'
 import StatusBadge from '@/components/StatusBadge.vue'
-import PipelineFlow from '@/components/PipelineFlow.vue'
+import TaskProgressMermaid from '@/components/TaskProgressMermaid.vue'
 import LogTerminal from '@/components/LogTerminal.vue'
 import FindingsPanel from '@/components/FindingsPanel.vue'
 import ReconPanel from '@/components/ReconPanel.vue'
@@ -129,7 +135,8 @@ const liveStore = useTaskLiveStore()
 const loading = ref(true)
 const activeTab = ref('decision')
 const approving = ref(false)
-const approvalSubmitted = ref(false)
+const approvalState = ref('idle')
+const cancelling = ref(false)
 const pollTimer = ref(null)
 
 const state = computed(() => liveStore.getLiveState(taskId))
@@ -138,7 +145,7 @@ const logs = computed(() => state.value.logs || [])
 const findings = computed(() => task.value?.findings || [])
 const isRunning = computed(() => ['pending', 'running'].includes(task.value?.status || ''))
 const needsApproval = computed(() => task.value?.current_phase === 'awaiting_approval')
-const showApprovalActions = computed(() => needsApproval.value && !approvalSubmitted.value)
+const showApprovalActions = computed(() => needsApproval.value && approvalState.value === 'idle')
 const exploitableCount = computed(() => findings.value.filter((item) => item.exploitable).length)
 
 const nextAction = computed(() => {
@@ -146,7 +153,12 @@ const nextAction = computed(() => {
   if (task.value.status === 'completed') return '审阅报告并发布'
   if (needsApproval.value) return '确认利用授权范围并执行审批'
   if (task.value.current_phase === 'exploit_decision') return '等待模型生成 PoC/Payload'
-  if (task.value.current_phase === 'exploit') return '观察利用结果与回显证据'
+  if (task.value.current_phase === 'surface_enum') return '合并 Web 攻击面与目录线索'
+  if (task.value.current_phase === 'foothold_attempt') return '战术层尝试建立立足点（CVE/Skill/ReAct）'
+  if (task.value.current_phase === 'secondary_attack') return '二次利用：结合对话提示重试失败项'
+  if (task.value.current_phase === 'post_foothold_enum') return '立足后枚举：身份、内核、sudo/SUID 线索'
+  if (task.value.current_phase === 'privesc_attempt') return '提权验证与假设排序'
+  if (task.value.current_phase === 'objective_collect') return '检索 flag/proof 与攻链总结'
   return '持续观察实时状态'
 })
 
@@ -203,11 +215,9 @@ const decisionItems = computed(() => {
   const liveDecisionEvents = Array.isArray(state.value?.decisionEvents) ? state.value.decisionEvents : []
   const storedDecisionEvents = Array.isArray(task.value?.decision_events) ? task.value.decision_events : []
   const structuredEvents = liveDecisionEvents.length ? liveDecisionEvents : storedDecisionEvents
-  const hasCommandExec = structuredEvents.some((entry) => entry?.action === 'command_exec')
-  structuredEvents.slice(-80).forEach((entry, idx) => {
+  structuredEvents.slice(-120).forEach((entry, idx) => {
     const time = entry.timestamp || new Date().toLocaleTimeString()
     if (entry.action === 'tool_start') {
-      if (hasCommandExec) return
       events.push({
         id: `tool-start-${idx}`,
         time,
@@ -218,7 +228,6 @@ const decisionItems = computed(() => {
       return
     }
     if (entry.action === 'tool_result') {
-      if (hasCommandExec) return
       const elapsedText = entry.elapsed_ms ? `${entry.elapsed_ms}ms` : '-'
       const exitText = entry.exit_code ?? '-'
       events.push({
@@ -264,12 +273,36 @@ const decisionItems = computed(() => {
         title: '审批节点',
         desc: entry.message || entry.raw || '',
       })
+      return
+    }
+    if (entry.action === 'thought') {
+      events.push({
+        id: `thought-${idx}`,
+        time,
+        tone: 'primary',
+        title: 'AI 思考',
+        desc: entry.message || entry.raw || '',
+      })
+      return
+    }
+    if (entry.action === 'log') {
+      const msg = entry.message || entry.raw || ''
+      if (!msg) return
+      const isPhase = /开始|完成|端口|漏洞|侦察|扫描|利用|后渗透|报告|PHP|phuip/i.test(msg)
+      if (!isPhase) return
+      events.push({
+        id: `log-${idx}`,
+        time,
+        tone: 'info',
+        title: '阶段进展',
+        desc: msg,
+      })
     }
   })
 
-  const hasStructuredCommands = hasCommandExec
+  const hasCommandExec = structuredEvents.some((e) => e?.action === 'command_exec')
   const exploitResults = Array.isArray(task.value?.exploit_results) ? task.value.exploit_results : []
-  if (!hasStructuredCommands) {
+  if (!hasCommandExec) {
     exploitResults.forEach((result, ridx) => {
       const records = result.command_records || result.command_results || []
       records.forEach((record, cidx) => {
@@ -290,7 +323,7 @@ const decisionItems = computed(() => {
     })
   }
 
-  if (!structuredEvents.length && !hasStructuredCommands) {
+  if (!structuredEvents.length && !hasCommandExec) {
     const payloadLogs = logs.value.filter((line) => /payload|poc|webshell|cmd|curl|python|bash|执行|完成|exit=/i.test(line)).slice(-12)
     payloadLogs.forEach((line, idx) => {
       events.push({
@@ -450,27 +483,49 @@ function phaseText(phase) {
     init: '初始化',
     recon: '信息侦察',
     vuln_scan: '漏洞扫描',
+    surface_enum: '表面枚举',
     exploit_decision: '利用决策',
     awaiting_approval: '等待审批',
+    foothold_attempt: '立足点尝试',
     exploit: '漏洞利用',
+    secondary_attack: '二次利用',
+    post_foothold_enum: '立足后枚举',
+    privesc_attempt: '提权尝试',
+    objective_collect: '目标收集',
     post_exploit: '后渗透',
     report: '报告生成',
   }[phase] || phase
 }
 
 async function doApprove(approved) {
-  if (!showApprovalActions.value || approving.value) return
+  if (approvalState.value !== 'idle' || approving.value) return
   approving.value = true
-  approvalSubmitted.value = true
+  approvalState.value = 'submitting'
   try {
     await api.approveTask(taskId, approved)
+    approvalState.value = 'submitted'
     trackEvent('task.approval', { taskId, approved })
     ElMessage.success(approved ? '已批准继续利用' : '已拒绝利用阶段')
   } catch (e) {
-    approvalSubmitted.value = false
+    approvalState.value = 'error'
     ElMessage.error(e?.response?.data?.detail || e.message || '审批失败')
+    setTimeout(() => { approvalState.value = 'idle' }, 3000)
   } finally {
     approving.value = false
+  }
+}
+
+async function doCancel() {
+  if (cancelling.value) return
+  cancelling.value = true
+  try {
+    await api.cancelTask(taskId)
+    ElMessage.success('任务已取消')
+    await liveStore.refreshTask(taskId)
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || e.message || '取消失败')
+  } finally {
+    cancelling.value = false
   }
 }
 
@@ -500,9 +555,10 @@ function stopPolling() {
   }
 }
 
-watch(needsApproval, (value) => {
-  if (value) return
-  approvalSubmitted.value = false
+watch(needsApproval, (val) => {
+  if (!val && approvalState.value === 'submitted') {
+    approvalState.value = 'idle'
+  }
 })
 
 onMounted(async () => {
@@ -539,21 +595,7 @@ onUnmounted(() => {
 .summary-value.risk { color: var(--accent-yellow); }
 .summary-value.evidence { font-family: var(--font-mono); font-size: 12px; }
 
-.pipeline-card { margin-bottom: 12px; }
-.pipeline-head {
-  margin-bottom: 8px;
-  padding: 0 4px;
-}
-.pipeline-head h3 {
-  font-size: 14px;
-  font-weight: 700;
-  color: var(--text-primary);
-}
-.pipeline-head p {
-  margin-top: 2px;
-  font-size: 12px;
-  color: var(--text-secondary);
-}
+.progress-mermaid { margin-bottom: 12px; }
 .approval-composer { margin-bottom: 12px; }
 .main-card { border-radius: var(--radius-lg) !important; }
 .tab-label { display: inline-flex; align-items: center; gap: 5px; }

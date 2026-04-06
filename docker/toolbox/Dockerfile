@@ -1,6 +1,12 @@
 # ===================================================
 # pentest-toolbox —— 预装所有安全工具的工具箱镜像
 # 构建：docker build -t pentest-toolbox:latest .
+#
+# 扩展工具（不改 Dockerfile 时）：起临时容器 → 安装 → 提交回同一标签
+#   docker run -d --name toolbox_upgrade_tmp pentest-toolbox:latest sleep 3600
+#   docker exec -it toolbox_upgrade_tmp bash   # apt install / go build 等
+#   docker commit toolbox_upgrade_tmp pentest-toolbox:latest && docker rm -f toolbox_upgrade_tmp
+# 项目内示例脚本：docker/toolbox/fix.sh（安装 phuip-fpizdam 后 commit）
 # ===================================================
 FROM kalilinux/kali-rolling:latest
 

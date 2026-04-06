@@ -4,6 +4,7 @@ models.py
 """
 from __future__ import annotations
 
+import os
 import re
 import uuid
 from datetime import datetime
@@ -214,6 +215,28 @@ class PentestState(BaseModel):
 	tool_records: list[CommandExecutionRecord] = Field(default_factory=list)
 	got_shell: bool = False
 	privilege_level: str = ""
+	# 利用阶段首轮全部失败后，是否已执行过二次攻击重试
+	secondary_attack_done: bool = False
+	# 首轮即拿到立足点，未进入二次利用节点（供 UI 标记跳过）
+	secondary_elided: bool = False
+
+	# ── 主机攻链状态（VulnHub / 靶机向）：与 findings 并存，策略以攻链为主 ──
+	# foothold: none | web_rce | shell | ssh | meterpreter
+	foothold_status: str = "none"
+	credential_store: list[dict[str, Any]] = Field(default_factory=list)
+	loot_store: list[dict[str, Any]] = Field(default_factory=list)
+	privesc_hypotheses: list[dict[str, Any]] = Field(default_factory=list)
+	# user_proof / root_proof / report_ready 等
+	objective_status: dict[str, Any] = Field(default_factory=dict)
+	# Agent 给出的结构化「下一步」建议（供编排与前端展示）
+	attack_next_steps: list[dict[str, Any]] = Field(default_factory=list)
+	privesc_attempt_count: int = 0
+	max_privesc_rounds: int = Field(
+		default_factory=lambda: max(1, int(os.getenv("MAX_PRIVESC_ROUNDS", "3")))
+	)
+	chain_summary: str = ""
+	# 实际执行过的攻链阶段（有序），供前端进度条精确展示
+	chain_visited: list[str] = Field(default_factory=list)
 
 	post_findings: dict = Field(default_factory=dict)
 
@@ -222,6 +245,10 @@ class PentestState(BaseModel):
 
 	# 人工审批标志（由 resume() 注入，默认 False）
 	approved: bool = False
+
+	# 用户-代理对话（决策视图交互式对话）
+	user_messages: list[dict] = Field(default_factory=list)
+	agent_replies: list[dict] = Field(default_factory=list)
 
 	def log(self, msg: str) -> None:
 		import logging

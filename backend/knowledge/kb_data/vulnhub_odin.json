@@ -72,6 +72,60 @@
   "requires_callback": true,
   "callback_note": "A reverse shell requires the target to connect back to the attacker's machine. Alternative: Use a web shell for command execution without callback, but this may be less reliable for interactive sessions.",
   "remediation": "1. Use strong, unique passwords and avoid default credentials. 2. Restrict file uploads to safe file types and validate inputs. 3. Implement proper access controls and least privilege principles. 4. Regularly update and patch software. 5. Conduct security audits and penetration testing.",
+  "privesc_steps": [
+    {
+      "step": 1,
+      "description": "在 webshell 或反弹 shell 中确认用户、内核与发行版",
+      "command": "id; uname -a; cat /etc/os-release"
+    },
+    {
+      "step": 2,
+      "description": "检查 sudo 与常见 SUID",
+      "command": "sudo -l 2>/dev/null; find / -perm -4000 -type f 2>/dev/null | head -40"
+    },
+    {
+      "step": 3,
+      "description": "查看计划任务与可写服务单元（若存在 systemd）",
+      "command": "ls -la /etc/cron* 2>/dev/null; ls -la /etc/systemd/system 2>/dev/null | head -30"
+    },
+    {
+      "step": 4,
+      "description": "若已获得 SSH，用本地脚本做快速枚举（可选）",
+      "command": "test -f /tmp/linpeas.sh && bash /tmp/linpeas.sh || echo 'upload enumerators only when authorized'"
+    }
+  ],
+  "path_templates": [
+    {
+      "stage": "surface_enum",
+      "precondition": "HTTP+SSH 开放",
+      "action": "默认/弱口令与管理页、上传点枚举",
+      "success_sign": "登录成功或发现上传接口",
+      "next_stage": "foothold"
+    },
+    {
+      "stage": "foothold",
+      "precondition": "可上传或可执行 Web shell",
+      "action": "上传 webshell 并验证 id/whoami",
+      "success_sign": "命令执行回显",
+      "next_stage": "privesc"
+    },
+    {
+      "stage": "privesc",
+      "precondition": "低权限 Web 用户",
+      "action": "sudo、SUID、内核与定时任务",
+      "success_sign": "root 权限",
+      "next_stage": "objective"
+    }
+  ],
+  "fallbacks": [
+    {
+      "stage": "foothold",
+      "action": "Web 弱口令失败时尝试 SSH 与相同密码复用"
+    }
+  ],
+  "opsec_notes": [
+    "弱口令尝试需控制速率；优先小字典与已知默认组合"
+  ],
   "tags": [
     "vulnhub",
     "weak-credentials",

@@ -16,6 +16,8 @@
   "default_port": 80,
   "common_endpoints": [
     "/",
+    "/antibot_image/",
+    "/antibot_image/antibots/info.php",
     "/admin",
     "/login"
   ],
@@ -55,6 +57,87 @@
   "requires_callback": false,
   "callback_note": "如果漏洞需要反弹shell，可使用nc监听端口，并在命令中执行反向连接",
   "remediation": "1. 使用强密码策略；2. 更新软件到最新版本；3. 限制命令执行功能；4. 定期进行安全审计",
+  "privesc_steps": [
+    {
+      "step": 1,
+      "description": "通过命令执行点确认当前用户与内核版本",
+      "command": "id; uname -a"
+    },
+    {
+      "step": 2,
+      "description": "检查 sudo 与 SUID",
+      "command": "sudo -l 2>/dev/null; find / -perm -4000 -type f 2>/dev/null | head -40"
+    },
+    {
+      "step": 3,
+      "description": "枚举定时任务与启动脚本",
+      "command": "ls -la /etc/cron* 2>/dev/null; ls -la /etc/init.d 2>/dev/null | head -20"
+    },
+    {
+      "step": 4,
+      "description": "查找备份与数据库配置中的凭据线索",
+      "command": "find /var /opt /home -maxdepth 4 -name '*.sql' -o -name '*backup*' 2>/dev/null | head -25"
+    }
+  ],
+  "path_templates": [
+    {
+      "stage": "surface_enum",
+      "precondition": "已发现 HTTP 服务",
+      "action": "目录枚举 gobuster/dirb；关注 /antibot_image/ 目录遍历与 info.php",
+      "success_sign": "可访问 antibots/info.php 或源码注释提示传参",
+      "next_stage": "foothold"
+    },
+    {
+      "stage": "foothold",
+      "precondition": "存在本地文件包含或可控 image 参数",
+      "action": "curl 访问 info.php?image= 尝试包含 /etc/passwd 验证 LFI",
+      "success_sign": "响应中出现 root:x: 等 passwd 内容",
+      "next_stage": "foothold_stable"
+    },
+    {
+      "stage": "foothold_stable",
+      "precondition": "已确认 LFI 且存在 SSH（常见非标准端口如 2211）",
+      "action": "包含 /var/log/auth.log；用 ssh 登录在日志中注入 PHP 一句话（用户名含 <?php ... ?>）",
+      "success_sign": "再次包含 auth.log 时 PHP 代码被执行",
+      "next_stage": "rce"
+    },
+    {
+      "stage": "rce",
+      "precondition": "可通过 LFI+日志投毒执行 PHP",
+      "action": "通过 &cmd= 参数执行命令（注意 URL 编码与语句结束分号）；必要时 php 反弹 shell",
+      "success_sign": "cmd=id 或反弹 shell 成功",
+      "next_stage": "privesc"
+    },
+    {
+      "stage": "privesc",
+      "precondition": "已获得交互或非交互 shell",
+      "action": "uname -a 对照内核；在授权环境下使用已知内核 LPE（如 CVE-2017-6074 类）或配置错误提权",
+      "success_sign": "uid=0 或可读 /root/proof.txt",
+      "next_stage": "objective"
+    },
+    {
+      "stage": "objective",
+      "precondition": "已 root 或可读 root 目录",
+      "action": "读取 /root/proof.txt 等 flag 文件",
+      "success_sign": "获得 proof/flag 内容",
+      "next_stage": "report"
+    }
+  ],
+  "fallbacks": [
+    {
+      "stage": "foothold",
+      "action": "若无 auth.log 投毒条件，改用其他可写日志或可包含的 session 文件路径"
+    },
+    {
+      "stage": "rce",
+      "action": "反弹 shell 失败时检查 payload 是否缺少结束分号、端口与 LHOST 是否可达"
+    }
+  ],
+  "opsec_notes": [
+    "优先轻量目录枚举再扩大扫描面，避免对小型靶机无意义噪音",
+    "日志投毒与内核利用仅适用于授权靶场；生产环境禁止",
+    "参考公开 walkthrough 对齐 Tomato 真实路径与非标准 SSH 端口"
+  ],
   "tags": [
     "VulnHub",
     "boot2root",

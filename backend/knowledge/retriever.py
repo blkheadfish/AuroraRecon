@@ -247,6 +247,37 @@ class KnowledgeRetriever:
         if entry.verification_success_sign:
             lines.append(f"**成功标志:** {entry.verification_success_sign}")
 
+        raw = entry.raw_json or {}
+        pt = raw.get("path_templates") or []
+        if pt:
+            lines.append("\n**主机攻链模板（按阶段推进，勿停在单点）:**")
+            for i, t in enumerate(pt[:15], 1):
+                if not isinstance(t, dict):
+                    continue
+                st = t.get("stage", "")
+                pre = t.get("precondition", "")
+                act = (t.get("action", "") or "").replace("{TARGET}", target_placeholder)
+                sig = t.get("success_sign", "")
+                nx = t.get("next_stage", "")
+                lines.append(f"\n  {i}. [{st}] {act}")
+                if pre:
+                    lines.append(f"      前置: {pre}")
+                if sig:
+                    lines.append(f"      成功迹象: {sig}")
+                if nx:
+                    lines.append(f"      下一阶段: {nx}")
+        fb = raw.get("fallbacks") or []
+        if fb:
+            lines.append("\n**阶段失败备选:**")
+            for t in fb[:12]:
+                if isinstance(t, dict):
+                    lines.append(f"  - [{t.get('stage', '')}] {t.get('action', '')}")
+        on = raw.get("opsec_notes") or []
+        if on:
+            lines.append("\n**OpSec / 稳定性:**")
+            for note in on:
+                lines.append(f"  - {note}")
+
         return "\n".join(lines)
 
     def _fallback(self, vuln_name: str, cve: str) -> str:

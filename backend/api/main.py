@@ -39,6 +39,7 @@ _tasks: dict[str, PentestState] = {}
 _ws_connections: dict[str, list[WebSocket]] = {}
 _running_tasks: set[str] = set()
 _approval_inflight: set[str] = set()
+_tool_registry_cache = None
 
 # ── 基础设施可用性 ────────────────────────────────────────
 _db_available = False
@@ -55,6 +56,18 @@ def get_orchestrator() -> Orchestrator:
     if _orchestrator is None:
         _orchestrator = Orchestrator()
     return _orchestrator
+
+
+def _get_tool_registry():
+    """
+    进程内复用 ToolRegistry，避免 metrics 轮询时反复加载 definitions 并刷日志。
+    """
+    global _tool_registry_cache
+    if _tool_registry_cache is None:
+        from backend.tools.tool_registry import ToolRegistry
+
+        _tool_registry_cache = ToolRegistry()
+    return _tool_registry_cache
 
 
 # ── 生命周期 ──────────────────────────────────────────────
@@ -240,6 +253,7 @@ class TaskStats(BaseModel):
     failed: int = 0
     pending: int = 0
     shells_obtained: int = 0
+    root_reached: int = 0
     total_findings: int = 0
 
 
@@ -276,6 +290,11 @@ def _parse_iso_ts(raw: str | None) -> datetime | None:
 
 
 def _build_system_overview(tasks: list[PentestState]) -> dict:
+    def _is_root_priv(s: PentestState) -> bool:
+        return (s.privilege_level or "").lower() == "root" or bool(
+            (s.objective_status or {}).get("root_reached")
+        )
+
     return {
         "api_status": "ok",
         "database": "connected" if _db_available else "unavailable",
@@ -287,14 +306,17 @@ def _build_system_overview(tasks: list[PentestState]) -> dict:
         "completed_tasks": sum(1 for t in tasks if t.status == TaskStatus.COMPLETED),
         "failed_tasks": sum(1 for t in tasks if t.status == TaskStatus.FAILED),
         "active_task_ids": len(_running_tasks),
+        "shells_obtained_tasks": sum(1 for t in tasks if t.got_shell),
+        "root_reached_tasks": sum(1 for t in tasks if _is_root_priv(t)),
+        "mean_privesc_rounds": round(
+            sum(t.privesc_attempt_count for t in tasks) / len(tasks), 2
+        ) if tasks else 0.0,
     }
 
 
 def _build_tool_overview() -> dict:
     try:
-        from backend.tools.tool_registry import ToolRegistry
-
-        registry = ToolRegistry()
+        registry = _get_tool_registry()
         by_executor: dict[str, int] = defaultdict(int)
         tools = []
         for td in registry.list_all():
@@ -465,6 +487,11 @@ async def get_stats():
         failed=sum(1 for t in tasks_list if t.status == TaskStatus.FAILED),
         pending=sum(1 for t in tasks_list if t.status == TaskStatus.PENDING),
         shells_obtained=sum(1 for t in tasks_list if t.got_shell),
+        root_reached=sum(
+            1 for t in tasks_list
+            if (t.privilege_level or "").lower() == "root"
+            or (t.objective_status or {}).get("root_reached")
+        ),
         total_findings=sum(len(t.findings) for t in tasks_list),
     )
 
@@ -737,11 +764,7 @@ async def _run_task(
 
             await _broadcast(task_id, {
                 "type": "phase_update",
-                "phase": state.current_phase,
-                "status": state.status.value,
-                "logs": state.phase_log[-5:],
-                "findings_count": len(state.findings),
-                "got_shell": state.got_shell,
+                **_ws_phase_payload(state, log_tail=5),
             })
 
     except Exception as e:
@@ -874,6 +897,15 @@ def _build_decision_events(state: PentestState) -> list[dict]:
         if "审批" in msg or "授权" in msg:
             action = "approval"
             tone = "warning"
+
+        _THOUGHT_RE = re.compile(
+            r"LLM|分析|决策|策略|推理|建议|主动发现|KB|知识库|扫描策略|优先级|"
+            r"Skill 引擎|ReAct|模型",
+            re.IGNORECASE,
+        )
+        if action == "log" and _THOUGHT_RE.search(msg):
+            action = "thought"
+            tone = "primary"
 
         events.append({
             "id": f"log-{idx}",
@@ -1048,8 +1080,37 @@ def _to_detail(state: PentestState) -> dict:
         "report_md": state.report_md,
         "phase_log": state.phase_log,
         "fingerprints": state.fingerprints,
+        "foothold_status": state.foothold_status,
+        "credential_store": state.credential_store,
+        "loot_store": state.loot_store,
+        "privesc_hypotheses": state.privesc_hypotheses,
+        "objective_status": state.objective_status,
+        "attack_next_steps": state.attack_next_steps,
+        "privesc_attempt_count": state.privesc_attempt_count,
+        "max_privesc_rounds": state.max_privesc_rounds,
+        "chain_summary": state.chain_summary,
+        "chain_visited": state.chain_visited,
+        "secondary_elided": state.secondary_elided,
     })
     return base
+
+
+def _ws_phase_payload(state: PentestState, log_tail: int = 5) -> dict:
+    """WebSocket phase_update 附加攻链字段，供决策页/详情实时展示。"""
+    tail = max(1, min(log_tail, 50))
+    return {
+        "phase": state.current_phase,
+        "status": state.status.value,
+        "logs": state.phase_log[-tail:],
+        "findings_count": len(state.findings),
+        "got_shell": state.got_shell,
+        "privilege_level": state.privilege_level,
+        "foothold_status": state.foothold_status,
+        "chain_visited": state.chain_visited,
+        "secondary_elided": state.secondary_elided,
+        "attack_next_steps": state.attack_next_steps,
+        "privesc_attempt_count": state.privesc_attempt_count,
+    }
 
 
 # ── 设置持久化 ────────────────────────────────────────────
@@ -1144,7 +1205,7 @@ async def approve_task(task_id: str, req: ApproveRequest):
         )
 
     # 立即切换阶段，防止重复提交（乐观锁）
-    state.current_phase = "exploit" if req.approved else "report"
+    state.current_phase = "foothold_attempt" if req.approved else "report"
     state.log(f"[审批] {'已授权，继续利用' if req.approved else '已拒绝，跳过利用'}")
     _tasks[task_id] = state
 
@@ -1155,12 +1216,9 @@ async def approve_task(task_id: str, req: ApproveRequest):
     asyncio.create_task(_resume_task(task_id, req.approved))
 
     await _broadcast(task_id, {
-        "type":           "phase_update",
-        "phase":          state.current_phase,
-        "status":         "running",
-        "logs":           state.phase_log[-3:],
-        "findings_count": len(state.findings),
-        "got_shell":      state.got_shell,
+        "type": "phase_update",
+        **_ws_phase_payload(state, log_tail=3),
+        "status": "running",
     })
     return {"status": "ok", "approved": req.approved}
 
@@ -1170,7 +1228,7 @@ async def _resume_task(task_id: str, approved: bool):
     审批后的流式恢复执行。
 
     与 _run_task 共享同一套状态更新 + 广播逻辑，
-    确保 exploit → post_exploit → report 阶段的状态变化
+    确保 foothold → 枚举/提权/目标收集 → report 阶段的状态变化
     能实时推送到前端。
     """
     _running_tasks.add(task_id)
@@ -1214,11 +1272,7 @@ async def _resume_task(task_id: str, approved: bool):
 
             await _broadcast(task_id, {
                 "type": "phase_update",
-                "phase": state.current_phase,
-                "status": state.status.value,
-                "logs": state.phase_log[-5:],
-                "findings_count": len(state.findings),
-                "got_shell": state.got_shell,
+                **_ws_phase_payload(state, log_tail=5),
             })
 
     except Exception as e:
@@ -1420,6 +1474,123 @@ async def update_skill_raw(skill_id: str, req: SkillRawUpdateRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Knowledge Base 管理 ────────────────────────────────────
+@app.get("/knowledge/entries")
+@app.get("/api/knowledge/entries")
+async def list_knowledge_entries():
+    """列出所有知识库条目（按 category 分组）"""
+    from backend.knowledge.exploit_kb import ExploitKB
+    kb = ExploitKB()
+    entries = []
+    for entry in kb.list_all():
+        entries.append({
+            "vuln_id": entry.vuln_id,
+            "description": entry.description[:120] if entry.description else "",
+            "category": entry.category,
+            "cves": entry.match_cves,
+            "tags": entry.tags,
+            "default_port": entry.default_port,
+        })
+    entries.sort(key=lambda e: (e["category"], e["vuln_id"]))
+    return {"entries": entries, "total": len(entries)}
+
+
+@app.get("/knowledge/{vuln_id}/raw")
+@app.get("/api/knowledge/{vuln_id}/raw")
+async def get_knowledge_raw(vuln_id: str):
+    """获取知识条目原始 JSON"""
+    import json as _json
+    from pathlib import Path
+    kb_dir = Path(__file__).parent.parent / "knowledge" / "kb_data"
+    target = kb_dir / f"{vuln_id}.json"
+    if not target.exists() or not str(target.resolve()).startswith(str(kb_dir.resolve())):
+        raise HTTPException(404, f"知识条目 {vuln_id} 不存在")
+    raw = target.read_text(encoding="utf-8")
+    return {"vuln_id": vuln_id, "source": str(target.name), "json": raw}
+
+
+class KnowledgeRawRequest(BaseModel):
+    json_content: str
+
+@app.put("/knowledge/{vuln_id}/raw")
+@app.put("/api/knowledge/{vuln_id}/raw")
+async def save_knowledge_raw(vuln_id: str, req: KnowledgeRawRequest):
+    """保存知识条目 JSON"""
+    import json as _json
+    from pathlib import Path
+    kb_dir = Path(__file__).parent.parent / "knowledge" / "kb_data"
+    target = kb_dir / f"{vuln_id}.json"
+    if not str(target.resolve()).startswith(str(kb_dir.resolve())):
+        raise HTTPException(400, "非法路径")
+    try:
+        parsed = _json.loads(req.json_content)
+    except _json.JSONDecodeError as e:
+        raise HTTPException(400, f"JSON 解析失败: {e}")
+    if parsed.get("vuln_id") != vuln_id:
+        raise HTTPException(400, f"vuln_id 不匹配: 期望 {vuln_id}")
+    target.write_text(_json.dumps(parsed, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"status": "saved", "vuln_id": vuln_id}
+
+
+@app.post("/knowledge/reload")
+@app.post("/api/knowledge/reload")
+async def reload_knowledge():
+    """重载知识库"""
+    from backend.knowledge.exploit_kb import ExploitKB
+    kb = ExploitKB()
+    return {"status": "reloaded", "total": kb.size}
+
+
+# ── 用户-代理对话接口 ──────────────────────────────────────
+
+class ChatMessageRequest(BaseModel):
+    text: str
+
+
+@app.post("/tasks/{task_id}/chat")
+@app.post("/api/tasks/{task_id}/chat")
+async def send_chat_message(task_id: str, req: ChatMessageRequest):
+    """用户向任务代理发送消息"""
+    state = _tasks.get(task_id)
+    if not state:
+        raise HTTPException(404, f"任务 {task_id} 不存在")
+    msg = {
+        "role": "user",
+        "text": req.text.strip(),
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+    state.user_messages.append(msg)
+    _tasks[task_id] = state
+    await _broadcast(task_id, {
+        "type": "decision_event",
+        "data": {
+            "id": f"chat-user-{len(state.user_messages)}",
+            "timestamp": msg["timestamp"],
+            "phase": state.current_phase,
+            "action": "user_chat",
+            "message": msg["text"],
+            "tone": "primary",
+        },
+    })
+    return {"status": "sent", "message": msg}
+
+
+@app.get("/tasks/{task_id}/chat")
+@app.get("/api/tasks/{task_id}/chat")
+async def get_chat_history(task_id: str):
+    """获取任务的用户-代理对话历史"""
+    state = _tasks.get(task_id)
+    if not state:
+        raise HTTPException(404, f"任务 {task_id} 不存在")
+    timeline = []
+    for m in state.user_messages:
+        timeline.append({**m, "role": "user"})
+    for m in state.agent_replies:
+        timeline.append({**m, "role": "agent"})
+    timeline.sort(key=lambda x: x.get("timestamp", ""))
+    return {"messages": timeline}
 
 
 # ── 团队协作预留接口（阶段二实现）────────────────────────

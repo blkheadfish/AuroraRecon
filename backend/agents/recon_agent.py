@@ -175,7 +175,6 @@ class ReconAgent:
 		task_id: Optional[str],
 		log_callback: LogCallback = None,
 	) -> tuple[list[str], str]:
-		# 目标对不存在路径返回 302 时，--wildcard 强制继续扫描
 		# -b 排除 302/301/404 避免通配符误报
 		# 注意：gobuster 找到路径时 exit_code=1，不能只看 success
 		result: ExecuteResult = await self.executor.run(
@@ -187,7 +186,6 @@ class ReconAgent:
 				"-t", "30",
 				"-q",
 				"--no-error",
-				"--wildcard",
 				"-b", "302,301,404",
 			],
 			timeout=120,
