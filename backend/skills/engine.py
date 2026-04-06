@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from datetime import datetime
 from typing import Any, Optional
@@ -34,7 +35,7 @@ from backend.skills.models import (
     SkillContext,
     StepOutcome,
 )
-from backend.tools.executor import ExecuteResult, ToolExecutor
+from backend.tools.executor import ExecuteResult, TaskContainerManager, ToolExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -302,6 +303,15 @@ class SkillEngine:
             # 日志：命令摘要
             cmd_preview = " ".join(command.split())[:500]
             logger.info(f"[SkillEngine]      命令: {cmd_preview}...")
+            if step.publish_ports:
+                container_name = TaskContainerManager.get_container(ctx.task_id) if ctx.task_id else None
+                logger.info(
+                    "[SkillEngine]      运行上下文: "
+                    f"task_id={ctx.task_id or '-'}, "
+                    f"container={container_name or 'none'}, "
+                    f"lhost={os.getenv('LHOST', '') or '-'}, "
+                    f"publish_ports={step.publish_ports}"
+                )
 
             exec_result = await self.executor.run_script(
                 script_content=command,

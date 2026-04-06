@@ -374,12 +374,19 @@ class ToolExecutor:
             "--network", TOOLBOX_NETWORK,   # host 模式：工具用宿主机 IP 出去
             "-w", workdir,
             "-v", f"{DATA_VOLUME}:/data",
+            "-v", f"{REPORTS_DIR}:/reports",
             "--privileged",
         ]
         # 端口映射（用于反连回调，如 Shiro 利用）
         if publish_ports:
-            for port in publish_ports:
-                docker_cmd.extend(["-p", f"{port}:{port}"])
+            # host 网络模式下 -p 会被 Docker 忽略并打印 warning，直接跳过映射参数。
+            if TOOLBOX_NETWORK == "host":
+                logger.info(
+                    f"[Executor] TOOLBOX_NETWORK=host，跳过 publish_ports={publish_ports} 的 -p 参数"
+                )
+            else:
+                for port in publish_ports:
+                    docker_cmd.extend(["-p", f"{port}:{port}"])
         lhost = os.getenv("LHOST", "")
         if lhost:
             docker_cmd.extend(["-e", f"LHOST={lhost}"])

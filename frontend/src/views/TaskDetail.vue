@@ -1,9 +1,9 @@
 <template>
   <div class="page-wrap" v-loading="loading" element-loading-background="rgba(13,17,23,0.9)">
     <div class="detail-header">
-      <el-button link @click="router.back()" class="back-btn">
+      <el-button link @click="router.push('/tasks')" class="back-btn">
         <el-icon><ArrowLeft /></el-icon>
-        返回
+        返回列表
       </el-button>
 
       <div class="title-line">
