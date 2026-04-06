@@ -1,0 +1,59 @@
+# ============================================
+# Web 应用测试工具
+# ============================================
+
+- name: feroxbuster
+  executor: container
+  command: "feroxbuster"
+  category: recon
+  timeout: 300
+  description: "快速递归目录扫描"
+
+- name: wfuzz
+  executor: container
+  command: "wfuzz"
+  category: recon
+  timeout: 120
+  description: "Web 应用模糊测试"
+
+- name: dirsearch
+  executor: container
+  command: "dirsearch"
+  category: recon
+  timeout: 180
+  description: "Web 目录/文件扫描"
+
+- name: dirmap
+  executor: container
+  command: "dirmap"
+  category: recon
+  timeout: 120
+  description: "Python 目录扫描"
+
+- name: wapiti
+  executor: container
+  command: "wapiti"
+  category: vuln_scan
+  timeout: 300
+  description: "Web 漏洞扫描器"
+
+- name: dalfox
+  executor: container
+  command: "dalfox"
+  category: vuln_scan
+  timeout: 120
+  description: "XSS 自动化检测"
+
+- name: katana
+  executor: container
+  command: "katana"
+  category: recon
+  timeout: 120
+  description: "爬虫驱动的 URL 发现"
+
+- name: gau
+  executor: container
+  command: "gau"
+  category: recon
+  timeout: 60
+  description: "URL 聚合工具(Wayback/OTX/CC)"

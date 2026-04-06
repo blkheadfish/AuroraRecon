@@ -72,3 +72,52 @@
   category: recon
   timeout: 30
   description: "SSL/TLS 扫描"
+
+- name: rustscan
+  executor: container
+  command: "rustscan"
+  category: recon
+  timeout: 120
+  description: "超快端口扫描器（自动调用 nmap 深扫）"
+
+- name: amass
+  executor: container
+  command: "amass"
+  category: recon
+  timeout: 300
+  description: "攻击面发现与子域名枚举"
+
+- name: nbtscan
+  executor: container
+  command: "nbtscan"
+  category: recon
+  timeout: 30
+  description: "NetBIOS 名称扫描"
+
+- name: arp-scan
+  executor: container
+  command: "arp-scan"
+  category: recon
+  timeout: 30
+  description: "局域网主机发现（ARP）"
+
+- name: naabu
+  executor: container
+  command: "naabu"
+  category: recon
+  timeout: 120
+  description: "快速端口扫描（ProjectDiscovery）"
+
+- name: dnsx
+  executor: container
+  command: "dnsx"
+  category: recon
+  timeout: 60
+  description: "高速 DNS 解析与枚举"
+
+- name: uncover
+  executor: container
+  command: "uncover"
+  category: recon
+  timeout: 60
+  description: "多引擎资产发现（Shodan/Fofa/Hunter）"

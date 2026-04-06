@@ -75,3 +75,31 @@
   category: general
   timeout: 30
   description: "TCP/IP 数据包组装工具"
+
+- name: ncat
+  executor: container
+  command: "ncat"
+  category: general
+  timeout: 30
+  description: "Nmap 版 netcat，支持 SSL/代理"
+
+- name: rlwrap
+  executor: container
+  command: "rlwrap"
+  category: general
+  timeout: 30
+  description: "为交互式 shell 补充 readline 历史/补全"
+
+- name: tmux
+  executor: container
+  command: "tmux"
+  category: general
+  timeout: 30
+  description: "终端复用器，用于保持会话"
+
+- name: proxychains4
+  executor: container
+  command: "proxychains4"
+  category: general
+  timeout: 60
+  description: "代理链工具，流量转发过 SOCKS/HTTP 代理"

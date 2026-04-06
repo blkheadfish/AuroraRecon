@@ -1,75 +1,109 @@
-# PentestAI v2.0 —— AI 驱动的自动化渗透测试平台
+# AuroraRecon (PentestAI v2)
 
-基于 LangGraph 编排的多 Agent 渗透测试系统，集成 30+ 安全工具，支持从侦察到报告的全自动化流程。
+面向 **CTF/授权靶场/授权红蓝对抗** 的 AI 渗透测试工作台。  
+项目核心是基于 LangGraph 的攻链编排，配合 Docker 工具沙箱、Skill 引擎、知识库检索与人工审批，实现从侦察到报告的闭环。
 
-## 系统架构
+## 1) 架构总览
 
-```
-┌──────────────────────────────────────────────────────────┐
-│            Web 前端（Vue 3 + TypeScript）                 │
-│         任务配置 · 实时日志流 · 报告预览                    │
-└──────────────────────┬───────────────────────────────────┘
-                       │
-┌──────────────────────▼───────────────────────────────────┐
-│              API 网关（FastAPI）                           │
-│         WebSocket 推送 · REST · 任务队列                   │
-└──────────────────────┬───────────────────────────────────┘
-                       │
-┌──────────────────────▼───────────────────────────────────┐
-│           主编排 Agent（LangGraph）                        │
-│      任务规划 · 阶段调度 · 上下文管理 · 异常处理             │
-└────┬─────────┬──────────┬──────────┬─────────────────────┘
-     │         │          │          │
- ┌───▼──┐  ┌──▼───┐  ┌──▼───┐  ┌──▼────┐
- │ 侦察  │  │ 漏洞  │  │ 利用  │  │ 后渗透 │
- │Agent │  │Agent │  │Agent │  │ Agent │
- └───┬──┘  └──┬───┘  └──┬───┘  └──┬────┘
-     └─────────┴─────────┴─────────┘
-                    │  工具调用
-     ┌──────────────▼──────────────────────────────────────┐
-     │        工具执行沙箱（Docker 隔离）                     │
-     │  Nmap · Masscan · SQLMap · Hydra · Nikto · Nuclei   │
-     │  Gobuster · Metasploit · John · Hashcat · ...       │
-     └──────────┬─────────────────────┬────────────────────┘
-                │                     │
-     ┌──────────▼──────┐   ┌─────────▼─────────┐
-     │    大模型层      │   │   数据持久层        │
-     │ DeepSeek/GPT/   │   │ PostgreSQL · Redis │
-     │ Claude          │   │ · MinIO            │
-     └────────┬────────┘   └───────────────────┘
-              │
-     ┌────────▼────────┐
-     │   报告生成引擎    │
-     │ Markdown · PDF   │
-     └─────────────────┘
+```text
+Vue 3 Frontend
+  ├─ 任务中心 / 决策视图 / 报告中心 / 工具管理 / Skill管理 / 知识库管理
+  └─ WebSocket 实时事件流（日志、命令执行、审批状态）
+             │
+             ▼
+FastAPI API Gateway
+  ├─ 任务与审批 API
+  ├─ Metrics API
+  ├─ Skill/Knowledge/Profile/Settings API
+  └─ Chat API（用户与任务代理对话）
+             │
+             ▼
+LangGraph Orchestrator
+  recon → vuln_scan → surface_enum → exploit_decision
+      → awaiting_approval → foothold_attempt → secondary_attack
+      → post_foothold_enum → privesc_attempt → objective_collect → report
+             │
+             ▼
+Tool Executor + Registry
+  ├─ container-exec（任务持久容器）
+  ├─ container-run（临时容器）
+  └─ remote（阶段二预留）
+             │
+             ▼
+Toolbox / MSF / LLM / Storage
+  ├─ pentest-toolbox (Kali tools)
+  ├─ Metasploit RPC
+  ├─ DeepSeek/OpenAI/Anthropic
+  └─ PostgreSQL + Redis + MinIO
 ```
 
-## 核心特性
+## 2) 核心特性
 
-- **多 Agent 协同**：侦察、漏洞扫描、利用、后渗透 4 个专业 Agent，由 LangGraph 编排
-- **LLM 智能决策**：大模型分析漏洞优先级、制定利用策略、解读工具输出
-- **Docker 沙箱**：所有工具在隔离容器中执行，安全可控
-- **实时监控**：WebSocket 推送日志和状态，前端实时展示
-- **数据持久化**：PostgreSQL 存储任务、Redis 缓存状态、MinIO 归档报告
-- **自动报告**：自动生成包含修复建议的 Markdown 渗透测试报告
+- **攻链优先编排**：流程不止“扫洞”，而是围绕立足点、提权与目标收集推进完整攻链。
+- **人工审批断点续跑**：在利用前强制进入 `awaiting_approval`，批准后无缝 `resume`。
+- **任务级容器隔离**：每个任务可复用独立 toolbox 容器，兼顾状态保留与并发隔离。
+- **结构化执行可观测**：命令、耗时、退出码、stdout/stderr 全链路入库并在前端可视化。
+- **Skill 引擎 + ReAct 兜底**：先走确定性利用路径，失败后进入 LLM 自由推理补偿。
+- **知识库混合检索**：关键词 + 语义向量（可降级），为利用决策提供上下文知识。
+- **报告中心在线编辑**：任务报告支持 Markdown 编辑与预览，便于二次修订输出。
 
-## 快速部署
+## 3) 功能模块
 
-### 1. 克隆项目
+### 后端能力
 
-```bash
-git clone <repo-url> pentestai
-cd pentestai
-```
+- 任务生命周期：创建、执行、取消、删除、恢复、统计。
+- 实时推送：`/ws/{task_id}` 推送日志、决策事件、审批状态、完成态。
+- 指标总览：`/metrics/overview` 输出系统状态、工具分布、调用成功率等。
+- 配置管理：LLM、执行器、流程策略可通过 API 动态配置。
+- Skill/Knowledge 管理：支持在线读取、编辑、重载 YAML/JSON。
+- 持久化策略：优先 PostgreSQL/Redis/MinIO，不可用时自动降级到内存/本地。
 
-### 2. 配置环境变量
+### 前端能力
 
-```bash
-cp .env.example docker/.env
-vim docker/.env   # 修改 LLM_API_KEY、LHOST 等必要配置
-```
+- `StartPage`：启动页 + 系统简报（调用 metrics 聚合看板）。
+- `Dashboard`：系统、工具、调用分布与成功率可视化。
+- `TaskList`：筛选/批量操作/任务创建（含策略提示）。
+- `TaskDetail`：Mermaid 进度、审批卡片、决策时间线、实时日志、原始数据。
+- `DecisionView`：专注决策流 + 用户消息干预代理行为。
+- `ReportCenter`：报告在线编辑与预览。
+- `ToolsManage` / `SkillsManage` / `KnowledgeManage`：运营与知识维护界面。
+- `Settings` / `Profile`：系统配置、LLM 测试、用户资料管理。
 
-### 3. 构建工具箱镜像
+## 4) 支持工具（当前注册）
+
+> 工具由 `backend/tools/definitions/*.yaml` 注册，可按 YAML 扩展。
+
+### Recon
+`nmap`, `masscan`, `gobuster`, `ffuf`, `subfinder`, `whatweb`, `httpx`, `wafw00f`, `dirb`, `sslscan`
+
+### Vuln Scan
+`nuclei`, `nikto`, `sqlmap`, `wpscan`
+
+### Exploit
+`jndi_fastjson`, `bcel_fastjson`, `hydra`, `medusa`, `john`, `hashcat`
+
+### General / Post Exploit
+`curl`, `wget`, `python3`, `java`, `socat`, `nc`, `enum4linux`, `smbclient`, `tcpdump`, `hping3`
+
+此外，toolbox 镜像内还预装了 `metasploit-framework`、`tshark`、`dnsrecon`、`arjun`、`paramspider` 等，可按需接入注册表。
+
+## 5) 技术栈
+
+- **Backend**: FastAPI, LangGraph, LangChain, SQLAlchemy Async, Redis, MinIO
+- **Frontend**: Vue 3, Vite, Pinia, Element Plus, Axios
+- **Runtime**: Docker, Docker Compose
+- **LLM Router**: DeepSeek / OpenAI / Anthropic（OpenAI-compatible 接口）
+
+## 6) 快速启动
+
+### 环境要求
+
+- Python `>= 3.11`
+- Node.js `>= 18`
+- Docker / Docker Compose
+- 可用的 LLM API Key
+
+### Step 1. 构建工具箱镜像
 
 ```bash
 cd docker/toolbox
@@ -77,123 +111,122 @@ docker build -t pentest-toolbox:latest .
 cd ../..
 ```
 
-### 4. 启动全部服务
+### Step 2. 配置环境变量
+
+Linux/macOS:
+
+```bash
+cp .env.example docker/.env
+```
+
+Windows (PowerShell):
+
+```powershell
+Copy-Item .env.example docker/.env
+```
+
+至少修改 `docker/.env` 中的以下值：
+
+- `LLM_API_KEY`
+- `LHOST`（反弹连接地址）
+- `POSTGRES_PASSWORD` / `MSF_PASSWORD`（建议改默认）
+
+### Step 3. 启动后端服务栈
 
 ```bash
 cd docker
 docker compose up -d
 ```
 
-### 5. 访问
+默认会启动：`api`、`postgres`、`redis`、`minio`、`msf`。  
+前端服务在 compose 中默认注释，建议开发时本地运行。
 
-- **前端**: http://localhost:3000
-- **API**: http://localhost:8000
-- **API 文档**: http://localhost:8000/docs
-- **MinIO 控制台**: http://localhost:9001
+### Step 4. 启动前端
 
-## 开发模式
+```bash
+cd frontend
+npm install
+npm run dev
+```
 
-### 后端（API）
+默认访问：
+
+- Frontend: [http://localhost:3000](http://localhost:3000)
+- API Docs: [http://localhost:8000/docs](http://localhost:8000/docs)
+- Health: [http://localhost:8000/health](http://localhost:8000/health)
+- MinIO Console: [http://localhost:9001](http://localhost:9001)
+
+## 7) 本地开发（不走 API 容器）
+
+后端：
 
 ```bash
 pip install -r requirements.txt
 uvicorn backend.api.main:app --reload --port 8000
 ```
 
-### 前端
+前端：
 
 ```bash
+cd frontend
 npm install
-npm run dev    # http://localhost:5173
+npm run dev
 ```
 
-前端开发服务器自动将 `/api` 代理到 `localhost:8000`。
+`vite` 已将 `/api` 与 `/ws` 代理到 `http://localhost:8000`。
 
-## 服务组件
+## 8) 关键 API（节选）
 
-| 服务 | 端口 | 说明 |
-|------|------|------|
-| Frontend | 3000 | Vue 3 SPA（Nginx） |
-| API | 8000 | FastAPI + WebSocket |
-| PostgreSQL | 5432（内网） | 任务持久化存储 |
-| Redis | 6379（内网） | 状态缓存 / 任务队列 |
-| MinIO | 9000/9001 | 报告对象存储 |
-| MSF RPC | 55553（内网） | Metasploit 服务 |
-| Toolbox | 临时容器 | 安全工具沙箱 |
+### 任务与执行
 
-## API 端点
+- `POST /tasks`
+- `GET /tasks`
+- `GET /tasks/{task_id}`
+- `POST /tasks/{task_id}/cancel`
+- `POST /tasks/{task_id}/approve`
+- `WS /ws/{task_id}`
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | /health | 健康检查（含数据库/Redis 状态） |
-| POST | /tasks | 创建渗透测试任务 |
-| GET | /tasks | 列出所有任务 |
-| GET | /tasks/stats | 全局统计信息 |
-| GET | /tasks/{id} | 任务详情（含完整扫描数据） |
-| GET | /tasks/{id}/logs | 任务日志 |
-| GET | /tasks/{id}/report | 下载报告 |
-| POST | /tasks/{id}/cancel | 取消运行中任务 |
-| DELETE | /tasks/{id} | 删除任务记录 |
-| WS | /ws/{id} | 实时日志推送 |
+### 指标与系统
 
-## 支持的 LLM
+- `GET /health`
+- `GET /metrics/overview`
 
-通过环境变量 `LLM_PROVIDER` 切换：
+### Skill / Knowledge
 
-| Provider | 模型 | BASE_URL |
-|----------|------|----------|
-| deepseek | deepseek-chat | https://api.deepseek.com |
-| openai | gpt-4o | https://api.openai.com/v1 |
-| anthropic | claude-sonnet-4-6 | https://api.anthropic.com/v1 |
+- `GET /skills`
+- `PUT /skills/{skill_id}/raw`
+- `GET /knowledge/entries`
+- `PUT /knowledge/{vuln_id}/raw`
 
-## 项目结构
+## 9) 项目结构（精简）
 
-```
-├── backend/
-│   ├── agents/
-│   │   ├── models.py          # 共享数据模型（PentestState 等）
-│   │   ├── orchestrator.py    # LangGraph 主编排
-│   │   ├── recon_agent.py     # 侦察 Agent
-│   │   ├── vuln_agent.py      # 漏洞扫描 Agent
-│   │   ├── exploit_agent.py   # 利用 Agent
-│   │   └── post_agent.py      # 后渗透 Agent
-│   ├── api/
-│   │   └── main.py            # FastAPI 应用入口
-│   ├── db/
-│   │   ├── database.py        # PostgreSQL 持久层
-│   │   └── redis_cache.py     # Redis 缓存层
-│   ├── storage/
-│   │   └── minio_client.py    # MinIO 对象存储
-│   ├── llm/
-│   │   ├── router.py          # LLM 统一路由
-│   │   └── prompts/
-│   │       └── templates.py   # Prompt 模板
-│   ├── report/
-│   │   └── generator.py       # 报告生成器
-│   └── tools/
-│       ├── executor.py        # Docker 工具执行器
-│       ├── msf_client.py      # Metasploit RPC 客户端
-│       └── parsers/           # 工具输出解析器
-├── src/                       # Vue 3 前端
-│   ├── views/
-│   │   ├── Dashboard.vue      # 仪表盘
-│   │   ├── TaskList.vue       # 任务列表
-│   │   ├── TaskDetail.vue     # 任务详情
-│   │   └── Settings.vue       # 系统设置
-│   ├── components/            # UI 组件
-│   ├── stores/                # Pinia 状态管理
-│   └── api/                   # API 客户端
-├── docker/
-│   ├── docker-compose.yml     # 完整服务编排
-│   ├── api/Dockerfile         # API 服务镜像
-│   ├── frontend/              # 前端镜像 + Nginx
-│   └── toolbox/Dockerfile     # 安全工具箱镜像
-└── requirements.txt           # Python 依赖
+```text
+backend/
+  agents/         # 编排器与各阶段 Agent
+  api/            # FastAPI 入口与全部路由
+  tools/          # 执行器、注册表、工具定义 YAML
+  skills/         # Skill 模型、加载、匹配、执行引擎
+  knowledge/      # 知识库与检索器
+  report/         # Markdown 报告生成
+  db/             # PostgreSQL / Redis 持久化
+  storage/        # MinIO 客户端
+
+frontend/src/
+  views/          # 页面（任务、决策、报告、工具、技能、知识等）
+  components/     # 可视化与编辑组件
+  stores/         # Pinia 状态管理
+  api/            # Axios API 封装
+
+docker/
+  docker-compose.yml
+  api/
+  toolbox/
 ```
 
-## 安全声明
+## 10) 合规声明
 
-本工具仅供合法授权的安全测试使用（CTF 靶场、授权渗透测试）。使用者须遵守相关法律法规，未经授权对他人系统进行渗透测试属违法行为。
+本项目仅用于 **合法授权** 的安全测试场景（CTF、内网演练、授权渗透测试）。  
+禁止在未获授权的目标上使用本系统，使用者需自行承担合规责任。
 
 ## License
 

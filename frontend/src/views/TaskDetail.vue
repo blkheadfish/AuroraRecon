@@ -376,13 +376,6 @@ function buildExecPayloads(command, stdout, stderr, meta = {}) {
     language: inferPayloadLang(command || ''),
     code: command || '(empty command)',
   }]
-  if (runtimeCommand && runtimeCommand !== String(command || '').trim()) {
-    blocks.push({
-      title: 'Backend Command',
-      language: 'bash',
-      code: runtimeCommand,
-    })
-  }
   if (stdout) {
     blocks.push({
       title: 'Stdout',

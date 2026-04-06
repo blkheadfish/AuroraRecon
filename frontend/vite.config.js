@@ -21,6 +21,7 @@ export default defineConfig({
 				target: BACKEND.replace(/^http/, 'ws'),
 				ws: true,
 				changeOrigin: true,
+				timeout: 0,
 			},
 		},
 	},

@@ -87,6 +87,13 @@ def command_count(result) -> int:
     return 0
 
 
+def safe_val(val, default: str = "-") -> str:
+    """Safely render a value, replacing None with a default string."""
+    if val is None:
+        return default
+    return str(val)
+
+
 def table_text(raw: str | None, limit: int = 72) -> str:
     text = re.sub(r"\s+", " ", str(raw or "")).strip()
     if not text:
@@ -258,30 +265,41 @@ MD_TEMPLATE = """# 渗透测试报告
 {% endfor %}
 
 {% for r in state.exploit_results %}
+
+---
+
 ### {{ loop.index }}. 漏洞 `{{ r.vuln_id }}`
 
-**状态：** {{ "✅ 利用成功" if r.success else "❌ 利用失败" }}
-{% if r.shell_type %}**Shell 类型：** {{ r.shell_type }}{% endif %}
+| 属性 | 值 |
+|------|-----|
+| **状态** | {{ "✅ 利用成功" if r.success else "❌ 利用失败" }} |
+{% if r.shell_type %}| **Shell 类型** | {{ r.shell_type }} |
+{% endif %}
 
 {% set rec_list = r.command_records if r.command_records else r.command_results %}
 {% if rec_list %}
 **执行过程（{{ rec_list | length }} 条命令）：**
 
 {% for rec in rec_list %}
-**第 {{ rec.round }} 轮{% if rec.purpose %} — {{ rec.purpose }}{% endif %}：**
+
+---
+
+#### 步骤 {{ rec.round if rec.round is not none else loop.index }}{% if rec.purpose %} — {{ rec.purpose }}{% endif %}
+
+**命令：**
 
 ```bash
 {{ rec.command }}
 ```
 
-输出（exit={{ rec.exit_code }}，耗时{{ rec.elapsed }}s）：
+**标准输出**（exit={{ rec.exit_code if rec.exit_code is not none else "-" }}，耗时{{ "%.1f"|format(rec.elapsed|float) if rec.elapsed is not none else "-" }}s）：
 
 ```text
-{{ rec.stdout if rec.stdout else '(empty)' }}
+{{ rec.stdout if rec.stdout else '(无输出)' }}
 ```
 
 {% if rec.stderr %}
-错误输出：
+**错误输出：**
 
 ```text
 {{ rec.stderr }}
@@ -382,6 +400,7 @@ class ReportGenerator:
         self._env.globals["sev_label"] = severity_label
         self._env.globals["cmd_count"] = command_count
         self._env.globals["table_text"] = table_text
+        self._env.globals["safe_val"] = safe_val
 
     async def generate(self, state) -> tuple[str, str]:
         template = self._env.from_string(MD_TEMPLATE)

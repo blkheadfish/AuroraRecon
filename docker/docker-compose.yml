@@ -49,6 +49,14 @@ services:
       dockerfile: docker/api/Dockerfile
     container_name: pentest_api
     restart: unless-stopped
+    command: >
+      uvicorn backend.api.main:app
+      --host 0.0.0.0
+      --port 8000
+      --workers 1
+      --ws-ping-interval 20
+      --ws-ping-timeout 60
+      --timeout-keep-alive 120
     ports:
       - "8000:8000"
     environment:

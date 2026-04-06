@@ -621,76 +621,239 @@ async def delete_task(task_id: str):
 async def websocket_endpoint(websocket: WebSocket, task_id: str):
     await websocket.accept()
     _ws_connections.setdefault(task_id, []).append(websocket)
-    try:
-        # 发送已有日志
+
+    async def _send(payload: dict) -> bool:
+        """Best-effort send; return False when connection is gone."""
+        try:
+            await websocket.send_json(payload)
+            return True
+        except Exception:
+            return False
+
+    async def _push_loop():
+        """Cursor-based incremental push — fast poll, no full rebuild each tick."""
         state = _tasks.get(task_id)
         sent_decision_ids: set[str] = set()
+
         if state:
             for log_entry in state.phase_log:
-                await websocket.send_json({"type": "log", "data": log_entry})
+                if not await _send({"type": "log", "data": log_entry}):
+                    return
             existing_events = _build_decision_events(state)
             snapshot = existing_events[-120:] if len(existing_events) > 120 else existing_events
             for event in snapshot:
-                await websocket.send_json({"type": "decision_event", "data": event})
+                if not await _send({"type": "decision_event", "data": event}):
+                    return
                 sent_decision_ids.add(str(event.get("id") or ""))
 
-        # 主动推送循环
-        last_log_count = len(state.phase_log) if state else 0
+        last_log_cursor = len(state.phase_log) if state else 0
+        last_rec_cursor = len(state.tool_records) if state else 0
+        last_exploit_sig = ""
+        sent_approval = False
+        heartbeat_counter = 0
+
         while True:
-            await asyncio.sleep(0.8)
+            await asyncio.sleep(0.15)
             state = _tasks.get(task_id)
             if not state:
                 break
 
-            # 推送新日志
-            current_count = len(state.phase_log)
-            if current_count > last_log_count:
-                for entry in state.phase_log[last_log_count:]:
-                    await websocket.send_json({"type": "log", "data": entry})
-                last_log_count = current_count
+            dirty = False
 
-            # 推送结构化 decision_event（增量）
-            decision_events = _build_decision_events(state)
-            for event in decision_events:
-                event_id = str(event.get("id") or "")
-                if event_id and event_id in sent_decision_ids:
-                    continue
-                if event_id:
-                    sent_decision_ids.add(event_id)
-                try:
-                    await websocket.send_json({"type": "decision_event", "data": event})
-                except Exception:
-                    break
+            # incremental logs
+            log_len = len(state.phase_log)
+            if log_len > last_log_cursor:
+                for entry in state.phase_log[last_log_cursor:]:
+                    if not await _send({"type": "log", "data": entry}):
+                        return
+                last_log_cursor = log_len
+                dirty = True
 
-            # awaiting_approval：每轮都推送，前端通过 upsertTask 幂等去重
+            # incremental tool_records
+            rec_len = len(state.tool_records)
+            if rec_len > last_rec_cursor:
+                for record in state.tool_records[last_rec_cursor:]:
+                    payload = record.model_dump() if hasattr(record, "model_dump") else dict(record or {})
+                    cmd = str(payload.get("command") or "")
+                    runtime_cmd = str(payload.get("runtime_command") or "")
+                    stdout = str(payload.get("stdout") or "")
+                    stderr = str(payload.get("stderr") or "")
+                    timestamp = str(payload.get("timestamp") or "")
+                    phase = str(payload.get("phase") or "unknown")
+                    tool = str(payload.get("tool") or "shell")
+                    backend = str(payload.get("backend") or "")
+                    exit_code = payload.get("exit_code")
+                    elapsed = payload.get("elapsed")
+                    purpose = str(payload.get("purpose") or "")
+                    round_no = payload.get("round")
+                    truncated = bool(payload.get("truncated") or False)
+                    total_len = payload.get("total_len")
+                    if total_len is None:
+                        total_len = len(stdout) + len(stderr)
+                    try:
+                        total_len_val = int(total_len)
+                    except Exception:
+                        total_len_val = len(stdout) + len(stderr)
+                    rec_id = str(payload.get("id") or f"tool-rec-{last_rec_cursor}")
+                    event_id = f"exec-{rec_id}"
+                    if event_id not in sent_decision_ids:
+                        sent_decision_ids.add(event_id)
+                        event = {
+                            "id": event_id,
+                            "timestamp": timestamp,
+                            "phase": phase,
+                            "action": "command_exec",
+                            "tool": tool,
+                            "backend": backend,
+                            "poc_or_vuln": "",
+                            "command": cmd,
+                            "runtime_command": runtime_cmd,
+                            "stdout": stdout,
+                            "stderr": stderr,
+                            "exit_code": exit_code,
+                            "elapsed_ms": int(float(elapsed) * 1000.0) if elapsed is not None else None,
+                            "purpose": purpose,
+                            "round": round_no,
+                            "truncated": truncated,
+                            "total_len": total_len_val,
+                            "message": f"命令执行: {tool} {cmd[:120]}".strip(),
+                            "raw": "",
+                            "tone": "success" if exit_code == 0 else "danger",
+                        }
+                        if not await _send({"type": "decision_event", "data": event}):
+                            return
+                    last_rec_cursor += 1
+                dirty = True
+
+            # incremental exploit_results (detect change via length signature)
+            exploit_sig = str(len(state.exploit_results or []))
+            if exploit_sig != last_exploit_sig:
+                last_exploit_sig = exploit_sig
+                for ridx, result in enumerate(state.exploit_results or []):
+                    result_payload = result.model_dump() if hasattr(result, "model_dump") else result
+                    vuln_id = result_payload.get("vuln_id", "")
+                    records = result_payload.get("command_records") or result_payload.get("command_results") or []
+                    for cidx, record in enumerate(records):
+                        eid = f"cmd-{ridx}-{cidx}"
+                        if eid in sent_decision_ids:
+                            continue
+                        sent_decision_ids.add(eid)
+                        cmd = str(record.get("command") or "")
+                        runtime_cmd = str(record.get("runtime_command") or "")
+                        stdout = str(record.get("stdout") or "")
+                        stderr = str(record.get("stderr") or "")
+                        exit_code = record.get("exit_code")
+                        elapsed = record.get("elapsed")
+                        timestamp = str(record.get("timestamp") or "")
+                        purpose = str(record.get("purpose") or "")
+                        round_no = record.get("round")
+                        truncated = bool(record.get("truncated") or False)
+                        total_len = record.get("total_len")
+                        if total_len is None:
+                            total_len = len(stdout) + len(stderr)
+                        try:
+                            total_len_val = int(total_len)
+                        except Exception:
+                            total_len_val = len(stdout) + len(stderr)
+                        if not await _send({"type": "decision_event", "data": {
+                            "id": eid,
+                            "timestamp": timestamp,
+                            "phase": str(record.get("phase") or "exploit"),
+                            "action": "command_exec",
+                            "tool": str(record.get("tool") or "shell"),
+                            "backend": str(record.get("backend") or ""),
+                            "poc_or_vuln": vuln_id,
+                            "command": cmd,
+                            "runtime_command": runtime_cmd,
+                            "stdout": stdout,
+                            "stderr": stderr,
+                            "exit_code": exit_code,
+                            "elapsed_ms": int(float(elapsed) * 1000.0) if elapsed is not None else None,
+                            "purpose": purpose,
+                            "round": round_no,
+                            "truncated": truncated,
+                            "total_len": total_len_val,
+                            "message": f"命令执行: {cmd[:120]}",
+                            "raw": "",
+                            "tone": "success" if exit_code == 0 else "danger",
+                        }}):
+                            return
+                dirty = True
+
+            # incremental phase_log-derived events (thoughts, approvals, tool_start/result)
+            # re-scan only new log lines for structured events
+            for idx in range(last_log_cursor - (log_len - (last_log_cursor - (len(state.phase_log) - log_len)) if False else 0), log_len):
+                pass  # already handled above via log push
+
+            # approval signal
             if state.current_phase == "awaiting_approval":
-                await websocket.send_json({
-                    "type":           "approval_required",
-                    "phase":          "awaiting_approval",
-                    "status":         "running",
-                    "findings_count": len(state.findings),
-                    "exploitable_count": sum(1 for f in state.findings if f.exploitable),
-                    "got_shell":      state.got_shell,
-                })
+                if not sent_approval:
+                    if not await _send({
+                        "type":           "approval_required",
+                        "phase":          "awaiting_approval",
+                        "status":         "running",
+                        "findings_count": len(state.findings),
+                        "exploitable_count": sum(1 for f in state.findings if f.exploitable),
+                        "got_shell":      state.got_shell,
+                    }):
+                        return
+                    sent_approval = True
+            else:
+                sent_approval = False
 
-            # 任务完成/失败则通知并退出
+            # done
             if state.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
-                await websocket.send_json({
+                if not await _send({
                     "type": "done",
                     "status": state.status.value,
                     "findings_count": len(state.findings),
                     "got_shell": state.got_shell,
-                })
+                }):
+                    return
                 break
 
-            # 心跳保活
-            await websocket.send_json({"type": "heartbeat"})
+            # heartbeat every ~3s (20 ticks * 150ms)
+            heartbeat_counter += 1
+            if heartbeat_counter >= 20:
+                heartbeat_counter = 0
+                if not await _send({"type": "heartbeat"}):
+                    return
 
-    except WebSocketDisconnect:
-        pass
-    except Exception:
-        pass
+    async def _recv_loop():
+        """Consume client frames (pings) to keep the connection alive through NAT."""
+        while True:
+            try:
+                data = await websocket.receive_text()
+                if data == "ping":
+                    if not await _send({"type": "pong"}):
+                        break
+            except Exception:
+                break
+
+    push_task = asyncio.create_task(_push_loop())
+    recv_task = asyncio.create_task(_recv_loop())
+    try:
+        done, _pending = await asyncio.wait(
+            [push_task, recv_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in done:
+            try:
+                task.result()
+            except WebSocketDisconnect:
+                pass
+            except Exception:
+                pass
     finally:
+        for task in [push_task, recv_task]:
+            if not task.done():
+                task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
         if task_id in _ws_connections:
             _ws_connections[task_id] = [
                 ws for ws in _ws_connections[task_id] if ws != websocket
