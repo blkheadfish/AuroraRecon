@@ -115,17 +115,18 @@ const renderedHtml = computed(() => {
   renderer.code = function (code, lang) {
     const text = typeof code === 'object' ? code.text : code
     const language = typeof code === 'object' ? code.lang : lang
+    const normalizedLang = String(language || '').trim().toLowerCase()
     let highlighted = text
     try {
-      if (language && hljs.getLanguage(language)) {
-        highlighted = hljs.highlight(text, { language }).value
+      if (normalizedLang && hljs.getLanguage(normalizedLang)) {
+        highlighted = hljs.highlight(text, { language: normalizedLang }).value
       } else {
         highlighted = hljs.highlightAuto(text).value
       }
     } catch {
       highlighted = escapeHtml(text)
     }
-    return `<pre><code class="hljs language-${language || ''}">${highlighted}</code></pre>`
+    return `<pre><code class="hljs language-${normalizedLang || 'text'}">${highlighted}</code></pre>`
   }
   const raw = marked.parse(draft.value, {
     renderer,

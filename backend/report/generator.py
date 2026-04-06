@@ -1,66 +1,177 @@
 """
-report/generator.py —— 渗透测试报告生成器（Markdown + MinIO 存储）
-
-改进：
-  - 证据完整展示，不截断
-  - HTTP 响应头和响应体分离
-  - HTML body 去除 style/script 噪音但保留完整结构
-  - 漏洞分组：高危漏洞和信息类发现分开展示
+report/generator.py
+渗透测试报告生成器（Markdown + MinIO 存储）
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 from datetime import datetime
+from typing import Any
 
-from jinja2 import Environment, BaseLoader
+from jinja2 import BaseLoader, Environment
 
 logger = logging.getLogger(__name__)
 
 REPORTS_DIR = os.getenv("REPORTS_DIR", "/tmp/pentest_reports")
-
-# ── Jinja2 自定义过滤器 ──────────────────────────────────
-
-def format_evidence(raw_evidence: str) -> str:
-    """格式化证据：分离 HTTP 响应头和响应体，完整展示"""
-    if not raw_evidence or not raw_evidence.strip():
-        return "无"
-
-    text = raw_evidence.strip()
-
-    # 检测 HTTP 响应格式
-    if text.startswith("HTTP/"):
-        # 兼容 \r\n\r\n 和 \n\n
-        sep = "\r\n\r\n" if "\r\n\r\n" in text else "\n\n"
-        parts = text.split(sep, 1)
-        headers = parts[0].strip()
-        body = parts[1].strip() if len(parts) > 1 else ""
-
-        result = "**响应头：**\n\n```http\n" + headers + "\n```\n"
-
-        if body:
-            clean_body = _clean_html_body(body)
-            if clean_body:
-                result += "\n**响应体：**\n\n```html\n" + clean_body + "\n```"
-
-        return result
-
-    # 非 HTTP 响应，完整展示
-    return "```\n" + text + "\n```"
+REPORT_BLOCK_MAX_CHARS = max(1200, int(os.getenv("REPORT_BLOCK_MAX_CHARS", "12000")))
 
 
 def _clean_html_body(body: str) -> str:
-    """清理 HTML body：去除 style/script 内容块但保留 HTML 结构"""
-    # 去掉 <style>...</style> 块（通常是大段 CSS，无安全意义）
-    cleaned = re.sub(r'<style[^>]*>.*?</style>', '<!-- style removed -->', body, flags=re.DOTALL)
-    # 去掉 <script>...</script> 块
-    cleaned = re.sub(r'<script[^>]*>.*?</script>', '<!-- script removed -->', cleaned, flags=re.DOTALL)
-    # 去掉内联 base64 图片数据（通常很长且无意义）
+    """清理 HTML body：去除 style/script 内容块但保留结构与关键文本。"""
+    cleaned = re.sub(r"<style[^>]*>.*?</style>", "<!-- style removed -->", body, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"<script[^>]*>.*?</script>", "<!-- script removed -->", cleaned, flags=re.DOTALL | re.IGNORECASE)
     cleaned = re.sub(r'src="data:image/[^"]{100,}"', 'src="[base64 image removed]"', cleaned)
-    # 压缩连续空行
-    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
+
+
+def _detect_text_lang(text: str) -> str:
+    raw = (text or "").strip()
+    if not raw:
+        return "text"
+    if re.search(r"^(HTTP/\d\.\d\s+\d{3}|GET\s+/|POST\s+/|PUT\s+/|DELETE\s+/|PATCH\s+/|HEAD\s+/|OPTIONS\s+/)", raw, re.MULTILINE):
+        return "http"
+    if re.match(r"^\s*[\[{].*[\]}]\s*$", raw, re.DOTALL):
+        return "json"
+    if re.match(r"^\s*<\?xml|^\s*</?[a-zA-Z][\w:-]*[\s>]", raw):
+        return "html"
+    return "text"
+
+
+def truncate_block(text: str, max_len: int = REPORT_BLOCK_MAX_CHARS) -> str:
+    raw = str(text or "")
+    if len(raw) <= max_len:
+        return raw
+    omitted = len(raw) - max_len
+    keep = max_len // 2
+    return (
+        raw[:keep]
+        + f"\n\n... [中间省略 {omitted} 字符] ...\n\n"
+        + raw[-keep:]
+    )
+
+
+def split_evidence_sections(raw_evidence: str) -> list[dict[str, str]]:
+    """将混合证据拆分为结构化块，供模板按块渲染。"""
+    if not raw_evidence or not raw_evidence.strip():
+        return []
+
+    text = raw_evidence.strip()
+    if text.startswith("HTTP/"):
+        sep = "\r\n\r\n" if "\r\n\r\n" in text else "\n\n"
+        headers, body = (text.split(sep, 1) + [""])[:2]
+        sections = [{
+            "title": "响应头",
+            "lang": "http",
+            "content": headers.strip() or "(无)",
+        }]
+        body_text = _clean_html_body(body.strip())
+        if body_text:
+            sections.append({
+                "title": "响应体",
+                "lang": "html",
+                "content": body_text,
+            })
+        return sections
+
+    section_alias = {
+        "command": ("Payload", "bash"),
+        "cmd": ("Payload", "bash"),
+        "payload": ("Payload", "bash"),
+        "stdout": ("Output", "text"),
+        "output": ("Output", "text"),
+        "response": ("Output", "text"),
+        "result": ("Output", "text"),
+        "stderr": ("Error Output", "text"),
+        "error": ("Error Output", "text"),
+        "errors": ("Error Output", "text"),
+        "命令": ("Payload", "bash"),
+        "输出": ("Output", "text"),
+        "响应": ("Output", "text"),
+        "回显": ("Output", "text"),
+        "错误": ("Error Output", "text"),
+    }
+    section_header = re.compile(
+        r"^\s*(?:#{1,6}\s*|[-*]\s*)?(command|cmd|payload|stdout|stderr|response|output|result|error|errors|命令|输出|响应|回显|错误)\s*[:：]?\s*$",
+        re.IGNORECASE,
+    )
+    inline_header = re.compile(
+        r"^\s*(command|cmd|payload|stdout|stderr|response|output|result|error|errors|命令|输出|响应|回显|错误)\s*[:：]\s*(.*)$",
+        re.IGNORECASE,
+    )
+
+    def _label_to_title_lang(label: str, content: str) -> tuple[str, str]:
+        key = str(label or "").strip().lower()
+        title, lang = section_alias.get(key, ("Evidence", "text"))
+        if title == "Output":
+            lang = _detect_text_lang(content)
+        return title, lang
+
+    sections: list[dict[str, str]] = []
+    current_label = ""
+    buffer: list[str] = []
+    lines = text.splitlines()
+
+    def flush() -> None:
+        nonlocal buffer, current_label
+        content = "\n".join(buffer).strip()
+        if not content:
+            buffer = []
+            return
+        title, lang = _label_to_title_lang(current_label, content)
+        sections.append({
+            "title": title,
+            "lang": lang,
+            "content": content,
+        })
+        buffer = []
+
+    for line in lines:
+        inline = inline_header.match(line)
+        if inline:
+            flush()
+            current_label = str(inline.group(1) or "")
+            tail = str(inline.group(2) or "").strip()
+            if tail:
+                buffer.append(tail)
+            continue
+
+        header = section_header.match(line)
+        if header:
+            flush()
+            current_label = str(header.group(1) or "")
+            continue
+
+        buffer.append(line)
+
+    flush()
+
+    if not sections:
+        sections.append({
+            "title": "Evidence",
+            "lang": _detect_text_lang(text),
+            "content": text,
+        })
+    return sections
+
+
+def format_evidence(raw_evidence: str) -> str:
+    """兼容旧调用：返回 Markdown 格式证据文本。"""
+    sections = split_evidence_sections(raw_evidence)
+    if not sections:
+        return "无"
+    parts: list[str] = []
+    for sec in sections:
+        parts.append(f"**{sec['title']}：**")
+        parts.append("")
+        parts.append(f"```{sec['lang']}")
+        parts.append(truncate_block(sec["content"]))
+        parts.append("```")
+        parts.append("")
+    return "\n".join(parts).strip()
 
 
 def severity_emoji(severity: str) -> str:
@@ -88,10 +199,10 @@ def command_count(result) -> int:
 
 
 def safe_val(val, default: str = "-") -> str:
-    """Safely render a value, replacing None with a default string."""
     if val is None:
         return default
-    return str(val)
+    text = str(val).strip()
+    return text if text else default
 
 
 def table_text(raw: str | None, limit: int = 72) -> str:
@@ -102,6 +213,40 @@ def table_text(raw: str | None, limit: int = 72) -> str:
     if len(text) > limit:
         return text[:limit] + "..."
     return text
+
+
+def normalize_round(round_val: Any, fallback_index: int) -> int:
+    """修复 round=None / round='None' / 非法值导致的“第None轮迭代”。"""
+    if round_val is None:
+        return fallback_index
+    text = str(round_val).strip()
+    if not text or text.lower() == "none":
+        return fallback_index
+    try:
+        val = int(float(text))
+    except Exception:
+        return fallback_index
+    return val if val > 0 else fallback_index
+
+
+def pretty_json(value: Any) -> str:
+    if value in (None, "", [], {}):
+        return "无"
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, indent=2)
+    except Exception:
+        return str(value)
+
+
+def format_elapsed(value: Any) -> str:
+    try:
+        if value is None:
+            return "-"
+        return f"{float(value):.2f}s"
+    except Exception:
+        return "-"
 
 
 def normalize_markdown_whitespace(content: str) -> str:
@@ -142,20 +287,16 @@ def normalize_markdown_whitespace(content: str) -> str:
     return "\n".join(output) + "\n"
 
 
-# ── 报告模板 ─────────────────────────────────────────────
-
 MD_TEMPLATE = """# 渗透测试报告
 
 | 项目 | 信息 |
 |------|------|
 | **任务 ID** | `{{ state.task_id }}` |
 | **目标** | `{{ state.target }}` |
-| **测试时间** | {{ state.created_at }} |
-| **操作系统** | {{ state.target_os }} |
-| **最终权限** | {{ state.privilege_level or "未获得" }} |
-| **授权说明** | {{ state.scope_note }} |
-
----
+| **测试时间** | {{ safe_val(state.created_at, "未知") }} |
+| **操作系统** | {{ safe_val(state.target_os, "未知") }} |
+| **最终权限** | {{ safe_val(state.privilege_level, "未获得") }} |
+| **授权说明** | {{ safe_val(state.scope_note, "未填写") }} |
 
 ## 一、执行摘要
 
@@ -163,7 +304,7 @@ MD_TEMPLATE = """# 渗透测试报告
 {% set high_count = state.findings | selectattr('severity','eq','high') | list | length %}
 {% set medium_count = state.findings | selectattr('severity','eq','medium') | list | length %}
 
-本次测试共发现 **{{ state.findings | length }}** 个漏洞/信息项，其中：
+本次测试共发现 **{{ state.findings | length }}** 个漏洞/信息项，其中严重/高危/中危共 **{{ critical_count + high_count + medium_count }}** 个。
 
 | 严重程度 | 数量 |
 |----------|------|
@@ -172,12 +313,43 @@ MD_TEMPLATE = """# 渗透测试报告
 | 🟡 中危 | {{ medium_count }} |
 
 {% if state.got_shell %}
-> ✅ **已成功获取目标 Shell，最终权限：{{ state.privilege_level }}**
+> ✅ 已获得目标访问能力，当前权限：**{{ safe_val(state.privilege_level, "unknown") }}**
 {% else %}
 > ❌ 本次测试未获得目标交互式访问权限。
 {% endif %}
 
----
+### 攻链状态
+
+| 字段 | 值 |
+|------|-----|
+| **foothold_status** | {{ safe_val(state.foothold_status, "none") }} |
+| **privesc_attempt_count** | {{ state.privesc_attempt_count if state.privesc_attempt_count is not none else 0 }} / {{ state.max_privesc_rounds if state.max_privesc_rounds is not none else "-" }} |
+| **chain_visited** | {{ (state.chain_visited | join(" -> ")) if state.chain_visited else "无" }} |
+
+{% if state.chain_summary %}
+**攻链总结：** {{ state.chain_summary }}
+{% endif %}
+
+{% if state.objective_status %}
+**目标完成度（objective_status）：**
+```json
+{{ pretty_json(state.objective_status) }}
+```
+{% endif %}
+
+{% if state.credential_store %}
+**凭据资产（credential_store）：**
+```json
+{{ pretty_json(state.credential_store) }}
+```
+{% endif %}
+
+{% if state.loot_store %}
+**战利品（loot_store）：**
+```json
+{{ pretty_json(state.loot_store) }}
+```
+{% endif %}
 
 ## 二、侦察结果
 
@@ -185,24 +357,25 @@ MD_TEMPLATE = """# 渗透测试报告
 
 | 端口 | 协议 | 服务 | 版本 |
 |------|------|------|------|
-{% for p in state.open_ports %}| {{ p.port }} | {{ p.protocol }} | {{ p.service }} | {{ p.version[:60] }} |
+{% for p in state.open_ports %}
+| {{ p.port }} | {{ safe_val(p.protocol, "tcp") }} | {{ safe_val(p.service, "-") }} | {{ table_text(p.version, 60) }} |
+{% else %}
+| - | - | - | 未发现开放端口 |
 {% endfor %}
 
 {% if state.web_paths %}
 ### Web 路径发现
-
-{% for path in state.web_paths %}- `{{ path }}`
+{% for path in state.web_paths %}
+- `{{ path }}`
 {% endfor %}
 {% endif %}
 
 {% if state.subdomains %}
 ### 子域名发现
-
-{% for sub in state.subdomains %}- `{{ sub }}`
+{% for sub in state.subdomains %}
+- `{{ sub }}`
 {% endfor %}
 {% endif %}
-
----
 
 ## 三、漏洞发现
 
@@ -218,7 +391,6 @@ MD_TEMPLATE = """# 渗透测试报告
 
 {% if real_vulns %}
 ### 可利用漏洞
-
 {% for f in real_vulns %}
 #### {{ loop.index }}. {{ sev_emoji(f.severity) }} {{ f.name }}
 
@@ -226,33 +398,34 @@ MD_TEMPLATE = """# 渗透测试报告
 |------|-----|
 | **严重程度** | {{ sev_emoji(f.severity) }} {{ sev_label(f.severity) }} |
 | **CVE** | {{ f.cve or "N/A" }} |
-| **目标** | `{{ f.target }}` |
-| **端口** | {{ f.port or "N/A" }} |
-| **发现工具** | {{ f.tool }} |
+| **目标** | `{{ safe_val(f.target, "-") }}` |
+| **端口** | {{ safe_val(f.port, "N/A") }} |
+| **发现工具** | {{ safe_val(f.tool, "unknown") }} |
 
-**描述：** {{ f.description }}
+**描述：** {{ safe_val(f.description, "无") }}
 
+{% set sections = split_evidence(f.evidence) %}
+{% if sections %}
 **证据：**
-
-{{ fmt_evidence(f.evidence) }}
-
+{% for sec in sections %}
+**{{ sec.title }}**
+```{{ sec.lang }}
+{{ truncate_block(sec.content) }}
+```
+{% endfor %}
+{% endif %}
 {% endfor %}
 {% endif %}
 
 {% if info_items %}
 ### 信息类发现
-
 <details>
 <summary>共 {{ info_items | length }} 项信息类发现（点击展开）</summary>
-
 {% for f in info_items %}
-- **{{ f.name[:70] }}** — {{ f.tool }}{% if f.cve %} ({{ f.cve }}){% endif %}
-
+- **{{ table_text(f.name, 80) }}** — {{ safe_val(f.tool, "unknown") }}{% if f.cve %} ({{ f.cve }}){% endif %}
 {% endfor %}
 </details>
 {% endif %}
-
----
 
 ## 四、漏洞利用结果
 
@@ -261,55 +434,53 @@ MD_TEMPLATE = """# 渗透测试报告
 
 | 漏洞 ID | 状态 | Shell 类型 | 命令数 | 结论摘要 |
 |---------|------|------------|--------|----------|
-{% for r in state.exploit_results %}| `{{ r.vuln_id }}` | {{ "✅ 成功" if r.success else "❌ 失败" }} | {{ r.shell_type or "N/A" }} | {{ cmd_count(r) }} | {{ table_text(r.evidence, 78) }} |
+{% for r in state.exploit_results %}
+| `{{ r.vuln_id }}` | {{ "✅ 成功" if r.success else "❌ 失败" }} | {{ safe_val(r.shell_type, "N/A") }} | {{ cmd_count(r) }} | {{ table_text(r.evidence, 78) }} |
 {% endfor %}
 
 {% for r in state.exploit_results %}
-
----
-
 ### {{ loop.index }}. 漏洞 `{{ r.vuln_id }}`
 
 | 属性 | 值 |
 |------|-----|
 | **状态** | {{ "✅ 利用成功" if r.success else "❌ 利用失败" }} |
-{% if r.shell_type %}| **Shell 类型** | {{ r.shell_type }} |
-{% endif %}
+| **Shell 类型** | {{ safe_val(r.shell_type, "N/A") }} |
 
 {% set rec_list = r.command_records if r.command_records else r.command_results %}
 {% if rec_list %}
-**执行过程（{{ rec_list | length }} 条命令）：**
-
+#### 命令执行过程（{{ rec_list | length }} 条）
 {% for rec in rec_list %}
+##### 第 {{ normalize_round(rec.round, loop.index) }} 轮迭代{% if rec.purpose %} — {{ rec.purpose }}{% endif %}
 
----
+- exit: {{ rec.exit_code | default("-", true) }}
+- elapsed: {{ format_elapsed(rec.elapsed | default(none, true)) }}
 
-#### 步骤 {{ rec.round if rec.round is not none else loop.index }}{% if rec.purpose %} — {{ rec.purpose }}{% endif %}
-
-**命令：**
-
+**Payload：**
 ```bash
-{{ rec.command }}
+{{ rec.command if rec.command else "(empty command)" }}
 ```
 
-**标准输出**（exit={{ rec.exit_code if rec.exit_code is not none else "-" }}，耗时{{ "%.1f"|format(rec.elapsed|float) if rec.elapsed is not none else "-" }}s）：
-
-```text
-{{ rec.stdout if rec.stdout else '(无输出)' }}
-```
-
-{% if rec.stderr %}
-**错误输出：**
-
-```text
-{{ rec.stderr }}
+{% if rec.runtime_command and rec.runtime_command != rec.command %}
+**Runtime Command：**
+```bash
+{{ rec.runtime_command }}
 ```
 {% endif %}
 
+**Output (stdout)：**
+```text
+{{ truncate_block(rec.stdout if rec.stdout else "(无输出)") }}
+```
+
+{% if rec.stderr %}
+**Error (stderr)：**
+```text
+{{ truncate_block(rec.stderr) }}
+```
+{% endif %}
 {% endfor %}
 {% elif r.commands_run %}
-**执行命令：**
-
+#### 执行命令
 {% for cmd in r.commands_run %}
 ```bash
 {{ cmd }}
@@ -318,34 +489,32 @@ MD_TEMPLATE = """# 渗透测试报告
 {% endif %}
 
 {% if r.evidence %}
-**最终结论：**
-
-{{ fmt_evidence(r.evidence) }}
+#### 最终证据
+{% set sections = split_evidence(r.evidence) %}
+{% for sec in sections %}
+**{{ sec.title }}**
+```{{ sec.lang }}
+{{ truncate_block(sec.content) }}
+```
+{% endfor %}
 {% endif %}
-
 {% endfor %}
 {% else %}
 无利用尝试或所有漏洞不满足利用条件。
 {% endif %}
-
----
 
 ## 五、后渗透发现
 
 {% if state.post_findings and state.post_findings.get('findings') %}
 {% for k, v in state.post_findings.get('findings', {}).items() %}
 **{{ k }}：**
-
+```text
+{{ v if v else "无" }}
 ```
-{{ v if v else '无' }}
-```
-
 {% endfor %}
 {% else %}
 无后渗透数据。
 {% endif %}
-
----
 
 ## 六、修复建议
 
@@ -355,38 +524,37 @@ MD_TEMPLATE = """# 渗透测试报告
 {% set _ = remediation_items.append(f) %}
 {% endif %}
 {% endfor %}
+
 {% if remediation_items %}
 | 漏洞 | 优先级 | 立即行动 | 参考 | 临时缓解 |
 |------|--------|----------|------|----------|
-{% for f in remediation_items %}| {{ table_text(f.name, 44) }} | {{ sev_emoji(f.severity) }} {{ sev_label(f.severity) }} | {{ "立即升级并应用官方补丁" if f.severity in ('critical', 'high') else "维护窗口内修复并完成回归验证" }} | {{ f.cve or "厂商安全公告" }} | {{ "部署 WAF 规则并限制高风险入口暴露" if f.severity in ('critical', 'high') else "审查配置并加强访问控制策略" }} |
+{% for f in remediation_items %}
+| {{ table_text(f.name, 44) }} | {{ sev_emoji(f.severity) }} {{ sev_label(f.severity) }} | {{ "立即升级并应用官方补丁" if f.severity in ('critical', 'high') else "维护窗口内修复并完成回归验证" }} | {{ f.cve or "厂商安全公告" }} | {{ "部署 WAF 规则并限制高风险入口暴露" if f.severity in ('critical', 'high') else "审查配置并加强访问控制策略" }} |
 {% endfor %}
 {% else %}
 当前未发现需要立即处置的高/中危漏洞，建议保持基线巡检与补丁更新节奏。
 {% endif %}
 
----
+## 七、测试过程日志（最近 200 行）
 
-## 七、测试过程日志
-
-```
-{% for entry in state.phase_log %}{{ entry }}
+```text
+{% for entry in (state.phase_log[-200:] if state.phase_log else []) %}
+{{ entry }}
 {% endfor %}
 ```
 
----
-
 ## 八、测试方法论
 
-1. **信息收集** — Nmap 端口扫描 + 服务识别，Gobuster Web 路径爆破
-2. **漏洞扫描** — Nuclei CVE 检测，Nikto Web 安全扫描，Hydra 弱口令检测
-3. **AI 决策分析** — 大语言模型分析漏洞并制定利用优先级
-4. **漏洞利用** — LLM 驱动动态生成 Payload + Metasploit 快速通道
-5. **后渗透** — 权限提升、信息收集、横向移动评估
-6. **报告生成** — 汇总所有发现，提供修复建议
+1. 信息收集：端口发现、服务识别、目录/路径枚举
+2. 漏洞扫描：模板/签名检测 + 证据回收
+3. 攻链决策：基于环境信息动态编排利用路径
+4. 漏洞利用：执行 payload 并验证命令执行证据
+5. 后渗透：权限提升、凭据与资产收集
+6. 报告生成：汇总证据与修复建议
 
 ---
 
-*本报告由 PentestAI v2.0 自动生成，仅供授权安全测试使用。*
+*本报告由 PentestAI v2.0 自动生成，仅供授权安全测试使用。*  
 *生成时间：{{ now }}*
 """
 
@@ -394,8 +562,17 @@ MD_TEMPLATE = """# 渗透测试报告
 class ReportGenerator:
     def __init__(self):
         os.makedirs(REPORTS_DIR, exist_ok=True)
-        self._env = Environment(loader=BaseLoader())
+        self._env = Environment(
+            loader=BaseLoader(),
+            trim_blocks=True,
+            lstrip_blocks=True,
+        )
         self._env.globals["fmt_evidence"] = format_evidence
+        self._env.globals["split_evidence"] = split_evidence_sections
+        self._env.globals["truncate_block"] = truncate_block
+        self._env.globals["normalize_round"] = normalize_round
+        self._env.globals["pretty_json"] = pretty_json
+        self._env.globals["format_elapsed"] = format_elapsed
         self._env.globals["sev_emoji"] = severity_emoji
         self._env.globals["sev_label"] = severity_label
         self._env.globals["cmd_count"] = command_count
@@ -405,7 +582,8 @@ class ReportGenerator:
     async def generate(self, state) -> tuple[str, str]:
         template = self._env.from_string(MD_TEMPLATE)
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-        md_content = normalize_markdown_whitespace(template.render(state=state, now=now))
+        rendered = template.render(state=state, now=now)
+        md_content = normalize_markdown_whitespace(rendered)
 
         timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         filename = f"report_{state.task_id[:8]}_{timestamp}.md"
@@ -418,9 +596,12 @@ class ReportGenerator:
         minio_path = ""
         try:
             from backend.storage.minio_client import get_storage
+
             storage = get_storage()
             minio_path = storage.upload_report(
-                task_id=state.task_id, filename=filename, content=md_content,
+                task_id=state.task_id,
+                filename=filename,
+                content=md_content,
             )
             logger.info(f"[ReportGenerator] 报告已上传至 MinIO: {minio_path}")
         except Exception as e:
