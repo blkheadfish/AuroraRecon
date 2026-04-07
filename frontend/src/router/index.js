@@ -1,5 +1,7 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import StartPage from '@/views/StartPage.vue'
+import LoginPage from '@/views/LoginPage.vue'
+import RegisterPage from '@/views/RegisterPage.vue'
 import Dashboard from '@/views/Dashboard.vue'
 import TaskList from '@/views/TaskList.vue'
 import TaskDetail from '@/views/TaskDetail.vue'
@@ -12,9 +14,13 @@ import KnowledgeManage from '@/views/KnowledgeManage.vue'
 import Profile from '@/views/Profile.vue'
 import Settings from '@/views/Settings.vue'
 
+const PUBLIC_ROUTES = new Set(['start-page', 'login', 'register'])
+
 const routes = [
   { path: '/', redirect: '/start' },
   { path: '/start', name: 'start-page', component: StartPage },
+  { path: '/login', name: 'login', component: LoginPage },
+  { path: '/register', name: 'register', component: RegisterPage },
   { path: '/dashboard', name: 'dashboard', component: Dashboard },
   { path: '/tasks', name: 'tasks', component: TaskList },
   { path: '/tasks/:id', name: 'task-detail', component: TaskDetail },
@@ -28,7 +34,16 @@ const routes = [
   { path: '/settings', name: 'settings', component: Settings },
 ]
 
-export default createRouter({
+const router = createRouter({
   history: createWebHistory(),
   routes,
 })
+
+router.beforeEach((to) => {
+  const token = localStorage.getItem('auth.token')
+  if (!token && !PUBLIC_ROUTES.has(to.name)) {
+    return { name: 'login' }
+  }
+})
+
+export default router

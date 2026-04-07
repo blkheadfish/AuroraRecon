@@ -11,6 +11,7 @@ import logging
 import os
 from datetime import datetime
 from typing import Optional
+from uuid import uuid4
 
 from sqlalchemy import (
     Column, String, Text, Integer, Boolean, DateTime, Enum as SAEnum,
@@ -66,6 +67,19 @@ class TaskRecord(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
     )
+
+
+# ── 用户表 ────────────────────────────────────────────────
+class UserRecord(Base):
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    username: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
+    password_hash: Mapped[str] = mapped_column(String(256), nullable=False)
+    nickname: Mapped[str] = mapped_column(String(64), default="")
+    avatar_url: Mapped[str] = mapped_column(String(1024), default="")
+    oss_url: Mapped[str] = mapped_column(String(1024), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 # ── 数据库操作 ────────────────────────────────────────────
@@ -200,3 +214,48 @@ async def get_task_stats() -> dict:
             "shells_obtained": row.shells_obtained,
             "total_findings": row.total_findings,
         }
+
+
+# ── 用户操作 ──────────────────────────────────────────────
+
+async def create_user(username: str, password_hash: str, nickname: str = "") -> UserRecord:
+    async with async_session() as session:
+        user = UserRecord(
+            username=username,
+            password_hash=password_hash,
+            nickname=nickname or username,
+        )
+        session.add(user)
+        await session.commit()
+        await session.refresh(user)
+        return user
+
+
+async def get_user_by_username(username: str) -> Optional[UserRecord]:
+    async with async_session() as session:
+        result = await session.execute(
+            text("SELECT * FROM users WHERE username = :u LIMIT 1"),
+            {"u": username},
+        )
+        row = result.fetchone()
+        if not row:
+            return None
+        return await session.get(UserRecord, row.id)
+
+
+async def get_user_by_id(user_id: str) -> Optional[UserRecord]:
+    async with async_session() as session:
+        return await session.get(UserRecord, user_id)
+
+
+async def update_user(user_id: str, **kwargs) -> Optional[UserRecord]:
+    async with async_session() as session:
+        user = await session.get(UserRecord, user_id)
+        if not user:
+            return None
+        for key, val in kwargs.items():
+            if hasattr(user, key):
+                setattr(user, key, val)
+        await session.commit()
+        await session.refresh(user)
+        return user

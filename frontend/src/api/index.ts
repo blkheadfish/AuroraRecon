@@ -17,15 +17,35 @@ import type {
 } from '@/types/settings'
 
 const BASE = '/api'
+const TOKEN_KEY = 'auth.token'
 
 const http: AxiosInstance = axios.create({
   baseURL: BASE,
   timeout: 15000,
 })
 
+http.interceptors.request.use((config) => {
+  const token = localStorage.getItem(TOKEN_KEY)
+  if (token) {
+    config.headers = config.headers || {}
+    config.headers['Authorization'] = `Bearer ${token}`
+  }
+  return config
+})
+
 http.interceptors.response.use(
   (res) => res.data,
-  (err) => Promise.reject(err),
+  (err) => {
+    if (err?.response?.status === 401) {
+      localStorage.removeItem(TOKEN_KEY)
+      localStorage.removeItem('auth.user')
+      const path = window.location.pathname
+      if (path !== '/login' && path !== '/register' && path !== '/start') {
+        window.location.href = '/login'
+      }
+    }
+    return Promise.reject(err)
+  },
 )
 
 function getWsBase(): string {
@@ -34,6 +54,14 @@ function getWsBase(): string {
 }
 
 export const api = {
+  authLogin: (username: string, password: string): Promise<{ token: string; user: any }> =>
+    http.post('/auth/login', { username, password }),
+  authRegister: (username: string, password: string, nickname?: string): Promise<{ token: string; user: any }> =>
+    http.post('/auth/register', { username, password, nickname: nickname || '' }),
+  authMe: (): Promise<any> => http.get('/auth/me'),
+  authUpdateMe: (data: { nickname?: string; avatar_url?: string; oss_url?: string; old_password?: string; new_password?: string }): Promise<{ status: string; user: any }> =>
+    http.put('/auth/me', data),
+
   healthCheck: (): Promise<HealthInfo> => http.get('/health'),
   createTask: (
     target: string,

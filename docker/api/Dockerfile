@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
 # 安装 Python 依赖
 COPY requirements.txt .
 RUN pip install -r requirements.txt
+RUN pip install --no-deps PyJWT bcrypt
 
 # 复制项目代码
 COPY . .

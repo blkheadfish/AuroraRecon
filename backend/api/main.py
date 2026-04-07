@@ -24,8 +24,9 @@ from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
 
 from backend.agents.models import PentestState, TaskStatus, parse_target
@@ -163,6 +164,67 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ── JWT 认证 ──────────────────────────────────────────────
+
+import secrets as _secrets
+import jwt as _jwt
+import bcrypt as _bcrypt_lib
+
+_JWT_SECRET = os.getenv("JWT_SECRET", _secrets.token_urlsafe(32))
+_JWT_ALGORITHM = "HS256"
+_JWT_EXPIRE_DAYS = 7
+
+_AUTH_WHITELIST_PREFIXES = (
+    "/health",
+    "/auth/login",
+    "/auth/register",
+    "/docs",
+    "/openapi.json",
+    "/redoc",
+)
+
+
+def _create_jwt(user_id: str, username: str) -> str:
+    payload = {
+        "sub": user_id,
+        "username": username,
+        "exp": datetime.utcnow() + timedelta(days=_JWT_EXPIRE_DAYS),
+        "iat": datetime.utcnow(),
+    }
+    return _jwt.encode(payload, _JWT_SECRET, algorithm=_JWT_ALGORITHM)
+
+
+def _decode_jwt(token: str) -> dict | None:
+    try:
+        return _jwt.decode(token, _JWT_SECRET, algorithms=[_JWT_ALGORITHM])
+    except _jwt.ExpiredSignatureError:
+        return None
+    except _jwt.InvalidTokenError:
+        return None
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    path = request.url.path
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    if any(path.startswith(p) for p in _AUTH_WHITELIST_PREFIXES):
+        return await call_next(request)
+    if path.startswith("/ws/"):
+        return await call_next(request)
+
+    auth_header = request.headers.get("authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return JSONResponse(status_code=401, content={"detail": "未登录"})
+    token = auth_header[7:]
+    claims = _decode_jwt(token)
+    if not claims:
+        return JSONResponse(status_code=401, content={"detail": "登录已过期，请重新登录"})
+    request.state.user_id = claims.get("sub", "")
+    request.state.username = claims.get("username", "")
+    return await call_next(request)
 
 
 # ── 请求/响应模型 ─────────────────────────────────────────
@@ -1287,6 +1349,119 @@ def _ws_phase_payload(state: PentestState, log_tail: int = 5) -> dict:
         "attack_next_steps": state.attack_next_steps,
         "privesc_attempt_count": state.privesc_attempt_count,
     }
+
+
+# ── 认证端点 ──────────────────────────────────────────────
+
+class AuthRegisterRequest(BaseModel):
+    username: str
+    password: str
+    nickname: str = ""
+
+    @field_validator("username")
+    @classmethod
+    def validate_username(cls, v: str) -> str:
+        v = v.strip()
+        if not v or len(v) < 2 or len(v) > 64:
+            raise ValueError("用户名长度 2-64 字符")
+        if not re.match(r"^[A-Za-z0-9_\-]+$", v):
+            raise ValueError("用户名仅允许字母/数字/_/-")
+        return v
+
+    @field_validator("password")
+    @classmethod
+    def validate_password(cls, v: str) -> str:
+        if len(v) < 6:
+            raise ValueError("密码至少 6 位")
+        return v
+
+
+class AuthLoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class AuthUpdateMeRequest(BaseModel):
+    nickname: str = ""
+    avatar_url: str = ""
+    oss_url: str = ""
+    old_password: str = ""
+    new_password: str = ""
+
+
+def _user_to_dict(user) -> dict:
+    return {
+        "id": user.id,
+        "username": user.username,
+        "nickname": user.nickname or user.username,
+        "avatar_url": user.avatar_url or "",
+        "oss_url": user.oss_url or "",
+        "created_at": user.created_at.isoformat() if user.created_at else "",
+    }
+
+
+@app.post("/auth/register")
+async def auth_register(req: AuthRegisterRequest):
+    from backend.db.database import create_user, get_user_by_username
+    existing = await get_user_by_username(req.username)
+    if existing:
+        raise HTTPException(409, "用户名已存在")
+    hashed = _bcrypt_lib.hashpw(req.password.encode(), _bcrypt_lib.gensalt()).decode()
+    user = await create_user(req.username, hashed, req.nickname or req.username)
+    token = _create_jwt(user.id, user.username)
+    return {"token": token, "user": _user_to_dict(user)}
+
+
+@app.post("/auth/login")
+async def auth_login(req: AuthLoginRequest):
+    from backend.db.database import get_user_by_username
+    user = await get_user_by_username(req.username.strip())
+    if not user or not _bcrypt_lib.checkpw(req.password.encode(), user.password_hash.encode()):
+        raise HTTPException(401, "用户名或密码错误")
+    token = _create_jwt(user.id, user.username)
+    return {"token": token, "user": _user_to_dict(user)}
+
+
+@app.get("/auth/me")
+async def auth_me(request: Request):
+    from backend.db.database import get_user_by_id
+    user_id = getattr(request.state, "user_id", "")
+    if not user_id:
+        raise HTTPException(401, "未登录")
+    user = await get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(404, "用户不存在")
+    return _user_to_dict(user)
+
+
+@app.put("/auth/me")
+async def auth_update_me(request: Request, req: AuthUpdateMeRequest):
+    from backend.db.database import get_user_by_id, update_user
+    user_id = getattr(request.state, "user_id", "")
+    if not user_id:
+        raise HTTPException(401, "未登录")
+    user = await get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(404, "用户不存在")
+
+    updates = {}
+    if req.nickname.strip():
+        updates["nickname"] = req.nickname.strip()[:64]
+    if req.avatar_url is not None:
+        updates["avatar_url"] = req.avatar_url.strip()[:1024]
+    if req.oss_url is not None:
+        updates["oss_url"] = req.oss_url.strip()[:1024]
+
+    if req.old_password and req.new_password:
+        if not _bcrypt_lib.checkpw(req.old_password.encode(), user.password_hash.encode()):
+            raise HTTPException(400, "旧密码错误")
+        if len(req.new_password) < 6:
+            raise HTTPException(400, "新密码至少 6 位")
+        updates["password_hash"] = _bcrypt_lib.hashpw(req.new_password.encode(), _bcrypt_lib.gensalt()).decode()
+
+    if updates:
+        user = await update_user(user_id, **updates)
+    return {"status": "ok", "user": _user_to_dict(user)}
 
 
 # ── 设置持久化 ────────────────────────────────────────────

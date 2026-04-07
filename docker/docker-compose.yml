@@ -84,6 +84,8 @@ services:
       - TOOLBOX_IMAGE=pentest-toolbox:latest
       - REPORTS_DIR=/reports
       - DATA_VOLUME=/data
+      # JWT 认证
+      - JWT_SECRET=${JWT_SECRET:-aurorarecon_default_secret_change_me}
       # 反弹 Shell
       - LHOST=${LHOST:-}
     volumes:

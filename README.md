@@ -4,7 +4,7 @@
 项目核心是基于 LangGraph 的攻链编排，配合 Docker 工具沙箱、Skill 引擎、知识库检索与人工审批，实现从侦察到报告的闭环。
 
 ## 1) 架构总览
-
+![img.png](img.png)
 ```text
 Vue 3 Frontend
   ├─ 任务中心 / 决策视图 / 报告中心 / 工具管理 / Skill管理 / 知识库管理

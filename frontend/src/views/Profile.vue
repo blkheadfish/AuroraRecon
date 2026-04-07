@@ -13,24 +13,30 @@
         <div class="avatar-col">
           <el-avatar
             :size="88"
-            :src="avatarError ? '' : profile.avatar"
+            :src="avatarError ? '' : profile.avatar_url"
             class="profile-avatar"
             @error="onAvatarError"
           >
             {{ nicknameInitial }}
           </el-avatar>
-          <el-button size="small" disabled>上传头像（预留）</el-button>
         </div>
         <div class="form-col">
-          <el-form label-width="90px">
+          <el-form label-width="100px">
+            <el-form-item label="用户名">
+              <el-input :model-value="profile.username" disabled />
+            </el-form-item>
             <el-form-item label="昵称">
-              <el-input v-model="profile.nickname" maxlength="32" show-word-limit />
+              <el-input v-model="profile.nickname" maxlength="64" show-word-limit />
             </el-form-item>
             <el-form-item label="头像链接">
-              <el-input v-model="profile.avatar" placeholder="https://example.com/avatar.png" />
+              <el-input v-model="profile.avatar_url" placeholder="https://example.com/avatar.png" />
             </el-form-item>
-            <el-form-item label="更新时间">
-              <span class="muted">{{ formatTime(profile.updated_at) }}</span>
+            <el-form-item label="OSS 地址">
+              <el-input v-model="profile.oss_url" placeholder="https://your-bucket.oss-cn-xxx.aliyuncs.com（预留）" />
+              <div class="hint">预留 OSS 基础地址，可自行填写后保存</div>
+            </el-form-item>
+            <el-form-item label="注册时间">
+              <span class="muted">{{ formatTime(profile.created_at) }}</span>
             </el-form-item>
             <el-form-item>
               <el-button type="primary" :loading="profileSaving" @click="saveProfile">保存资料</el-button>
@@ -93,16 +99,19 @@
 import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { api } from '@/api'
+import { useAuthStore } from '@/stores/auth'
 
-const PROFILE_LOCAL_KEY = 'profile.local.v1'
+const auth = useAuthStore()
 
 const profileLoading = ref(false)
 const profileSaving = ref(false)
 const avatarError = ref(false)
 const profile = ref({
-  nickname: '安全研究员',
-  avatar: '',
-  updated_at: '',
+  username: '',
+  nickname: '',
+  avatar_url: '',
+  oss_url: '',
+  created_at: '',
 })
 
 const passwordSaving = ref(false)
@@ -153,38 +162,27 @@ function onAvatarError() {
   return false
 }
 
-function loadProfileLocal() {
-  const cached = localStorage.getItem(PROFILE_LOCAL_KEY)
-  if (!cached) return
-  try {
-    const parsed = JSON.parse(cached)
-    profile.value = {
-      nickname: parsed.nickname || '安全研究员',
-      avatar: parsed.avatar || '',
-      updated_at: parsed.updated_at || '',
-    }
-  } catch {
-    // Ignore invalid cache.
-  }
-}
-
-function saveProfileLocal(data) {
-  localStorage.setItem(PROFILE_LOCAL_KEY, JSON.stringify(data))
-}
-
 async function loadProfile() {
   profileLoading.value = true
-  loadProfileLocal()
   try {
-    const remote = await api.getProfile()
+    const me = await api.authMe()
     profile.value = {
-      nickname: remote.nickname || profile.value.nickname || '安全研究员',
-      avatar: remote.avatar || '',
-      updated_at: remote.updated_at || profile.value.updated_at || '',
+      username: me.username || '',
+      nickname: me.nickname || me.username || '',
+      avatar_url: me.avatar_url || '',
+      oss_url: me.oss_url || '',
+      created_at: me.created_at || '',
     }
-    saveProfileLocal(profile.value)
   } catch {
-    // Backend not ready: keep local profile.
+    if (auth.user) {
+      profile.value = {
+        username: auth.user.username || '',
+        nickname: auth.user.nickname || '',
+        avatar_url: auth.user.avatar_url || '',
+        oss_url: auth.user.oss_url || '',
+        created_at: auth.user.created_at || '',
+      }
+    }
   } finally {
     profileLoading.value = false
   }
@@ -196,37 +194,31 @@ async function saveProfile() {
     ElMessage.error('昵称不能为空')
     return
   }
-  const payload = {
-    nickname,
-    avatar: String(profile.value.avatar || '').trim(),
-  }
   profileSaving.value = true
-  const localProfile = {
-    ...payload,
-    updated_at: new Date().toISOString(),
-  }
-  saveProfileLocal(localProfile)
-  profile.value = localProfile
   avatarError.value = false
-
   try {
-    const res = await api.updateProfile(payload)
-    if (res?.profile) {
+    const res = await api.authUpdateMe({
+      nickname,
+      avatar_url: String(profile.value.avatar_url || '').trim(),
+      oss_url: String(profile.value.oss_url || '').trim(),
+    })
+    if (res?.user) {
       profile.value = {
-        nickname: res.profile.nickname || localProfile.nickname,
-        avatar: res.profile.avatar || '',
-        updated_at: res.profile.updated_at || localProfile.updated_at,
+        username: res.user.username || profile.value.username,
+        nickname: res.user.nickname || nickname,
+        avatar_url: res.user.avatar_url || '',
+        oss_url: res.user.oss_url || '',
+        created_at: res.user.created_at || profile.value.created_at,
       }
-      saveProfileLocal(profile.value)
+      auth.updateUser({
+        nickname: res.user.nickname,
+        avatar_url: res.user.avatar_url,
+        oss_url: res.user.oss_url,
+      })
     }
     ElMessage.success('个人资料已保存')
   } catch (e) {
-    const status = e?.response?.status
-    if (status === 404 || status === 501) {
-      ElMessage.warning('后端个人资料接口未启用，已保存到本地')
-    } else {
-      ElMessage.warning('后端保存失败，已保存到本地')
-    }
+    ElMessage.error(e?.response?.data?.detail || e.message || '保存失败')
   } finally {
     profileSaving.value = false
   }
@@ -237,8 +229,8 @@ async function submitPassword() {
     ElMessage.error('请输入旧密码')
     return
   }
-  if (passwordForm.value.new_password.length < 8) {
-    ElMessage.error('新密码至少 8 位')
+  if (passwordForm.value.new_password.length < 6) {
+    ElMessage.error('新密码至少 6 位')
     return
   }
   if (passwordForm.value.new_password !== passwordForm.value.confirm_password) {
@@ -248,18 +240,14 @@ async function submitPassword() {
 
   passwordSaving.value = true
   try {
-    await api.changePassword({
+    await api.authUpdateMe({
       old_password: passwordForm.value.old_password,
       new_password: passwordForm.value.new_password,
     })
     ElMessage.success('密码修改成功')
     passwordForm.value = { old_password: '', new_password: '', confirm_password: '' }
   } catch (e) {
-    if (e?.response?.status === 501) {
-      ElMessage.warning('后端修改密码接口未启用（预留中）')
-    } else {
-      ElMessage.error(e?.response?.data?.detail || e.message || '修改密码失败')
-    }
+    ElMessage.error(e?.response?.data?.detail || e.message || '修改密码失败')
   } finally {
     passwordSaving.value = false
   }

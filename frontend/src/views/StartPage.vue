@@ -1,5 +1,5 @@
 <template>
-  <div ref="rootRef" class="start-page" tabindex="0" @keyup.enter="goWorkbench">
+  <div ref="rootRef" class="start-page" tabindex="0" @keyup.enter="handleMainAction">
     <div class="bg-decor" aria-hidden="true">
       <span class="bg-grid"></span>
       <span class="bg-circuit"></span>
@@ -13,19 +13,19 @@
         <el-icon v-else><Moon /></el-icon>
       </button>
 
-      <el-dropdown trigger="click" @command="handleUserCommand">
+      <el-dropdown v-if="isLoggedIn" trigger="click" @command="handleUserCommand">
         <div class="user-trigger">
-          <el-avatar :size="34" :src="avatarError ? '' : profile.avatar" @error="onAvatarError">
+          <el-avatar :size="34" :src="avatarError ? '' : currentAvatar" @error="onAvatarError">
             {{ userInitial }}
           </el-avatar>
-          <span class="username">{{ profile.nickname }}</span>
+          <span class="username">{{ currentNickname }}</span>
           <el-icon><ArrowDown /></el-icon>
         </div>
         <template #dropdown>
           <el-dropdown-menu>
             <el-dropdown-item command="profile">个人空间</el-dropdown-item>
             <el-dropdown-item command="settings">系统设置</el-dropdown-item>
-            <el-dropdown-item command="logout" divided>退出（预留）</el-dropdown-item>
+            <el-dropdown-item command="logout" divided>退出登录</el-dropdown-item>
           </el-dropdown-menu>
         </template>
       </el-dropdown>
@@ -55,7 +55,7 @@
             size="large"
             class="start-btn"
             :class="{ 'is-hovering': startHoverActive }"
-            @click="goWorkbench"
+            @click="handleMainAction"
             @mouseenter="onStartHover"
             @mouseleave="onStartLeave"
             @focus="onStartHover"
@@ -65,11 +65,11 @@
             <span class="btn-frame btn-frame-tr" aria-hidden="true"></span>
             <span class="btn-frame btn-frame-bl" aria-hidden="true"></span>
             <span class="btn-frame btn-frame-br" aria-hidden="true"></span>
-            <span class="btn-main">START</span>
+            <span class="btn-main">{{ isLoggedIn ? 'START' : 'LOGIN' }}</span>
           </el-button>
           <p v-if="startHoverActive" class="btn-terminal-line">{{ startHoverText }}</p>
         </div>
-        <p class="hint"><span class="prompt">&gt;&gt;</span> 按 Enter 键也可快速开始</p>
+        <p class="hint"><span class="prompt">&gt;&gt;</span> {{ isLoggedIn ? '按 Enter 键也可快速开始' : '按 Enter 键前往登录' }}</p>
       </section>
 
       <section class="board-panel" :class="{ 'is-loading': boardLoading }">
@@ -113,14 +113,15 @@ import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { api } from '@/api'
 import { useTheme } from '@/composables/useTheme'
+import { useAuthStore } from '@/stores/auth'
 
-const PROFILE_LOCAL_KEY = 'profile.local.v1'
 const POLL_INTERVAL_MS = 20000
 const START_TERMINAL_IDLE = 'exec::dashboard_boot'
 const START_TERMINAL_READY = 'exec::dashboard_ready'
 const TERMINAL_GLYPHS = '01ABCDEF$#*_-'
 
 const router = useRouter()
+const auth = useAuthStore()
 const rootRef = ref(null)
 const avatarError = ref(false)
 const boardLoading = ref(false)
@@ -130,10 +131,10 @@ const startHoverText = ref(START_TERMINAL_IDLE)
 const prefersReducedMotion = ref(false)
 const boardModel = ref(createFallbackBoard())
 const { theme, init: initTheme, toggle: toggleTheme } = useTheme()
-const profile = ref({
-  nickname: '安全研究员',
-  avatar: '',
-})
+
+const isLoggedIn = computed(() => auth.isLoggedIn)
+const currentNickname = computed(() => auth.displayName || '安全研究员')
+const currentAvatar = computed(() => auth.avatarUrl || '')
 
 let boardTimer = null
 let startHoverTimer = null
@@ -141,7 +142,7 @@ let startHoverResetTimer = null
 let reducedMotionMedia = null
 let reducedMotionHandler = null
 
-const userInitial = computed(() => (profile.value.nickname || 'U').slice(0, 1).toUpperCase())
+const userInitial = computed(() => (currentNickname.value || 'U').slice(0, 1).toUpperCase())
 const boardKpis = computed(() => boardModel.value.kpis || [])
 const boardServices = computed(() => boardModel.value.services || [])
 const sourceText = computed(() => {
@@ -222,22 +223,12 @@ async function loadBoard() {
   }
 }
 
-function loadProfileLocal() {
-  const cached = localStorage.getItem(PROFILE_LOCAL_KEY)
-  if (!cached) return
-  try {
-    const parsed = JSON.parse(cached)
-    profile.value = {
-      nickname: parsed.nickname || '安全研究员',
-      avatar: parsed.avatar || '',
-    }
-  } catch {
-    // Ignore invalid cache.
+function handleMainAction() {
+  if (isLoggedIn.value) {
+    router.push('/dashboard')
+  } else {
+    router.push('/login')
   }
-}
-
-function goWorkbench() {
-  router.push('/dashboard')
 }
 
 function handleUserCommand(command) {
@@ -249,7 +240,11 @@ function handleUserCommand(command) {
     router.push('/settings')
     return
   }
-  ElMessage.info('退出功能预留中')
+  if (command === 'logout') {
+    auth.logout()
+    ElMessage.success('已退出登录')
+    return
+  }
 }
 
 function onAvatarError() {
@@ -342,7 +337,6 @@ function cleanupReducedMotionWatcher() {
 onMounted(async () => {
   initTheme()
   initReducedMotionWatcher()
-  loadProfileLocal()
   rootRef.value?.focus()
   await loadBoard()
   boardTimer = window.setInterval(() => {

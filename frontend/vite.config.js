@@ -2,7 +2,8 @@ import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import path from 'path'
 
-const BACKEND = process.env.VITE_API_BASE || 'http://localhost:8000'
+// Prefer IPv4 loopback in dev to avoid VM/NAT localhost(::1) issues on Windows.
+const BACKEND = process.env.VITE_API_BASE || 'http://127.0.0.1:8000'
 
 export default defineConfig({
 	plugins: [vue()],
