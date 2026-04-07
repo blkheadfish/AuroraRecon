@@ -123,6 +123,49 @@ export const api = {
   reloadKnowledge: (): Promise<{ status: string; total: number }> =>
     http.post('/knowledge/reload'),
 
+  getKnowledgeSource: (vulnId: string): Promise<{
+    vuln_id: string
+    name: string
+    urls: string[]
+    extra_context: string
+    fallback_content: string
+    is_custom: boolean
+    built: boolean
+  }> => http.get(`/knowledge/${vulnId}/sources`),
+
+  saveKnowledgeSource: (vulnId: string, payload: {
+    name?: string
+    urls?: string[]
+    extra_context?: string
+    fallback_content?: string
+  }): Promise<{ status: string; source: { vuln_id: string } }> =>
+    http.put(`/knowledge/${vulnId}/sources`, payload),
+
+  addKnowledgeSourceUrl: (vulnId: string, url: string): Promise<{ status: string; url: string; urls: string[] }> =>
+    http.post(`/knowledge/${vulnId}/sources/url`, { url }),
+
+  removeKnowledgeSourceUrl: (vulnId: string, url: string): Promise<{ status: string; url: string; urls: string[] }> =>
+    http.delete(`/knowledge/${vulnId}/sources/url`, { data: { url } }),
+
+  createKnowledgeSource: (payload: {
+    vuln_id: string
+    name: string
+    urls: string[]
+    extra_context?: string
+    fallback_content?: string
+  }): Promise<{ status: string; source: { vuln_id: string } }> =>
+    http.post('/knowledge/sources/new', payload),
+
+  buildKnowledge: (vulnId?: string): Promise<{
+    status: string
+    mode: 'single' | 'all'
+    total?: number
+    success: number
+    failed: number
+    vuln_id?: string
+    results?: Record<string, boolean>
+  }> => http.post('/knowledge/build', vulnId ? { vuln_id: vulnId } : {}, { timeout: 600000 }),
+
   sendChat: (taskId: string, text: string): Promise<{ status: string; message: { role: string; text: string; timestamp: string } }> =>
     http.post(`/tasks/${taskId}/chat`, { text }),
   getChatHistory: (taskId: string): Promise<{ messages: Array<{ role: string; text: string; timestamp: string }> }> =>

@@ -65,6 +65,49 @@
             </el-form-item>
           </el-form>
         </el-card>
+
+        <el-card class="settings-card">
+          <template #header><span class="card-title">Embedding 配置</span></template>
+
+          <el-form :model="embedding" label-width="120px" class="settings-form">
+            <el-form-item label="启用语义检索">
+              <el-switch
+                v-model="embedding.enabled"
+                active-text="开启"
+                inactive-text="关闭（仅关键词检索）"
+              />
+            </el-form-item>
+
+            <el-form-item label="Embedding API Key">
+              <el-input
+                v-model="embedding.api_key"
+                type="password"
+                show-password
+                placeholder="jina_xxx / sk-xxx"
+                class="mono-input"
+              />
+            </el-form-item>
+
+            <el-form-item label="Embedding Base URL">
+              <el-input
+                v-model="embedding.base_url"
+                class="mono-input"
+                placeholder="https://api.jina.ai/v1"
+              />
+              <div class="form-tip error" v-if="validationErrors.embeddingBaseUrl">
+                {{ validationErrors.embeddingBaseUrl }}
+              </div>
+            </el-form-item>
+
+            <el-form-item label="Embedding 模型">
+              <el-input
+                v-model="embedding.model"
+                class="mono-input"
+                placeholder="jina-embeddings-v3 / text-embedding-3-small"
+              />
+            </el-form-item>
+          </el-form>
+        </el-card>
       </el-tab-pane>
 
       <!-- ② 系统状态 -->
@@ -256,6 +299,13 @@ const llm = ref({
   max_tokens: 4096,
 })
 
+const embedding = ref({
+  enabled: true,
+  api_key: '',
+  base_url: 'https://api.jina.ai/v1',
+  model: '',
+})
+
 const executor = ref({
   docker_network:       'pentest_net',
   toolbox_image:        'pentest-toolbox:latest',
@@ -305,7 +355,12 @@ async function testLLM() {
 }
 
 async function saveAll() {
-  if (validationErrors.value.apiKey || validationErrors.value.baseUrl || validationErrors.value.lhost) {
+  if (
+    validationErrors.value.apiKey ||
+    validationErrors.value.baseUrl ||
+    validationErrors.value.embeddingBaseUrl ||
+    validationErrors.value.lhost
+  ) {
     ElMessage.error('请先修正配置校验错误后再保存')
     return
   }
@@ -313,6 +368,7 @@ async function saveAll() {
   try {
     await api.saveSettings({
       llm: llm.value,
+      embedding: embedding.value,
       executor: executor.value,
       workflow: workflow.value,
     })
@@ -329,14 +385,18 @@ const validationErrors = computed(() => {
   const errors = {
     apiKey: '',
     baseUrl: '',
+    embeddingBaseUrl: '',
     lhost: '',
   }
 
   if (llm.value.api_key && !/^sk-[a-zA-Z0-9\-_]{8,}/.test(llm.value.api_key)) {
     errors.apiKey = 'API Key 格式不合法，通常应以 sk- 开头。'
   }
-  if (llm.value.base_url && !/^https?:\/\/[\w.-]+/.test(llm.value.base_url)) {
+  if (llm.value.base_url && !/^https?:\/\/[\w.-]+(?:\/.*)?$/.test(llm.value.base_url)) {
     errors.baseUrl = 'Base URL 必须是合法的 http/https 地址。'
+  }
+  if (embedding.value.base_url && !/^https?:\/\/[\w.-]+(?:\/.*)?$/.test(embedding.value.base_url)) {
+    errors.embeddingBaseUrl = 'Embedding Base URL 必须是合法的 http/https 地址。'
   }
   if (executor.value.lhost && !/^\d{1,3}(\.\d{1,3}){3}$/.test(executor.value.lhost)) {
     errors.lhost = 'LHOST 建议填写合法 IPv4 地址。'
@@ -348,6 +408,7 @@ async function loadSettings() {
   try {
     const s = await api.getSettings()
     if (s.llm)      Object.assign(llm.value, s.llm)
+    if (s.embedding) Object.assign(embedding.value, s.embedding)
     if (s.executor) Object.assign(executor.value, s.executor)
     if (s.workflow) Object.assign(workflow.value, s.workflow)
   } catch { /* 首次启动时后端可能还没有设置 */ }

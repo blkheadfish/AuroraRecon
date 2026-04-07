@@ -13,6 +13,13 @@ export interface ExecutorSettings {
   lhost: string
 }
 
+export interface EmbeddingSettings {
+  enabled: boolean
+  api_key: string
+  base_url: string
+  model: string
+}
+
 export interface WorkflowSettings {
   require_approval: boolean
   max_retries: number
@@ -22,6 +29,7 @@ export interface WorkflowSettings {
 
 export interface SettingsPayload {
   llm?: Partial<LlmSettings>
+  embedding?: Partial<EmbeddingSettings>
   executor?: Partial<ExecutorSettings>
   workflow?: Partial<WorkflowSettings>
 }

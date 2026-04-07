@@ -79,21 +79,13 @@ const liveStore = useTaskLiveStore()
 const loading = ref(true)
 const chatInput = ref('')
 const sending = ref(false)
-const approving = ref(false)
-const approvalDone = ref(false)
 
-async function doApprove(approved) {
-  if (approving.value || approvalDone.value) return
-  approving.value = true
-  try {
-    await api.approveTask(taskId, approved)
-    approvalDone.value = true
-    ElMessage.success(approved ? '已批准继续利用' : '已拒绝利用阶段')
-  } catch (e) {
-    ElMessage.error(e?.response?.data?.detail || e.message || '审批失败')
-  } finally {
-    approving.value = false
-  }
+const approvalState = computed(() => liveStore.getLiveState(taskId).approvalState)
+const approvalDone = computed(() => approvalState.value === 'submitted')
+const approving = computed(() => approvalState.value === 'submitting')
+
+function doApprove(approved) {
+  liveStore.submitApproval(taskId, approved)
 }
 
 async function sendMessage() {

@@ -152,11 +152,20 @@ class ReconAgent:
 			logger.warning("两轮扫描均未发现开放端口")
 			return [], {}, precise_result.stdout or ""
 
-		# 对合并后的端口做精细探测
+		# 对合并后的端口做精细探测（公网目标跳过 -O，降低脚本强度）
 		port_str = ",".join(str(p) for p in sorted(all_ports)[:50])
+		import ipaddress as _ipaddress
+		try:
+			_is_private = _ipaddress.ip_address(target).is_private
+		except ValueError:
+			_is_private = False
+		if _is_private:
+			nmap_detail_args = ["-sV", "-sC", "-O", "--osscan-guess", "-Pn", "-p", port_str, "-oX", "-", target]
+		else:
+			nmap_detail_args = ["-sV", "--version-intensity", "5", "-Pn", "-p", port_str, "-oX", "-", target]
 		detail_result: ExecuteResult = await self.executor.run(
 			tool="nmap",
-			args=["-sV", "-sC", "-O", "--osscan-guess", "-Pn", "-p", port_str, "-oX", "-", target],
+			args=nmap_detail_args,
 			timeout=300,
 			task_id=task_id,
 			log_callback=log_callback,

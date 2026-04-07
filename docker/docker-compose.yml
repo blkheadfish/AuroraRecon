@@ -85,7 +85,7 @@ services:
       - REPORTS_DIR=/reports
       - DATA_VOLUME=/data
       # 反弹 Shell
-      - LHOST=${LHOST:-125.70.254.93}
+      - LHOST=${LHOST:-}
     volumes:
       - reports_data:/reports
       - /var/run/docker.sock:/var/run/docker.sock

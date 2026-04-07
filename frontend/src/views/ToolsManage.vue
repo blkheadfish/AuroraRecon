@@ -43,7 +43,7 @@
             <div class="collapse-title">
               <div class="cat-header" :style="categoryStyle(group.category)">
                 <span class="cat-marker" aria-hidden="true"></span>
-                <span class="cat-name">{{ group.category }}</span>
+                <span class="cat-name">{{ resolveCategoryLabel(group.category) }}</span>
                 <el-tag size="small" class="cat-count">{{ group.items.length }}</el-tag>
               </div>
             </div>
@@ -65,6 +65,7 @@ import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { api } from '@/api'
 import { resolveCategoryColor } from '@/utils/categoryColor'
+import { resolveCategoryLabel } from '@/utils/categoryLabel'
 
 const loading = ref(false)
 const windowHours = ref(24)

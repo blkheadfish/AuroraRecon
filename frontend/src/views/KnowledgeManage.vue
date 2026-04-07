@@ -3,9 +3,11 @@
     <div class="page-header">
       <div>
         <h1 class="page-title">知识库管理</h1>
-        <p class="page-sub">支持查看与编辑检测知识 JSON，保存后重载知识库</p>
+        <p class="page-sub">查看/编辑知识条目与来源，支持单条或全量构建</p>
       </div>
       <div class="header-actions">
+        <el-button @click="openNewSourceDialog">新建来源</el-button>
+        <el-button type="success" @click="buildAll" :loading="buildAllLoading">一键构建</el-button>
         <el-button @click="fetchEntries" :loading="entriesLoading">刷新</el-button>
         <el-button class="header-reload-btn" type="primary" @click="reloadKB" :loading="reloadLoading">重载知识库</el-button>
       </div>
@@ -24,7 +26,7 @@
             <div class="collapse-title">
               <div class="cat-header" :style="categoryStyle(group.category)">
                 <span class="cat-marker" aria-hidden="true"></span>
-                <span class="cat-name">{{ group.category }}</span>
+                <span class="cat-name">{{ resolveCategoryLabel(group.category) }}</span>
                 <el-tag size="small" class="cat-count">{{ group.items.length }}</el-tag>
               </div>
             </div>
@@ -42,7 +44,7 @@
                 <span class="mono-text">{{ (row.cves || []).join(', ') || '-' }}</span>
               </template>
             </el-table-column>
-            <el-table-column label="Tags" min-width="160">
+            <el-table-column label="标签" min-width="160">
               <template #default="{ row }">
                 <span>{{ (row.tags || []).join(', ') || '-' }}</span>
               </template>
@@ -65,22 +67,73 @@
       </el-collapse>
     </el-card>
 
-    <el-drawer v-model="drawerVisible" title="知识条目详情" size="55%">
+    <!-- ── 条目详情抽屉（含来源管理） ── -->
+    <el-drawer v-model="drawerVisible" title="知识条目详情" size="58%">
       <template v-if="selectedEntry">
         <div class="entry-meta">
           <div><b>Vuln ID：</b><code>{{ selectedEntry.vuln_id }}</code></div>
-          <div><b>分类：</b>{{ selectedEntry.category }}</div>
+          <div><b>分类：</b>{{ resolveCategoryLabel(selectedEntry.category) }}</div>
           <div><b>CVEs：</b>{{ (selectedEntry.cves || []).join(', ') || '-' }}</div>
-          <div><b>Tags：</b>{{ (selectedEntry.tags || []).join(', ') || '-' }}</div>
+          <div><b>标签：</b>{{ (selectedEntry.tags || []).join(', ') || '-' }}</div>
           <div><b>端口：</b>{{ selectedEntry.default_port ?? '-' }}</div>
         </div>
         <div class="drawer-actions">
           <el-button class="drawer-edit-btn" @click="openEditor(selectedEntry)">编辑 JSON</el-button>
         </div>
         <pre class="json-preview"><code class="hljs language-json" v-html="selectedJsonHighlighted"></code></pre>
+
+        <!-- ── 来源管理区块 ── -->
+        <div class="source-section" v-loading="sourceLoading">
+          <div class="source-section-title">来源管理</div>
+
+          <el-form label-width="100px" size="small" class="source-form">
+            <el-form-item label="名称">
+              <el-input v-model="sourceData.name" />
+            </el-form-item>
+
+            <el-form-item label="来源 URL">
+              <div class="url-list">
+                <div v-for="(u, idx) in sourceData.urls" :key="idx" class="url-row">
+                  <code class="url-text">{{ u }}</code>
+                  <el-button size="small" type="danger" text @click="removeUrl(idx)">删除</el-button>
+                </div>
+                <div v-if="!sourceData.urls.length" class="url-empty">暂无 URL</div>
+              </div>
+              <div class="url-add-row">
+                <el-input
+                  v-model="newUrlInput"
+                  placeholder="https://..."
+                  class="mono-input"
+                  @keyup.enter="addUrl"
+                />
+                <el-button size="small" @click="addUrl" :disabled="!newUrlInput.trim()">添加</el-button>
+              </div>
+              <div class="form-tip error" v-if="urlError">{{ urlError }}</div>
+            </el-form-item>
+
+            <el-form-item label="额外上下文">
+              <el-input v-model="sourceData.extra_context" type="textarea" :rows="2" />
+            </el-form-item>
+
+            <el-form-item label="兜底内容">
+              <el-input v-model="sourceData.fallback_content" type="textarea" :rows="3" />
+            </el-form-item>
+
+            <el-form-item>
+              <div class="source-btn-row">
+                <el-button type="primary" @click="saveSource" :loading="savingSource">保存来源</el-button>
+                <el-button type="success" @click="buildEntry" :loading="buildingEntry">构建本条</el-button>
+                <el-tag v-if="sourceData.is_custom" type="warning" size="small">自定义</el-tag>
+                <el-tag v-else type="info" size="small">内置</el-tag>
+                <el-tag :type="sourceData.built ? 'success' : 'info'" size="small">{{ sourceData.built ? '已构建' : '未构建' }}</el-tag>
+              </div>
+            </el-form-item>
+          </el-form>
+        </div>
       </template>
     </el-drawer>
 
+    <!-- ── JSON 编辑对话框 ── -->
     <el-dialog
       v-model="editorVisible"
       :title="selectedEntry ? `编辑 JSON · ${selectedEntry.vuln_id}` : '编辑 JSON'"
@@ -102,54 +155,93 @@
         <el-button type="primary" :loading="saveLoading" @click="saveJson">保存并重载</el-button>
       </template>
     </el-dialog>
+
+    <!-- ── 新建来源条目弹窗 ── -->
+    <el-dialog v-model="newSourceVisible" title="新建知识来源" width="480px" destroy-on-close>
+      <el-form :model="newSourceForm" label-width="100px" size="small">
+        <el-form-item label="Vuln ID">
+          <el-input v-model="newSourceForm.vuln_id" placeholder="例如: custom_cve_001" class="mono-input" />
+          <div class="form-tip error" v-if="newSourceErrors.vuln_id">{{ newSourceErrors.vuln_id }}</div>
+        </el-form-item>
+        <el-form-item label="名称">
+          <el-input v-model="newSourceForm.name" placeholder="漏洞名称" />
+          <div class="form-tip error" v-if="newSourceErrors.name">{{ newSourceErrors.name }}</div>
+        </el-form-item>
+        <el-form-item label="首个 URL">
+          <el-input v-model="newSourceForm.url" placeholder="https://... （可选）" class="mono-input" />
+          <div class="form-tip error" v-if="newSourceErrors.url">{{ newSourceErrors.url }}</div>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="newSourceVisible = false">取消</el-button>
+        <el-button type="primary" :loading="creatingSource" @click="createSource">创建</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import hljs from 'highlight.js/lib/core'
 import jsonLanguage from 'highlight.js/lib/languages/json'
 import { api } from '@/api'
 import { resolveCategoryColor } from '@/utils/categoryColor'
+import { resolveCategoryLabel } from '@/utils/categoryLabel'
 
 hljs.registerLanguage('json', jsonLanguage)
 
+// ── 列表 ──
 const entriesLoading = ref(false)
 const entries = ref([])
 const reloadLoading = ref(false)
 const activeCategories = ref([])
+const buildAllLoading = ref(false)
 
+// ── 详情抽屉 ──
 const selectedEntry = ref(null)
 const selectedJsonRaw = ref('')
 const drawerVisible = ref(false)
+
+// ── JSON 编辑 ──
 const editorVisible = ref(false)
 const saveLoading = ref(false)
 const jsonDraft = ref('')
 
+// ── 来源管理（抽屉内） ──
+const sourceLoading = ref(false)
+const sourceData = ref({
+  name: '',
+  urls: [],
+  extra_context: '',
+  fallback_content: '',
+  is_custom: false,
+  built: false,
+})
+const newUrlInput = ref('')
+const urlError = ref('')
+const savingSource = ref(false)
+const buildingEntry = ref(false)
+
+// ── 新建来源弹窗 ──
+const newSourceVisible = ref(false)
+const creatingSource = ref(false)
+const newSourceForm = ref({ vuln_id: '', name: '', url: '' })
+const newSourceErrors = ref({ vuln_id: '', name: '', url: '' })
+
+// ── 工具函数 ──
 function escapeHtml(text) {
-  return String(text || '')
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
+  return String(text || '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
 }
 
 function highlightJson(text) {
   const raw = String(text || '')
   if (!raw) return ''
-  try {
-    return hljs.highlight(raw, { language: 'json' }).value
-  } catch {
-    return escapeHtml(raw)
-  }
+  try { return hljs.highlight(raw, { language: 'json' }).value } catch { return escapeHtml(raw) }
 }
 
 function prettyJson(raw) {
-  try {
-    return JSON.stringify(JSON.parse(raw), null, 2)
-  } catch {
-    return raw
-  }
+  try { return JSON.stringify(JSON.parse(raw), null, 2) } catch { return raw }
 }
 
 const selectedJsonHighlighted = computed(() => highlightJson(prettyJson(selectedJsonRaw.value)))
@@ -171,11 +263,10 @@ const groupedEntries = computed(() => {
 })
 
 function categoryStyle(category) {
-  return {
-    '--cat-tone': resolveCategoryColor(category),
-  }
+  return { '--cat-tone': resolveCategoryColor(category) }
 }
 
+// ── 列表操作 ──
 async function fetchEntries() {
   entriesLoading.value = true
   try {
@@ -202,6 +293,20 @@ async function reloadKB() {
   }
 }
 
+async function buildAll() {
+  buildAllLoading.value = true
+  try {
+    const res = await api.buildKnowledge()
+    ElMessage.success(`构建完成：成功 ${res.success}，失败 ${res.failed}`)
+    await fetchEntries()
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || e.message || '全量构建失败')
+  } finally {
+    buildAllLoading.value = false
+  }
+}
+
+// ── 详情抽屉 ──
 async function openDrawer(row) {
   selectedEntry.value = row
   selectedJsonRaw.value = ''
@@ -212,8 +317,91 @@ async function openDrawer(row) {
   } catch (e) {
     selectedJsonRaw.value = `读取失败: ${e?.response?.data?.detail || e.message}`
   }
+  await loadSource(row.vuln_id)
 }
 
+// ── 来源管理 ──
+async function loadSource(vulnId) {
+  sourceLoading.value = true
+  newUrlInput.value = ''
+  urlError.value = ''
+  try {
+    const src = await api.getKnowledgeSource(vulnId)
+    sourceData.value = {
+      name: src.name || '',
+      urls: src.urls || [],
+      extra_context: src.extra_context || '',
+      fallback_content: src.fallback_content || '',
+      is_custom: src.is_custom,
+      built: src.built,
+    }
+  } catch {
+    sourceData.value = { name: '', urls: [], extra_context: '', fallback_content: '', is_custom: false, built: false }
+  } finally {
+    sourceLoading.value = false
+  }
+}
+
+function addUrl() {
+  const url = newUrlInput.value.trim()
+  if (!url) return
+  if (!/^https?:\/\//i.test(url)) {
+    urlError.value = 'URL 必须以 http:// 或 https:// 开头'
+    return
+  }
+  urlError.value = ''
+  if (!sourceData.value.urls.includes(url)) {
+    sourceData.value.urls.push(url)
+  }
+  newUrlInput.value = ''
+}
+
+function removeUrl(idx) {
+  sourceData.value.urls.splice(idx, 1)
+}
+
+async function saveSource() {
+  const vulnId = selectedEntry.value?.vuln_id
+  if (!vulnId) return
+  savingSource.value = true
+  try {
+    await api.saveKnowledgeSource(vulnId, {
+      name: sourceData.value.name,
+      urls: sourceData.value.urls,
+      extra_context: sourceData.value.extra_context,
+      fallback_content: sourceData.value.fallback_content,
+    })
+    ElMessage.success('来源已保存')
+    await loadSource(vulnId)
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || e.message || '保存来源失败')
+  } finally {
+    savingSource.value = false
+  }
+}
+
+async function buildEntry() {
+  const vulnId = selectedEntry.value?.vuln_id
+  if (!vulnId) return
+  buildingEntry.value = true
+  try {
+    const res = await api.buildKnowledge(vulnId)
+    if (res.failed > 0) {
+      ElMessage.warning(`${vulnId} 构建失败，请检查后端日志`)
+    } else {
+      ElMessage.success(`${vulnId} 构建成功`)
+    }
+    await Promise.all([fetchEntries(), loadSource(vulnId)])
+    const raw = await api.getKnowledgeRaw(vulnId)
+    selectedJsonRaw.value = raw.json || ''
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || e.message || '构建失败')
+  } finally {
+    buildingEntry.value = false
+  }
+}
+
+// ── JSON 编辑 ──
 async function openEditor(row) {
   selectedEntry.value = row
   jsonDraft.value = ''
@@ -249,6 +437,53 @@ async function saveJson() {
   }
 }
 
+// ── 新建来源条目 ──
+function openNewSourceDialog() {
+  newSourceForm.value = { vuln_id: '', name: '', url: '' }
+  newSourceErrors.value = { vuln_id: '', name: '', url: '' }
+  newSourceVisible.value = true
+}
+
+function validateNewSource() {
+  const errs = { vuln_id: '', name: '', url: '' }
+  const vid = newSourceForm.value.vuln_id.trim().toLowerCase()
+  if (!vid) {
+    errs.vuln_id = 'vuln_id 不能为空'
+  } else if (!/^[a-z0-9][a-z0-9_\-]{1,63}$/.test(vid)) {
+    errs.vuln_id = '仅允许小写字母/数字/_/-，长度 2-64'
+  }
+  if (!newSourceForm.value.name.trim()) {
+    errs.name = '名称不能为空'
+  }
+  const url = newSourceForm.value.url.trim()
+  if (url && !/^https?:\/\//i.test(url)) {
+    errs.url = 'URL 必须以 http:// 或 https:// 开头'
+  }
+  newSourceErrors.value = errs
+  return !errs.vuln_id && !errs.name && !errs.url
+}
+
+async function createSource() {
+  if (!validateNewSource()) return
+  creatingSource.value = true
+  try {
+    const vid = newSourceForm.value.vuln_id.trim().toLowerCase()
+    const url = newSourceForm.value.url.trim()
+    await api.createKnowledgeSource({
+      vuln_id: vid,
+      name: newSourceForm.value.name.trim(),
+      urls: url ? [url] : [],
+    })
+    newSourceVisible.value = false
+    ElMessage.success(`来源 ${vid} 已创建`)
+    await fetchEntries()
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || e.message || '创建来源失败')
+  } finally {
+    creatingSource.value = false
+  }
+}
+
 onMounted(async () => {
   await fetchEntries()
 })
@@ -260,6 +495,10 @@ onMounted(async () => {
 .page-title { font-size: 24px; font-weight: 700; color: var(--text-primary); }
 .page-sub { color: var(--text-secondary); font-size: 13px; margin-top: 4px; }
 .header-actions { display: flex; gap: 8px; }
+.mono-input :deep(input), .mono-input :deep(textarea) {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
 :deep(.header-reload-btn.el-button--primary) {
   color: #f6fbff !important;
   font-weight: 600;
@@ -403,7 +642,7 @@ onMounted(async () => {
   border-radius: var(--radius-md);
   background: var(--hljs-bg);
   color: var(--hljs-fg);
-  max-height: 62vh;
+  max-height: 40vh;
   overflow: auto;
   white-space: pre-wrap;
   word-break: break-word;
@@ -411,6 +650,44 @@ onMounted(async () => {
   font-size: 12px;
   line-height: 1.6;
 }
+
+/* ── 来源管理区块 ── */
+.source-section {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+.source-section-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text-primary);
+  margin-bottom: 12px;
+}
+.source-form { max-width: 100%; }
+.url-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+.url-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+}
+.url-text {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+  word-break: break-all;
+  flex: 1;
+  margin-right: 8px;
+}
+.url-empty { color: var(--text-muted); font-size: 12px; }
+.url-add-row { display: flex; gap: 8px; }
+.url-add-row .el-input { flex: 1; }
+.source-btn-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.form-tip { font-size: 12px; margin-top: 4px; }
+.form-tip.error { color: var(--accent-red); }
 
 .editor-wrap {
   display: grid;

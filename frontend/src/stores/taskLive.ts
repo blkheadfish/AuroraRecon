@@ -1,9 +1,12 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
+import { ElMessage } from 'element-plus'
 import { api } from '@/api'
 import { subscribeTaskEvents } from '@/services/wsManager'
 import { useTaskListStore } from '@/stores/taskList'
 import type { DecisionEvent, TaskDetail, WsTaskEvent } from '@/types/task'
+
+type ApprovalState = 'idle' | 'submitting' | 'submitted' | 'error'
 
 interface TaskLiveState {
   task: TaskDetail | null
@@ -12,6 +15,7 @@ interface TaskLiveState {
   events: WsTaskEvent[]
   decisionEvents: DecisionEvent[]
   decisionEventIds: Set<string>
+  approvalState: ApprovalState
   unsub?: () => void
 }
 
@@ -28,6 +32,7 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
         events: [],
         decisionEvents: [],
         decisionEventIds: new Set<string>(),
+        approvalState: 'idle',
       }
     }
     return taskStateMap.value[taskId]
@@ -110,6 +115,7 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
           got_shell: patch.got_shell,
         })
         if (state.task && patch.phase) {
+          const prevPhase = state.task.current_phase
           state.task = {
             ...state.task,
             current_phase: patch.phase,
@@ -121,6 +127,9 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
             secondary_elided: patch.secondary_elided ?? state.task.secondary_elided,
             attack_next_steps: patch.attack_next_steps ?? state.task.attack_next_steps,
             privesc_attempt_count: patch.privesc_attempt_count ?? state.task.privesc_attempt_count,
+          }
+          if (prevPhase === 'awaiting_approval' && patch.phase !== 'awaiting_approval') {
+            state.approvalState = 'idle'
           }
         }
         if (patch.logs?.length) {
@@ -134,8 +143,11 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
         if (state.task) {
           state.task = { ...state.task, current_phase: 'awaiting_approval' }
         }
+        if (state.approvalState === 'submitted') {
+          state.approvalState = 'idle'
+        }
         const approvalEvent: DecisionEvent = {
-          id: `approval-req-${Date.now()}`,
+          id: `approval-req-${taskId}`,
           timestamp: new Date().toLocaleTimeString(),
           phase: 'awaiting_approval',
           action: 'approval_required',
@@ -171,6 +183,28 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
     return ensureState(taskId)
   }
 
+  async function submitApproval(taskId: string, approved: boolean) {
+    const s = ensureState(taskId)
+    if (s.approvalState !== 'idle') return
+    s.approvalState = 'submitting'
+    try {
+      await api.approveTask(taskId, approved)
+      s.approvalState = 'submitted'
+      ElMessage.success(approved ? '已批准继续利用' : '已拒绝利用阶段')
+    } catch (e: unknown) {
+      const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+      const msg = detail || (e as Error)?.message || '审批失败'
+      if (detail && /已在执行/.test(detail)) {
+        s.approvalState = 'submitted'
+        ElMessage.info('审批已在执行中')
+      } else {
+        s.approvalState = 'error'
+        ElMessage.error(msg)
+        setTimeout(() => { s.approvalState = 'idle' }, 3000)
+      }
+    }
+  }
+
   return {
     taskStateMap,
     ensureState,
@@ -179,5 +213,6 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
     detach,
     clear,
     getLiveState,
+    submitApproval,
   }
 })

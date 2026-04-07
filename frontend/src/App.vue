@@ -30,11 +30,11 @@
         </el-menu-item>
         <el-menu-item index="/skills">
           <el-icon><Tools /></el-icon>
-          <span>Skill管理</span>
+          <span>Skills管理</span>
         </el-menu-item>
         <el-menu-item index="/knowledge">
           <el-icon><Reading /></el-icon>
-          <span>知识库</span>
+          <span>知识库管理</span>
         </el-menu-item>
         <el-menu-item index="/prompts">
           <el-icon><ChatDotRound /></el-icon>

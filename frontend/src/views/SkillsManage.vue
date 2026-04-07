@@ -2,17 +2,17 @@
   <div class="page-wrap">
     <div class="page-header">
       <div>
-        <h1 class="page-title">Skill管理</h1>
-        <p class="page-sub">支持查看与编辑 YAML，保存后自动重载 Skill 注册表</p>
+        <h1 class="page-title">技能管理</h1>
+        <p class="page-sub">支持查看与编辑 YAML，保存后自动重载技能注册表</p>
       </div>
       <div class="header-actions">
         <el-button @click="fetchSkills" :loading="skillsLoading">刷新</el-button>
-        <el-button class="header-reload-btn" type="primary" @click="reloadAllSkills" :loading="reloadLoading">重载 Skill</el-button>
+        <el-button class="header-reload-btn" type="primary" @click="reloadAllSkills" :loading="reloadLoading">重载技能</el-button>
       </div>
     </div>
 
     <el-card class="panel" v-loading="skillsLoading">
-      <el-empty v-if="!groupedSkills.length" description="暂无 Skill 数据" />
+      <el-empty v-if="!groupedSkills.length" description="暂无技能数据" />
 
       <el-collapse v-else v-model="activeCategories">
         <el-collapse-item
@@ -24,14 +24,14 @@
             <div class="collapse-title">
               <div class="cat-header" :style="categoryStyle(group.category)">
                 <span class="cat-marker" aria-hidden="true"></span>
-                <span class="cat-name">{{ group.category }}</span>
+                <span class="cat-name">{{ resolveCategoryLabel(group.category) }}</span>
                 <el-tag size="small" class="cat-count">{{ group.items.length }}</el-tag>
               </div>
             </div>
           </template>
 
           <el-table :data="group.items" size="small">
-            <el-table-column prop="skill_id" label="Skill ID" min-width="180" />
+            <el-table-column prop="skill_id" label="技能 ID" min-width="180" />
             <el-table-column prop="name" label="名称" min-width="180" />
             <el-table-column prop="paths_count" label="利用路径" width="100" align="center" />
             <el-table-column prop="probes_count" label="探测数" width="90" align="center" />
@@ -53,12 +53,12 @@
       </el-collapse>
     </el-card>
 
-    <el-drawer v-model="skillDrawerVisible" title="Skill 详情" size="55%">
+    <el-drawer v-model="skillDrawerVisible" title="技能详情" size="55%">
       <template v-if="selectedSkill">
         <div class="skill-meta">
-          <div><b>Skill ID：</b><code>{{ selectedSkill.skill_id }}</code></div>
+          <div><b>技能 ID：</b><code>{{ selectedSkill.skill_id }}</code></div>
           <div><b>名称：</b>{{ selectedSkill.name }}</div>
-          <div><b>分类：</b>{{ selectedSkill.category }}</div>
+          <div><b>分类：</b>{{ resolveCategoryLabel(selectedSkill.category) }}</div>
           <div><b>路径数：</b>{{ selectedSkill.paths_count }}，<b>探测数：</b>{{ selectedSkill.probes_count }}</div>
           <div><b>来源：</b><code>{{ selectedSkill.source }}</code></div>
         </div>
@@ -100,6 +100,7 @@ import hljs from 'highlight.js/lib/core'
 import yamlLanguage from 'highlight.js/lib/languages/yaml'
 import { api } from '@/api'
 import { resolveCategoryColor } from '@/utils/categoryColor'
+import { resolveCategoryLabel } from '@/utils/categoryLabel'
 
 hljs.registerLanguage('yaml', yamlLanguage)
 
@@ -169,7 +170,7 @@ async function fetchSkills() {
     skills.value = res.skills || []
     activeCategories.value = groupedSkills.value.map((group) => group.category)
   } catch (e) {
-    ElMessage.error(e?.response?.data?.detail || e.message || '读取 Skill 列表失败')
+    ElMessage.error(e?.response?.data?.detail || e.message || '读取技能列表失败')
   } finally {
     skillsLoading.value = false
   }
@@ -179,10 +180,10 @@ async function reloadAllSkills() {
   reloadLoading.value = true
   try {
     await api.reloadSkills()
-    ElMessage.success('Skill 已重载')
+    ElMessage.success('技能已重载')
     await fetchSkills()
   } catch (e) {
-    ElMessage.error(e?.response?.data?.detail || e.message || '重载 Skill 失败')
+    ElMessage.error(e?.response?.data?.detail || e.message || '重载技能失败')
   } finally {
     reloadLoading.value = false
   }

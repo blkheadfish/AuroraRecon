@@ -10,6 +10,7 @@ knowledge/retriever.py
 """
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 from typing import Optional
@@ -19,19 +20,30 @@ from backend.knowledge.exploit_kb import ExploitEntry, ExploitKB
 logger = logging.getLogger(__name__)
 
 
+def check_can_reverse(lhost: str) -> bool:
+    """Determine if the target can connect back to LHOST.
+
+    Returns False for empty, loopback, RFC1918 private, and link-local addresses.
+    """
+    if not lhost:
+        return False
+    if lhost in ("127.0.0.1", "0.0.0.0", "localhost"):
+        return False
+    try:
+        addr = ipaddress.ip_address(lhost)
+        if addr.is_private or addr.is_loopback or addr.is_link_local:
+            return False
+    except ValueError:
+        pass  # hostname/domain — assume reachable
+    return True
+
+
 class EnvironmentProfile:
     """运行环境特征，影响可用的利用方案"""
 
     def __init__(self):
         self.lhost: str = os.getenv("LHOST", "")
-        self.can_reverse: bool = self._check_reverse()
-
-    def _check_reverse(self) -> bool:
-        if not self.lhost:
-            return False
-        if self.lhost in ("127.0.0.1", "0.0.0.0", "localhost"):
-            return False
-        return True
+        self.can_reverse: bool = check_can_reverse(self.lhost)
 
     def format_constraints(self) -> str:
         lines = []

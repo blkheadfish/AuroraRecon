@@ -109,7 +109,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { api } from '@/api'
@@ -134,8 +134,6 @@ const liveStore = useTaskLiveStore()
 
 const loading = ref(true)
 const activeTab = ref('decision')
-const approving = ref(false)
-const approvalState = ref('idle')
 const cancelling = ref(false)
 const pollTimer = ref(null)
 
@@ -145,6 +143,8 @@ const logs = computed(() => state.value.logs || [])
 const findings = computed(() => task.value?.findings || [])
 const isRunning = computed(() => ['pending', 'running'].includes(task.value?.status || ''))
 const needsApproval = computed(() => task.value?.current_phase === 'awaiting_approval')
+const approvalState = computed(() => state.value.approvalState)
+const approving = computed(() => approvalState.value === 'submitting')
 const showApprovalActions = computed(() => needsApproval.value && approvalState.value === 'idle')
 const exploitableCount = computed(() => findings.value.filter((item) => item.exploitable).length)
 
@@ -489,22 +489,9 @@ function phaseText(phase) {
   }[phase] || phase
 }
 
-async function doApprove(approved) {
-  if (approvalState.value !== 'idle' || approving.value) return
-  approving.value = true
-  approvalState.value = 'submitting'
-  try {
-    await api.approveTask(taskId, approved)
-    approvalState.value = 'submitted'
-    trackEvent('task.approval', { taskId, approved })
-    ElMessage.success(approved ? '已批准继续利用' : '已拒绝利用阶段')
-  } catch (e) {
-    approvalState.value = 'error'
-    ElMessage.error(e?.response?.data?.detail || e.message || '审批失败')
-    setTimeout(() => { approvalState.value = 'idle' }, 3000)
-  } finally {
-    approving.value = false
-  }
+function doApprove(approved) {
+  trackEvent('task.approval', { taskId, approved })
+  liveStore.submitApproval(taskId, approved)
 }
 
 async function doCancel() {
@@ -546,12 +533,6 @@ function stopPolling() {
     pollTimer.value = null
   }
 }
-
-watch(needsApproval, (val) => {
-  if (!val && approvalState.value === 'submitted') {
-    approvalState.value = 'idle'
-  }
-})
 
 onMounted(async () => {
   loading.value = true

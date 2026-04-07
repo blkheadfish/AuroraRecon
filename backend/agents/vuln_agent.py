@@ -442,19 +442,20 @@ $PHUIP "{web_url}/index.php" 2>&1
         if html_body:
             html_lower = html_body.lower()
 
-            # Struts2: 页面中出现 .action 链接、opensymphony、xwork
+            # Struts2: 需要 opensymphony/xwork 强特征 + 至少 3 分
             import re
             if not any(t == "Struts" for t in techs):
                 struts_indicators = 0
+                has_strong_struts = ("opensymphony" in html_lower or "xwork" in html_lower)
                 if ".action" in html_lower and ("href" in html_lower or "action=" in html_lower):
                     struts_indicators += 1
-                if "opensymphony" in html_lower or "xwork" in html_lower:
+                if has_strong_struts:
                     struts_indicators += 2
                 if "showcase" in html_lower and ".action" in html_lower:
                     struts_indicators += 2
                 if re.search(r'\.action["\s?;]', html_lower):
                     struts_indicators += 1
-                if struts_indicators >= 2:
+                if struts_indicators >= 3 and has_strong_struts:
                     techs.append("Struts")
                     if "Java" not in techs:
                         techs.append("Java")
@@ -645,8 +646,29 @@ $PHUIP "{web_url}/index.php" 2>&1
     # Phase 3: Nuclei 扫描
     # ================================================================
 
+    @staticmethod
+    def _target_scan_profile(host: str) -> dict:
+        """Return scan parameters tuned for target network location."""
+        import ipaddress
+        try:
+            is_private = ipaddress.ip_address(host).is_private
+        except ValueError:
+            is_private = False
+        if is_private:
+            return {
+                "nuclei_timeout": "10", "nuclei_retries": "1",
+                "nuclei_concurrency": "25", "nuclei_rate_limit": "150",
+                "nmap_os_detect": True,
+            }
+        return {
+            "nuclei_timeout": "20", "nuclei_retries": "2",
+            "nuclei_concurrency": "10", "nuclei_rate_limit": "80",
+            "nmap_os_detect": False,
+        }
+
     async def _nuclei_broad_scan(self, web_url: str, target: str) -> dict:
         """基础扫描：CVE + 漏洞 + 配置错误"""
+        sp = self._target_scan_profile(target)
         result: ExecuteResult = await self.executor.run(
             tool="nuclei",
             args=[
@@ -658,10 +680,10 @@ $PHUIP "{web_url}/index.php" 2>&1
                 "-etags", "default-login",
                 "-jsonl",
                 "-silent",
-                "-rate-limit", "150",
-                "-timeout", "10",
-                "-retries", "1",
-                "-c", "25",
+                "-rate-limit", sp["nuclei_rate_limit"],
+                "-timeout", sp["nuclei_timeout"],
+                "-retries", sp["nuclei_retries"],
+                "-c", sp["nuclei_concurrency"],
             ],
             timeout=600,
         )
@@ -680,6 +702,7 @@ $PHUIP "{web_url}/index.php" 2>&1
         tag_str = ",".join(tags[:8])
         logger.info(f"[VulnAgent] LLM 推荐标签扫描: {tag_str} @ {web_url}")
 
+        sp = self._target_scan_profile(target)
         result: ExecuteResult = await self.executor.run(
             tool="nuclei",
             args=[
@@ -688,9 +711,9 @@ $PHUIP "{web_url}/index.php" 2>&1
                 "-etags", "default-login",
                 "-jsonl",
                 "-silent",
-                "-timeout", "10",
-                "-retries", "1",
-                "-c", "25",
+                "-timeout", sp["nuclei_timeout"],
+                "-retries", sp["nuclei_retries"],
+                "-c", sp["nuclei_concurrency"],
             ],
             timeout=600,
         )
@@ -714,6 +737,7 @@ $PHUIP "{web_url}/index.php" 2>&1
         url_list = "\n".join(urls)
         logger.info(f"[VulnAgent] 路径深扫: {len(urls)} 条路径 @ {web_url}")
 
+        sp = self._target_scan_profile(target)
         result: ExecuteResult = await self.executor.run(
             tool="nuclei",
             args=[
@@ -726,9 +750,9 @@ $PHUIP "{web_url}/index.php" 2>&1
                 "-etags", "default-login",
                 "-jsonl",
                 "-silent",
-                "-timeout", "10",
-                "-retries", "1",
-                "-c", "25",
+                "-timeout", sp["nuclei_timeout"],
+                "-retries", sp["nuclei_retries"],
+                "-c", sp["nuclei_concurrency"],
             ],
             input_data=url_list,
             timeout=300,
@@ -870,9 +894,9 @@ $PHUIP "{web_url}/index.php" 2>&1
             ("gunicorn",):   ["flask", "django", "ssti", "python"],
             ("werkzeug",):   ["flask", "ssti", "python"],
             ("wsgiserver",): ["flask", "django", "ssti", "python"],
-            # Java 服务器 → 搜索常见 Java 漏洞
-            ("java",):       ["fastjson", "shiro", "struts", "spring"],
-            ("tomcat",):     ["tomcat", "java", "shiro", "struts"],
+            # Java 服务器 → 搜索常见 Java 漏洞（struts 需独立指纹确认）
+            ("java",):       ["fastjson", "shiro", "spring"],
+            ("tomcat",):     ["tomcat", "java", "shiro"],
             ("jboss",):      ["jboss", "java", "jmxinvoker"],
             ("weblogic",):   ["weblogic", "java", "t3"],
             # PHP → ThinkPHP 等 + PHP-FPM（Nginx+PHP 组合是 CVE-2019-11043 的前提）
@@ -1083,7 +1107,7 @@ $PHUIP "{web_url}/index.php" 2>&1
                 probe_specific_signs = {
                     "builtin_fastjson_detect": ["fastjson", "com.alibaba.fastjson", "autotype", "type not match", "@type"],
                     "builtin_fastjson_inet": ["fastjson", "com.alibaba.fastjson", "autotype"],
-                    "builtin_s2045_detect": ["x-struts-test", "s2-045-ok"],
+                    "builtin_s2045_detect": ["s2-045-ok"],
                     "builtin_s2057_detect": ["54289", "location"],
                     "builtin_s2057_showcase_detect": ["54289", "location"],
                     "builtin_shiro_detect": ["rememberme=deleteme"],
