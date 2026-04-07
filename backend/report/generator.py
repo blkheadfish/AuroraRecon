@@ -407,11 +407,14 @@ MD_TEMPLATE = """# 渗透测试报告
 {% set sections = split_evidence(f.evidence) %}
 {% if sections %}
 **证据：**
+
 {% for sec in sections %}
-**{{ sec.title }}**
+**{{ sec.title }}：**
+
 ```{{ sec.lang }}
 {{ truncate_block(sec.content) }}
 ```
+
 {% endfor %}
 {% endif %}
 {% endfor %}
@@ -452,36 +455,47 @@ MD_TEMPLATE = """# 渗透测试报告
 {% for rec in rec_list %}
 ##### 第 {{ normalize_round(rec.round, loop.index) }} 轮迭代{% if rec.purpose %} — {{ rec.purpose }}{% endif %}
 
-- exit: {{ rec.exit_code | default("-", true) }}
-- elapsed: {{ format_elapsed(rec.elapsed | default(none, true)) }}
+| 属性 | 值 |
+|------|-----|
+| **退出码** | `{{ rec.exit_code if rec.exit_code is not none else "-" }}` |
+| **耗时** | {{ format_elapsed(rec.elapsed if rec.elapsed is not none else none) }} |
+| **工具** | {{ safe_val(rec.tool, "-") }} |
 
 **Payload：**
+
 ```bash
 {{ rec.command if rec.command else "(empty command)" }}
 ```
 
 {% if rec.runtime_command and rec.runtime_command != rec.command %}
 **Runtime Command：**
+
 ```bash
 {{ rec.runtime_command }}
 ```
 {% endif %}
 
 **Output (stdout)：**
-```text
+
+```{{ detect_lang(rec.stdout) }}
 {{ truncate_block(rec.stdout if rec.stdout else "(无输出)") }}
 ```
 
 {% if rec.stderr %}
 **Error (stderr)：**
+
 ```text
 {{ truncate_block(rec.stderr) }}
 ```
 {% endif %}
+
+---
 {% endfor %}
 {% elif r.commands_run %}
-#### 执行命令
+#### 执行命令（{{ r.commands_run | length }} 条）
 {% for cmd in r.commands_run %}
+**第 {{ loop.index }} 条命令：**
+
 ```bash
 {{ cmd }}
 ```
@@ -490,12 +504,15 @@ MD_TEMPLATE = """# 渗透测试报告
 
 {% if r.evidence %}
 #### 最终证据
+
 {% set sections = split_evidence(r.evidence) %}
 {% for sec in sections %}
-**{{ sec.title }}**
+**{{ sec.title }}：**
+
 ```{{ sec.lang }}
 {{ truncate_block(sec.content) }}
 ```
+
 {% endfor %}
 {% endif %}
 {% endfor %}
@@ -573,6 +590,7 @@ class ReportGenerator:
         self._env.globals["normalize_round"] = normalize_round
         self._env.globals["pretty_json"] = pretty_json
         self._env.globals["format_elapsed"] = format_elapsed
+        self._env.globals["detect_lang"] = _detect_text_lang
         self._env.globals["sev_emoji"] = severity_emoji
         self._env.globals["sev_label"] = severity_label
         self._env.globals["cmd_count"] = command_count

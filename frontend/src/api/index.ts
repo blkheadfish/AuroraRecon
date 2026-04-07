@@ -1,0 +1,217 @@
+import axios from 'axios'
+import type { AxiosInstance } from 'axios'
+import type {
+  HealthInfo,
+  MetricsOverview,
+  ReportData,
+  TaskDetail,
+  TaskStats,
+  TaskSummary,
+  WsTaskEvent,
+} from '@/types/task'
+import type {
+  PasswordChangePayload,
+  ProfileUpdatePayload,
+  SettingsPayload,
+  UserProfile,
+} from '@/types/settings'
+
+const BASE = '/api'
+
+const http: AxiosInstance = axios.create({
+  baseURL: BASE,
+  timeout: 15000,
+})
+
+http.interceptors.response.use(
+  (res) => res.data,
+  (err) => Promise.reject(err),
+)
+
+function getWsBase(): string {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
+  return `${proto}//${location.host}`
+}
+
+export const api = {
+  healthCheck: (): Promise<HealthInfo> => http.get('/health'),
+  createTask: (
+    target: string,
+    note: string,
+    extraHint = '',
+    userPrompt = '',
+    workflowMode = 'standard',
+  ): Promise<TaskSummary> =>
+    http.post('/tasks', {
+      target,
+      scope_note: note,
+      extra_hint: extraHint,
+      user_prompt: userPrompt,
+      workflow_mode: workflowMode,
+    }),
+  getTask: (id: string): Promise<TaskDetail> => http.get(`/tasks/${id}`),
+  listTasks: (): Promise<TaskSummary[]> => http.get('/tasks'),
+  getStats: (): Promise<TaskStats> => http.get('/tasks/stats'),
+  getLogs: (id: string): Promise<{ logs: string[] }> => http.get(`/tasks/${id}/logs`),
+  getReport: (id: string): Promise<ReportData> => http.get(`/tasks/${id}/report`),
+  cancelTask: (id: string): Promise<{ ok: boolean }> => http.post(`/tasks/${id}/cancel`),
+  deleteTask: (id: string): Promise<{ ok: boolean }> => http.delete(`/tasks/${id}`),
+  approveTask: (id: string, approved = true): Promise<{ ok: boolean }> =>
+    http.post(`/tasks/${id}/approve`, { approved }),
+
+  getSettings: (): Promise<SettingsPayload> => http.get('/settings'),
+  saveSettings: (data: SettingsPayload): Promise<{ ok: boolean }> => http.post('/settings', data),
+  testLLM: (): Promise<{ ok: boolean }> => http.post('/settings/test-llm'),
+  getProfile: (): Promise<UserProfile> => http.get('/profile'),
+  updateProfile: (data: ProfileUpdatePayload): Promise<{ status: string; profile: UserProfile }> =>
+    http.put('/profile', data),
+  changePassword: (data: PasswordChangePayload): Promise<{ status: string }> =>
+    http.post('/profile/change-password', data),
+  getMetricsOverview: async (windowHours = 24): Promise<MetricsOverview> => {
+    const params = { window_hours: windowHours }
+    try {
+      return await http.get('/metrics/overview', { params })
+    } catch (e) {
+      const status = e?.response?.status ?? null
+      if (status !== 404) throw e
+    }
+
+    try {
+      const res = await axios.get<MetricsOverview>('/metrics/overview', { params, timeout: 15000 })
+      return res.data
+    } catch (e) {
+      const status = e?.response?.status ?? null
+      if (status !== 404) throw e
+    }
+
+    const res = await axios.get<MetricsOverview>('/api/metrics/overview', { params, timeout: 15000 })
+    return res.data
+  },
+  getSkills: (): Promise<{
+    skills: Array<{
+      skill_id: string
+      name: string
+      category: string
+      paths_count: number
+      probes_count: number
+      source: string
+    }>
+    total: number
+  }> => http.get('/skills'),
+  getSkillRaw: (skillId: string): Promise<{ skill_id: string; source: string; yaml: string }> =>
+    http.get(`/skills/${skillId}/raw`),
+  saveSkillRaw: (skillId: string, yamlContent: string): Promise<{ status: string; skill_id: string }> =>
+    http.put(`/skills/${skillId}/raw`, { yaml: yamlContent }),
+  reloadSkills: (): Promise<{ status: string; total: number }> =>
+    http.post('/skills/reload'),
+
+  getKnowledgeEntries: (): Promise<{
+    entries: Array<{
+      vuln_id: string
+      description: string
+      category: string
+      cves: string[]
+      tags: string[]
+      default_port: number | null
+    }>
+    total: number
+  }> => http.get('/knowledge/entries'),
+  getKnowledgeRaw: (vulnId: string): Promise<{ vuln_id: string; source: string; json: string }> =>
+    http.get(`/knowledge/${vulnId}/raw`),
+  saveKnowledgeRaw: (vulnId: string, jsonContent: string): Promise<{ status: string; vuln_id: string }> =>
+    http.put(`/knowledge/${vulnId}/raw`, { json_content: jsonContent }),
+  reloadKnowledge: (): Promise<{ status: string; total: number }> =>
+    http.post('/knowledge/reload'),
+
+  sendChat: (taskId: string, text: string): Promise<{ status: string; message: { role: string; text: string; timestamp: string } }> =>
+    http.post(`/tasks/${taskId}/chat`, { text }),
+  getChatHistory: (taskId: string): Promise<{ messages: Array<{ role: string; text: string; timestamp: string }> }> =>
+    http.get(`/tasks/${taskId}/chat`),
+
+  listMembers: (): Promise<Array<{ user_id: string; email: string; role: string }>> =>
+    http.get('/team/members'),
+  inviteMember: (email: string, role: string): Promise<{ ok: boolean }> =>
+    http.post('/team/members', { email, role }),
+  removeMember: (userId: string): Promise<{ ok: boolean }> =>
+    http.delete(`/team/members/${userId}`),
+
+  assignTask: (taskId: string, userId: string): Promise<{ ok: boolean }> =>
+    http.post(`/tasks/${taskId}/assign`, { user_id: userId }),
+
+  getComments: (taskId: string): Promise<Array<{ id: string; text: string; created_at: string }>> =>
+    http.get(`/tasks/${taskId}/comments`),
+  addComment: (taskId: string, text: string): Promise<{ ok: boolean }> =>
+    http.post(`/tasks/${taskId}/comments`, { text }),
+}
+
+export interface WsConnection {
+  close: () => void
+  readonly readyState: number
+}
+
+export function createWsConnection(
+  taskId: string,
+  onMessage?: (data: WsTaskEvent) => void,
+  onClose?: () => void,
+): WsConnection {
+  const wsBase = getWsBase()
+  const url = `${wsBase}/ws/${taskId}`
+
+  let ws: WebSocket | null = null
+  let heartbeatTimer: number | undefined
+  let destroyed = false
+
+  function connect() {
+    if (destroyed) return
+    ws = new WebSocket(url)
+
+    ws.onopen = () => {
+      heartbeatTimer = window.setInterval(() => {
+        if (ws?.readyState === WebSocket.OPEN) {
+          ws.send('ping')
+        }
+      }, 15000)
+    }
+
+    ws.onmessage = (e) => {
+      try {
+        const data = JSON.parse(e.data) as WsTaskEvent
+        const t = (data as { type?: string }).type
+        if (t === 'heartbeat' || t === 'pong') return
+        onMessage?.(data)
+      } catch {
+        // Ignore non-JSON frames.
+      }
+    }
+
+    ws.onclose = () => {
+      if (heartbeatTimer) {
+        window.clearInterval(heartbeatTimer)
+      }
+      if (!destroyed) {
+        onClose?.()
+      }
+    }
+
+    ws.onerror = () => {
+      ws?.close()
+    }
+  }
+
+  connect()
+
+  return {
+    close() {
+      destroyed = true
+      if (heartbeatTimer) {
+        window.clearInterval(heartbeatTimer)
+      }
+      ws?.close()
+    },
+    get readyState() {
+      return ws?.readyState ?? WebSocket.CLOSED
+    },
+  }
+}
+
+export default http

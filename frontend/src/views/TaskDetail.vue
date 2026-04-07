@@ -223,7 +223,7 @@ const decisionItems = computed(() => {
         time,
         tone: 'primary',
         title: `工具调用 · ${entry.tool || 'unknown'}`,
-        desc: `阶段 ${entry.phase || '-'} ｜ 后端 ${entry.backend || '-'}\n${entry.message || ''}`.trim(),
+        desc: `阶段 ${entry.phase || '-'}\n${entry.message || ''}`.trim(),
       })
       return
     }
@@ -247,7 +247,6 @@ const decisionItems = computed(() => {
       const purposeText = entry.purpose ? ` ｜ purpose=${entry.purpose}` : ''
       const roundText = entry.round !== undefined && entry.round !== null ? ` ｜ round=${entry.round}` : ''
       const phaseTextInfo = entry.phase ? ` ｜ phase=${entry.phase}` : ''
-      const backendText = entry.backend ? ` ｜ backend=${entry.backend}` : ''
       const titleText = entry.poc_or_vuln
         ? `命令执行 · ${entry.poc_or_vuln}`
         : `命令执行 · ${entry.tool || 'shell'}`
@@ -256,7 +255,7 @@ const decisionItems = computed(() => {
         time,
         tone: (entry.exit_code ?? -1) === 0 ? 'success' : 'danger',
         title: titleText,
-        desc: `exit=${entry.exit_code ?? '-'} ｜ elapsed=${entry.elapsed_ms ?? '-'}ms${phaseTextInfo}${backendText}${roundText}${purposeText}`,
+        desc: `exit=${entry.exit_code ?? '-'} ｜ elapsed=${entry.elapsed_ms ?? '-'}ms${phaseTextInfo}${roundText}${purposeText}`,
         payloads: buildExecPayloads(command, stdout, stderr, {
           runtimeCommand,
           truncated: Boolean(entry.truncated),
