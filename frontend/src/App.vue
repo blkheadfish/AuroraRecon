@@ -8,7 +8,7 @@
     <el-aside width="220px" class="sidebar">
       <div class="sidebar-logo">
         <el-icon class="logo-icon"><Monitor /></el-icon>
-        <span class="logo-text">AuroraRecon</span>
+        <span class="logo-text">Aurora</span><span class="logo-text" style="color:#7fe0bd">Recon</span>
       </div>
 
       <el-menu
@@ -153,7 +153,8 @@ onMounted(() => {
   font-weight: 700;
   letter-spacing: 0.02em;
   color: var(--text-primary);
-  font-family: var(--font-mono);
+  font-family: var(--font-orbitron);
+  //font-family: var(--font-mono);
 }
 
 .sidebar-menu {

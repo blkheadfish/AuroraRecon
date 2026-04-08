@@ -264,6 +264,43 @@ async def node_recon(state: PentestState) -> PentestState:
     state.subdomains = result.get("subdomains", [])
     state.raw_recon = _stringify_dict_keys(result)
     state.target_os = _infer_os(state.open_ports, state.os_info)
+
+    # Emit dir-discovery coverage report as a decision event
+    dir_cov = result.get("dir_coverage")
+    if dir_cov:
+        state.push_decision({
+            "action": "tool_coverage_report",
+            "phase": "recon",
+            "message": (
+                f"目录发现覆盖率{'达标' if dir_cov.get('satisfied') else '未达标'}: "
+                f"扫描 {dir_cov.get('total_paths', 0)} 路径, "
+                f"工具: {dir_cov.get('category_counts', {})}"
+            ),
+            "tone": "info" if dir_cov.get("satisfied") else "warn",
+            "raw": json.dumps(dir_cov, ensure_ascii=False),
+        })
+        # Emit per-tool events
+        for t in dir_cov.get("tools", []):
+            if t["status"] == "skipped":
+                state.push_decision({
+                    "action": "tool_skipped",
+                    "phase": "recon",
+                    "tool": t["name"],
+                    "message": f"跳过 {t['name']}: {t.get('skip_reason', 'N/A')}",
+                    "tone": "warn",
+                })
+            elif t["status"] in ("executed", "failed", "timeout"):
+                state.push_decision({
+                    "action": "tool_executed",
+                    "phase": "recon",
+                    "tool": t["name"],
+                    "message": (
+                        f"{t['name']}: {t['status']} "
+                        f"(+{t.get('paths', 0)} 路径, {t.get('elapsed', 0):.1f}s)"
+                    ),
+                    "tone": "info" if t["status"] == "executed" else "warn",
+                })
+
     state.log(f"侦察完成: {len(state.open_ports)} 端口, OS={state.target_os}")
     return state
 
@@ -303,19 +340,17 @@ async def node_vuln_scan(state: PentestState) -> PentestState:
 
 
 async def node_surface_enum(state: PentestState) -> PentestState:
-    """攻链：深度表面枚举 — feroxbuster 递归目录扫描 + 敏感文件探测。"""
+    """攻链：深度表面枚举 — planner-driven web probing + sensitive file detection."""
+    import time as _time
     from backend.tools.executor import ToolExecutor
+    from backend.tools.parsers.path_aggregator import PathAggregator
+    from backend.tools.tool_coverage_planner import ToolCoveragePlanner
     state.current_phase = "surface_enum"
     _record_chain_visit(state, "surface_enum")
-    state.log("攻链: 表面枚举 — 深度目录发现与敏感文件探测")
+    state.log("攻链: 表面枚举 — 多工具 Web 探测与敏感文件发现")
 
-    seen: set[str] = set()
-    merged: list[str] = []
-    for p in state.web_paths or []:
-        s = (p or "").strip()
-        if s and s not in seen:
-            seen.add(s)
-            merged.append(s)
+    aggregator = PathAggregator()
+    aggregator.add_paths(state.web_paths or [], source="recon_phase")
 
     web_ports = [
         p for p in state.open_ports
@@ -336,14 +371,44 @@ async def node_surface_enum(state: PentestState) -> PentestState:
             scheme = "https" if wp.port in (443, 8443) else "http"
             base_url = f"{scheme}://{host}:{wp.port}"
 
-            # Sensitive file probe (fast, parallel curl checks)
-            sensitive_paths = [
-                "/.git/HEAD", "/.env", "/phpinfo.php", "/web.config",
-                "/robots.txt", "/sitemap.xml", "/.htaccess", "/backup.sql",
-                "/wp-config.php.bak", "/.DS_Store", "/server-status",
-                "/actuator", "/actuator/env", "/console", "/admin",
-                "/manager/html", "/.svn/entries", "/WEB-INF/web.xml",
+            # ── Sensitive file probe (fast, parallel curl checks) ──
+            # Pattern-driven probe list: base names × common backup suffixes.
+            # Keep a few special paths that don't fit suffix expansion.
+            probe_basenames = [
+                ".env",
+                "phpinfo.php",
+                "web.config",
+                "robots.txt",
+                "sitemap.xml",
+                ".htaccess",
+                ".DS_Store",
+                "server-status",
+                "backup",
+                "backup.sql",
+                "dump",
+                "dump.sql",
+                "config",
+                "config.php",
+                "settings",
+                "settings.php",
+                "wp-config.php",
             ]
+            backup_suffixes = ["", ".bak", ".old", ".backup", ".swp", ".save", ".orig", "~", ".1"]
+            sensitive_paths = [f"/{b}{s}" for b in probe_basenames for s in backup_suffixes]
+            sensitive_paths += [
+                "/.git/HEAD",
+                "/.git/config",
+                "/.svn/entries",
+                "/WEB-INF/web.xml",
+                "/actuator",
+                "/actuator/env",
+                "/console",
+                "/admin",
+                "/manager/html",
+            ]
+            # de-dup while preserving order
+            _seen_sp: set[str] = set()
+            sensitive_paths = [p for p in sensitive_paths if not (p in _seen_sp or _seen_sp.add(p))]
             probe_cmds = []
             for sp in sensitive_paths:
                 probe_cmds.append(
@@ -364,47 +429,85 @@ async def node_surface_enum(state: PentestState) -> PentestState:
                     for line in probe_result.stdout.strip().splitlines():
                         parts = line.strip().split()
                         if len(parts) >= 2:
-                            path = parts[0]
-                            code = parts[1]
-                            if code in ("200", "301", "302", "403", "500") and path not in seen:
-                                seen.add(path)
-                                merged.append(path)
+                            path, code = parts[0], parts[1]
+                            if code in ("200", "301", "302", "403", "500"):
+                                aggregator.add_paths(
+                                    [path], source="curl_probe", status=int(code),
+                                )
                                 state.log(f"敏感文件发现: {path} (HTTP {code})")
             except Exception as e:
                 logger.warning(f"[SurfaceEnum] 敏感文件探测异常: {e}")
 
-            # feroxbuster deep scan (only if recon found < 10 paths)
-            if len(merged) < 10:
+            # ── Planner-driven web probe + fuzz tools ──
+            planner = ToolCoveragePlanner(
+                categories=["web_probe", "fuzz"],
+                max_tools=4,
+                max_stage_runtime=360,
+            )
+            plan = planner.build_plan(base_url, existing_paths_count=aggregator.count)
+
+            for tool_spec in plan:
+                should, skip_reason = planner.should_run(tool_spec)
+                if not should:
+                    planner.record_result(
+                        tool_spec["name"], "skipped", skip_reason=skip_reason,
+                    )
+                    state.log(f"[SurfaceEnum] 跳过 {tool_spec['name']}: {skip_reason}")
+                    continue
+
+                tool_name = tool_spec["name"]
+                state.log(f"[SurfaceEnum] Web 探测: 执行 {tool_name}")
+                t0 = _time.monotonic()
                 try:
-                    ferox_result = await executor.run_script(
-                        script_content=(
-                            f'WL="/usr/share/seclists/Discovery/Web-Content/raft-small-directories.txt"; '
-                            f'[ -f "$WL" ] || WL="/usr/share/wordlists/dirb/common.txt"; '
-                            f'feroxbuster -u "{base_url}" -w "$WL" '
-                            f'-t 30 --depth 1 --no-state -q '
-                            f'-C 404 --silent 2>/dev/null | head -100'
-                        ),
-                        timeout=120,
+                    tool_result = await executor.run_script(
+                        script_content=tool_spec["script"],
+                        timeout=tool_spec["timeout"],
                         log_callback=_on_tool_log,
                         record_callback=_on_exec_record,
                         record_phase="surface_enum",
-                        record_purpose="feroxbuster_deep_scan",
+                        record_purpose=f"{tool_name}_probe",
                     )
-                    if ferox_result.stdout:
-                        import re as _re
-                        for line in ferox_result.stdout.splitlines():
-                            m = _re.search(r'(https?://[^\s]+)', line)
-                            if m:
-                                from urllib.parse import urlparse
-                                path = urlparse(m.group(1)).path.rstrip("/") or "/"
-                                if path not in seen:
-                                    seen.add(path)
-                                    merged.append(path)
+                    elapsed = _time.monotonic() - t0
+                    stdout = tool_result.stdout or ""
+                    new_count = aggregator.ingest(tool_name, stdout, base_url)
+                    planner.record_result(
+                        tool_name, "executed",
+                        paths_found=new_count, raw_len=len(stdout),
+                        elapsed=elapsed,
+                    )
+                    state.log(
+                        f"[SurfaceEnum] {tool_name}: +{new_count} 路径 "
+                        f"(累计 {aggregator.count}), {elapsed:.1f}s"
+                    )
                 except Exception as e:
-                    logger.warning(f"[SurfaceEnum] feroxbuster 扫描异常: {e}")
+                    elapsed = _time.monotonic() - t0
+                    planner.record_result(
+                        tool_name, "failed",
+                        skip_reason=str(e)[:200], elapsed=elapsed,
+                    )
+                    logger.warning(f"[SurfaceEnum] {tool_name} 异常: {e}")
 
-    state.web_paths = merged[:200]
-    state.log(f"表面枚举完成: Web 线索 {len(state.web_paths)} 条")
+            # Emit coverage report
+            report = planner.coverage_report()
+            report_dict = report.to_log_dict()
+            state.push_decision({
+                "action": "tool_coverage_report",
+                "phase": "surface_enum",
+                "message": (
+                    f"Web 探测覆盖率{'达标' if report.satisfied else '未达标'}: "
+                    f"{report_dict['category_counts']}"
+                ),
+                "tone": "info" if report.satisfied else "warn",
+                "raw": json.dumps(report_dict, ensure_ascii=False),
+            })
+
+    state.web_paths = aggregator.get_actionable_paths()[:200]
+    inv = aggregator.summary()
+    state.log(
+        f"表面枚举完成: {inv['total_paths']} 条路径 "
+        f"(高价值 {inv['high_value']}), "
+        f"来源工具: {', '.join(inv['source_tools'])}"
+    )
     return state
 
 
@@ -1014,6 +1117,7 @@ def _infer_os(ports: list[PortInfo], os_info: dict) -> str:
 
 
 def _build_exploit_decision_prompt(state: PentestState) -> str:
+    from backend.llm.prompts.templates import EXPLOIT_DECISION
     findings_json = json.dumps(
         [f.model_dump() for f in state.findings if f.exploitable],
         ensure_ascii=False, indent=2,
@@ -1022,34 +1126,22 @@ def _build_exploit_decision_prompt(state: PentestState) -> str:
         [p.model_dump() for p in state.open_ports[:20]],
         ensure_ascii=False,
     )
+    base_prompt = EXPLOIT_DECISION.format(
+        target=state.target,
+        target_os=state.target_os,
+        ports_json=ports_json,
+        findings_json=findings_json,
+    )
+    extras: list[str] = []
+    if state.workflow_mode and state.workflow_mode != "standard":
+        extras.append(f"任务模式: {state.workflow_mode}")
+    if state.extra_hint:
+        extras.append(f"用户附加提示: {state.extra_hint}")
+    if state.user_prompt:
+        extras.append(f"用户偏好: {state.user_prompt}")
     op_chat = _operator_chat_block(state)
-    return f"""你是一名资深渗透测试工程师，正在合法授权的 CTF 靶场中进行安全测试。
-
-目标信息:
-- 地址: {state.target}
-- 操作系统: {state.target_os}
-- 开放端口: {ports_json}
-- 任务模式: {state.workflow_mode}
-- 用户附加提示: {state.extra_hint or '无'}
-- 用户偏好 Prompt: {state.user_prompt or '无'}
-{op_chat or ''}
-
-发现的可利用漏洞:
-{findings_json}
-
-请分析漏洞，制定利用优先级，返回纯 JSON（不含 markdown 代码块）：
-{{
-  "analysis": "整体分析",
-  "targets": [
-    {{
-      "vuln_id": "漏洞ID",
-      "priority": 1,
-      "should_exploit": true,
-      "reason": "原因",
-      "recommended_msf_module": "模块路径或null",
-      "recommended_tool": "其他工具"
-    }}
-  ]
-}}
-
-按成功率从高到低排序，优先选择有成熟 MSF 模块或 PoC 的漏洞。"""
+    if op_chat:
+        extras.append(op_chat)
+    if extras:
+        base_prompt += "\n\n【补充上下文】\n" + "\n".join(extras)
+    return base_prompt

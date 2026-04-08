@@ -5,17 +5,21 @@ recon_agent.py
 改进：
   - target 参数现在是纯 host/IP（由 orchestrator 统一解析）
   - 新增 target_port 参数，用户显式指定端口时优先扫描该端口
+  - 目录发现使用 ToolCoveragePlanner 驱动多工具链
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Optional
 
 from backend.agents.models import PortInfo
 from backend.tools.executor import ToolExecutor, ExecuteResult, LogCallback, RecordCallback
 from backend.tools.parsers.nmap_parser import NmapParser
 from backend.tools.parsers.gobuster_parser import GobusterParser
+from backend.tools.parsers.path_aggregator import PathAggregator
+from backend.tools.tool_coverage_planner import ToolCoveragePlanner, CoverageReport
 
 logger = logging.getLogger(__name__)
 
@@ -96,11 +100,15 @@ class ReconAgent:
 
 		web_paths: list[str] = []
 		raw_gobuster = ""
+		dir_coverage: dict = {}
 
 		if web_ports:
 			scheme = "https" if any(p.port in (443, 8443) for p in web_ports) else "http"
 			web_target = f"{scheme}://{target}:{web_ports[0].port}"
-			web_paths, raw_gobuster = await self._dir_scan(web_target, task_id, log_callback)
+			web_paths, raw_gobuster, coverage_rpt = await self._dir_scan(
+				web_target, task_id, log_callback,
+			)
+			dir_coverage = coverage_rpt.to_log_dict()
 
 		return {
 			"ports": ports,
@@ -110,6 +118,7 @@ class ReconAgent:
 			"raw_nmap": raw_nmap,
 			"raw_gobuster": raw_gobuster,
 			"nmap_vuln_hints": nmap_vuln_hints,
+			"dir_coverage": dir_coverage,
 		}
 
 	async def _nmap_scan(
@@ -226,86 +235,86 @@ class ReconAgent:
 		web_target: str,
 		task_id: Optional[str],
 		log_callback: LogCallback = None,
-	) -> tuple[list[str], str]:
-		"""Directory discovery: feroxbuster (recursive) -> gobuster fallback."""
-		paths, raw = await self._feroxbuster_scan(web_target, task_id, log_callback)
-		if paths:
-			return paths, raw
-		logger.info("[ReconAgent] feroxbuster 无结果，降级到 gobuster")
-		return await self._gobuster_scan(web_target, task_id, log_callback)
-
-	async def _feroxbuster_scan(
-		self,
-		web_target: str,
-		task_id: Optional[str],
-		log_callback: LogCallback = None,
-	) -> tuple[list[str], str]:
-		"""Recursive directory scan with feroxbuster."""
-		wordlist = "/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt"
-		fallback_wl = "/usr/share/wordlists/dirb/common.txt"
-		result: ExecuteResult = await self.executor.run_script(
-			script_content=(
-				f'WL="{wordlist}"; '
-				f'[ -f "$WL" ] || WL="{fallback_wl}"; '
-				f'feroxbuster -u "{web_target}" -w "$WL" '
-				f'-t 40 --depth 2 --no-state -q '
-				f'-C 404,301,302 --silent 2>/dev/null || echo "__FEROX_FAIL__"'
-			),
-			timeout=180,
-			record_purpose="feroxbuster_dir_scan",
+	) -> tuple[list[str], str, CoverageReport]:
+		"""Planner-driven multi-tool directory discovery chain."""
+		planner = ToolCoveragePlanner(
+			categories=["dir_discovery"],
+			max_tools=6,
+			max_stage_runtime=480,
 		)
-		stdout = result.stdout or ""
-		if "__FEROX_FAIL__" in stdout or not stdout.strip():
-			logger.warning(f"[ReconAgent] feroxbuster 失败或无输出")
-			return [], ""
-		paths = self._parse_feroxbuster_output(stdout)
-		logger.info(f"[ReconAgent] feroxbuster 发现 {len(paths)} 条路径")
-		return paths, stdout
+		plan = planner.build_plan(web_target)
+		aggregator = PathAggregator()
+		raw_outputs: list[str] = []
 
-	@staticmethod
-	def _parse_feroxbuster_output(raw: str) -> list[str]:
-		"""Extract URL paths from feroxbuster output lines."""
-		import re
-		paths: list[str] = []
-		seen: set[str] = set()
-		for line in raw.splitlines():
-			line = line.strip()
-			if not line:
+		for tool_spec in plan:
+			should, skip_reason = planner.should_run(tool_spec)
+			if not should:
+				planner.record_result(
+					tool_spec["name"], "skipped", skip_reason=skip_reason,
+				)
+				if log_callback:
+					await log_callback(
+						f"[ReconAgent] 跳过 {tool_spec['name']}: {skip_reason}"
+					)
 				continue
-			m = re.search(r'(https?://[^\s]+)', line)
-			if m:
-				from urllib.parse import urlparse
-				parsed = urlparse(m.group(1))
-				path = parsed.path.rstrip("/") or "/"
-				if path not in seen:
-					seen.add(path)
-					paths.append(path)
-		return paths
 
-	async def _gobuster_scan(
-		self,
-		web_target: str,
-		task_id: Optional[str],
-		log_callback: LogCallback = None,
-	) -> tuple[list[str], str]:
-		result: ExecuteResult = await self.executor.run(
-			tool="gobuster",
-			args=[
-				"dir",
-				"-u", web_target,
-				"-w", "/usr/share/wordlists/dirb/common.txt",
-				"-t", "30",
-				"-q",
-				"--no-error",
-				"-b", "302,301,404",
-			],
-			timeout=120,
-			task_id=task_id,
-			log_callback=log_callback,
-		)
-		if not result.stdout.strip():
-			logger.warning(f"Gobuster 无输出: {result.stderr[:200]}")
-			return [], ""
+			tool_name = tool_spec["name"]
+			if log_callback:
+				await log_callback(f"[ReconAgent] 目录发现: 执行 {tool_name}")
+			t0 = time.monotonic()
+			try:
+				result: ExecuteResult = await self.executor.run_script(
+					script_content=tool_spec["script"],
+					timeout=tool_spec["timeout"],
+					record_purpose=f"{tool_name}_dir_scan",
+				)
+				elapsed = time.monotonic() - t0
+				stdout = result.stdout or ""
+				raw_outputs.append(f"=== {tool_name} ===\n{stdout}")
 
-		paths = self.gobuster_parser.parse(result.stdout)
-		return paths, result.stdout
+				new_count = aggregator.ingest(tool_name, stdout, web_target)
+				planner.record_result(
+					tool_name, "executed",
+					paths_found=new_count,
+					raw_len=len(stdout),
+					elapsed=elapsed,
+				)
+				if log_callback:
+					await log_callback(
+						f"[ReconAgent] {tool_name} 完成: "
+						f"+{new_count} 路径 (累计 {aggregator.count}), "
+						f"{elapsed:.1f}s"
+					)
+			except asyncio.TimeoutError:
+				elapsed = time.monotonic() - t0
+				planner.record_result(
+					tool_name, "timeout", elapsed=elapsed,
+					skip_reason=f"timeout after {elapsed:.0f}s",
+				)
+				if log_callback:
+					await log_callback(
+						f"[ReconAgent] {tool_name} 超时 ({elapsed:.0f}s)"
+					)
+			except Exception as e:
+				elapsed = time.monotonic() - t0
+				planner.record_result(
+					tool_name, "failed",
+					skip_reason=str(e)[:200], elapsed=elapsed,
+				)
+				logger.warning(f"[ReconAgent] {tool_name} 异常: {e}")
+
+		report = planner.coverage_report()
+		paths = aggregator.get_actionable_paths()
+		combined_raw = "\n".join(raw_outputs)
+
+		if log_callback:
+			await log_callback(
+				f"[ReconAgent] 目录发现完成: {len(paths)} 路径, "
+				f"覆盖率{'达标' if report.satisfied else '未达标'} "
+				f"({report.total_elapsed:.0f}s)"
+			)
+		if not report.satisfied:
+			for v in report.violations:
+				logger.warning(f"[ReconAgent] 覆盖率不足: {v}")
+
+		return paths, combined_raw, report
