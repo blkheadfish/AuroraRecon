@@ -290,12 +290,27 @@ const decisionItems = computed(() => {
     }
 
     if (entry.action === 'thought') {
+      const roundLabel = entry.round ? `第 ${entry.round} 轮` : ''
+      const vulnLabel = entry.vuln_name ? ` · ${entry.vuln_name}` : ''
+      const purposeLine = entry.purpose ? `\n🎯 目标: ${entry.purpose}` : ''
+      const expectedLine = entry.expected ? `\n📋 预期: ${entry.expected}` : ''
+      const planLines = Array.isArray(entry.plan) && entry.plan.length
+        ? '\n📝 计划:\n' + entry.plan.map((s, i) => `  ${i + 1}. ${s}`).join('\n')
+        : ''
       events.push({
-        id: `thought-${idx}`,
+        id: entry.id || `thought-${idx}`,
         time,
         tone: 'primary',
-        title: 'AI 思考',
-        desc: entry.message || '',
+        title: `AI 推理${roundLabel ? ' · ' + roundLabel : ''}${vulnLabel}`,
+        desc: (entry.message || entry.thinking || '').slice(0, 200),
+        thinking: entry.thinking || entry.message || '',
+        purpose: entry.purpose || '',
+        expected: entry.expected || '',
+        plan: entry.plan || [],
+        round: entry.round,
+        expandable: (entry.thinking || '').length > 200,
+        fullDesc: (entry.thinking || '') + purposeLine + expectedLine + planLines,
+        action: 'thought',
       })
       return
     }

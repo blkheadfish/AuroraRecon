@@ -250,12 +250,23 @@ class PentestState(BaseModel):
 	user_messages: list[dict] = Field(default_factory=list)
 	agent_replies: list[dict] = Field(default_factory=list)
 
+	# 结构化决策事件队列（ReAct thinking / Skill reasoning），供 WS 增量推送
+	live_decision_events: list[dict] = Field(default_factory=list)
+
 	def log(self, msg: str) -> None:
 		import logging
 		ts = datetime.utcnow().strftime("%H:%M:%S")
 		entry = f"[{ts}] [{self.current_phase}] {msg}"
 		self.phase_log.append(entry)
 		logging.getLogger(__name__).info(entry)
+
+	def push_decision(self, event: dict) -> None:
+		"""Append a structured decision event for real-time WS push."""
+		if "id" not in event:
+			event["id"] = f"de-{len(self.live_decision_events)}-{datetime.utcnow().strftime('%H%M%S%f')}"
+		if "timestamp" not in event:
+			event["timestamp"] = datetime.utcnow().strftime("%H:%M:%S")
+		self.live_decision_events.append(event)
 
 	@field_validator("fingerprints", mode="before")
 	@classmethod

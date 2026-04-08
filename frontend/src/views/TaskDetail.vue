@@ -275,12 +275,21 @@ const decisionItems = computed(() => {
       return
     }
     if (entry.action === 'thought') {
+      const roundLabel = entry.round ? `第 ${entry.round} 轮` : ''
+      const vulnLabel = entry.vuln_name ? ` · ${entry.vuln_name}` : ''
       events.push({
-        id: `thought-${idx}`,
+        id: entry.id || `thought-${idx}`,
         time,
         tone: 'primary',
-        title: 'AI 思考',
-        desc: entry.message || entry.raw || '',
+        title: `AI 推理${roundLabel ? ' · ' + roundLabel : ''}${vulnLabel}`,
+        desc: (entry.message || entry.thinking || entry.raw || '').slice(0, 200),
+        thinking: entry.thinking || entry.message || '',
+        purpose: entry.purpose || '',
+        expected: entry.expected || '',
+        plan: entry.plan || [],
+        round: entry.round,
+        expandable: (entry.thinking || '').length > 200,
+        action: 'thought',
       })
       return
     }

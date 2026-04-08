@@ -430,6 +430,8 @@ async def node_foothold_attempt(state: PentestState) -> PentestState:
             state.log(line)
         async def _on_exec_record(record: dict):
             _append_tool_record(state, record, default_phase="foothold_attempt")
+        async def _on_decision(event: dict):
+            state.push_decision(event)
         results = await agent.run(
             target=state.target_host or state.target,
             findings=exploitable,
@@ -438,6 +440,7 @@ async def node_foothold_attempt(state: PentestState) -> PentestState:
             task_id=state.task_id,
             log_callback=_on_tool_log,
             record_callback=_on_exec_record,
+            decision_callback=_on_decision,
         )
         state.exploit_results = results
         successes = [r for r in results if r.success]
@@ -493,6 +496,8 @@ async def node_secondary_attack(state: PentestState) -> PentestState:
             state.log(line)
         async def _on_exec_record(record: dict):
             _append_tool_record(state, record, default_phase="secondary_attack")
+        async def _on_decision(event: dict):
+            state.push_decision(event)
         new_results = await agent.run(
             target=state.target_host or state.target,
             findings=findings_retry,
@@ -501,6 +506,7 @@ async def node_secondary_attack(state: PentestState) -> PentestState:
             task_id=state.task_id,
             log_callback=_on_tool_log,
             record_callback=_on_exec_record,
+            decision_callback=_on_decision,
         )
         by_id: dict[str, ExploitResult] = {r.vuln_id: r for r in state.exploit_results}
         for nr in new_results:

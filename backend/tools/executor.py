@@ -50,6 +50,7 @@ REPORTS_DIR    = os.getenv("REPORTS_DIR", "/tmp/pentest_reports")
 
 LogCallback = Optional[Callable[[str], Awaitable[None]]]
 RecordCallback = Optional[Callable[[dict], Awaitable[None]]]
+DecisionCallback = Optional[Callable[[dict], Awaitable[None]]]
 
 
 @dataclass

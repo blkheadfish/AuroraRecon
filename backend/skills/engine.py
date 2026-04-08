@@ -35,7 +35,7 @@ from backend.skills.models import (
     SkillContext,
     StepOutcome,
 )
-from backend.tools.executor import ExecuteResult, TaskContainerManager, ToolExecutor
+from backend.tools.executor import DecisionCallback, ExecuteResult, TaskContainerManager, ToolExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +61,7 @@ class SkillEngine:
         lhost: str = "",
         target_os: str = "unknown",
         task_id: Optional[str] = None,
+        decision_callback: DecisionCallback = None,
     ) -> ExploitResult:
         """
         执行 Skill 完整流程。
@@ -77,6 +78,8 @@ class SkillEngine:
         Returns:
             ExploitResult
         """
+        self._decision_callback = decision_callback
+
         # ── 初始化上下文 ──────────────────────────────
         parsed = urlparse(target_url)
         ctx = SkillContext(
@@ -540,11 +543,26 @@ class SkillEngine:
 
             action = decision.get("action", "")
             purpose = decision.get("purpose", "")
+            thinking = decision.get("thinking", "")
 
             logger.info(
                 f"[SkillEngine] 🤖 LLM 第{round_num+1}轮: action={action}, "
-                f"purpose={purpose}"
+                f"thinking={thinking[:120]}, purpose={purpose}"
             )
+
+            if thinking and self._decision_callback:
+                await self._decision_callback({
+                    "action": "thought",
+                    "phase": "foothold_attempt",
+                    "round": round_num + 1,
+                    "thinking": thinking,
+                    "purpose": purpose,
+                    "expected": decision.get("expected", ""),
+                    "plan": decision.get("plan", []),
+                    "message": thinking[:300],
+                    "tone": "primary",
+                    "vuln_name": f"{skill.name} (LLM兜底)",
+                })
 
             if action == "conclude_success":
                 logger.info(f"[SkillEngine] 🤖 LLM 判定利用成功")
@@ -607,6 +625,22 @@ class SkillEngine:
                 step_id=f"llm_round_{round_num + 1}",
                 round_no=round_num + 1,
             ))
+
+            if self._decision_callback:
+                await self._decision_callback({
+                    "action": "command_exec",
+                    "phase": "foothold_attempt",
+                    "round": round_num + 1,
+                    "command": cmd,
+                    "purpose": purpose,
+                    "stdout": exec_result.stdout[:2000],
+                    "stderr": exec_result.stderr[:500],
+                    "exit_code": exec_result.exit_code,
+                    "elapsed": round(exec_result.elapsed, 1),
+                    "vuln_name": f"{skill.name} (LLM兜底)",
+                    "message": f"命令执行: {cmd[:120]}",
+                    "tone": "success" if exec_result.exit_code == 0 else "danger",
+                })
 
             conversation.append({
                 "role": "user",

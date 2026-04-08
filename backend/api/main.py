@@ -715,6 +715,8 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
                 if not await _send({"type": "log", "data": log_entry}):
                     return
             existing_events = _build_decision_events(state)
+            for de in state.live_decision_events:
+                existing_events.append(de)
             snapshot = existing_events[-120:] if len(existing_events) > 120 else existing_events
             for event in snapshot:
                 if not await _send({"type": "decision_event", "data": event}):
@@ -723,6 +725,7 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
 
         last_log_cursor = len(state.phase_log) if state else 0
         last_rec_cursor = len(state.tool_records) if state else 0
+        last_decision_cursor = len(state.live_decision_events) if state else 0
         last_exploit_sig = ""
         sent_approval = False
         heartbeat_counter = 0
@@ -855,10 +858,17 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
                             return
                 dirty = True
 
-            # incremental phase_log-derived events (thoughts, approvals, tool_start/result)
-            # re-scan only new log lines for structured events
-            for idx in range(last_log_cursor - (log_len - (last_log_cursor - (len(state.phase_log) - log_len)) if False else 0), log_len):
-                pass  # already handled above via log push
+            # incremental live_decision_events (thought, plan, etc.)
+            de_len = len(state.live_decision_events)
+            if de_len > last_decision_cursor:
+                for de in state.live_decision_events[last_decision_cursor:]:
+                    de_id = str(de.get("id") or "")
+                    if de_id and de_id not in sent_decision_ids:
+                        sent_decision_ids.add(de_id)
+                        if not await _send({"type": "decision_event", "data": de}):
+                            return
+                last_decision_cursor = de_len
+                dirty = True
 
             # approval signal
             if state.current_phase == "awaiting_approval":
@@ -1313,7 +1323,7 @@ def _to_detail(state: PentestState) -> dict:
         "findings": [f.model_dump() for f in state.findings],
         "exploit_results": [r.model_dump() for r in state.exploit_results],
         "tool_records": [r.model_dump() for r in state.tool_records],
-        "decision_events": _build_decision_events(state),
+        "decision_events": _build_decision_events(state) + list(state.live_decision_events),
         "post_findings": state.post_findings,
         "report_md": state.report_md,
         "phase_log": state.phase_log,

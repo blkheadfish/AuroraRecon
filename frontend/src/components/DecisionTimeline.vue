@@ -9,12 +9,32 @@
           :type="item.tone"
           :hollow="item.tone === 'info'"
         >
-          <div class="timeline-item">
+          <div class="timeline-item" :class="{ 'thought-item': item.action === 'thought' }">
             <div class="top-line">
               <span class="title">{{ item.title }}</span>
               <el-tag size="small" :type="toneTagMap[item.tone]">{{ toneTextMap[item.tone] }}</el-tag>
             </div>
             <p class="desc">{{ item.desc }}</p>
+
+            <template v-if="item.action === 'thought'">
+              <div v-if="item.purpose" class="thought-meta">
+                <span class="meta-label">目标</span> {{ item.purpose }}
+              </div>
+              <div v-if="item.expected" class="thought-meta">
+                <span class="meta-label">预期</span> {{ item.expected }}
+              </div>
+              <div v-if="Array.isArray(item.plan) && item.plan.length" class="thought-plan">
+                <span class="meta-label">攻击计划</span>
+                <ol>
+                  <li v-for="(step, si) in item.plan" :key="si">{{ step }}</li>
+                </ol>
+              </div>
+              <details v-if="item.expandable" class="thought-expand">
+                <summary>展开完整推理</summary>
+                <pre class="thought-full">{{ item.thinking }}</pre>
+              </details>
+            </template>
+
             <slot name="card" :item="item" />
             <PayloadCodeBlock
               v-for="(block, index) in payloadBlocks(item)"
@@ -197,6 +217,66 @@ function payloadBlocks(item) {
   font-size: 12px;
   line-height: 1.6;
   white-space: pre-line;
+}
+
+.thought-item {
+  border-left: 3px solid var(--el-color-primary);
+}
+
+.thought-meta {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin: 2px 0;
+  line-height: 1.5;
+}
+
+.meta-label {
+  display: inline-block;
+  min-width: 3em;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-right: 4px;
+}
+
+.thought-plan {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin: 4px 0 6px;
+}
+
+.thought-plan ol {
+  margin: 2px 0 0;
+  padding-left: 20px;
+}
+
+.thought-plan li {
+  line-height: 1.6;
+}
+
+.thought-expand {
+  margin-top: 6px;
+  font-size: 12px;
+}
+
+.thought-expand summary {
+  cursor: pointer;
+  color: var(--accent-blue);
+  font-weight: 500;
+  user-select: none;
+}
+
+.thought-full {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  background: color-mix(in srgb, var(--bg-base) 80%, var(--el-color-primary) 5%);
+  border-radius: var(--radius-md);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 300px;
+  overflow-y: auto;
 }
 
 .jump-latest {
