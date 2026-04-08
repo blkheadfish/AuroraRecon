@@ -279,6 +279,7 @@ async def node_vuln_scan(state: PentestState) -> PentestState:
         state.log(line)
     async def _on_exec_record(record: dict):
         _append_tool_record(state, record, default_phase="vuln_scan")
+    nmap_vuln_hints = state.raw_recon.get("nmap_vuln_hints", [])
     result = await agent.run(
         target=state.target_host or state.target,
         ports=state.open_ports,
@@ -289,6 +290,7 @@ async def node_vuln_scan(state: PentestState) -> PentestState:
         task_id=state.task_id,
         log_callback=_on_tool_log,
         record_callback=_on_exec_record,
+        nmap_vuln_hints=nmap_vuln_hints,
     )
     state.findings = result.get("findings", [])
     # msgpack (LangGraph checkpoint) 不允许 int 作 dict key
@@ -301,10 +303,12 @@ async def node_vuln_scan(state: PentestState) -> PentestState:
 
 
 async def node_surface_enum(state: PentestState) -> PentestState:
-    """攻链：Web/服务表面枚举线索合并（轻量，避免重复重型扫描）。"""
+    """攻链：深度表面枚举 — feroxbuster 递归目录扫描 + 敏感文件探测。"""
+    from backend.tools.executor import ToolExecutor
     state.current_phase = "surface_enum"
     _record_chain_visit(state, "surface_enum")
-    state.log("攻链: 表面枚举 — 合并 Web 路径与常见入口线索")
+    state.log("攻链: 表面枚举 — 深度目录发现与敏感文件探测")
+
     seen: set[str] = set()
     merged: list[str] = []
     for p in state.web_paths or []:
@@ -312,17 +316,94 @@ async def node_surface_enum(state: PentestState) -> PentestState:
         if s and s not in seen:
             seen.add(s)
             merged.append(s)
-    webish = any(
-        p.port in (80, 443, 8080, 8443, 8000, 8888)
+
+    web_ports = [
+        p for p in state.open_ports
+        if p.port in (80, 443, 8080, 8443, 8000, 8888, 8081, 8090, 9000, 9090)
         or "http" in (p.service or "").lower()
-        for p in state.open_ports
-    )
-    if webish:
-        for extra in ("/robots.txt", "/.git/HEAD", "/admin", "/antibot_image/", "/login"):
-            if extra not in seen:
-                seen.add(extra)
-                merged.append(extra)
-    state.web_paths = merged[:100]
+    ]
+
+    if web_ports:
+        executor = ToolExecutor()
+        host = state.target_host or state.target
+
+        async def _on_tool_log(line: str):
+            state.log(line)
+        async def _on_exec_record(record: dict):
+            _append_tool_record(state, record, default_phase="surface_enum")
+
+        for wp in web_ports[:3]:
+            scheme = "https" if wp.port in (443, 8443) else "http"
+            base_url = f"{scheme}://{host}:{wp.port}"
+
+            # Sensitive file probe (fast, parallel curl checks)
+            sensitive_paths = [
+                "/.git/HEAD", "/.env", "/phpinfo.php", "/web.config",
+                "/robots.txt", "/sitemap.xml", "/.htaccess", "/backup.sql",
+                "/wp-config.php.bak", "/.DS_Store", "/server-status",
+                "/actuator", "/actuator/env", "/console", "/admin",
+                "/manager/html", "/.svn/entries", "/WEB-INF/web.xml",
+            ]
+            probe_cmds = []
+            for sp in sensitive_paths:
+                probe_cmds.append(
+                    f'CODE=$(curl -s -o /dev/null -w "%{{http_code}}" --max-time 5 "{base_url}{sp}"); '
+                    f'[ "$CODE" != "404" ] && [ "$CODE" != "000" ] && echo "{sp} $CODE"'
+                )
+            probe_script = " ; ".join(probe_cmds)
+            try:
+                probe_result = await executor.run_script(
+                    script_content=probe_script,
+                    timeout=60,
+                    log_callback=_on_tool_log,
+                    record_callback=_on_exec_record,
+                    record_phase="surface_enum",
+                    record_purpose="sensitive_file_probe",
+                )
+                if probe_result.stdout:
+                    for line in probe_result.stdout.strip().splitlines():
+                        parts = line.strip().split()
+                        if len(parts) >= 2:
+                            path = parts[0]
+                            code = parts[1]
+                            if code in ("200", "301", "302", "403", "500") and path not in seen:
+                                seen.add(path)
+                                merged.append(path)
+                                state.log(f"敏感文件发现: {path} (HTTP {code})")
+            except Exception as e:
+                logger.warning(f"[SurfaceEnum] 敏感文件探测异常: {e}")
+
+            # feroxbuster deep scan (only if recon found < 10 paths)
+            if len(merged) < 10:
+                try:
+                    ferox_result = await executor.run_script(
+                        script_content=(
+                            f'WL="/usr/share/seclists/Discovery/Web-Content/raft-small-directories.txt"; '
+                            f'[ -f "$WL" ] || WL="/usr/share/wordlists/dirb/common.txt"; '
+                            f'feroxbuster -u "{base_url}" -w "$WL" '
+                            f'-t 30 --depth 1 --no-state -q '
+                            f'-C 404 --silent 2>/dev/null | head -100'
+                        ),
+                        timeout=120,
+                        log_callback=_on_tool_log,
+                        record_callback=_on_exec_record,
+                        record_phase="surface_enum",
+                        record_purpose="feroxbuster_deep_scan",
+                    )
+                    if ferox_result.stdout:
+                        import re as _re
+                        for line in ferox_result.stdout.splitlines():
+                            m = _re.search(r'(https?://[^\s]+)', line)
+                            if m:
+                                from urllib.parse import urlparse
+                                path = urlparse(m.group(1)).path.rstrip("/") or "/"
+                                if path not in seen:
+                                    seen.add(path)
+                                    merged.append(path)
+                except Exception as e:
+                    logger.warning(f"[SurfaceEnum] feroxbuster 扫描异常: {e}")
+
+    state.web_paths = merged[:200]
     state.log(f"表面枚举完成: Web 线索 {len(state.web_paths)} 条")
     return state
 

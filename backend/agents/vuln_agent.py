@@ -57,6 +57,7 @@ class VulnAgent:
         task_id: Optional[str] = None,
         log_callback: LogCallback = None,
         record_callback: RecordCallback = None,
+        nmap_vuln_hints: list[dict] | None = None,
     ) -> dict[str, Any]:
         logger.info(f"[VulnAgent] 开始漏洞扫描: {target}")
 
@@ -108,6 +109,30 @@ class VulnAgent:
         _user_scheme = target_scheme.lower() if target_scheme else ""
 
         all_findings: list[VulnFinding] = []
+
+        # ── Phase 0: 将 nmap --script=vuln 结果转为 VulnFinding ──
+        if nmap_vuln_hints:
+            for hint in nmap_vuln_hints:
+                cves = hint.get("cves", [])
+                cve_str = cves[0] if cves else ""
+                hint_port = hint.get("port", 0)
+                script_id = hint.get("script_id", "")
+                vuln_state = hint.get("state", "info")
+                is_confirmed = vuln_state == "VULNERABLE"
+                name = cve_str or script_id.replace("-", " ").title()
+                target_url = f"http://{target}:{hint_port}" if hint_port else target
+                all_findings.append(VulnFinding(
+                    name=f"Nmap: {name}",
+                    severity="high" if is_confirmed else "medium",
+                    cve=cve_str,
+                    target=target_url,
+                    port=hint_port,
+                    description=f"nmap --script=vuln ({script_id}): {vuln_state}",
+                    evidence=hint.get("output", "")[:2000],
+                    exploitable=is_confirmed,
+                    tool="nmap-vuln-script",
+                ))
+            logger.info(f"[VulnAgent] nmap vuln hints → {len(nmap_vuln_hints)} findings")
 
         # ── Phase 1: 指纹识别（各端口并发）───────────────
         fingerprints: dict[int, dict] = {}
@@ -210,6 +235,11 @@ class VulnAgent:
                 target, target_os, ports, fingerprints, web_paths, all_findings
             )
             all_findings.extend(llm_findings)
+
+        # ── Phase 4.5: 为非 Web 服务端口生成 service-level findings ──
+        # 确保 SSH/FTP/SMB/RDP 等端口有对应 finding，让 ExploitAgent 的 Skill 能匹配
+        svc_findings = self._generate_service_findings(target, ports, all_findings)
+        all_findings.extend(svc_findings)
 
         all_findings = _deduplicate(all_findings)
 
@@ -358,6 +388,73 @@ $PHUIP "{web_url}/index.php" 2>&1
             exploitable=True,
             tool="phuip-probe",
         )
+
+    # ================================================================
+    # Phase 4.5: 为非 Web 服务端口生成 service-level findings
+    # ================================================================
+
+    _SERVICE_FINDING_MAP: dict[str, dict] = {
+        "ssh":    {"name": "SSH Service",  "severity": "medium", "desc": "SSH 服务开放，可尝试弱口令/版本漏洞利用"},
+        "ftp":    {"name": "FTP Service",  "severity": "medium", "desc": "FTP 服务开放，可尝试匿名登录/弱口令/版本漏洞"},
+        "smb":    {"name": "SMB Service",  "severity": "medium", "desc": "SMB 服务开放，可尝试枚举共享/弱口令/MS17-010等"},
+        "microsoft-ds": {"name": "SMB Service", "severity": "medium", "desc": "SMB 服务开放"},
+        "netbios-ssn":  {"name": "SMB Service", "severity": "medium", "desc": "NetBIOS/SMB 服务开放"},
+        "telnet": {"name": "Telnet Service", "severity": "high", "desc": "Telnet 明文协议开放，可尝试弱口令"},
+        "rdp":    {"name": "RDP Service",  "severity": "medium", "desc": "RDP 远程桌面开放，可尝试弱口令/BlueKeep"},
+        "ms-wbt-server": {"name": "RDP Service", "severity": "medium", "desc": "RDP 远程桌面开放"},
+        "mysql":  {"name": "MySQL Service", "severity": "medium", "desc": "MySQL 数据库暴露，可尝试弱口令/UDF提权"},
+        "postgresql": {"name": "PostgreSQL Service", "severity": "medium", "desc": "PostgreSQL 数据库暴露"},
+        "redis":  {"name": "Redis Service", "severity": "high", "desc": "Redis 服务暴露，可尝试未授权访问/写文件"},
+        "mongodb": {"name": "MongoDB Service", "severity": "high", "desc": "MongoDB 暴露，可尝试未授权访问"},
+        "snmp":   {"name": "SNMP Service", "severity": "medium", "desc": "SNMP 服务开放，可尝试社区字符串枚举"},
+        "vnc":    {"name": "VNC Service",  "severity": "medium", "desc": "VNC 远程桌面开放，可尝试弱口令"},
+    }
+
+    _PORT_SERVICE_OVERRIDE: dict[int, str] = {
+        21: "ftp", 22: "ssh", 23: "telnet", 445: "smb", 139: "netbios-ssn",
+        3306: "mysql", 5432: "postgresql", 6379: "redis", 27017: "mongodb",
+        3389: "rdp", 161: "snmp", 5900: "vnc",
+    }
+
+    def _generate_service_findings(
+        self,
+        target: str,
+        ports: list[PortInfo],
+        existing_findings: list[VulnFinding],
+    ) -> list[VulnFinding]:
+        """Create lightweight VulnFinding entries for non-web service ports
+        so ExploitAgent skill matching can pick them up."""
+        existing_ports = {f.port for f in existing_findings if f.port}
+        findings: list[VulnFinding] = []
+        seen_services: set[str] = set()
+
+        for p in ports:
+            svc = p.service.lower() if p.service else ""
+            if not svc:
+                svc = self._PORT_SERVICE_OVERRIDE.get(p.port, "")
+            if not svc or svc in seen_services:
+                continue
+            meta = self._SERVICE_FINDING_MAP.get(svc)
+            if not meta:
+                continue
+            if p.port in existing_ports:
+                continue
+            seen_services.add(svc)
+            findings.append(VulnFinding(
+                name=meta["name"],
+                severity=meta["severity"],
+                cve="",
+                target=f"{target}:{p.port}",
+                port=p.port,
+                description=f"{meta['desc']} (版本: {p.version or 'unknown'})",
+                evidence=f"nmap: {p.port}/{p.service} {p.version} {p.banner}".strip(),
+                exploitable=True,
+                tool="service-enum",
+            ))
+        if findings:
+            logger.info(f"[VulnAgent] 生成 {len(findings)} 个 service-level findings: "
+                        + ", ".join(f.name for f in findings))
+        return findings
 
     # ================================================================
     # Phase 1: 指纹识别

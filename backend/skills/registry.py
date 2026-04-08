@@ -28,9 +28,17 @@ _CATEGORY_PRIORITY = {
     "java_deserialization": 10,
     "web_rce": 9,
     "web_inject": 8,
-    "server_misconfig": 5,   # 宿主级匹配，优先级最低
+    "network": 7,
+    "server_misconfig": 5,
     "credential": 4,
+    "recon_skill": 3,
 }
+
+_SERVICE_FINDING_NAMES = frozenset({
+    "ssh service", "ftp service", "smb service", "rdp service",
+    "telnet service", "mysql service", "postgresql service",
+    "redis service", "mongodb service", "snmp service", "vnc service",
+})
 
 
 class SkillRegistry:
@@ -225,11 +233,44 @@ class SkillRegistry:
                 if any(kw.lower() in ev_lower for kw in rule.evidence_contains):
                     rule_score += 10
 
-            # 端口/服务匹配（辅助信号）
+            # 端口/服务匹配
+            # For generic service findings (e.g. "SSH Service"), port match
+            # is a strong signal (+30); for specific CVE findings it's weaker (+5)
             if rule.port_is and finding.port:
                 if finding.port in rule.port_is:
-                    rule_score += 5
+                    is_service_finding = name_lower in _SERVICE_FINDING_NAMES
+                    rule_score += 30 if is_service_finding else 5
+
+            # service_is matching (for service-level findings)
+            if rule.service_is and name_lower:
+                svc_kw = rule.service_is.lower()
+                if svc_kw in name_lower or svc_kw in fp_lower:
+                    rule_score += 25
 
             best_score = max(best_score, rule_score)
 
         return best_score
+
+    def match_by_port(
+        self,
+        port: int,
+        service: str = "",
+        fingerprint: str = "",
+    ) -> Optional[Skill]:
+        """Match a skill purely by port/service when no VulnFinding matched.
+
+        Creates a synthetic minimal finding for scoring purposes.
+        """
+        self.ensure_loaded()
+        synthetic = VulnFinding(
+            name=f"{service.upper() or 'Unknown'} Service",
+            port=port,
+            target=f":{port}",
+            evidence=fingerprint[:500],
+            exploitable=True,
+            tool="port-match",
+        )
+        return self.match(
+            finding=synthetic,
+            fingerprint=fingerprint,
+        )

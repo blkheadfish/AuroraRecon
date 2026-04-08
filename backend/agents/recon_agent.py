@@ -47,6 +47,7 @@ class ReconAgent:
 		"""
 		if log_callback or record_callback:
 			origin_run = self.executor.run
+			origin_run_script = self.executor.run_script
 
 			async def _run_with_hooks(*args, **kwargs):
 				if log_callback:
@@ -56,7 +57,16 @@ class ReconAgent:
 					kwargs.setdefault("record_phase", "recon")
 				return await origin_run(*args, **kwargs)
 
+			async def _run_script_with_hooks(*args, **kwargs):
+				if log_callback:
+					kwargs.setdefault("log_callback", log_callback)
+				if record_callback:
+					kwargs.setdefault("record_callback", record_callback)
+					kwargs.setdefault("record_phase", "recon")
+				return await origin_run_script(*args, **kwargs)
+
 			self.executor.run = _run_with_hooks
+			self.executor.run_script = _run_script_with_hooks
 
 		logger.info(f"[ReconAgent] 开始侦察: {target}" +
 		            (f" (用户指定端口: {target_port})" if target_port else ""))
@@ -65,18 +75,20 @@ class ReconAgent:
 			target, target_port, task_id, log_callback,
 		)
 
+		# 4th pass: nmap --script=vuln on discovered open ports
+		nmap_vuln_hints = await self._nmap_vuln_scan(
+			target, [p.port for p in ports], task_id, log_callback,
+		)
+
 		web_ports = [
 			p for p in ports
 			if p.service in ("http", "https")
 			or p.port in (80, 443, 8080, 8443, 8888)
 		]
 
-		# 如果用户指定了端口但 nmap 未识别为 web 服务，
-		# 仍然将该端口加入 web_ports 尝试目录爆破
 		if target_port:
 			existing_port_nums = {p.port for p in web_ports}
 			if target_port not in existing_port_nums:
-				# 检查该端口是否在开放端口列表中
 				for p in ports:
 					if p.port == target_port:
 						web_ports.append(p)
@@ -88,7 +100,7 @@ class ReconAgent:
 		if web_ports:
 			scheme = "https" if any(p.port in (443, 8443) for p in web_ports) else "http"
 			web_target = f"{scheme}://{target}:{web_ports[0].port}"
-			web_paths, raw_gobuster = await self._gobuster_scan(web_target, task_id, log_callback)
+			web_paths, raw_gobuster = await self._dir_scan(web_target, task_id, log_callback)
 
 		return {
 			"ports": ports,
@@ -97,6 +109,7 @@ class ReconAgent:
 			"subdomains": [],
 			"raw_nmap": raw_nmap,
 			"raw_gobuster": raw_gobuster,
+			"nmap_vuln_hints": nmap_vuln_hints,
 		}
 
 	async def _nmap_scan(
@@ -178,14 +191,103 @@ class ReconAgent:
 		ports, os_info = self.nmap_parser.parse_xml_full(detail_result.stdout)
 		return ports, os_info, detail_result.stdout
 
+	async def _nmap_vuln_scan(
+		self,
+		target: str,
+		open_ports: list[int],
+		task_id: Optional[str],
+		log_callback: LogCallback = None,
+	) -> list[dict]:
+		"""4th nmap pass: --script=vuln on discovered open ports."""
+		if not open_ports:
+			return []
+		port_str = ",".join(str(p) for p in sorted(open_ports)[:30])
+		logger.info(f"[ReconAgent] Nmap vuln script 扫描: {port_str}")
+		result: ExecuteResult = await self.executor.run(
+			tool="nmap",
+			args=[
+				"-sT", "-Pn", "--script=vuln",
+				"-p", port_str, "-oX", "-", target,
+			],
+			timeout=240,
+			task_id=task_id,
+			log_callback=log_callback,
+		)
+		if not result.success and not result.stdout:
+			logger.warning(f"[ReconAgent] Nmap vuln scan 失败: {(result.stderr or '')[:200]}")
+			return []
+		hints = self.nmap_parser.parse_vuln_scripts(result.stdout or "")
+		if hints:
+			logger.info(f"[ReconAgent] Nmap vuln scan 发现 {len(hints)} 个漏洞提示")
+		return hints
+
+	async def _dir_scan(
+		self,
+		web_target: str,
+		task_id: Optional[str],
+		log_callback: LogCallback = None,
+	) -> tuple[list[str], str]:
+		"""Directory discovery: feroxbuster (recursive) -> gobuster fallback."""
+		paths, raw = await self._feroxbuster_scan(web_target, task_id, log_callback)
+		if paths:
+			return paths, raw
+		logger.info("[ReconAgent] feroxbuster 无结果，降级到 gobuster")
+		return await self._gobuster_scan(web_target, task_id, log_callback)
+
+	async def _feroxbuster_scan(
+		self,
+		web_target: str,
+		task_id: Optional[str],
+		log_callback: LogCallback = None,
+	) -> tuple[list[str], str]:
+		"""Recursive directory scan with feroxbuster."""
+		wordlist = "/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt"
+		fallback_wl = "/usr/share/wordlists/dirb/common.txt"
+		result: ExecuteResult = await self.executor.run_script(
+			script_content=(
+				f'WL="{wordlist}"; '
+				f'[ -f "$WL" ] || WL="{fallback_wl}"; '
+				f'feroxbuster -u "{web_target}" -w "$WL" '
+				f'-t 40 --depth 2 --no-state -q '
+				f'-C 404,301,302 --silent 2>/dev/null || echo "__FEROX_FAIL__"'
+			),
+			timeout=180,
+			record_purpose="feroxbuster_dir_scan",
+		)
+		stdout = result.stdout or ""
+		if "__FEROX_FAIL__" in stdout or not stdout.strip():
+			logger.warning(f"[ReconAgent] feroxbuster 失败或无输出")
+			return [], ""
+		paths = self._parse_feroxbuster_output(stdout)
+		logger.info(f"[ReconAgent] feroxbuster 发现 {len(paths)} 条路径")
+		return paths, stdout
+
+	@staticmethod
+	def _parse_feroxbuster_output(raw: str) -> list[str]:
+		"""Extract URL paths from feroxbuster output lines."""
+		import re
+		paths: list[str] = []
+		seen: set[str] = set()
+		for line in raw.splitlines():
+			line = line.strip()
+			if not line:
+				continue
+			m = re.search(r'(https?://[^\s]+)', line)
+			if m:
+				from urllib.parse import urlparse
+				parsed = urlparse(m.group(1))
+				path = parsed.path.rstrip("/") or "/"
+				if path not in seen:
+					seen.add(path)
+					paths.append(path)
+		return paths
+
 	async def _gobuster_scan(
 		self,
 		web_target: str,
 		task_id: Optional[str],
 		log_callback: LogCallback = None,
 	) -> tuple[list[str], str]:
-		# -b 排除 302/301/404 避免通配符误报
-		# 注意：gobuster 找到路径时 exit_code=1，不能只看 success
 		result: ExecuteResult = await self.executor.run(
 			tool="gobuster",
 			args=[
