@@ -313,6 +313,7 @@ class TaskDetail(TaskSummary):
     open_ports: list = []
     os_info: dict = {}
     web_paths: list = []
+    path_contents: list = []
     subdomains: list = []
     findings: list = []
     exploit_results: list = []
@@ -1319,6 +1320,7 @@ def _to_detail(state: PentestState) -> dict:
         "open_ports": [p.model_dump() for p in state.open_ports],
         "os_info": state.os_info,
         "web_paths": state.web_paths,
+        "path_contents": state.path_contents,
         "subdomains": state.subdomains,
         "findings": [f.model_dump() for f in state.findings],
         "exploit_results": [r.model_dump() for r in state.exploit_results],

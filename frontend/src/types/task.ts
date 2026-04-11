@@ -43,6 +43,17 @@ export interface TaskDetail extends TaskSummary {
   open_ports?: PortInfo[]
   os_info?: Record<string, string>
   web_paths?: string[]
+  path_contents?: {
+    path?: string
+    status?: number
+    title?: string
+    hints?: string[]
+    tech_clues?: string[]
+    keywords?: string[]
+    server?: string
+    powered_by?: string
+    content_snippet?: string
+  }[]
   subdomains?: string[]
   scope_note?: string
   extra_hint?: string

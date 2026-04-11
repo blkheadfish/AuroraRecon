@@ -8,8 +8,9 @@
           :timestamp="item.time"
           :type="item.tone"
           :hollow="item.tone === 'info'"
+          :data-item-id="item.id"
         >
-          <div class="timeline-item" :class="{ 'thought-item': item.action === 'thought' }">
+          <div class="timeline-item" :class="{ 'thought-item': item.action === 'thought' }" :data-item-id="item.id">
             <div class="top-line">
               <span class="title">{{ item.title }}</span>
               <el-tag size="small" :type="toneTagMap[item.tone]">{{ toneTextMap[item.tone] }}</el-tag>
@@ -162,6 +163,19 @@ function payloadBlocks(item) {
   if (item?.payload) return [item.payload]
   return []
 }
+
+function scrollToItem(id) {
+  if (!wrapRef.value || !id) return
+  const el = wrapRef.value.querySelector(`[data-item-id="${id}"]`)
+  if (el) {
+    stickyBottom.value = false
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    el.classList.add('highlight-flash')
+    setTimeout(() => el.classList.remove('highlight-flash'), 1500)
+  }
+}
+
+defineExpose({ scrollToItem })
 </script>
 
 <style scoped>
@@ -313,5 +327,16 @@ function payloadBlocks(item) {
 .fade-leave-to {
   opacity: 0;
   transform: translateX(-50%) translateY(8px);
+}
+
+@keyframes highlight-pulse {
+  0%   { box-shadow: 0 0 0 0 var(--accent-blue); }
+  50%  { box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent-blue) 25%, transparent); }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+
+.highlight-flash {
+  animation: highlight-pulse 0.7s ease 2;
+  border-color: var(--accent-blue) !important;
 }
 </style>

@@ -81,6 +81,7 @@ _STATUS_CODE_RE = re.compile(r'\b([1-5]\d{2})\b')
 _FEROX_LINE_RE = re.compile(r'^\s*(\d{3})\s+\S+\s+\S+\s+\S+\s+(https?://\S+)')
 _GOBUSTER_RE = re.compile(r'^(/\S+)\s+\(Status:\s*(\d{3})\)')
 _DIRB_RE = re.compile(r'^\+\s+(https?://\S+)\s+\(CODE:(\d{3})')
+_DIRB_DIRECTORY_RE = re.compile(r'^\s*==>\s*DIRECTORY:\s*(https?://\S+)', re.IGNORECASE)
 _FFUF_RE = re.compile(r'^\s*(\S+)\s+\[Status:\s*(\d{3})')
 _DIRSEARCH_RE = re.compile(r'^\s*(\d{3})\s+\S+\s+\S+\s+(\S+)')
 _WFUZZ_RE = re.compile(r'^\d+\s+\d+\s+\d+\s+\d+\s+(\d{3})\s+\d+\s+\w+\s+\d+\s+"([^"]+)"')
@@ -227,9 +228,16 @@ def _parse_dirsearch(raw: str, base_url: str) -> list[tuple[str, int]]:
 def _parse_dirb(raw: str, base_url: str) -> list[tuple[str, int]]:
     results: list[tuple[str, int]] = []
     for line in raw.splitlines():
-        m = _DIRB_RE.match(line.strip())
+        stripped = line.strip()
+        m = _DIRB_RE.match(stripped)
         if m:
             results.append((m.group(1), int(m.group(2))))
+            continue
+        # dirb sometimes reports directory hits in this form:
+        # ==> DIRECTORY: http://target/admin/
+        d = _DIRB_DIRECTORY_RE.match(stripped)
+        if d:
+            results.append((d.group(1), 200))
     return results
 
 

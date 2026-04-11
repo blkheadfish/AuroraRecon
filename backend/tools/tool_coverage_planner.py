@@ -18,7 +18,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 MAX_TOOLS_PER_STAGE = int(os.getenv("MAX_TOOLS_PER_STAGE", "10"))
-MAX_TOOL_TIMEOUT = int(os.getenv("MAX_TOOL_TIMEOUT", "180"))
+MAX_TOOL_TIMEOUT = int(os.getenv("MAX_TOOL_TIMEOUT", "360"))
 MAX_STAGE_RUNTIME = int(os.getenv("MAX_STAGE_RUNTIME", "600"))
 
 # ── Tool catalog by category ─────────────────────────────
@@ -47,7 +47,7 @@ _DIR_DISCOVERY_TOOLS: list[dict[str, Any]] = [
     {
         "name": "dirb", "priority": 4, "must_run": False,
         "script": 'dirb "{url}" /usr/share/wordlists/dirb/common.txt -S -r -z 50 2>/dev/null',
-        "timeout": 120,
+        "timeout": 360,
     },
     {
         "name": "ffuf", "priority": 5, "must_run": False,
@@ -155,7 +155,7 @@ class ToolCoveragePlanner:
 
     Budget controls (all env-configurable):
       MAX_TOOLS_PER_STAGE  — hard cap on tools per stage (default 10)
-      MAX_TOOL_TIMEOUT     — per-tool cap in seconds (default 180)
+      MAX_TOOL_TIMEOUT     — per-tool cap in seconds (default 360)
       MAX_STAGE_RUNTIME    — cumulative wall-clock cap for a stage (default 600)
       HIGH_CONFIDENCE_PATHS — if reached AND min coverage met, skip optional tools (default 30)
       EARLY_STOP_MIN_TOOLS — minimum executed before early-stop can trigger (default 3)
@@ -188,6 +188,8 @@ class ToolCoveragePlanner:
                     "name": t["name"],
                     "category": cat,
                     "script": t["script"].format(url=url),
+                    # runtime_command 用于日志/前端展示真实执行命令
+                    "runtime_command": t["script"].format(url=url),
                     "timeout": min(t["timeout"], MAX_TOOL_TIMEOUT),
                     "must_run": t["must_run"],
                 })

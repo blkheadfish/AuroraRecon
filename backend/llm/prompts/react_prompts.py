@@ -283,7 +283,9 @@ REACT_EXPLORE_INITIAL = """目标信息:
 所有已知信息:
 - 开放端口: {ports_summary}
 - Web路径: {web_paths}
+- 路径内容探测摘要: {path_contents}
 - 指纹信息: {fingerprint}
+{dirlist_info}
 - 扫描证据:
 ```
 {evidence}
@@ -332,7 +334,9 @@ REACT_FREEFORM_EXPLORE = """【自由探索阶段】
 操作系统: {target_os}
 开放端口: {ports_summary}
 已知Web路径: {web_paths}
+路径内容探测摘要: {path_contents}
 指纹信息: {fingerprint}
+{dirlist_info}
 
 【已尝试但失败的漏洞】
 {failed_vulns}

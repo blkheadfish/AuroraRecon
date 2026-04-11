@@ -129,11 +129,38 @@ def _operator_chat_block(state: PentestState) -> str:
 
 
 def _build_exploit_context(state: PentestState) -> dict[str, Any]:
+    path_contents = state.path_contents or []
+    path_content_summary = "无"
+    if path_contents:
+        summary_lines = []
+        for item in path_contents[:12]:
+            keywords = item.get("keywords", [])
+            summary_lines.append(
+                f"{item.get('path', '')} "
+                f"(status={item.get('status', 0)}, "
+                f"title={item.get('title', '')[:50]}, "
+                f"tech={','.join(item.get('tech_clues', [])[:4])}"
+                + (f", keywords={','.join(keywords[:4])}" if keywords else "")
+                + ")"
+            )
+        path_content_summary = "\n".join(summary_lines)
+
+    web_paths_str = ", ".join(state.web_paths[:30]) if state.web_paths else "无"
+
+    # Include directory listing tree if available
+    dirlist_info = ""
+    if state.dirlist_tree:
+        dirlist_info = f"\n目录列表文件树:\n{state.dirlist_tree}"
+    if state.dirlist_interesting_files:
+        dirlist_info += f"\n有价值文件: {', '.join(state.dirlist_interesting_files[:15])}"
+
     ctx: dict[str, Any] = {
         "ports_summary": ", ".join(
             f"{p.port}/{p.service}({p.version[:30]})" for p in state.open_ports[:20]
         ),
-        "web_paths": ", ".join(state.web_paths[:20]) if state.web_paths else "无",
+        "web_paths": web_paths_str,
+        "path_contents": path_content_summary,
+        "dirlist_info": dirlist_info,
         "fingerprint": state.raw_recon.get("raw_nmap", "")[:500],
         "fingerprints": state.fingerprints,
         "extra_hint": state.extra_hint,
@@ -261,6 +288,7 @@ async def node_recon(state: PentestState) -> PentestState:
     state.open_ports = result.get("ports", [])
     state.os_info = _stringify_dict_keys(result.get("os_info", {}))
     state.web_paths = result.get("web_paths", [])
+    state.path_contents = _stringify_dict_keys(result.get("path_contents", []))
     state.subdomains = result.get("subdomains", [])
     state.raw_recon = _stringify_dict_keys(result)
     state.target_os = _infer_os(state.open_ports, state.os_info)
@@ -302,6 +330,28 @@ async def node_recon(state: PentestState) -> PentestState:
                 })
 
     state.log(f"侦察完成: {len(state.open_ports)} 端口, OS={state.target_os}")
+
+    # Emit recon summary thought event
+    ports_summary = ", ".join(
+        f"{p.port}/{p.service}" for p in state.open_ports[:15]
+    )
+    web_count = len(state.web_paths or [])
+    state.push_decision({
+        "action": "thought",
+        "phase": "recon",
+        "thinking": (
+            f"侦察完成: 发现 {len(state.open_ports)} 个开放端口 ({ports_summary}), "
+            f"OS推断={state.target_os}, 发现 {web_count} 条Web路径. "
+            f"路径内容探测采集 {len(state.path_contents or [])} 条."
+        ),
+        "purpose": "侦察阶段总结",
+        "plan": [
+            f"开放端口: {len(state.open_ports)} 个",
+            f"Web路径: {web_count} 条",
+            f"下一步: 漏洞扫描",
+        ],
+        "message": f"侦察完成: {len(state.open_ports)} 端口, {web_count} 路径, OS={state.target_os}",
+    })
     return state
 
 
@@ -316,17 +366,21 @@ async def node_vuln_scan(state: PentestState) -> PentestState:
         state.log(line)
     async def _on_exec_record(record: dict):
         _append_tool_record(state, record, default_phase="vuln_scan")
+    async def _on_decision(event: dict):
+        state.push_decision(event)
     nmap_vuln_hints = state.raw_recon.get("nmap_vuln_hints", [])
     result = await agent.run(
         target=state.target_host or state.target,
         ports=state.open_ports,
         web_paths=state.web_paths,
+        path_contents=state.path_contents,
         target_os=state.target_os,
         target_port=state.target_port,
         target_scheme=state.target_scheme,
         task_id=state.task_id,
         log_callback=_on_tool_log,
         record_callback=_on_exec_record,
+        decision_callback=_on_decision,
         nmap_vuln_hints=nmap_vuln_hints,
     )
     state.findings = result.get("findings", [])
@@ -344,6 +398,7 @@ async def node_surface_enum(state: PentestState) -> PentestState:
     import time as _time
     from backend.tools.executor import ToolExecutor
     from backend.tools.parsers.path_aggregator import PathAggregator
+    from backend.tools.parsers.dirlist_crawler import crawl_directory_listings
     from backend.tools.tool_coverage_planner import ToolCoveragePlanner
     state.current_phase = "surface_enum"
     _record_chain_visit(state, "surface_enum")
@@ -438,6 +493,58 @@ async def node_surface_enum(state: PentestState) -> PentestState:
             except Exception as e:
                 logger.warning(f"[SurfaceEnum] 敏感文件探测异常: {e}")
 
+            # ── Directory listing crawl (recursive) ──
+            existing_paths = aggregator.get_actionable_paths()
+
+            def _looks_like_directory(p: str) -> bool:
+                basename = p.rstrip("/").rsplit("/", 1)[-1]
+                if not basename:
+                    return True
+                return "." not in basename
+
+            dir_candidates = [p for p in existing_paths if _looks_like_directory(p)]
+
+            dirlist_seeds_from_content: list[str] = []
+            for pc in (state.path_contents or []):
+                title = (pc.get("title") or "").lower()
+                snippet = (pc.get("content_snippet") or "").lower()
+                if (
+                    "index of" in title
+                    or "parent directory" in snippet
+                    or pc.get("dir_listing")
+                ):
+                    dirlist_seeds_from_content.append(pc["path"])
+
+            dir_candidates = dirlist_seeds_from_content + dir_candidates
+            dir_candidates.append("/")
+            dir_candidates = list(dict.fromkeys(dir_candidates))[:30]
+            try:
+                dirlist_result = await crawl_directory_listings(
+                    base_url=base_url,
+                    seed_paths=dir_candidates,
+                    executor=executor,
+                    max_depth=3,
+                    max_total_entries=200,
+                    log_callback=_on_tool_log,
+                    record_callback=_on_exec_record,
+                )
+                if dirlist_result.entries:
+                    new_paths = [e.path for e in dirlist_result.entries]
+                    aggregator.add_paths(new_paths, source="dirlist_crawl")
+                    interesting = [e for e in dirlist_result.entries if e.interesting]
+                    state.log(
+                        f"[SurfaceEnum] 目录列表爬取: "
+                        f"发现 {len(dirlist_result.entries)} 条目 "
+                        f"({len(interesting)} 个有价值文件), "
+                        f"{len(dirlist_result.dir_listing_paths)} 个目录列表页"
+                    )
+                    state.dirlist_tree = dirlist_result.file_tree_text
+                    state.dirlist_interesting_files = [
+                        e.path for e in dirlist_result.entries if e.interesting
+                    ][:30]
+            except Exception as e:
+                logger.warning(f"[SurfaceEnum] 目录列表爬取异常: {e}")
+
             # ── Planner-driven web probe + fuzz tools ──
             planner = ToolCoveragePlanner(
                 categories=["web_probe", "fuzz"],
@@ -508,6 +615,32 @@ async def node_surface_enum(state: PentestState) -> PentestState:
         f"(高价值 {inv['high_value']}), "
         f"来源工具: {', '.join(inv['source_tools'])}"
     )
+
+    # Emit surface_enum summary thought
+    high_value_paths = [
+        p for p in state.web_paths[:30]
+        if any(kw in p.lower() for kw in (
+            "admin", "login", "config", "backup", ".git", ".env", "manager",
+            "console", "upload", "api", "debug", "phpinfo",
+        ))
+    ]
+    state.push_decision({
+        "action": "thought",
+        "phase": "surface_enum",
+        "thinking": (
+            f"表面枚举完成: 共发现 {inv['total_paths']} 条路径, "
+            f"其中高价值 {inv['high_value']} 条. "
+            f"来源工具: {', '.join(inv['source_tools'])}. "
+            + (f"高价值路径: {', '.join(high_value_paths[:10])}" if high_value_paths else "未发现明显高价值路径.")
+        ),
+        "purpose": "表面枚举总结",
+        "plan": [
+            f"总路径: {inv['total_paths']}",
+            f"高价值: {inv['high_value']}",
+            f"下一步: 利用决策分析",
+        ],
+        "message": f"表面枚举完成: {inv['total_paths']} 路径, {inv['high_value']} 高价值",
+    })
     return state
 
 
@@ -534,8 +667,6 @@ async def node_exploit_decision(state: PentestState) -> PentestState:
             if finding.vuln_id in priority_map:
                 rec = priority_map[finding.vuln_id]
                 if not rec.get("should_exploit", True):
-                    # 只允许 LLM 禁用 low/info 级别的漏洞
-                    # high/critical 级别的漏洞必须保留，避免 LLM 误判
                     if finding.severity in ("low", "info"):
                         finding.exploitable = False
                         logger.info(
@@ -549,6 +680,26 @@ async def node_exploit_decision(state: PentestState) -> PentestState:
 
         remaining = sum(1 for f in state.findings if f.exploitable)
         state.log(f"LLM 决策完成，保留 {remaining} 个可利用漏洞")
+
+        # Emit exploit decision thought event
+        analysis = decision_data.get("analysis", "")
+        targets_info = decision_data.get("targets", [])
+        plan_steps = []
+        for t in targets_info[:6]:
+            vuln_id = t.get("vuln_id", "?")
+            reason = t.get("reason", "")
+            should = t.get("should_exploit", True)
+            plan_steps.append(
+                f"{'[利用]' if should else '[跳过]'} {vuln_id}: {reason[:80]}"
+            )
+        state.push_decision({
+            "action": "thought",
+            "phase": "exploit_decision",
+            "thinking": analysis or f"LLM 分析 {len(exploitable)} 个漏洞，保留 {remaining} 个可利用",
+            "purpose": "利用优先级决策",
+            "plan": plan_steps,
+            "message": f"LLM 决策: {remaining}/{len(exploitable)} 个漏洞将被利用",
+        })
     except Exception as e:
         state.log(f"LLM 决策异常（保留原始可利用标记）: {e}")
     return state

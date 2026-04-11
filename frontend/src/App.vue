@@ -1,76 +1,89 @@
 <template>
-  <div v-if="isStartPage" class="start-layout">
+  <div v-if="hideSidebar" class="start-layout">
     <router-view />
   </div>
 
   <el-container v-else class="app-layout">
-    <!-- Sidebar -->
-    <el-aside width="220px" class="sidebar">
+    <el-aside :width="sidebarCollapsed ? '64px' : '220px'" class="sidebar" :class="{ collapsed: sidebarCollapsed }">
       <div class="sidebar-logo">
         <el-icon class="logo-icon"><Monitor /></el-icon>
-        <span class="logo-text">Aurora</span><span class="logo-text" style="color:#7fe0bd">Recon</span>
+        <transition name="fade-text">
+          <span v-if="!sidebarCollapsed" class="logo-text-group">
+            <span class="logo-text">Aurora</span><span class="logo-text" style="color:#7fe0bd">Recon</span>
+          </span>
+        </transition>
+      </div>
+
+      <div class="collapse-toggle" @click="uiPrefs.sidebarCollapsed = !uiPrefs.sidebarCollapsed">
+        <el-icon><Fold v-if="!sidebarCollapsed" /><Expand v-else /></el-icon>
       </div>
 
       <el-menu
           :default-active="activeMenu"
           router
+          :collapse="sidebarCollapsed"
           class="sidebar-menu"
       >
         <el-menu-item index="/dashboard">
           <el-icon><DataLine /></el-icon>
-          <span>工作台</span>
+          <template #title><span>工作台</span></template>
         </el-menu-item>
         <el-menu-item index="/tasks">
           <el-icon><List /></el-icon>
-          <span>任务列表</span>
+          <template #title><span>任务列表</span></template>
         </el-menu-item>
         <el-menu-item index="/tools">
           <el-icon><Grid /></el-icon>
-          <span>工具管理</span>
+          <template #title><span>工具管理</span></template>
         </el-menu-item>
         <el-menu-item index="/skills">
           <el-icon><Tools /></el-icon>
-          <span>Skills管理</span>
+          <template #title><span>Skills管理</span></template>
         </el-menu-item>
         <el-menu-item index="/knowledge">
           <el-icon><Reading /></el-icon>
-          <span>知识库管理</span>
+          <template #title><span>知识库管理</span></template>
         </el-menu-item>
         <el-menu-item index="/prompts">
           <el-icon><ChatDotRound /></el-icon>
-          <span>Prompt管理</span>
+          <template #title><span>Prompt管理</span></template>
         </el-menu-item>
         <el-menu-item index="/profile">
           <el-icon><User /></el-icon>
-          <span>个人空间</span>
+          <template #title><span>个人空间</span></template>
         </el-menu-item>
         <el-menu-item index="/settings">
           <el-icon><Setting /></el-icon>
-          <span>系统设置</span>
+          <template #title><span>系统设置</span></template>
         </el-menu-item>
       </el-menu>
 
       <div class="sidebar-footer">
-        <!-- Theme toggle -->
         <div class="theme-toggle" @click="toggleTheme">
           <el-icon v-if="theme === 'dark'" class="theme-icon"><Sunny /></el-icon>
           <el-icon v-else class="theme-icon"><Moon /></el-icon>
-          <span class="theme-label">{{ theme === 'dark' ? '切换亮色' : '切换暗色' }}</span>
+          <span v-if="!sidebarCollapsed" class="theme-label">{{ theme === 'dark' ? '切换亮色' : '切换暗色' }}</span>
         </div>
 
-        <span class="version-badge">v2.0.0</span>
-        <span class="api-status" :class="apiOk ? 'ok' : 'err'">
-          <span class="dot"></span>
-          {{ apiOk ? 'API 在线' : 'API 离线' }}
-        </span>
-        <span v-if="dbStatus" class="db-status" :class="dbStatus === 'connected' ? 'ok' : 'warn'">
-          <span class="dot"></span>
-          DB {{ dbStatus === 'connected' ? '已连接' : '离线' }}
-        </span>
+        <template v-if="!sidebarCollapsed">
+          <span class="version-badge">v2.0.0</span>
+          <span class="api-status" :class="apiOk ? 'ok' : 'err'">
+            <span class="dot"></span>
+            {{ apiOk ? 'API 在线' : 'API 离线' }}
+          </span>
+          <span v-if="dbStatus" class="db-status" :class="dbStatus === 'connected' ? 'ok' : 'warn'">
+            <span class="dot"></span>
+            DB {{ dbStatus === 'connected' ? '已连接' : '离线' }}
+          </span>
+        </template>
+        <template v-else>
+          <span class="api-dot-only" :class="apiOk ? 'ok' : 'err'">
+            <span class="dot"></span>
+          </span>
+        </template>
       </div>
     </el-aside>
 
-    <!-- Main content -->
     <el-main class="main-content">
       <router-view />
     </el-main>
@@ -82,9 +95,16 @@ import { computed, ref, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { api } from '@/api'
 import { useTheme } from '@/composables/useTheme'
+import { useUiPrefsStore } from '@/stores/uiPrefs'
+import { storeToRefs } from 'pinia'
 
 const route = useRoute()
-const isStartPage = computed(() => route.path === '/start')
+const uiPrefs = useUiPrefsStore()
+const { sidebarCollapsed } = storeToRefs(uiPrefs)
+
+const hideSidebar = computed(() =>
+  ['/start', '/login', '/register'].includes(route.path)
+)
 const activeMenu = computed(() => {
   if (route.path.startsWith('/tasks/')) return '/tasks'
   if (route.path.startsWith('/reports/')) return '/tasks'
@@ -132,7 +152,7 @@ onMounted(() => {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  transition: background 0.2s, border-color 0.2s;
+  transition: width 0.25s cubic-bezier(0.4, 0, 0.2, 1), background 0.2s, border-color 0.2s;
 }
 
 .sidebar-logo {
@@ -141,11 +161,24 @@ onMounted(() => {
   gap: 10px;
   padding: 18px 20px;
   border-bottom: 1px solid var(--border);
+  min-height: 56px;
+  overflow: hidden;
+}
+
+.sidebar.collapsed .sidebar-logo {
+  justify-content: center;
+  padding: 18px 0;
 }
 
 .logo-icon {
   font-size: 20px;
   color: var(--accent-blue);
+  flex-shrink: 0;
+}
+
+.logo-text-group {
+  white-space: nowrap;
+  overflow: hidden;
 }
 
 .logo-text {
@@ -154,19 +187,46 @@ onMounted(() => {
   letter-spacing: 0.02em;
   color: var(--text-primary);
   font-family: var(--font-orbitron);
-  //font-family: var(--font-mono);
+}
+
+.collapse-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6px;
+  margin: 4px 8px;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  color: var(--text-muted);
+  transition: background 0.15s, color 0.15s;
+}
+
+.collapse-toggle:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
 }
 
 .sidebar-menu {
   flex: 1;
   border: none !important;
   padding: 8px;
+  overflow: hidden;
 }
 
 :deep(.el-menu-item) {
   border-radius: var(--radius-md) !important;
   margin: 2px 0 !important;
   font-size: 13px !important;
+}
+
+.sidebar.collapsed :deep(.el-menu) {
+  padding: 8px 4px;
+}
+
+.sidebar.collapsed :deep(.el-menu-item) {
+  padding: 0 !important;
+  justify-content: center;
+  margin: 2px auto !important;
 }
 
 .sidebar-footer {
@@ -177,7 +237,11 @@ onMounted(() => {
   gap: 8px;
 }
 
-/* Theme toggle */
+.sidebar.collapsed .sidebar-footer {
+  padding: 12px 8px;
+  align-items: center;
+}
+
 .theme-toggle {
   display: flex;
   align-items: center;
@@ -190,6 +254,11 @@ onMounted(() => {
   font-size: 12px;
 }
 
+.sidebar.collapsed .theme-toggle {
+  justify-content: center;
+  padding: 6px;
+}
+
 .theme-toggle:hover {
   background: var(--bg-hover);
   color: var(--text-primary);
@@ -198,10 +267,13 @@ onMounted(() => {
 .theme-icon {
   font-size: 16px;
   color: var(--accent-yellow);
+  flex-shrink: 0;
 }
 
 .theme-label {
   font-family: var(--font-sans);
+  white-space: nowrap;
+  overflow: hidden;
 }
 
 .version-badge {
@@ -220,7 +292,8 @@ onMounted(() => {
 }
 
 .api-status .dot,
-.db-status .dot {
+.db-status .dot,
+.api-dot-only .dot {
   width: 6px;
   height: 6px;
   border-radius: 50%;
@@ -236,10 +309,26 @@ onMounted(() => {
 .db-status.warn { color: var(--accent-yellow); }
 .db-status.warn .dot { background: var(--accent-yellow); }
 
+.api-dot-only {
+  display: flex;
+  justify-content: center;
+}
+.api-dot-only.ok .dot { background: var(--accent-green); }
+.api-dot-only.err .dot { background: var(--accent-red); }
+
 .main-content {
   background: var(--bg-base);
   padding: 0;
   overflow-y: auto;
   transition: background 0.2s;
+}
+
+.fade-text-enter-active,
+.fade-text-leave-active {
+  transition: opacity 0.2s ease;
+}
+.fade-text-enter-from,
+.fade-text-leave-to {
+  opacity: 0;
 }
 </style>

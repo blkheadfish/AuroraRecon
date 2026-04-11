@@ -11,8 +11,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import re
+import shlex
 import time
 from typing import Any, Optional
+from urllib.parse import urljoin, urlparse
 
 from backend.agents.models import PortInfo
 from backend.tools.executor import ToolExecutor, ExecuteResult, LogCallback, RecordCallback
@@ -79,9 +83,10 @@ class ReconAgent:
 			target, target_port, task_id, log_callback,
 		)
 
-		# 4th pass: nmap --script=vuln on discovered open ports
+		# 4th pass: targeted per-service nmap vuln scripts
 		nmap_vuln_hints = await self._nmap_vuln_scan(
 			target, [p.port for p in ports], task_id, log_callback,
+			ports_info=ports,
 		)
 
 		web_ports = [
@@ -99,21 +104,30 @@ class ReconAgent:
 						break
 
 		web_paths: list[str] = []
+		path_contents: list[dict[str, Any]] = []
 		raw_gobuster = ""
 		dir_coverage: dict = {}
 
 		if web_ports:
 			scheme = "https" if any(p.port in (443, 8443) for p in web_ports) else "http"
 			web_target = f"{scheme}://{target}:{web_ports[0].port}"
-			web_paths, raw_gobuster, coverage_rpt = await self._dir_scan(
+			web_paths, raw_gobuster, coverage_rpt, aggregator = await self._dir_scan(
 				web_target, task_id, log_callback,
 			)
+			path_contents = await self._probe_path_contents(
+				web_target=web_target,
+				aggregator=aggregator,
+				task_id=task_id,
+				log_callback=log_callback,
+			)
+			web_paths = aggregator.get_actionable_paths()
 			dir_coverage = coverage_rpt.to_log_dict()
 
 		return {
 			"ports": ports,
 			"os_info": os_info,
 			"web_paths": web_paths,
+			"path_contents": path_contents,
 			"subdomains": [],
 			"raw_nmap": raw_nmap,
 			"raw_gobuster": raw_gobuster,
@@ -206,36 +220,116 @@ class ReconAgent:
 		open_ports: list[int],
 		task_id: Optional[str],
 		log_callback: LogCallback = None,
+		ports_info: list[PortInfo] | None = None,
 	) -> list[dict]:
-		"""4th nmap pass: --script=vuln on discovered open ports."""
+		"""4th nmap pass: targeted per-service vuln scripts instead of blanket --script=vuln."""
 		if not open_ports:
 			return []
-		port_str = ",".join(str(p) for p in sorted(open_ports)[:30])
-		logger.info(f"[ReconAgent] Nmap vuln script 扫描: {port_str}")
-		result: ExecuteResult = await self.executor.run(
-			tool="nmap",
-			args=[
-				"-sT", "-Pn", "--script=vuln",
-				"-p", port_str, "-oX", "-", target,
-			],
-			timeout=240,
-			task_id=task_id,
-			log_callback=log_callback,
-		)
-		if not result.success and not result.stdout:
-			logger.warning(f"[ReconAgent] Nmap vuln scan 失败: {(result.stderr or '')[:200]}")
-			return []
-		hints = self.nmap_parser.parse_vuln_scripts(result.stdout or "")
-		if hints:
-			logger.info(f"[ReconAgent] Nmap vuln scan 发现 {len(hints)} 个漏洞提示")
-		return hints
+
+		script_timeout = int(os.getenv("NMAP_SCRIPT_TIMEOUT", "30"))
+
+		_SERVICE_SCRIPTS: dict[str, tuple[set[int], str]] = {
+			"http": (
+				{80, 443, 8080, 8443, 8000, 8888, 8081, 8090, 9000, 9090, 3000, 7001, 7002, 8008, 8161, 9200, 9443, 10000},
+				"http-vuln*,http-enum,http-shellshock,http-sql-injection",
+			),
+			"smb": ({445, 139}, "smb-vuln*,smb-enum-shares,smb-os-discovery"),
+			"ftp": ({21}, "ftp-anon,ftp-vsftpd-backdoor,ftp-proftpd-backdoor"),
+			"ssh": ({22}, "ssh2-enum-algos,ssh-auth-methods"),
+			"mysql": ({3306}, "mysql-vuln-cve2012-2122,mysql-empty-password,mysql-enum"),
+			"rdp": ({3389}, "rdp-vuln-ms12-020"),
+			"smtp": ({25, 587}, "smtp-vuln-cve2010-4344,smtp-open-relay"),
+		}
+
+		svc_port_map: dict[str, list[int]] = {}
+		_service_lookup: dict[int, str] = {}
+		if ports_info:
+			_service_lookup = {p.port: (p.service or "").lower() for p in ports_info}
+
+		remaining: list[int] = []
+		for port in sorted(open_ports):
+			matched = False
+			svc_name = _service_lookup.get(port, "")
+			for group_name, (port_set, _scripts) in _SERVICE_SCRIPTS.items():
+				if port in port_set or group_name in svc_name:
+					svc_port_map.setdefault(group_name, []).append(port)
+					matched = True
+					break
+			if not matched:
+				remaining.append(port)
+
+		all_hints: list[dict] = []
+
+		for group_name, group_ports in svc_port_map.items():
+			_, scripts = _SERVICE_SCRIPTS[group_name]
+			port_str = ",".join(str(p) for p in group_ports[:10])
+			timeout = 60 + 10 * len(group_ports)
+			if log_callback:
+				await log_callback(
+					f"[ReconAgent] nmap vuln ({group_name}): ports={port_str}, timeout={timeout}s"
+				)
+			logger.info(f"[ReconAgent] Nmap vuln ({group_name}): {port_str}")
+			try:
+				result: ExecuteResult = await self.executor.run(
+					tool="nmap",
+					args=[
+						"-sT", "-Pn",
+						f"--script={scripts}",
+						f"--script-timeout={script_timeout}",
+						"-p", port_str, "-oX", "-", target,
+					],
+					timeout=timeout,
+					task_id=task_id,
+					log_callback=log_callback,
+				)
+				if result.success or result.stdout:
+					hints = self.nmap_parser.parse_vuln_scripts(result.stdout or "")
+					all_hints.extend(hints)
+				else:
+					logger.warning(
+						f"[ReconAgent] Nmap vuln ({group_name}) 失败: "
+						f"{(result.stderr or '')[:200]}"
+					)
+			except Exception as e:
+				logger.warning(f"[ReconAgent] Nmap vuln ({group_name}) 异常: {e}")
+
+		if remaining:
+			fallback_ports = remaining[:5]
+			port_str = ",".join(str(p) for p in fallback_ports)
+			timeout = 90 + 15 * len(fallback_ports)
+			if log_callback:
+				await log_callback(
+					f"[ReconAgent] nmap vuln (other): ports={port_str}, timeout={timeout}s"
+				)
+			logger.info(f"[ReconAgent] Nmap vuln (other): {port_str}")
+			try:
+				result = await self.executor.run(
+					tool="nmap",
+					args=[
+						"-sT", "-Pn", "--script=vuln",
+						f"--script-timeout={script_timeout}",
+						"-p", port_str, "-oX", "-", target,
+					],
+					timeout=timeout,
+					task_id=task_id,
+					log_callback=log_callback,
+				)
+				if result.success or result.stdout:
+					hints = self.nmap_parser.parse_vuln_scripts(result.stdout or "")
+					all_hints.extend(hints)
+			except Exception as e:
+				logger.warning(f"[ReconAgent] Nmap vuln (other) 异常: {e}")
+
+		if all_hints:
+			logger.info(f"[ReconAgent] Nmap vuln scan 共发现 {len(all_hints)} 个漏洞提示")
+		return all_hints
 
 	async def _dir_scan(
 		self,
 		web_target: str,
 		task_id: Optional[str],
 		log_callback: LogCallback = None,
-	) -> tuple[list[str], str, CoverageReport]:
+	) -> tuple[list[str], str, CoverageReport, PathAggregator]:
 		"""Planner-driven multi-tool directory discovery chain."""
 		planner = ToolCoveragePlanner(
 			categories=["dir_discovery"],
@@ -259,14 +353,24 @@ class ReconAgent:
 				continue
 
 			tool_name = tool_spec["name"]
+			runtime_command = str(tool_spec.get("runtime_command") or tool_spec.get("script") or "").strip()
+			command_preview = " ".join(runtime_command.split())
+			if len(command_preview) > 260:
+				command_preview = command_preview[:260] + "..."
 			if log_callback:
-				await log_callback(f"[ReconAgent] 目录发现: 执行 {tool_name}")
+				await log_callback(
+					f"[ReconAgent] 目录发现: 执行 {tool_name} | "
+					f"timeout={tool_spec['timeout']}s | cmd={command_preview}"
+				)
 			t0 = time.monotonic()
 			try:
 				result: ExecuteResult = await self.executor.run_script(
 					script_content=tool_spec["script"],
 					timeout=tool_spec["timeout"],
+					task_id=task_id,
+					log_callback=log_callback,
 					record_purpose=f"{tool_name}_dir_scan",
+					record_runtime_command=runtime_command,
 				)
 				elapsed = time.monotonic() - t0
 				stdout = result.stdout or ""
@@ -317,4 +421,229 @@ class ReconAgent:
 			for v in report.violations:
 				logger.warning(f"[ReconAgent] 覆盖率不足: {v}")
 
-		return paths, combined_raw, report
+		return paths, combined_raw, report, aggregator
+
+	def _pick_content_probe_candidates(
+		self,
+		aggregator: PathAggregator,
+		max_items: int = 20,
+	) -> list[dict[str, Any]]:
+		high_value_hints = {
+			"admin", "login", "api", "config",
+			"backup", "upload", "info_disclosure", "leak",
+		}
+		inventory = aggregator.get_inventory(min_confidence=0.45)
+		candidates = [
+			item for item in inventory
+			if "static" not in item.get("hints", [])
+		]
+		prioritized = [
+			item for item in candidates
+			if high_value_hints.intersection(set(item.get("hints", [])))
+		]
+		selected = prioritized or candidates[:8]
+		selected.sort(key=lambda x: (-float(x.get("confidence", 0.0)), x.get("path", "")))
+		return selected[:max_items]
+
+	async def _probe_path_contents(
+		self,
+		web_target: str,
+		aggregator: PathAggregator,
+		task_id: Optional[str],
+		log_callback: LogCallback = None,
+	) -> list[dict[str, Any]]:
+		candidates = self._pick_content_probe_candidates(aggregator, max_items=20)
+		if not candidates:
+			return []
+
+		base_url = web_target.rstrip("/")
+		path_lines = "\n".join(item.get("path", "") for item in candidates if item.get("path"))
+		if not path_lines:
+			return []
+
+		if log_callback:
+			await log_callback(
+				f"[ReconAgent] 路径内容探测: 准备探测 {len(candidates)} 条高价值路径"
+			)
+
+		probe_script = f"""
+set +e
+BASE={shlex.quote(base_url)}
+while IFS= read -r PATH_ITEM; do
+  [ -z "$PATH_ITEM" ] && continue
+  URL="${{BASE}}${{PATH_ITEM}}"
+  TMP_BODY=$(mktemp)
+  TMP_HEADER=$(mktemp)
+  CODE=$(curl -sS -L --max-time 8 -D "$TMP_HEADER" -o "$TMP_BODY" -w "%{{http_code}}" "$URL" 2>/dev/null || echo "000")
+  SERVER=$(awk 'BEGIN{{IGNORECASE=1}} /^Server:/{{sub(/^Server:[[:space:]]*/,""); print; exit}}' "$TMP_HEADER" | tr -d '\\r' | tr '\\n' ' ' | cut -c1-140)
+  POWERED=$(awk 'BEGIN{{IGNORECASE=1}} /^X-Powered-By:/{{sub(/^X-Powered-By:[[:space:]]*/,""); print; exit}}' "$TMP_HEADER" | tr -d '\\r' | tr '\\n' ' ' | cut -c1-140)
+  LINKS=$(grep -Eoi 'href=["'"'"'][^"'"'"']+["'"'"']' "$TMP_BODY" | head -n 25 | sed -E 's/^href=["'"'"']|["'"'"']$//g' | paste -sd'|' -)
+  BODY=$(tr '\\r\\n' '  ' < "$TMP_BODY" | sed -E 's/[[:space:]]+/ /g' | cut -c1-2000)
+  echo "__PATH_PROBE_BEGIN__"
+  echo "PATH:$PATH_ITEM"
+  echo "CODE:$CODE"
+  echo "SERVER:$SERVER"
+  echo "POWERED:$POWERED"
+  echo "LINKS:$LINKS"
+  echo "BODY:$BODY"
+  echo "__PATH_PROBE_END__"
+  rm -f "$TMP_BODY" "$TMP_HEADER"
+done <<'EOF_PATHS'
+{path_lines}
+EOF_PATHS
+""".strip()
+
+		try:
+			result: ExecuteResult = await self.executor.run_script(
+				script_content=probe_script,
+				timeout=240,
+				task_id=task_id,
+				log_callback=log_callback,
+				record_purpose="path_content_probe",
+				record_runtime_command=f"batch-curl {base_url} ({len(candidates)} paths)",
+			)
+		except Exception as e:
+			logger.warning(f"[ReconAgent] 路径内容探测异常: {e}")
+			return []
+
+		path_hint_map = {item["path"]: item.get("hints", []) for item in candidates}
+		probed: list[dict[str, Any]] = []
+		new_paths = 0
+		for block in self._parse_probe_blocks(result.stdout or ""):
+			path = str(block.get("PATH", "")).strip()
+			if not path:
+				continue
+			code = self._safe_int(str(block.get("CODE", "0")), default=0)
+			body = str(block.get("BODY", "")).strip()
+			title = self._extract_title(body)
+			server = str(block.get("SERVER", "")).strip()
+			powered = str(block.get("POWERED", "")).strip()
+			tech_clues = self._extract_tech_clues(body, title, server, powered)
+			keywords = self._extract_keywords(body)
+
+			links_field = str(block.get("LINKS", "")).strip()
+			discovered = self._extract_paths_from_links(path, links_field)
+			if discovered:
+				aggregator.add_paths(discovered, source="content_probe", status=200)
+				new_paths += len(discovered)
+
+			is_dirlist = (
+				"index of" in title.lower()
+				or "parent directory" in body.lower()
+			)
+
+			probed.append({
+				"path": path,
+				"status": code,
+				"title": title,
+				"hints": path_hint_map.get(path, []),
+				"tech_clues": tech_clues,
+				"keywords": keywords,
+				"server": server,
+				"powered_by": powered,
+				"content_snippet": body[:500],
+				"dir_listing": is_dirlist,
+			})
+
+		if log_callback:
+			await log_callback(
+				f"[ReconAgent] 路径内容探测完成: 采集 {len(probed)} 条, 新增候选路径 {new_paths} 条"
+			)
+		return probed
+
+	@staticmethod
+	def _parse_probe_blocks(raw: str) -> list[dict[str, str]]:
+		records: list[dict[str, str]] = []
+		current: dict[str, str] | None = None
+		for line in raw.splitlines():
+			if line.strip() == "__PATH_PROBE_BEGIN__":
+				current = {}
+				continue
+			if line.strip() == "__PATH_PROBE_END__":
+				if current:
+					records.append(current)
+				current = None
+				continue
+			if current is None or ":" not in line:
+				continue
+			key, value = line.split(":", 1)
+			current[key.strip()] = value.strip()
+		return records
+
+	@staticmethod
+	def _safe_int(raw: str, default: int = 0) -> int:
+		try:
+			return int(raw)
+		except Exception:
+			return default
+
+	@staticmethod
+	def _extract_title(body: str) -> str:
+		if not body:
+			return ""
+		m = re.search(r"<title[^>]*>(.*?)</title>", body, re.IGNORECASE)
+		if not m:
+			return ""
+		return re.sub(r"\s+", " ", m.group(1)).strip()[:120]
+
+	@staticmethod
+	def _extract_tech_clues(body: str, title: str, server: str, powered: str) -> list[str]:
+		text = f"{body} {title} {server} {powered}".lower()
+		mapping = {
+			"php": "PHP",
+			"jsp": "JSP",
+			"spring": "Spring",
+			"struts": "Struts",
+			"tomcat": "Tomcat",
+			"weblogic": "WebLogic",
+			"nginx": "Nginx",
+			"apache": "Apache",
+			"iis": "IIS",
+			"wordpress": "WordPress",
+			"django": "Django",
+			"flask": "Flask",
+			"react": "React",
+			"vue": "Vue",
+		}
+		out: list[str] = []
+		for kw, label in mapping.items():
+			if kw in text and label not in out:
+				out.append(label)
+		return out[:8]
+
+	@staticmethod
+	def _extract_keywords(body: str) -> list[str]:
+		text = (body or "").lower()
+		kw_order = [
+			"login", "password", "token", "apikey", "secret", "upload",
+			"admin", "database", "sql", "debug", "traceback", "exception",
+		]
+		return [kw for kw in kw_order if kw in text][:8]
+
+	def _extract_paths_from_links(self, current_path: str, links_blob: str) -> list[str]:
+		if not links_blob:
+			return []
+		paths: list[str] = []
+		for raw in links_blob.split("|"):
+			path = self._normalize_link_to_path(raw.strip(), current_path)
+			if path and path not in paths:
+				paths.append(path)
+		return paths[:20]
+
+	@staticmethod
+	def _normalize_link_to_path(link: str, current_path: str) -> str:
+		if not link:
+			return ""
+		lower = link.lower()
+		if lower.startswith(("javascript:", "mailto:", "tel:", "data:", "#")):
+			return ""
+		if link.startswith(("http://", "https://")):
+			path = urlparse(link).path or "/"
+		elif link.startswith("/"):
+			path = link
+		else:
+			base_dir = current_path if current_path.endswith("/") else (current_path.rsplit("/", 1)[0] + "/")
+			path = urlparse(urljoin(f"http://dummy{base_dir}", link)).path or "/"
+		if not path.startswith("/"):
+			path = "/" + path
+		return path.rstrip("/") or "/"

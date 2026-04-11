@@ -25,7 +25,12 @@
     </section>
 
     <section class="timeline-section">
-      <DecisionTimeline :items="decisionItems">
+      <ToolChainRail
+        :items="decisionItems"
+        :active-id="activeRailId"
+        @jump="handleRailJump"
+      />
+      <DecisionTimeline ref="timelineRef" :items="decisionItems">
         <template #card="{ item }">
           <div v-if="item.action === 'approval_required' && !approvalDone" class="approval-card-slot">
             <ApprovalComposer
@@ -67,6 +72,7 @@ import { api } from '@/api'
 import { useTaskListStore } from '@/stores/taskList'
 import { useTaskLiveStore } from '@/stores/taskLive'
 import DecisionTimeline from '@/components/DecisionTimeline.vue'
+import ToolChainRail from '@/components/ToolChainRail.vue'
 import ApprovalComposer from '@/components/ApprovalComposer.vue'
 import StatusBadge from '@/components/StatusBadge.vue'
 
@@ -79,6 +85,13 @@ const liveStore = useTaskLiveStore()
 const loading = ref(true)
 const chatInput = ref('')
 const sending = ref(false)
+const timelineRef = ref(null)
+const activeRailId = ref('')
+
+function handleRailJump(id) {
+  activeRailId.value = id
+  timelineRef.value?.scrollToItem(id)
+}
 
 const approvalState = computed(() => liveStore.getLiveState(taskId).approvalState)
 const approvalDone = computed(() => approvalState.value === 'submitted')
@@ -156,6 +169,13 @@ function buildExecPayloads(command, stdout, stderr, meta = {}) {
     language: inferPayloadLang(command || ''),
     code: command || '(empty command)',
   }]
+  if (runtimeCommand && runtimeCommand !== String(command || '').trim()) {
+    blocks.push({
+      title: 'RuntimeCommand',
+      language: inferPayloadLang(runtimeCommand),
+      code: runtimeCommand,
+    })
+  }
   if (stdout) {
     blocks.push({ title: 'Stdout', language: inferOutputLang(stdout), code: stdout, ...outputMeta })
   }
@@ -490,7 +510,13 @@ onUnmounted(() => {
   min-height: 0;
   overflow: hidden;
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
+  padding: 0;
+}
+
+.timeline-section > :deep(.timeline-wrap) {
+  flex: 1;
+  min-width: 0;
   padding: 16px 28px;
 }
 

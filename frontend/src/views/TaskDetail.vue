@@ -73,7 +73,19 @@
 
     <el-card class="main-card">
       <el-tabs v-model="activeTab" class="detail-tabs">
-        <el-tab-pane label="Decision Chat" name="decision">
+        <el-tab-pane name="decision">
+          <template #label>
+            <span class="tab-label">
+              <el-icon><ChatDotRound /></el-icon>
+              决策摘要
+            </span>
+          </template>
+          <div class="decision-summary-header">
+            <span class="summary-hint">仅显示关键决策节点，详细工具调用请查看完整视图</span>
+            <el-button type="primary" link @click="router.push(`/tasks/${taskId}/decision`)">
+              查看完整决策 →
+            </el-button>
+          </div>
           <DecisionTimeline :items="decisionItems" />
         </el-tab-pane>
 
@@ -215,55 +227,15 @@ const decisionItems = computed(() => {
   const liveDecisionEvents = Array.isArray(state.value?.decisionEvents) ? state.value.decisionEvents : []
   const storedDecisionEvents = Array.isArray(task.value?.decision_events) ? task.value.decision_events : []
   const structuredEvents = liveDecisionEvents.length ? liveDecisionEvents : storedDecisionEvents
+  const SKIP_ACTIONS = new Set([
+    'command_exec', 'tool_start', 'tool_result',
+    'tool_coverage_report', 'tool_executed', 'tool_skipped',
+  ])
+
   structuredEvents.slice(-120).forEach((entry, idx) => {
+    if (SKIP_ACTIONS.has(entry.action)) return
+
     const time = entry.timestamp || new Date().toLocaleTimeString()
-    if (entry.action === 'tool_start') {
-      events.push({
-        id: `tool-start-${idx}`,
-        time,
-        tone: 'primary',
-        title: `工具调用 · ${entry.tool || 'unknown'}`,
-        desc: `阶段 ${entry.phase || '-'}\n${entry.message || ''}`.trim(),
-      })
-      return
-    }
-    if (entry.action === 'tool_result') {
-      const elapsedText = entry.elapsed_ms ? `${entry.elapsed_ms}ms` : '-'
-      const exitText = entry.exit_code ?? '-'
-      events.push({
-        id: `tool-res-${idx}`,
-        time,
-        tone: Number(exitText) === 0 ? 'success' : 'danger',
-        title: `调用结果 · ${entry.tool || 'unknown'}`,
-        desc: `exit=${exitText} ｜ elapsed=${elapsedText}\n${entry.message || ''}`.trim(),
-      })
-      return
-    }
-    if (entry.action === 'command_exec') {
-      const command = entry.command || '(empty command)'
-      const runtimeCommand = entry.runtime_command || ''
-      const stdout = entry.stdout || ''
-      const stderr = entry.stderr || ''
-      const purposeText = entry.purpose ? ` ｜ purpose=${entry.purpose}` : ''
-      const roundText = entry.round !== undefined && entry.round !== null ? ` ｜ round=${entry.round}` : ''
-      const phaseTextInfo = entry.phase ? ` ｜ phase=${entry.phase}` : ''
-      const titleText = entry.poc_or_vuln
-        ? `命令执行 · ${entry.poc_or_vuln}`
-        : `命令执行 · ${entry.tool || 'shell'}`
-      events.push({
-        id: `cmd-${idx}`,
-        time,
-        tone: (entry.exit_code ?? -1) === 0 ? 'success' : 'danger',
-        title: titleText,
-        desc: `exit=${entry.exit_code ?? '-'} ｜ elapsed=${entry.elapsed_ms ?? '-'}ms${phaseTextInfo}${roundText}${purposeText}`,
-        payloads: buildExecPayloads(command, stdout, stderr, {
-          runtimeCommand,
-          truncated: Boolean(entry.truncated),
-          totalLen: Number(entry.total_len || 0),
-        }),
-      })
-      return
-    }
     if (entry.action === 'approval') {
       events.push({
         id: `approve-${idx}`,
@@ -271,6 +243,17 @@ const decisionItems = computed(() => {
         tone: 'warning',
         title: '审批节点',
         desc: entry.message || entry.raw || '',
+      })
+      return
+    }
+    if (entry.action === 'approval_required') {
+      events.push({
+        id: entry.id || `approval-req-${idx}`,
+        time,
+        tone: 'warning',
+        title: '审批请求',
+        desc: entry.message || '系统检测到可利用路径，等待人工审批。',
+        action: 'approval_required',
       })
       return
     }
@@ -293,6 +276,26 @@ const decisionItems = computed(() => {
       })
       return
     }
+    if (entry.action === 'user_chat') {
+      events.push({
+        id: `user-chat-${idx}`,
+        time,
+        tone: 'warning',
+        title: '用户指令',
+        desc: entry.message || '',
+      })
+      return
+    }
+    if (entry.action === 'agent_reply') {
+      events.push({
+        id: `agent-reply-${idx}`,
+        time,
+        tone: 'success',
+        title: 'AI 回复',
+        desc: entry.message || '',
+      })
+      return
+    }
     if (entry.action === 'log') {
       const msg = entry.message || entry.raw || ''
       if (!msg) return
@@ -307,47 +310,6 @@ const decisionItems = computed(() => {
       })
     }
   })
-
-  const hasCommandExec = structuredEvents.some((e) => e?.action === 'command_exec')
-  const exploitResults = Array.isArray(task.value?.exploit_results) ? task.value.exploit_results : []
-  if (!hasCommandExec) {
-    exploitResults.forEach((result, ridx) => {
-      const records = result.command_records || result.command_results || []
-      records.forEach((record, cidx) => {
-        const command = record.command || ''
-        events.push({
-          id: `exploit-${ridx}-${cidx}`,
-          time: new Date().toLocaleTimeString(),
-          tone: record.exit_code === 0 ? 'success' : 'danger',
-          title: `命令执行 · ${result.vuln_id || 'unknown vuln'}`,
-          desc: `purpose=${record.purpose || '-'} ｜ exit=${record.exit_code ?? '-'} ｜ elapsed=${record.elapsed ?? '-'}s`,
-          payloads: buildExecPayloads(command, record.stdout || '', record.stderr || '', {
-            runtimeCommand: record.runtime_command || '',
-            truncated: Boolean(record.truncated),
-            totalLen: Number(record.total_len || 0),
-          }),
-        })
-      })
-    })
-  }
-
-  if (!structuredEvents.length && !hasCommandExec) {
-    const payloadLogs = logs.value.filter((line) => /payload|poc|webshell|cmd|curl|python|bash|执行|完成|exit=/i.test(line)).slice(-12)
-    payloadLogs.forEach((line, idx) => {
-      events.push({
-        id: `log-${idx}`,
-        time: new Date().toLocaleTimeString(),
-        tone: /failed|error|denied|401|403|❌/i.test(line) ? 'danger' : 'success',
-        title: '执行轨迹',
-        desc: line,
-        payloads: [{
-          title: '执行命令片段',
-          language: inferPayloadLang(line),
-          code: line,
-        }],
-      })
-    })
-  }
 
   return events
 })
@@ -369,46 +331,6 @@ function inferOutputLang(text) {
   }
   if (/^\s*<\?xml|^\s*<\/?[a-zA-Z][\w:-]*[\s>]/.test(raw)) return 'xml'
   return 'auto'
-}
-
-function buildExecPayloads(command, stdout, stderr, meta = {}) {
-  const truncated = Boolean(meta?.truncated)
-  const totalLen = Number(meta?.totalLen || 0)
-  const runtimeCommand = String(meta?.runtimeCommand || '').trim()
-  const outputMeta = {
-    truncated,
-    totalLen,
-  }
-  const blocks = [{
-    title: 'Command',
-    language: inferPayloadLang(command || ''),
-    code: command || '(empty command)',
-  }]
-  if (stdout) {
-    blocks.push({
-      title: 'Stdout',
-      language: inferOutputLang(stdout),
-      code: stdout,
-      ...outputMeta,
-    })
-  }
-  if (stderr) {
-    blocks.push({
-      title: 'Stderr',
-      language: inferOutputLang(stderr),
-      code: stderr,
-      ...outputMeta,
-    })
-  }
-  if (!stdout && !stderr) {
-    blocks.push({
-      title: 'Output',
-      language: 'text',
-      code: '(empty)',
-      ...outputMeta,
-    })
-  }
-  return blocks
 }
 
 function splitEvidencePayloads(evidence) {
@@ -582,4 +504,19 @@ onUnmounted(() => {
 .main-card { border-radius: var(--radius-lg) !important; }
 .tab-label { display: inline-flex; align-items: center; gap: 5px; }
 .tab-badge { margin-left: 4px; }
+
+.decision-summary-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 12px;
+  margin-bottom: 8px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  font-size: 12px;
+}
+.summary-hint {
+  color: var(--text-muted);
+}
 </style>

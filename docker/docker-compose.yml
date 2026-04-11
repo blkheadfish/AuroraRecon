@@ -82,6 +82,8 @@ services:
       # Docker（工具沙箱）
       - DOCKER_NETWORK=pentest_net
       - TOOLBOX_IMAGE=pentest-toolbox:latest
+      - MAX_TOOL_TIMEOUT=${MAX_TOOL_TIMEOUT:-360}
+      - MAX_STAGE_RUNTIME=${MAX_STAGE_RUNTIME:-900}
       - REPORTS_DIR=/reports
       - DATA_VOLUME=/data
       # JWT 认证

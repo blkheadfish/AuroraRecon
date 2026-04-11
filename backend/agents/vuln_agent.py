@@ -18,7 +18,7 @@ from typing import Any, Optional
 
 from backend.agents.models import PortInfo, VulnFinding
 from backend.knowledge.exploit_kb import ExploitKB, ExploitEntry
-from backend.tools.executor import ToolExecutor, ExecuteResult, LogCallback, RecordCallback
+from backend.tools.executor import ToolExecutor, ExecuteResult, LogCallback, RecordCallback, DecisionCallback
 from backend.tools.parsers.nuclei_parser import NucleiParser
 from backend.tools.parsers.nikto_parser import NiktoParser
 from backend.llm.router import LLMRouter
@@ -45,20 +45,24 @@ class VulnAgent:
         self.nikto_parser = NiktoParser()
         self.llm = LLMRouter()
         self.kb = ExploitKB()
+        self._decision_callback: DecisionCallback = None
 
     async def run(
         self,
         target: str,
         ports: list[PortInfo],
         web_paths: list[str],
+        path_contents: list[dict[str, Any]] | None = None,
         target_os: str = "unknown",
         target_port: Optional[int] = None,
         target_scheme: str = "",
         task_id: Optional[str] = None,
         log_callback: LogCallback = None,
         record_callback: RecordCallback = None,
+        decision_callback: DecisionCallback = None,
         nmap_vuln_hints: list[dict] | None = None,
     ) -> dict[str, Any]:
+        self._decision_callback = decision_callback
         logger.info(f"[VulnAgent] 开始漏洞扫描: {target}")
 
         if log_callback or record_callback:
@@ -155,8 +159,31 @@ class VulnAgent:
                 logger.info(f"[VulnAgent] 指纹 :{wp.port} -> {fp_result.get('summary', 'unknown')}")
 
         # ── Phase 2: LLM 分析指纹 → 扫描策略 ────────────
-        scan_strategy = await self._llm_scan_strategy(target, target_os, ports, web_ports, fingerprints, web_paths)
+        scan_strategy = await self._llm_scan_strategy(
+            target,
+            target_os,
+            ports,
+            web_ports,
+            fingerprints,
+            web_paths,
+            path_contents or [],
+        )
         logger.info(f"[VulnAgent] LLM 扫描策略: {json.dumps(scan_strategy, ensure_ascii=False)[:300]}")
+
+        if self._decision_callback:
+            analysis = scan_strategy.get("analysis", "")
+            tags = scan_strategy.get("nuclei_tags", [])
+            hv_targets = scan_strategy.get("high_value_targets", [])
+            await self._decision_callback({
+                "action": "thought",
+                "phase": "vuln_scan",
+                "thinking": analysis or f"LLM 分析指纹后选择扫描标签: {', '.join(tags[:10])}",
+                "purpose": "漏洞扫描策略制定",
+                "plan": [f"Nuclei 标签: {', '.join(tags[:8])}"] + [
+                    f"高价值目标: {t}" for t in (hv_targets[:5] if isinstance(hv_targets, list) else [])
+                ],
+                "message": f"LLM 扫描策略: {len(tags)} 个标签, {len(hv_targets) if isinstance(hv_targets, list) else 0} 个高价值目标",
+            })
 
         # ── Phase 3: 按端口并发，端口内串行扫描 ──────────
         async def _scan_one_port(wp: PortInfo) -> list[VulnFinding]:
@@ -232,9 +259,30 @@ class VulnAgent:
         if exploitable_count == 0 or not has_high:
             logger.info("[VulnAgent] 工具发现不足，启动 LLM 主动漏洞分析...")
             llm_findings = await self._llm_active_discovery(
-                target, target_os, ports, fingerprints, web_paths, all_findings
+                target,
+                target_os,
+                ports,
+                fingerprints,
+                web_paths,
+                path_contents or [],
+                all_findings,
             )
             all_findings.extend(llm_findings)
+
+            if self._decision_callback and llm_findings:
+                finding_names = [f.name for f in llm_findings[:5]]
+                await self._decision_callback({
+                    "action": "thought",
+                    "phase": "vuln_scan",
+                    "thinking": (
+                        f"工具扫描发现不足(exploitable={exploitable_count}, has_high={has_high})，"
+                        f"LLM 主动分析后推测出 {len(llm_findings)} 个潜在漏洞: "
+                        + ", ".join(finding_names)
+                    ),
+                    "purpose": "LLM 主动漏洞发现",
+                    "plan": [f"发现: {n}" for n in finding_names],
+                    "message": f"LLM 主动发现 {len(llm_findings)} 个潜在漏洞",
+                })
 
         # ── Phase 4.5: 为非 Web 服务端口生成 service-level findings ──
         # 确保 SSH/FTP/SMB/RDP 等端口有对应 finding，让 ExploitAgent 的 Skill 能匹配
@@ -693,6 +741,7 @@ $PHUIP "{web_url}/index.php" 2>&1
         web_ports: list[PortInfo],
         fingerprints: dict[int, dict],
         web_paths: list[str],
+        path_contents: list[dict[str, Any]],
     ) -> dict:
         from backend.llm.prompts.templates import VULN_SCAN_STRATEGY
 
@@ -708,6 +757,16 @@ $PHUIP "{web_url}/index.php" 2>&1
             }
 
         ports_info = [{"port": p.port, "service": p.service, "version": p.version[:60]} for p in ports[:20]]
+        path_content_summary = []
+        for item in (path_contents or [])[:12]:
+            path_content_summary.append({
+                "path": item.get("path", ""),
+                "status": item.get("status", 0),
+                "title": str(item.get("title", ""))[:80],
+                "tech_clues": item.get("tech_clues", []),
+                "keywords": item.get("keywords", []),
+                "content_snippet": str(item.get("content_snippet", ""))[:220],
+            })
 
         prompt = VULN_SCAN_STRATEGY.format(
             target=target,
@@ -715,6 +774,7 @@ $PHUIP "{web_url}/index.php" 2>&1
             ports_json=json.dumps(ports_info, ensure_ascii=False),
             fingerprints_json=json.dumps(fp_summary, ensure_ascii=False, indent=2),
             web_paths_json=json.dumps(web_paths[:30], ensure_ascii=False),
+            path_contents_json=json.dumps(path_content_summary, ensure_ascii=False),
         )
 
         try:
@@ -1528,6 +1588,7 @@ $PHUIP "{web_url}/index.php" 2>&1
         ports: list[PortInfo],
         fingerprints: dict[int, dict],
         web_paths: list[str],
+        path_contents: list[dict[str, Any]],
         existing_findings: list[VulnFinding],
     ) -> list[VulnFinding]:
         """LLM 根据指纹主动推测漏洞并生成验证命令"""
@@ -1554,6 +1615,7 @@ $PHUIP "{web_url}/index.php" 2>&1
             target_os=target_os,
             fingerprints_text=fp_text,
             web_paths=json.dumps(web_paths[:20], ensure_ascii=False),
+            path_contents=json.dumps((path_contents or [])[:12], ensure_ascii=False),
             existing_findings=existing_text,
         )
 
