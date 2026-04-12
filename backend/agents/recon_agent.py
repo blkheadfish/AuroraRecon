@@ -169,11 +169,11 @@ class ReconAgent:
 		if precise_result.success:
 			precise_ports = self.nmap_parser.extract_open_ports(precise_result.stdout)
 
-		# 第二轮：Top 3000 端口广扫（覆盖非标准端口）
+		# 第二轮：全端口扫描（覆盖所有 65535 端口）
 		fast_result: ExecuteResult = await self.executor.run(
 			tool="nmap",
-			args=["-T4", "-Pn", "--open", "--top-ports", "3000", "-oX", "-", target],
-			timeout=300,
+			args=["-T4", "-Pn", "--open", "--min-rate", "2000", "-p-", "-oX", "-", target],
+			timeout=600,
 			task_id=task_id,
 			log_callback=log_callback,
 		)

