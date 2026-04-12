@@ -65,18 +65,26 @@
       </el-row>
 
       <!-- Web paths -->
-      <div class="info-card mt-16" v-if="webPaths.length">
+      <div class="info-card mt-16" v-if="displayPaths.length">
         <div class="card-title">
           <el-icon><Link /></el-icon>
           Web 路径发现
-          <span class="count-badge">{{ webPaths.length }}</span>
+          <span class="count-badge">{{ displayPaths.length }}</span>
         </div>
         <div class="path-grid">
-          <code
-            v-for="(p, i) in webPaths"
+          <span
+            v-for="(item, i) in displayPaths"
             :key="i"
             class="path-item"
-          >{{ p }}</code>
+            :class="{
+              'path-high-value': item.highValue,
+              'path-forbidden': item.status === 403,
+            }"
+          >
+            <code>{{ item.path }}</code>
+            <span v-if="item.status === 403" class="path-status-tag forbidden">403</span>
+            <span v-if="item.badge" class="path-badge" :class="'badge-' + item.badge">{{ item.badge }}</span>
+          </span>
         </div>
       </div>
 
@@ -98,17 +106,53 @@
 <script setup>
 import { computed } from 'vue'
 
+const HIGH_VALUE_HINTS = new Set([
+  'admin', 'login', 'config', 'backup', 'leak', 'upload', 'api', 'info_disclosure',
+])
+
+const BADGE_MAP = {
+  admin: 'admin', login: 'login', config: 'config', backup: 'backup',
+  leak: 'leak', upload: 'upload', api: 'api', info_disclosure: 'info',
+}
+
 const props = defineProps({
   task: Object,
 })
 
 const ports = computed(() => props.task?.open_ports || [])
 const osInfo = computed(() => props.task?.os_info || {})
-const webPaths = computed(() => props.task?.web_paths || [])
 const subdomains = computed(() => props.task?.subdomains || [])
 
+const displayPaths = computed(() => {
+  const inventory = props.task?.web_paths_inventory
+  if (inventory && inventory.length) {
+    const verified = inventory.filter(
+      item => item.status === 200 || item.status === 403 || item.status === 0
+    )
+    return verified
+      .map(item => {
+        const hints = item.hints || []
+        const hvHints = hints.filter(h => HIGH_VALUE_HINTS.has(h))
+        const badge = hvHints.length ? BADGE_MAP[hvHints[0]] || '' : ''
+        return {
+          path: item.path,
+          status: item.status,
+          confidence: item.confidence,
+          highValue: hvHints.length > 0,
+          badge,
+        }
+      })
+      .sort((a, b) => {
+        if (a.highValue !== b.highValue) return a.highValue ? -1 : 1
+        return (b.confidence || 0) - (a.confidence || 0)
+      })
+  }
+  const plain = props.task?.web_paths || []
+  return plain.map(p => ({ path: p, status: 200, confidence: 0.5, highValue: false, badge: '' }))
+})
+
 const isEmpty = computed(() =>
-  !ports.value.length && !webPaths.value.length && !subdomains.value.length
+  !ports.value.length && !displayPaths.value.length && !subdomains.value.length
 )
 </script>
 
@@ -190,6 +234,9 @@ const isEmpty = computed(() =>
 }
 
 .path-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   font-family: var(--font-mono);
   font-size: 12px;
   color: var(--text-secondary);
@@ -203,6 +250,69 @@ const isEmpty = computed(() =>
 .path-item:hover {
   border-color: var(--accent-blue);
   color: var(--accent-blue);
+}
+
+.path-item.path-high-value {
+  border-color: rgba(255, 160, 50, 0.45);
+  color: #e8a040;
+}
+
+.path-item.path-forbidden {
+  opacity: 0.7;
+}
+
+.path-status-tag {
+  font-size: 9px;
+  padding: 0 4px;
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  line-height: 15px;
+}
+
+.path-status-tag.forbidden {
+  color: #d18040;
+  background: rgba(209, 128, 64, 0.15);
+}
+
+.path-badge {
+  font-size: 9px;
+  padding: 0 5px;
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  line-height: 15px;
+  color: #e0a050;
+  background: rgba(224, 160, 80, 0.12);
+  border: 1px solid rgba(224, 160, 80, 0.25);
+}
+
+.badge-admin, .badge-login {
+  color: #e06060;
+  background: rgba(224, 96, 96, 0.12);
+  border-color: rgba(224, 96, 96, 0.25);
+}
+
+.badge-config, .badge-backup, .badge-leak {
+  color: #e0a050;
+  background: rgba(224, 160, 80, 0.12);
+  border-color: rgba(224, 160, 80, 0.25);
+}
+
+.badge-upload {
+  color: #d070d0;
+  background: rgba(208, 112, 208, 0.12);
+  border-color: rgba(208, 112, 208, 0.25);
+}
+
+.badge-api {
+  color: #60b0e0;
+  background: rgba(96, 176, 224, 0.12);
+  border-color: rgba(96, 176, 224, 0.25);
+}
+
+.badge-info {
+  color: #80c080;
+  background: rgba(128, 192, 128, 0.12);
+  border-color: rgba(128, 192, 128, 0.25);
 }
 
 .path-item.subdomain {

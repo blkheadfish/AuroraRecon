@@ -274,3 +274,15 @@ class SkillRegistry:
             finding=synthetic,
             fingerprint=fingerprint,
         )
+
+
+# ── Module-level singleton ──────────────────────────────
+_registry_singleton: SkillRegistry | None = None
+
+
+def get_registry() -> SkillRegistry:
+    global _registry_singleton
+    if _registry_singleton is None:
+        _registry_singleton = SkillRegistry()
+        _registry_singleton.ensure_loaded()
+    return _registry_singleton

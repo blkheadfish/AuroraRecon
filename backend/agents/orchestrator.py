@@ -22,6 +22,7 @@ import asyncio
 import functools
 import json
 import logging
+import os
 import uuid
 from datetime import datetime
 from typing import Any, Optional
@@ -41,6 +42,8 @@ from backend.agents.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+TASK_TIMEOUT = int(os.getenv("TASK_TIMEOUT_SECONDS", "7200"))
 
 # 与前端 TaskProgressMermaid 节点顺序一致（单调推进）
 _CHAIN_PHASE_ORDER: list[str] = [
@@ -245,6 +248,7 @@ def retry_node(max_attempts: int = 3, delay: float = 2.0):
                     if attempt < max_attempts:
                         await asyncio.sleep(delay * attempt)
             state.error_msg = f"{fn.__name__} 在 {max_attempts} 次重试后仍失败: {last_exc}"
+            state.status = TaskStatus.FAILED
             state.log(state.error_msg)
             return state
         return wrapper
@@ -608,7 +612,12 @@ async def node_surface_enum(state: PentestState) -> PentestState:
                 "raw": json.dumps(report_dict, ensure_ascii=False),
             })
 
-    state.web_paths = aggregator.get_actionable_paths()[:200]
+    full_inventory = aggregator.get_inventory(min_confidence=0.4)
+    state.web_paths_inventory = full_inventory[:200]
+    state.web_paths = [
+        item["path"] for item in full_inventory
+        if item.get("status") in (200, 403, 0)
+    ][:200]
     inv = aggregator.summary()
     state.log(
         f"表面枚举完成: {inv['total_paths']} 条路径 "
@@ -1017,14 +1026,20 @@ async def node_report(state: PentestState) -> PentestState:
 # ───────────────────────────────────────────────────────
 
 def edge_should_exploit(state: PentestState) -> str:
+    if state.status == TaskStatus.FAILED:
+        return "report"
     return "human_approval" if any(f.exploitable for f in state.findings) else "report"
 
 
 def edge_after_approval(state: PentestState) -> str:
+    if state.status == TaskStatus.FAILED:
+        return "report"
     return "foothold_attempt" if any(f.exploitable for f in state.findings) else "report"
 
 
 def edge_after_foothold(state: PentestState) -> str:
+    if state.status == TaskStatus.FAILED:
+        return "report"
     if state.got_shell:
         return "post_foothold_enum"
     if not state.secondary_attack_done and any(f.exploitable for f in state.findings):
@@ -1033,10 +1048,14 @@ def edge_after_foothold(state: PentestState) -> str:
 
 
 def edge_after_secondary(state: PentestState) -> str:
+    if state.status == TaskStatus.FAILED:
+        return "report"
     return "post_foothold_enum" if state.got_shell else "report"
 
 
 def edge_after_privesc(state: PentestState) -> str:
+    if state.status == TaskStatus.FAILED:
+        return "objective_collect"
     pl = (state.privilege_level or "").lower()
     if pl == "root":
         return "objective_collect"
@@ -1113,13 +1132,15 @@ def build_graph(checkpointer=None):
 class Orchestrator:
     def __init__(self):
         self._graph = None
+        self._graph_lock = asyncio.Lock()
 
     async def _ensure_graph(self):
-        if self._graph is None:
-            # MemorySaver 内置于 langgraph，无需额外依赖
-            # 进程内断点续跑完全正常，重启后状态清空
-            checkpointer = MemorySaver()
-            self._graph = build_graph(checkpointer=checkpointer)
+        if self._graph is not None:
+            return
+        async with self._graph_lock:
+            if self._graph is None:
+                checkpointer = MemorySaver()
+                self._graph = build_graph(checkpointer=checkpointer)
 
     def _prepare_state(
         self,
@@ -1158,7 +1179,16 @@ class Orchestrator:
         )
         config = {"configurable": {"thread_id": initial_state.task_id}}
         initial_state.log(f"任务启动，目标: {target}")
-        final_state: PentestState = await self._graph.ainvoke(initial_state, config=config)
+        try:
+            final_state: PentestState = await asyncio.wait_for(
+                self._graph.ainvoke(initial_state, config=config),
+                timeout=TASK_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            initial_state.status = TaskStatus.FAILED
+            initial_state.error_msg = f"任务超时（>{TASK_TIMEOUT}s）"
+            initial_state.log(initial_state.error_msg)
+            return initial_state
         return final_state
 
     async def run_stream(

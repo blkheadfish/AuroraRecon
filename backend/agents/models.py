@@ -202,6 +202,7 @@ class PentestState(BaseModel):
 	open_ports: list[PortInfo] = Field(default_factory=list)
 	os_info: dict = Field(default_factory=dict)
 	web_paths: list[str] = Field(default_factory=list)
+	web_paths_inventory: list[dict[str, Any]] = Field(default_factory=list)
 	path_contents: list[dict[str, Any]] = Field(default_factory=list)
 	dirlist_tree: str = ""
 	dirlist_interesting_files: list[str] = Field(default_factory=list)

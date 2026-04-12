@@ -497,7 +497,7 @@ $PHUIP "{web_url}/index.php" 2>&1
                 port=p.port,
                 description=f"{meta['desc']} (版本: {p.version or 'unknown'})",
                 evidence=f"nmap: {p.port}/{p.service} {p.version} {p.banner}".strip(),
-                exploitable=True,
+                exploitable=False,
                 tool="service-enum",
             ))
         if findings:
@@ -1311,7 +1311,7 @@ $PHUIP "{web_url}/index.php" 2>&1
                     "builtin_shiro_detect": ["rememberme=deleteme"],
                     "builtin_ssti_detect": ["49"],
                     "builtin_django_detect": ["programmingerror", "django.db", "traceback"],
-                    "builtin_thinkphp_detect": ["thinkphp_rce_ok"],
+                    "builtin_thinkphp_detect": ["thinkphp_fingerprint_ok"],
                     "builtin_tomcat_put_detect": ["201", "204"],
                     "builtin_tomcat_weak_detect": ["tomcat_manager_confirmed", "ok - listed applications"],
                     "builtin_tomcat_weak_html_detect": ["tomcat_manager_html_confirmed"],
@@ -1467,12 +1467,14 @@ $PHUIP "{web_url}/index.php" 2>&1
                 "builtin_django_detect"
             ))
 
-        # ── ThinkPHP 检测 ──────────────────────────
+        # ── ThinkPHP 检测（passive: check captcha route & error page fingerprint）──
         if "thinkphp" in keywords:
             probes.append((
-                f'curl -s -d "_method=__construct&filter[]=system&method=get'
-                f'&server[REQUEST_METHOD]=echo%20THINKPHP_RCE_OK" '
-                f'"{target_url}/index.php?s=captcha" --max-time 10',
+                f'status=$(curl -s -o /dev/null -w "%{{http_code}}" '
+                f'"{target_url}/index.php?s=captcha" --max-time 8); '
+                f'body=$(curl -s "{target_url}/index.php?s=xxx/xxx/xxx" --max-time 8); '
+                f'echo "THINKPHP_STATUS:$status"; '
+                f'echo "$body" | grep -qi "thinkphp\\|think\\\\\\\\app\\|V5\\." && echo "THINKPHP_FINGERPRINT_OK"',
                 "builtin_thinkphp_detect"
             ))
 

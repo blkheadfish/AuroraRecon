@@ -196,9 +196,9 @@ class ReconAgent:
 		except ValueError:
 			_is_private = False
 		if _is_private:
-			nmap_detail_args = ["-sV", "-sC", "-O", "--osscan-guess", "-Pn", "-p", port_str, "-oX", "-", target]
+			nmap_detail_args = ["-A", "--osscan-guess", "-Pn", "-p", port_str, "-oX", "-", target]
 		else:
-			nmap_detail_args = ["-sV", "--version-intensity", "5", "-Pn", "-p", port_str, "-oX", "-", target]
+			nmap_detail_args = ["-sV", "--version-all", "-sC", "-Pn", "-p", port_str, "-oX", "-", target]
 		detail_result: ExecuteResult = await self.executor.run(
 			tool="nmap",
 			args=nmap_detail_args,

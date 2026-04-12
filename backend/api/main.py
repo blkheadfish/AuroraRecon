@@ -145,6 +145,15 @@ async def lifespan(app: FastAPI):
         except ValueError:
             pass
 
+    # Build KB vector index in background (non-blocking, failure won't stop startup)
+    try:
+        from backend.knowledge.exploit_kb import ExploitKB
+        _kb = ExploitKB()
+        asyncio.create_task(_kb.build_index())
+        logger.info("[启动] 知识库向量索引构建任务已提交")
+    except Exception as e:
+        logger.warning(f"[启动] 知识库向量索引构建失败: {e}")
+
     yield
 
     if _redis_available:
@@ -168,6 +177,7 @@ app.add_middleware(
 
 # ── JWT 认证 ──────────────────────────────────────────────
 
+import time as _time
 import secrets as _secrets
 import jwt as _jwt
 import bcrypt as _bcrypt_lib
@@ -1424,8 +1434,29 @@ async def auth_register(req: AuthRegisterRequest):
     return {"token": token, "user": _user_to_dict(user)}
 
 
+# ── Login rate limiting (in-memory sliding window) ──────
+_login_attempts: dict[str, list[float]] = {}
+_LOGIN_MAX_ATTEMPTS = int(os.getenv("LOGIN_MAX_ATTEMPTS", "10"))
+_LOGIN_WINDOW_SECONDS = 300
+
+
+def _check_login_rate(ip: str) -> bool:
+    now = _time.time()
+    attempts = _login_attempts.get(ip, [])
+    attempts = [t for t in attempts if now - t < _LOGIN_WINDOW_SECONDS]
+    if len(attempts) >= _LOGIN_MAX_ATTEMPTS:
+        _login_attempts[ip] = attempts
+        return False
+    attempts.append(now)
+    _login_attempts[ip] = attempts
+    return True
+
+
 @app.post("/auth/login")
-async def auth_login(req: AuthLoginRequest):
+async def auth_login(request: Request, req: AuthLoginRequest):
+    client_ip = request.client.host if request.client else "unknown"
+    if not _check_login_rate(client_ip):
+        raise HTTPException(429, "登录尝试过于频繁，请 5 分钟后再试")
     from backend.db.database import get_user_by_username
     user = await get_user_by_username(req.username.strip())
     if not user or not _bcrypt_lib.checkpw(req.password.encode(), user.password_hash.encode()):
@@ -1769,7 +1800,11 @@ async def update_profile(req: ProfileUpdateRequest):
 
 
 @app.post("/profile/change-password")
-async def change_password(req: PasswordChangeRequest):
+async def change_password(request: Request, req: PasswordChangeRequest):
+    from backend.db.database import get_user_by_id, update_user
+    user_id = getattr(request.state, "user_id", "")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="未登录")
     old_password = req.old_password.strip()
     new_password = req.new_password.strip()
     if not old_password or not new_password:
@@ -1778,7 +1813,13 @@ async def change_password(req: PasswordChangeRequest):
         raise HTTPException(status_code=400, detail="新密码至少 8 位")
     if old_password == new_password:
         raise HTTPException(status_code=400, detail="新旧密码不能相同")
-    # 最小化实现：当前版本不接入真实鉴权，仅返回成功占位响应。
+    user = await get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    if not _bcrypt_lib.checkpw(old_password.encode(), user.password_hash.encode()):
+        raise HTTPException(status_code=400, detail="旧密码错误")
+    new_hash = _bcrypt_lib.hashpw(new_password.encode(), _bcrypt_lib.gensalt()).decode()
+    await update_user(user_id, password_hash=new_hash)
     return {"status": "ok", "updated_at": datetime.utcnow().isoformat()}
 
 
@@ -1791,8 +1832,8 @@ class SkillRawUpdateRequest(BaseModel):
 async def list_skills():
     """列出所有已加载的 Exploit Skill"""
     try:
-        from backend.skills.registry import SkillRegistry
-        registry = SkillRegistry()
+        from backend.skills.registry import get_registry
+        registry = get_registry()
         return {"skills": registry.list_all(), "total": registry.size}
     except Exception as e:
         return {"skills": [], "total": 0, "error": str(e)}
@@ -1802,8 +1843,8 @@ async def list_skills():
 async def reload_skills():
     """重新加载 Skill YAML（开发调试用）"""
     try:
-        from backend.skills.registry import SkillRegistry
-        registry = SkillRegistry()
+        from backend.skills.registry import get_registry
+        registry = get_registry()
         registry.reload()
         return {"status": "ok", "total": registry.size}
     except Exception as e:
@@ -1814,8 +1855,8 @@ async def reload_skills():
 async def get_skill_raw(skill_id: str):
     """读取指定 Skill 的 YAML 原文"""
     try:
-        from backend.skills.registry import SkillRegistry
-        registry = SkillRegistry()
+        from backend.skills.registry import get_registry
+        registry = get_registry()
         skill = registry.get_by_id(skill_id)
         if not skill:
             raise HTTPException(status_code=404, detail=f"Skill 不存在: {skill_id}")
@@ -1837,9 +1878,9 @@ async def get_skill_raw(skill_id: str):
 async def update_skill_raw(skill_id: str, req: SkillRawUpdateRequest):
     """更新指定 Skill 的 YAML 并立即重载"""
     try:
-        from backend.skills.registry import SkillRegistry
+        from backend.skills.registry import get_registry
 
-        registry = SkillRegistry()
+        registry = get_registry()
         skill = registry.get_by_id(skill_id)
         if not skill:
             raise HTTPException(status_code=404, detail=f"Skill 不存在: {skill_id}")

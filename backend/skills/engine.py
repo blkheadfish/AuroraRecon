@@ -565,7 +565,20 @@ class SkillEngine:
                 })
 
             if action == "conclude_success":
-                logger.info(f"[SkillEngine] 🤖 LLM 判定利用成功")
+                logger.info(f"[SkillEngine] 🤖 LLM 判定利用成功，执行 id 命令二次验证...")
+                verify = await self.executor.run_script(
+                    "id",
+                    timeout=10,
+                    task_id=ctx.task_id,
+                )
+                if "uid=" not in (verify.stdout or ""):
+                    logger.warning("[SkillEngine] 二次验证失败: id 命令未返回 uid=")
+                    conversation.append({
+                        "role": "user",
+                        "content": "无法通过 id 命令确认 shell 访问（输出中未见 uid=），请重新评估。",
+                    })
+                    continue
+                logger.info(f"[SkillEngine] ✅ 二次验证通过: {verify.stdout.strip()[:200]}")
                 return ExploitResult(
                     vuln_id=finding.vuln_id,
                     success=True,
@@ -575,7 +588,7 @@ class SkillEngine:
                         "current_user": decision.get("current_user", ""),
                         "rounds": round_num + 1,
                     },
-                    evidence=decision.get("evidence", ""),
+                    evidence=f"{decision.get('evidence', '')} [verified: {verify.stdout.strip()[:100]}]",
                     commands_run=ctx.commands_run,
                     command_records=ctx.step_records,
                 )

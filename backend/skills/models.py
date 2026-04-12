@@ -10,9 +10,50 @@ Skill 数据模型
 from __future__ import annotations
 
 import re
+import shlex
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
+
+
+def _parse_version_tuple(v: str) -> tuple[int, ...]:
+    """Parse '1.2.68' into (1, 2, 68) for comparison."""
+    parts: list[int] = []
+    for seg in re.split(r'[.\-_]', v.strip()):
+        m = re.match(r'(\d+)', seg)
+        if m:
+            parts.append(int(m.group(1)))
+    return tuple(parts) if parts else (0,)
+
+
+def _compare_version(actual: str, expression: str) -> bool:
+    """Evaluate version range expressions like '>= 1.2.68', '< 2.0'."""
+    expression = expression.strip()
+    m = re.match(r'^([><!]=?)\s*(.+)$', expression)
+    if not m:
+        return str(actual) == expression
+    op, ver_str = m.group(1), m.group(2)
+    try:
+        a = _parse_version_tuple(actual)
+        b = _parse_version_tuple(ver_str)
+    except Exception:
+        return False
+    ops = {
+        '>=': a >= b, '<=': a <= b,
+        '>': a > b, '<': a < b,
+        '!=': a != b, '==': a == b,
+    }
+    return ops.get(op, False)
+
+
+_SHELL_SAFE_RE = re.compile(r'^[A-Za-z0-9._/:\-=+@,]+$')
+
+
+def _needs_shell_quoting(value: str) -> bool:
+    """Return True if the value contains shell metacharacters that need quoting."""
+    if not value:
+        return True
+    return not _SHELL_SAFE_RE.match(value)
 
 
 # ─────────────────────────────────────────────────────────
@@ -51,30 +92,33 @@ class ParseRule:
         """评估规则，返回要设置的变量（空 dict = 未触发）"""
         combined = f"{stdout} {stderr}".lower()
 
-        triggered = False
+        # Collect results for each configured condition block.
+        # All configured (non-empty) conditions must pass (AND semantics).
+        checks: list[bool] = []
 
         if self.if_contains:
-            if any(kw.lower() in combined for kw in self.if_contains):
-                triggered = True
+            checks.append(
+                any(kw.lower() in combined for kw in self.if_contains)
+            )
 
         if self.if_not_contains:
-            if all(kw.lower() not in combined for kw in self.if_not_contains):
-                triggered = True
+            checks.append(
+                all(kw.lower() not in combined for kw in self.if_not_contains)
+            )
 
         if self.if_status_code:
-            if status_code in self.if_status_code:
-                triggered = True
+            checks.append(status_code in self.if_status_code)
 
         if self.if_regex:
-            if re.search(self.if_regex, stdout, re.IGNORECASE):
-                triggered = True
+            combined_for_regex = stdout + "\n" + stderr
+            checks.append(
+                bool(re.search(self.if_regex, combined_for_regex, re.IGNORECASE))
+            )
 
-        # 无任何触发条件 = 不触发
-        if not (self.if_contains or self.if_not_contains
-                or self.if_status_code or self.if_regex):
+        if not checks:
             return {}
 
-        if not triggered:
+        if not all(checks):
             return {}
 
         # 附加条件检查
@@ -385,9 +429,12 @@ class SkillContext:
             if isinstance(expected, bool):
                 if bool(actual) != expected:
                     return False
-            # 字符串比较（含版本范围等，简单做精确匹配）
             elif isinstance(expected, str):
-                if str(actual) != expected:
+                exp_stripped = expected.strip()
+                if exp_stripped and exp_stripped[0] in ('>','<','!','=') and re.match(r'^[><!]=?\s*[\d.]', exp_stripped):
+                    if not _compare_version(str(actual), exp_stripped):
+                        return False
+                elif str(actual) != expected:
                     return False
             # 其他类型
             else:
@@ -421,8 +468,12 @@ class SkillContext:
         for placeholder, value in replacements.items():
             result = result.replace(placeholder, value)
 
-        # 动态变量
+        # 动态变量（from probe results — shell-escape to prevent injection)
         for key, value in self.variables.items():
-            result = result.replace(f"{{{key}}}", str(value))
+            placeholder = f"{{{key}}}"
+            if placeholder in result:
+                str_val = str(value)
+                safe_val = shlex.quote(str_val) if _needs_shell_quoting(str_val) else str_val
+                result = result.replace(placeholder, safe_val)
 
         return result
