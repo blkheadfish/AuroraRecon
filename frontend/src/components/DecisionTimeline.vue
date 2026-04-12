@@ -34,6 +34,10 @@
                 <summary>展开完整推理</summary>
                 <pre class="thought-full">{{ item.thinking }}</pre>
               </details>
+              <details v-if="item.reasoning" class="thought-expand reasoning-expand">
+                <summary>LLM Thinking (Chain-of-Thought)</summary>
+                <pre class="thought-full reasoning-full">{{ item.reasoning }}</pre>
+              </details>
             </template>
 
             <slot name="card" :item="item" />
@@ -291,6 +295,18 @@ defineExpose({ scrollToItem })
   word-break: break-word;
   max-height: 300px;
   overflow-y: auto;
+}
+
+.reasoning-expand summary {
+  color: var(--accent-purple);
+}
+
+.reasoning-full {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  background: var(--bg-base);
+  border: 1px solid var(--border-muted);
 }
 
 .jump-latest {

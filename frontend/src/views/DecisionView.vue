@@ -324,6 +324,7 @@ const decisionItems = computed(() => {
         title: `AI 推理${roundLabel ? ' · ' + roundLabel : ''}${vulnLabel}`,
         desc: (entry.message || entry.thinking || '').slice(0, 200),
         thinking: entry.thinking || entry.message || '',
+        reasoning: entry.reasoning || '',
         purpose: entry.purpose || '',
         expected: entry.expected || '',
         plan: entry.plan || [],

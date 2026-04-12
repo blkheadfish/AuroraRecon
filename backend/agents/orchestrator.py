@@ -9,7 +9,7 @@ orchestrator.py  ── 改进版
   6. parse_target 统一解析       → 创建 state 后立即解析，全链路使用 target_host/target_port
 
 流程（主机攻链优先）：
-  START → recon → vuln_scan → surface_enum → exploit_decision
+  START → recon → surface_enum → vuln_scan → exploit_decision
         → human_approval（interrupt_before 暂停等待审批）
         → foothold_attempt → secondary_attack（可选）→ post_foothold_enum
         → privesc_attempt（可循环）→ objective_collect → report → END
@@ -45,8 +45,8 @@ logger = logging.getLogger(__name__)
 # 与前端 TaskProgressMermaid 节点顺序一致（单调推进）
 _CHAIN_PHASE_ORDER: list[str] = [
     "recon",
-    "vuln_scan",
     "surface_enum",
+    "vuln_scan",
     "exploit_decision",
     "awaiting_approval",
     "foothold_attempt",
@@ -1065,9 +1065,9 @@ def build_graph(checkpointer=None):
     graph.add_node("report",              node_report)
 
     graph.add_edge(START, "recon")
-    graph.add_edge("recon", "vuln_scan")
-    graph.add_edge("vuln_scan", "surface_enum")
-    graph.add_edge("surface_enum", "exploit_decision")
+    graph.add_edge("recon", "surface_enum")
+    graph.add_edge("surface_enum", "vuln_scan")
+    graph.add_edge("vuln_scan", "exploit_decision")
     graph.add_conditional_edges(
         "exploit_decision", edge_should_exploit,
         {"human_approval": "human_approval", "report": "report"},

@@ -12,7 +12,7 @@ import asyncio
 import json
 import logging
 import os
-from typing import Optional
+from typing import Optional, Union, overload
 
 from openai import AsyncOpenAI
 
@@ -97,6 +97,15 @@ class LLMRouter:
         )
         logger.info(f"[LLMRouter] 使用模型: {provider}/{model} @ {base_url}")
 
+    @staticmethod
+    def _extract_reasoning(message) -> str:
+        """Extract reasoning_content from DeepSeek response message (if present)."""
+        rc = getattr(message, "reasoning_content", None)
+        if rc:
+            return str(rc)
+        raw = getattr(message, "model_extra", None) or {}
+        return str(raw.get("reasoning_content", "") or "")
+
     async def chat(
         self,
         user_message: str,
@@ -104,7 +113,8 @@ class LLMRouter:
         response_format: str = "text",      # text | json
         temperature: float = 0.2,           # 低温度，输出更确定
         max_tokens: int = LLM_MAX_TOKENS,
-    ) -> str:
+        return_thinking: bool = False,
+    ) -> Union[str, tuple[str, str]]:
         """
         发送消息并返回模型回复（带自动重试）。
 
@@ -113,9 +123,10 @@ class LLMRouter:
             system_prompt:   可覆盖默认的安全专家 System Prompt
             response_format: "json" 时强制要求模型返回 JSON
             temperature:     模型温度（越低越确定，渗透分析建议 0.1~0.3）
+            return_thinking: True 时返回 (content, reasoning_content) 元组
 
         Returns:
-            模型回复的文本（如果 response_format=json，调用方负责 json.loads）
+            模型回复的文本，或 (content, reasoning) 元组
         """
         messages = [
             {
@@ -142,8 +153,11 @@ class LLMRouter:
         for attempt in range(MAX_RETRIES):
             try:
                 response = await self._client.chat.completions.create(**kwargs)
-                content = response.choices[0].message.content or ""
+                msg = response.choices[0].message
+                content = msg.content or ""
                 logger.debug(f"[LLMRouter] 响应长度: {len(content)} chars")
+                if return_thinking:
+                    return content, self._extract_reasoning(msg)
                 return content
 
             except Exception as e:
@@ -158,14 +172,11 @@ class LLMRouter:
                     logger.error(
                         f"[LLMRouter] API 调用失败 (已重试{MAX_RETRIES}次): {e}"
                     )
-                    if response_format == "json":
-                        return json.dumps({"error": str(e), "targets": []})
-                    return f"LLM 调用失败: {e}"
+                    fallback = json.dumps({"error": str(e), "targets": []}) if response_format == "json" else f"LLM 调用失败: {e}"
+                    return (fallback, "") if return_thinking else fallback
 
-        # 不应到达这里，但以防万一
-        if response_format == "json":
-            return json.dumps({"error": "unexpected", "targets": []})
-        return "LLM 调用失败: 未知错误"
+        fallback = json.dumps({"error": "unexpected", "targets": []}) if response_format == "json" else "LLM 调用失败: 未知错误"
+        return (fallback, "") if return_thinking else fallback
 
     async def chat_multi_turn(
         self,
@@ -174,7 +185,8 @@ class LLMRouter:
         response_format: str = "text",
         temperature: float = 0.2,
         max_tokens: int = LLM_MAX_TOKENS,
-    ) -> str:
+        return_thinking: bool = False,
+    ) -> Union[str, tuple[str, str]]:
         """
         多轮对话接口 —— 传入完整 messages 历史。
 
@@ -185,9 +197,10 @@ class LLMRouter:
             system_prompt:   System Prompt（如不指定则使用默认安全专家角色）
             response_format: "json" 时强制返回 JSON
             temperature:     模型温度
+            return_thinking: True 时返回 (content, reasoning_content) 元组
 
         Returns:
-            模型回复文本
+            模型回复文本，或 (content, reasoning) 元组
         """
         full_messages = [
             {
@@ -210,11 +223,14 @@ class LLMRouter:
         for attempt in range(MAX_RETRIES):
             try:
                 response = await self._client.chat.completions.create(**kwargs)
-                content = response.choices[0].message.content or ""
+                msg = response.choices[0].message
+                content = msg.content or ""
                 logger.debug(
                     f"[LLMRouter] 多轮响应: {len(content)} chars, "
                     f"轮次={len(messages)}条消息"
                 )
+                if return_thinking:
+                    return content, self._extract_reasoning(msg)
                 return content
             except Exception as e:
                 if attempt < MAX_RETRIES - 1:
@@ -228,13 +244,11 @@ class LLMRouter:
                     logger.error(
                         f"[LLMRouter] 多轮调用失败 (已重试{MAX_RETRIES}次): {e}"
                     )
-                    if response_format == "json":
-                        return json.dumps({"error": str(e), "action": "conclude_fail"})
-                    return f"LLM 调用失败: {e}"
+                    fallback = json.dumps({"error": str(e), "action": "conclude_fail"}) if response_format == "json" else f"LLM 调用失败: {e}"
+                    return (fallback, "") if return_thinking else fallback
 
-        if response_format == "json":
-            return json.dumps({"error": "unexpected", "action": "conclude_fail"})
-        return "LLM 调用失败: 未知错误"
+        fallback = json.dumps({"error": "unexpected", "action": "conclude_fail"}) if response_format == "json" else "LLM 调用失败: 未知错误"
+        return (fallback, "") if return_thinking else fallback
 
     async def analyze_scan_output(self, raw_output: str, tool_name: str) -> dict:
         """

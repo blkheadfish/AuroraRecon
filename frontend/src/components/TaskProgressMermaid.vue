@@ -46,8 +46,8 @@ const props = defineProps({
 
 const nodes = [
   { id: 'recon', label: '信息侦察' },
-  { id: 'vuln_scan', label: '漏洞扫描' },
   { id: 'surface_enum', label: '表面枚举' },
+  { id: 'vuln_scan', label: '漏洞扫描' },
   { id: 'exploit_decision', label: 'AI 决策' },
   { id: 'awaiting_approval', label: '人工审批' },
   { id: 'foothold_attempt', label: '立足点' },

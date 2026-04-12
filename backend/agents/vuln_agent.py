@@ -178,6 +178,7 @@ class VulnAgent:
                 "action": "thought",
                 "phase": "vuln_scan",
                 "thinking": analysis or f"LLM 分析指纹后选择扫描标签: {', '.join(tags[:10])}",
+                "reasoning": scan_strategy.get("reasoning", ""),
                 "purpose": "漏洞扫描策略制定",
                 "plan": [f"Nuclei 标签: {', '.join(tags[:8])}"] + [
                     f"高价值目标: {t}" for t in (hv_targets[:5] if isinstance(hv_targets, list) else [])
@@ -778,7 +779,7 @@ $PHUIP "{web_url}/index.php" 2>&1
         )
 
         try:
-            result = await self.llm.chat(prompt, response_format="json")
+            result, reasoning = await self.llm.chat(prompt, response_format="json", return_thinking=True)
             strategy = json.loads(result)
             if "error" in strategy or not strategy.get("nuclei_tags"):
                 raise ValueError(f"LLM 返回无效策略: {strategy.get('error', 'empty tags')}")
@@ -786,6 +787,7 @@ $PHUIP "{web_url}/index.php" 2>&1
                 "nuclei_tags": strategy.get("nuclei_tags", []),
                 "analysis": strategy.get("analysis", ""),
                 "high_value_targets": strategy.get("high_value_targets", []),
+                "reasoning": reasoning,
             }
         except Exception as e:
             logger.warning(f"[VulnAgent] LLM 扫描策略失败，根据指纹生成回退策略: {e}")
@@ -1103,6 +1105,13 @@ $PHUIP "{web_url}/index.php" 2>&1
                 if entry.vuln_id not in matched_entries:
                     matched_entries[entry.vuln_id] = entry
 
+        # ── 过滤方法论 / 泛化条目（不是具体漏洞）────────
+        matched_entries = {
+            vid: e for vid, e in matched_entries.items()
+            if (e.category or "").lower() not in ("web_enum", "methodology")
+            and not vid.startswith("generic_")
+        }
+
         if not matched_entries:
             logger.info("[VulnAgent] KB 未匹配到任何条目")
             return []
@@ -1154,6 +1163,22 @@ $PHUIP "{web_url}/index.php" 2>&1
             f"{list(matched_entries.keys())}"
         )
 
+        if self._decision_callback:
+            kb_plan = [
+                f"{eid}: {e.description[:60]}" for eid, e in list(matched_entries.items())[:10]
+            ]
+            await self._decision_callback({
+                "action": "thought",
+                "phase": "vuln_scan",
+                "thinking": (
+                    f"知识库匹配到 {len(matched_entries)} 个条目: "
+                    + ", ".join(list(matched_entries.keys())[:10])
+                ),
+                "purpose": "KB 驱动精准检测",
+                "plan": kb_plan,
+                "message": f"KB 匹配 {len(matched_entries)} 个条目，开始逐一验证",
+            })
+
         # ── 对每个匹配条目执行检测 ────────────────────
         findings: list[VulnFinding] = []
 
@@ -1199,8 +1224,24 @@ $PHUIP "{web_url}/index.php" 2>&1
                     exploitable=True,
                     tool="kb-detection",
                 ))
+                if self._decision_callback:
+                    await self._decision_callback({
+                        "action": "tool_result",
+                        "phase": "vuln_scan",
+                        "tool": f"kb:{entry.vuln_id}",
+                        "message": f"KB 确认漏洞: {entry.description[:80]}",
+                        "tone": "success",
+                    })
             else:
                 logger.info(f"[VulnAgent] ❌ KB 未确认: {entry.vuln_id}")
+                if self._decision_callback:
+                    await self._decision_callback({
+                        "action": "tool_result",
+                        "phase": "vuln_scan",
+                        "tool": f"kb:{entry.vuln_id}",
+                        "message": f"KB 未确认: {entry.vuln_id}",
+                        "tone": "info",
+                    })
 
         logger.info(f"[VulnAgent] KB 驱动检测完成: {len(findings)} 个确认漏洞")
         return findings
@@ -1620,7 +1661,7 @@ $PHUIP "{web_url}/index.php" 2>&1
         )
 
         try:
-            result = await self.llm.chat(prompt, response_format="json")
+            result, reasoning = await self.llm.chat(prompt, response_format="json", return_thinking=True)
             plan = json.loads(result)
         except Exception as e:
             logger.warning(f"[VulnAgent] LLM 主动发现失败: {e}")
@@ -1631,6 +1672,19 @@ $PHUIP "{web_url}/index.php" 2>&1
             return []
 
         logger.info(f"[VulnAgent] LLM 建议验证 {len(checks)} 个潜在漏洞")
+
+        if self._decision_callback:
+            check_names = [c.get("vuln_name", "?") for c in checks[:8]]
+            await self._decision_callback({
+                "action": "thought",
+                "phase": "vuln_scan",
+                "thinking": plan.get("analysis", "") or f"LLM 主动发现提出 {len(checks)} 个验证方案",
+                "reasoning": reasoning,
+                "purpose": "LLM 主动漏洞发现",
+                "plan": [f"验证: {n}" for n in check_names],
+                "message": f"LLM 建议验证 {len(checks)} 个潜在漏洞: {', '.join(check_names)}",
+            })
+
         findings: list[VulnFinding] = []
 
         for check in checks[:8]:
@@ -1650,6 +1704,20 @@ $PHUIP "{web_url}/index.php" 2>&1
                 script_content=command,
                 timeout=30,
             )
+
+            if self._decision_callback:
+                await self._decision_callback({
+                    "action": "command_exec",
+                    "phase": "vuln_scan",
+                    "tool": "llm-discovery",
+                    "command": command,
+                    "purpose": f"验证: {vuln_name}",
+                    "stdout": (exec_result.stdout or "")[:4000],
+                    "stderr": (exec_result.stderr or "")[:1000],
+                    "exit_code": exec_result.exit_code,
+                    "elapsed_ms": int(exec_result.elapsed * 1000) if exec_result.elapsed else None,
+                    "message": f"LLM 验证 {vuln_name}",
+                })
 
             # 让 LLM 判断验证结果
             analyze_prompt = (

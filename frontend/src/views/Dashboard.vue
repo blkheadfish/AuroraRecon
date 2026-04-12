@@ -17,6 +17,7 @@
       </div>
     </div>
 
+    <!-- System Overview -->
     <el-card class="panel">
       <template #header>
         <div class="card-header">
@@ -24,50 +25,63 @@
           <span class="meta">更新时间 {{ formatTime(metrics.generated_at) }}</span>
         </div>
       </template>
-      <div class="system-grid">
-        <div class="metric-item">
-          <div class="label">API 状态</div>
-          <el-tag :type="statusTagType(system.api_status)">{{ system.api_status }}</el-tag>
+      <div class="system-row">
+        <div class="chart-cell">
+          <v-chart :option="taskDonutOption" autoresize class="chart" />
         </div>
-        <div class="metric-item">
-          <div class="label">数据库</div>
-          <el-tag :type="statusTagType(system.database)">{{ system.database }}</el-tag>
+        <div class="stats-center">
+          <div class="status-row">
+            <div class="metric-item">
+              <div class="label">API 状态</div>
+              <el-tag :type="statusTagType(system.api_status)" size="small">{{ system.api_status || '-' }}</el-tag>
+            </div>
+            <div class="metric-item">
+              <div class="label">数据库</div>
+              <el-tag :type="statusTagType(system.database)" size="small">{{ system.database || '-' }}</el-tag>
+            </div>
+            <div class="metric-item">
+              <div class="label">Redis</div>
+              <el-tag :type="statusTagType(system.redis)" size="small">{{ system.redis || '-' }}</el-tag>
+            </div>
+            <div class="metric-item">
+              <div class="label">MSF</div>
+              <el-tag :type="statusTagType(system.msf)" size="small">{{ system.msf || '-' }}</el-tag>
+            </div>
+          </div>
+          <div class="numbers-row">
+            <div class="num-card">
+              <div class="num-value mono">{{ system.total_tasks || 0 }}</div>
+              <div class="num-label">任务总数</div>
+            </div>
+            <div class="num-card">
+              <div class="num-value mono running">{{ system.running_tasks || 0 }}</div>
+              <div class="num-label">运行中</div>
+            </div>
+            <div class="num-card">
+              <div class="num-value mono success">{{ system.completed_tasks || 0 }}</div>
+              <div class="num-label">已完成</div>
+            </div>
+            <div class="num-card">
+              <div class="num-value mono danger">{{ system.failed_tasks || 0 }}</div>
+              <div class="num-label">失败</div>
+            </div>
+            <div class="num-card">
+              <div class="num-value mono shell-color">{{ system.shells_obtained_tasks || 0 }}</div>
+              <div class="num-label">获取Shell</div>
+            </div>
+            <div class="num-card">
+              <div class="num-value mono root-color">{{ system.root_reached_tasks || 0 }}</div>
+              <div class="num-label">Root提权</div>
+            </div>
+          </div>
         </div>
-        <div class="metric-item">
-          <div class="label">Redis</div>
-          <el-tag :type="statusTagType(system.redis)">{{ system.redis }}</el-tag>
-        </div>
-        <div class="metric-item">
-          <div class="label">MSF</div>
-          <el-tag :type="statusTagType(system.msf)">{{ system.msf }}</el-tag>
-        </div>
-        <div class="metric-item">
-          <div class="label">版本</div>
-          <div class="value mono">{{ system.version || '-' }}</div>
-        </div>
-        <div class="metric-item">
-          <div class="label">任务总数</div>
-          <div class="value mono">{{ system.total_tasks || 0 }}</div>
-        </div>
-        <div class="metric-item">
-          <div class="label">运行中任务</div>
-          <div class="value mono running">{{ system.running_tasks || 0 }}</div>
-        </div>
-        <div class="metric-item">
-          <div class="label">已完成任务</div>
-          <div class="value mono success">{{ system.completed_tasks || 0 }}</div>
-        </div>
-        <div class="metric-item">
-          <div class="label">失败任务</div>
-          <div class="value mono danger">{{ system.failed_tasks || 0 }}</div>
-        </div>
-        <div class="metric-item">
-          <div class="label">活动任务ID</div>
-          <div class="value mono">{{ system.active_task_ids || 0 }}</div>
+        <div class="chart-cell">
+          <v-chart :option="successGaugeOption" autoresize class="chart" />
         </div>
       </div>
     </el-card>
 
+    <!-- Main Grid: Tool Overview + Tool Invocation -->
     <div class="main-grid">
       <el-card class="panel">
         <template #header>
@@ -90,10 +104,9 @@
             <div class="value mono">{{ executorRows.length }}</div>
           </div>
         </div>
-        <el-table :data="categoryRows" size="small" class="table">
-          <el-table-column prop="name" label="分类" min-width="160" />
-          <el-table-column prop="count" label="数量" width="90" />
-        </el-table>
+        <div class="chart-container-sm">
+          <v-chart :option="categoryPieOption" autoresize class="chart" />
+        </div>
         <el-table :data="executorRows" size="small" class="table">
           <el-table-column prop="name" label="执行器" min-width="160" />
           <el-table-column prop="count" label="数量" width="90" />
@@ -123,7 +136,7 @@
         </div>
 
         <div class="backend-row">
-          <span class="label backend-row-title">工具调用按执行后端分布（本时间窗）</span>
+          <span class="label backend-row-title">执行后端分布</span>
           <el-tooltip
             v-for="item in backendRows"
             :key="item.name"
@@ -138,16 +151,9 @@
           <span v-if="!backendRows.length" class="empty-tip">暂无数据</span>
         </div>
 
-        <el-table :data="invocation.top_tools || []" size="small" class="table">
-          <el-table-column prop="tool" label="工具" min-width="140" />
-          <el-table-column prop="calls" label="调用次数" width="90" />
-          <el-table-column prop="success_rate" label="成功率" width="90">
-            <template #default="{ row }">{{ row.success_rate }}%</template>
-          </el-table-column>
-          <el-table-column prop="avg_elapsed_ms" label="平均耗时" width="120">
-            <template #default="{ row }">{{ formatMs(row.avg_elapsed_ms) }}</template>
-          </el-table-column>
-        </el-table>
+        <div class="chart-container-md">
+          <v-chart :option="topToolsBarOption" autoresize class="chart" />
+        </div>
       </el-card>
     </div>
   </div>
@@ -158,6 +164,35 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { api } from '@/api'
 import { trackEvent } from '@/metrics/tracker'
+
+import VChart from 'vue-echarts'
+import { use } from 'echarts/core'
+import { CanvasRenderer } from 'echarts/renderers'
+import { PieChart, BarChart, GaugeChart } from 'echarts/charts'
+import {
+  TitleComponent,
+  TooltipComponent,
+  LegendComponent,
+  GridComponent,
+} from 'echarts/components'
+
+use([
+  CanvasRenderer, PieChart, BarChart, GaugeChart,
+  TitleComponent, TooltipComponent, LegendComponent, GridComponent,
+])
+
+const C = {
+  cyan:   '#58b8c9',
+  teal:   '#4a9ea8',
+  mint:   '#5cbda3',
+  slate:  '#6889a0',
+  indigo: '#7680b8',
+  mauve:  '#8878a8',
+  ember:  '#a86070',
+  amber:  '#9c8a62',
+  dim:    '#4e5c68',
+}
+const PALETTE = [C.cyan, C.teal, C.mint, C.slate, C.indigo, C.mauve, C.amber, C.dim]
 
 const autoRefresh = ref(true)
 const loading = ref(false)
@@ -205,14 +240,184 @@ const backendRows = computed(() =>
     .sort((a, b) => b.count - a.count),
 )
 
+// ── Chart Options ──
+
+const TIP_STYLE = {
+  backgroundColor: 'rgba(10,16,22,0.94)',
+  borderColor: 'rgba(88,184,201,0.18)',
+  textStyle: { color: '#9ab4c0', fontSize: 12 },
+}
+
+const taskDonutOption = computed(() => {
+  const running = Number(system.value.running_tasks || 0)
+  const completed = Number(system.value.completed_tasks || 0)
+  const failed = Number(system.value.failed_tasks || 0)
+  const total = running + completed + failed
+
+  return {
+    tooltip: { trigger: 'item', ...TIP_STYLE },
+    legend: {
+      bottom: 4,
+      itemWidth: 10,
+      itemHeight: 10,
+      textStyle: { color: '#8b9caa', fontSize: 11 },
+    },
+    series: [{
+      type: 'pie',
+      radius: ['48%', '72%'],
+      center: ['50%', '45%'],
+      avoidLabelOverlap: true,
+      itemStyle: { borderRadius: 4, borderColor: '#0d1117', borderWidth: 2 },
+      label: {
+        show: true,
+        position: 'center',
+        formatter: `{big|${total}}\n{sub|任务总数}`,
+        rich: {
+          big: { fontSize: 22, fontWeight: 700, color: '#c0d4de', fontFamily: 'JetBrains Mono, monospace', lineHeight: 28 },
+          sub: { fontSize: 11, color: '#6a8090', lineHeight: 18 },
+        },
+      },
+      emphasis: {
+        label: { show: true, fontSize: 12 },
+        itemStyle: { shadowBlur: 16, shadowColor: 'rgba(88,184,201,0.25)' },
+      },
+      data: [
+        { value: running, name: '运行中', itemStyle: { color: C.cyan } },
+        { value: completed, name: '已完成', itemStyle: { color: C.mint } },
+        { value: failed, name: '失败', itemStyle: { color: C.ember } },
+      ].filter(d => d.value > 0),
+    }],
+  }
+})
+
+const successGaugeOption = computed(() => {
+  const rate = Number(invocation.value.success_rate || 0)
+  const gaugeColor = rate >= 85 ? C.cyan : rate >= 60 ? C.teal : C.ember
+  return {
+    series: [{
+      type: 'gauge',
+      startAngle: 200,
+      endAngle: -20,
+      radius: '88%',
+      center: ['50%', '55%'],
+      min: 0,
+      max: 100,
+      splitNumber: 5,
+      itemStyle: { color: gaugeColor },
+      progress: { show: true, width: 14, roundCap: true },
+      pointer: { show: false },
+      axisLine: {
+        lineStyle: {
+          width: 14,
+          color: [[1, 'rgba(88,184,201,0.08)']],
+        },
+      },
+      axisTick: { show: false },
+      splitLine: { show: false },
+      axisLabel: { show: false },
+      title: {
+        show: true,
+        offsetCenter: [0, '68%'],
+        color: '#6a8090',
+        fontSize: 11,
+      },
+      detail: {
+        valueAnimation: true,
+        offsetCenter: [0, '20%'],
+        fontSize: 22,
+        fontWeight: 700,
+        fontFamily: 'JetBrains Mono, monospace',
+        formatter: '{value}%',
+        color: gaugeColor,
+      },
+      data: [{ value: rate, name: '工具调用成功率' }],
+    }],
+  }
+})
+
+const topToolsBarOption = computed(() => {
+  const tools = (invocation.value.top_tools || []).slice(0, 8).reverse()
+  if (!tools.length) {
+    return { title: { text: '暂无调用数据', left: 'center', top: 'center', textStyle: { color: '#6a8090', fontSize: 12, fontWeight: 400 } } }
+  }
+  return {
+    tooltip: {
+      trigger: 'axis',
+      axisPointer: { type: 'shadow' },
+      ...TIP_STYLE,
+      formatter: (params) => {
+        const p = params[0]
+        const tool = tools[p.dataIndex]
+        return `<b style="color:#c0d4de">${tool.tool}</b><br/>调用: ${tool.calls} 次<br/>成功率: ${tool.success_rate}%<br/>平均耗时: ${Math.round(tool.avg_elapsed_ms)} ms`
+      },
+    },
+    grid: { left: 8, right: 24, top: 8, bottom: 8, containLabel: true },
+    xAxis: {
+      type: 'value',
+      axisLabel: { color: '#6a8090', fontSize: 10 },
+      axisLine: { show: false },
+      splitLine: { lineStyle: { color: 'rgba(88,184,201,0.06)' } },
+    },
+    yAxis: {
+      type: 'category',
+      data: tools.map(t => t.tool),
+      axisLabel: { color: '#8b9caa', fontSize: 11, width: 100, overflow: 'truncate' },
+      axisLine: { show: false },
+      axisTick: { show: false },
+    },
+    series: [{
+      type: 'bar',
+      barWidth: 14,
+      data: tools.map(t => ({
+        value: t.calls,
+        itemStyle: {
+          color: t.success_rate >= 80 ? C.cyan : t.success_rate >= 50 ? C.teal : C.ember,
+          borderRadius: [0, 4, 4, 0],
+        },
+      })),
+    }],
+  }
+})
+
+const categoryPieOption = computed(() => {
+  const entries = categoryRows.value
+  if (!entries.length) {
+    return { title: { text: '暂无工具数据', left: 'center', top: 'center', textStyle: { color: '#6a8090', fontSize: 12, fontWeight: 400 } } }
+  }
+  return {
+    tooltip: { trigger: 'item', ...TIP_STYLE },
+    legend: {
+      orient: 'vertical',
+      right: 8,
+      top: 'center',
+      itemWidth: 10,
+      itemHeight: 10,
+      textStyle: { color: '#8b9caa', fontSize: 11 },
+    },
+    series: [{
+      type: 'pie',
+      radius: ['36%', '66%'],
+      center: ['35%', '50%'],
+      itemStyle: { borderRadius: 4, borderColor: '#0d1117', borderWidth: 2 },
+      label: { show: false },
+      emphasis: {
+        itemStyle: { shadowBlur: 16, shadowColor: 'rgba(88,184,201,0.20)' },
+      },
+      data: entries.map((e, i) => ({
+        value: e.count,
+        name: e.name,
+        itemStyle: { color: PALETTE[i % PALETTE.length] },
+      })),
+    }],
+  }
+})
+
+// ── Helpers ──
+
 function backendTip(name) {
   const key = String(name || '').toLowerCase()
-  if (key === 'container-run') {
-    return 'container-run: 以运行容器任务方式调用工具，常用于完整扫描流程。'
-  }
-  if (key === 'container-exec') {
-    return 'container-exec: 在现有容器中执行命令，常用于短命令探测与补充校验。'
-  }
+  if (key === 'container-run') return 'container-run: 以运行容器任务方式调用工具，常用于完整扫描流程。'
+  if (key === 'container-exec') return 'container-exec: 在现有容器中执行命令，常用于短命令探测与补充校验。'
   return `${name}: 按执行后端统计的工具调用次数。`
 }
 
@@ -236,9 +441,7 @@ function formatMs(value) {
 }
 
 async function refresh(trigger = 'manual') {
-  if (metricsEndpointMissing.value && trigger === 'auto') {
-    return
-  }
+  if (metricsEndpointMissing.value && trigger === 'auto') return
   loading.value = true
   try {
     metrics.value = await api.getMetricsOverview(windowHours.value)
@@ -285,39 +488,126 @@ onUnmounted(() => {
 .card-header { display: flex; justify-content: space-between; align-items: center; font-weight: 600; }
 .meta { font-size: 12px; color: var(--text-muted); font-weight: 500; }
 
-.system-grid {
-  display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
-  gap: 10px;
+/* ── System Overview Row ── */
+.system-row {
+  display: flex;
+  gap: 16px;
+  align-items: stretch;
 }
-.metric-item {
+
+.chart-cell {
+  width: 220px;
+  min-width: 180px;
+  min-height: 200px;
+  flex-shrink: 0;
+}
+
+.chart-cell .chart {
+  width: 100%;
+  height: 100%;
+  min-height: 200px;
+}
+
+.stats-center {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.status-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.status-row .metric-item {
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   background: var(--bg-base);
-  padding: 10px 12px;
+  padding: 8px 12px;
+  flex: 1;
+  min-width: 100px;
 }
+
+.numbers-row {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.num-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-base);
+  padding: 10px 8px;
+  text-align: center;
+}
+
+.num-value {
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--text-primary);
+  line-height: 1.2;
+}
+
+.num-label {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+
+/* ── Shared ── */
 .label { color: var(--text-secondary); font-size: 12px; }
 .value { margin-top: 4px; color: var(--text-primary); font-weight: 700; font-size: 20px; }
 .mono { font-family: var(--font-mono); }
-.running { color: var(--accent-blue); }
-.success { color: var(--accent-green); }
-.danger { color: var(--accent-red); }
+.running { color: #58b8c9; }
+.success { color: #5cbda3; }
+.danger { color: #a86070; }
+.shell-color { color: #7680b8; }
+.root-color { color: #9c8a62; }
 
+/* ── Main Grid ── */
 .main-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+
 .inline-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
   margin-bottom: 10px;
 }
+
 .mini-card {
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   background: var(--bg-base);
   padding: 10px 12px;
 }
+
 .table { margin-top: 8px; }
 
+.chart-container-sm {
+  min-height: 220px;
+  margin-bottom: 8px;
+}
+
+.chart-container-sm .chart {
+  width: 100%;
+  height: 220px;
+}
+
+.chart-container-md {
+  min-height: 260px;
+  margin-top: 8px;
+}
+
+.chart-container-md .chart {
+  width: 100%;
+  height: 260px;
+}
+
+/* ── Backend Row ── */
 .backend-row {
   display: flex;
   gap: 8px;
@@ -329,11 +619,13 @@ onUnmounted(() => {
   border-radius: var(--radius-md);
   background: color-mix(in srgb, var(--bg-base) 82%, transparent);
 }
+
 .backend-row-title {
   font-size: 12px;
   font-weight: 600;
   color: var(--text-secondary);
 }
+
 :deep(.backend-tag.el-tag) {
   margin-right: 0;
   display: inline-flex;
@@ -342,10 +634,8 @@ onUnmounted(() => {
   border-color: color-mix(in srgb, var(--border) 72%, var(--accent-blue));
   background: color-mix(in srgb, var(--bg-surface) 88%, transparent);
 }
+
 .backend-name { color: var(--text-secondary); }
-.backend-count {
-  color: var(--text-primary);
-  font-weight: 700;
-}
+.backend-count { color: var(--text-primary); font-weight: 700; }
 .empty-tip { color: var(--text-muted); font-size: 12px; }
 </style>
