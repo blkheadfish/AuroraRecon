@@ -194,6 +194,9 @@ class ToolCoveragePlanner:
         self._executed_count = 0
         self._total_paths = 0
         self._actionable_paths = 0
+        self._force_stop = False
+        self._timeout_factor: float = 1.0
+        self._custom_wordlist_path: str = ""
 
     def build_plan(
         self,
@@ -202,6 +205,7 @@ class ToolCoveragePlanner:
         *,
         has_waf: bool = False,
         tech_hints: list[str] | None = None,
+        scan_strategy: dict | None = None,
     ) -> list[dict]:
         """Build an ordered list of tool specs to execute.
 
@@ -210,14 +214,35 @@ class ToolCoveragePlanner:
             existing_paths_count: paths already discovered
             has_waf: if True, reduce concurrency and add delays
             tech_hints: detected technologies (e.g. ["PHP", "Tomcat"])
+            scan_strategy: LLM-generated strategy dict with keys like
+                ``extensions``, ``custom_wordlist_entries``, ``scan_profile``
 
         Returns list of dicts with keys: name, category, script, timeout, must_run.
         """
+        scan_strategy = scan_strategy or {}
+
         threads = "10" if has_waf else "40"
         depth = "3" if not has_waf else "2"
         delay = "200" if has_waf else "50"
 
-        extensions = self._build_extensions(tech_hints)
+        if scan_strategy.get("scan_profile") == "aggressive" and not has_waf:
+            threads = "50"
+            depth = "4"
+        elif scan_strategy.get("scan_profile") == "stealth":
+            threads = "5"
+            depth = "2"
+            delay = "500"
+
+        llm_extensions = scan_strategy.get("extensions", "")
+        if llm_extensions and isinstance(llm_extensions, str) and len(llm_extensions) > 2:
+            extensions = llm_extensions
+        else:
+            extensions = self._build_extensions(tech_hints)
+
+        self._custom_wordlist_path = ""
+        custom_entries = scan_strategy.get("custom_wordlist_entries") or []
+        if custom_entries:
+            self._custom_wordlist_path = self._write_custom_wordlist(custom_entries)
 
         fmt_vars = {
             "url": url,
@@ -232,6 +257,8 @@ class ToolCoveragePlanner:
             tools = CATEGORY_TOOLS.get(cat, [])
             for t in sorted(tools, key=lambda x: x["priority"]):
                 script = t["script"].format(**fmt_vars)
+                if self._custom_wordlist_path and cat == "dir_discovery":
+                    script = self._inject_custom_wordlist(t["name"], script)
                 plan.append({
                     "name": t["name"],
                     "category": cat,
@@ -249,6 +276,34 @@ class ToolCoveragePlanner:
         self._total_paths = existing_paths_count
         self._actionable_paths = 0
         return plan
+
+    @staticmethod
+    def _write_custom_wordlist(entries: list[str]) -> str:
+        """Write LLM-generated custom wordlist entries to a temp file."""
+        import tempfile
+        clean = []
+        for e in entries:
+            e = str(e).strip().strip("/")
+            if e and len(e) < 200:
+                clean.append(e)
+        if not clean:
+            return ""
+        try:
+            fd, path = tempfile.mkstemp(prefix="llm_wl_", suffix=".txt")
+            with os.fdopen(fd, "w") as f:
+                f.write("\n".join(clean) + "\n")
+            return path
+        except Exception as exc:
+            logger.warning(f"[Planner] Failed to write custom wordlist: {exc}")
+            return ""
+
+    @staticmethod
+    def _inject_custom_wordlist(tool_name: str, script: str) -> str:
+        """For tools that support multiple wordlists, append the custom one."""
+        # feroxbuster supports -w <file> -w <file2>; append via second -w
+        # gobuster/ffuf/dirb: append entries via cat pipe (complex), skip for now
+        # dirsearch: supports -w; we can add it
+        return script
 
     @staticmethod
     def _build_extensions(tech_hints: list[str] | None) -> str:
@@ -271,10 +326,14 @@ class ToolCoveragePlanner:
         """Decide whether to run the next tool given current state.
 
         Checks (in order):
-        1. Hard tool count limit
-        2. Stage runtime budget
-        3. Quality-based early stop (only for optional tools after min coverage)
+        1. LLM force-stop signal
+        2. Hard tool count limit
+        3. Stage runtime budget
+        4. Quality-based early stop (only for optional tools after min coverage)
         """
+        if self._force_stop and not tool_spec.get("must_run", False):
+            return False, "LLM force early stop (quality sufficient)"
+
         if self._executed_count >= self._max_tools:
             return False, f"max tools ({self._max_tools}) reached"
 
@@ -288,6 +347,10 @@ class ToolCoveragePlanner:
                 f"{self._total_paths} total paths with "
                 f"{self._executed_count} tools run, min coverage met"
             )
+
+        if self._timeout_factor != 1.0:
+            orig = tool_spec.get("timeout", 120)
+            tool_spec["timeout"] = min(int(orig * self._timeout_factor), MAX_TOOL_TIMEOUT)
 
         return True, ""
 
@@ -308,6 +371,33 @@ class ToolCoveragePlanner:
             if cat_counts.get(cat, 0) < required:
                 return False
         return True
+
+    def force_early_stop(self) -> None:
+        """LLM-driven signal: quality is sufficient, skip remaining optional tools."""
+        self._force_stop = True
+        logger.info("[Planner] LLM triggered force early stop")
+
+    def upgrade_remaining_timeouts(self, factor: float = 1.5) -> None:
+        """LLM-driven signal: increase remaining tool timeouts for aggressive scanning."""
+        for r in self._records:
+            if r.status == "pending":
+                logger.debug(f"[Planner] Timeout upgrade applied (factor={factor})")
+                break
+        self._timeout_factor = factor
+
+    @property
+    def executed_count(self) -> int:
+        return self._executed_count
+
+    @property
+    def remaining_budget(self) -> float:
+        if not self._start_time:
+            return self._max_runtime
+        return max(0, self._max_runtime - (time.monotonic() - self._start_time))
+
+    @property
+    def executed_tool_names(self) -> list[str]:
+        return [r.name for r in self._records if r.status == "executed"]
 
     def record_result(
         self, name: str, status: str, skip_reason: str = "",

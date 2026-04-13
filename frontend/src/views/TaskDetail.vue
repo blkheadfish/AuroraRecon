@@ -1,10 +1,11 @@
 <template>
   <div class="page-wrap" v-loading="loading" element-loading-background="rgba(13,17,23,0.9)">
     <div class="detail-header">
-      <el-button link @click="router.push('/tasks')" class="back-btn">
-        <el-icon><ArrowLeft /></el-icon>
-        返回列表
-      </el-button>
+      <el-breadcrumb separator="/" class="page-breadcrumb">
+        <el-breadcrumb-item :to="{ path: '/dashboard' }">首页</el-breadcrumb-item>
+        <el-breadcrumb-item :to="{ path: '/tasks' }">任务列表</el-breadcrumb-item>
+        <el-breadcrumb-item>{{ task?.target || '任务详情' }}</el-breadcrumb-item>
+      </el-breadcrumb>
 
       <div class="title-line">
         <div>
@@ -27,6 +28,26 @@
         </div>
       </div>
     </div>
+
+    <el-alert
+      v-if="showApprovalActions"
+      type="warning"
+      :closable="false"
+      show-icon
+      class="approval-banner"
+    >
+      <template #title>
+        <span class="approval-banner-text">当前任务需要人工审批确认</span>
+        <div class="approval-banner-actions">
+          <el-button type="success" size="small" :loading="approving" @click="doApprove(true)">
+            <el-icon><Check /></el-icon> 批准执行
+          </el-button>
+          <el-button type="danger" size="small" plain :loading="approving" @click="doApprove(false)">
+            拒绝
+          </el-button>
+        </div>
+      </template>
+    </el-alert>
 
     <div class="summary-grid" v-if="task">
       <el-card class="summary-card">
@@ -443,11 +464,6 @@ async function pollTask() {
   if (!isRunning.value) return
   try {
     await liveStore.refreshTask(taskId)
-    const logResp = await api.getLogs(taskId)
-    const stateRef = liveStore.getLiveState(taskId)
-    if (logResp.logs?.length) {
-      stateRef.logs = logResp.logs
-    }
   } catch {
     // Ignore polling errors.
   }
@@ -455,7 +471,7 @@ async function pollTask() {
 
 function startPolling() {
   stopPolling()
-  pollTimer.value = window.setInterval(pollTask, 3000)
+  pollTimer.value = window.setInterval(pollTask, 15000)
 }
 
 function stopPolling() {
@@ -486,7 +502,7 @@ onUnmounted(() => {
 <style scoped>
 .page-wrap { padding: 24px 32px; min-height: 100%; }
 .detail-header { margin-bottom: 14px; }
-.back-btn { color: var(--text-secondary) !important; margin-bottom: 8px; }
+.page-breadcrumb { margin-bottom: 10px; }
 .title-line { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
 .target-title { color: var(--text-primary); font-size: 22px; font-weight: 700; font-family: var(--font-mono); }
 .task-id { margin-top: 6px; display: inline-block; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 2px 8px; color: var(--text-muted); font-size: 11px; font-family: var(--font-mono); }
@@ -498,6 +514,26 @@ onUnmounted(() => {
 .summary-value { margin-top: 6px; font-size: 14px; color: var(--text-primary); font-weight: 600; }
 .summary-value.risk { color: var(--accent-yellow); }
 .summary-value.evidence { font-family: var(--font-mono); font-size: 12px; }
+
+.approval-banner {
+  margin-bottom: 12px;
+  border-radius: var(--radius-md);
+}
+.approval-banner :deep(.el-alert__title) {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+}
+.approval-banner-text {
+  font-weight: 600;
+  font-size: 13px;
+}
+.approval-banner-actions {
+  display: flex;
+  gap: 8px;
+  margin-left: 16px;
+}
 
 .progress-mermaid { margin-bottom: 12px; }
 .approval-composer { margin-bottom: 12px; }

@@ -47,6 +47,7 @@ const props = defineProps({
 const nodes = [
   { id: 'recon', label: '信息侦察' },
   { id: 'surface_enum', label: '表面枚举' },
+  { id: 'intel_harvest', label: '情报采集' },
   { id: 'vuln_scan', label: '漏洞扫描' },
   { id: 'exploit_decision', label: 'AI 决策' },
   { id: 'awaiting_approval', label: '人工审批' },
@@ -122,6 +123,7 @@ function nodeIcon(id) {
     recon: '🔍',
     vuln_scan: '🛡',
     surface_enum: '📂',
+    intel_harvest: '🧠',
     exploit_decision: '🤖',
     awaiting_approval: '⏳',
     foothold_attempt: '⚡',

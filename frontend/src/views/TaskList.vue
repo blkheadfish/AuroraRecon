@@ -36,6 +36,13 @@
 
     <el-card class="table-card">
       <div class="toolbar">
+        <el-input
+          v-model="searchKeyword"
+          placeholder="搜索目标 IP / 域名"
+          clearable
+          style="width: 200px"
+          :prefix-icon="Search"
+        />
         <el-select v-model="filterStatus" placeholder="状态筛选" clearable style="width: 140px">
           <el-option label="运行中" value="running" />
           <el-option label="已完成" value="completed" />
@@ -65,11 +72,15 @@
         <el-button size="small" type="danger" plain @click="batchDelete">批量删除</el-button>
       </div>
 
-      <el-empty v-if="!listStore.loading && !filteredTasks.length" description="暂无匹配任务" />
+      <el-empty v-if="!listStore.loading && !filteredTasks.length" description="暂无匹配任务">
+        <el-button type="primary" @click="showCreate = true">
+          <el-icon><Plus /></el-icon> 创建第一个任务
+        </el-button>
+      </el-empty>
 
       <el-table
         v-else
-        :data="filteredTasks"
+        :data="pagedTasks"
         v-loading="listStore.loading"
         @selection-change="onSelectionChange"
         @row-click="(row) => goDetail(row.task_id)"
@@ -128,6 +139,17 @@
           </template>
         </el-table-column>
       </el-table>
+
+      <div class="pagination-wrap" v-if="filteredTasks.length > pageSize">
+        <el-pagination
+          v-model:current-page="currentPage"
+          :page-size="pageSize"
+          :total="filteredTasks.length"
+          layout="total, prev, pager, next"
+          background
+          small
+        />
+      </div>
     </el-card>
 
     <el-dialog v-model="showCreate" title="创建渗透测试任务" width="700px" :close-on-click-modal="false">
@@ -178,9 +200,10 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { Search } from '@element-plus/icons-vue'
 import { useTaskListStore } from '@/stores/taskList'
 import { useUiPrefsStore } from '@/stores/uiPrefs'
 import { trackEvent } from '@/metrics/tracker'
@@ -272,14 +295,28 @@ const rules = {
 const filterStatus = ref('')
 const filterPhase = ref('')
 const onlyShell = ref(false)
+const searchKeyword = ref('')
+const currentPage = ref(1)
+const pageSize = 20
 
 const filteredTasks = computed(() => {
+  const keyword = searchKeyword.value.trim().toLowerCase()
   return listStore.tasks.filter((task) => {
+    if (keyword && !task.target?.toLowerCase().includes(keyword)) return false
     if (filterStatus.value && task.status !== filterStatus.value) return false
     if (filterPhase.value && task.current_phase !== filterPhase.value) return false
     if (onlyShell.value && !task.got_shell) return false
     return true
   })
+})
+
+const pagedTasks = computed(() => {
+  const start = (currentPage.value - 1) * pageSize
+  return filteredTasks.value.slice(start, start + pageSize)
+})
+
+watch([filterStatus, filterPhase, onlyShell, searchKeyword], () => {
+  currentPage.value = 1
 })
 
 const awaitingApprovalCount = computed(() =>
@@ -290,6 +327,8 @@ function clearFilters() {
   filterStatus.value = ''
   filterPhase.value = ''
   onlyShell.value = false
+  searchKeyword.value = ''
+  currentPage.value = 1
 }
 
 function onSelectionChange(rows) {
@@ -344,10 +383,18 @@ function handleDelete(row) {
   ElMessage.success('任务已删除')
 }
 
-function batchDelete() {
+async function batchDelete() {
+  const count = selectedRows.value.length
+  try {
+    await ElMessageBox.confirm(`确认删除选中的 ${count} 个任务？此操作不可撤销。`, '批量删除', {
+      confirmButtonText: '确认删除',
+      cancelButtonText: '取消',
+      type: 'warning',
+    })
+  } catch { return }
   selectedRows.value.forEach((item) => listStore.removeTask(item.task_id))
-  trackEvent('task.batch_delete', { count: selectedRows.value.length })
-  ElMessage.success(`已删除 ${selectedRows.value.length} 个任务`)
+  trackEvent('task.batch_delete', { count })
+  ElMessage.success(`已删除 ${count} 个任务`)
   selectedRows.value = []
 }
 
@@ -425,4 +472,5 @@ onMounted(() => {
   ) !important;
 }
 .form-tip { margin-top: 4px; color: var(--text-muted); font-size: 12px; }
+.pagination-wrap { display: flex; justify-content: flex-end; padding: 12px 0 4px; }
 </style>

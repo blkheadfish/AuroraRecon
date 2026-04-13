@@ -16,12 +16,17 @@ interface TaskLiveState {
   decisionEvents: DecisionEvent[]
   decisionEventIds: Set<string>
   approvalState: ApprovalState
+  approvalNonce: string
+  approvalSubmittedAt: number
+  lastWsUpdate: number
   unsub?: () => void
 }
 
 export const useTaskLiveStore = defineStore('taskLive', () => {
   const taskStateMap = ref<Record<string, TaskLiveState>>({})
   const taskListStore = useTaskListStore()
+
+  const APPROVAL_PROTECTION_MS = 5000
 
   function ensureState(taskId: string): TaskLiveState {
     if (!taskStateMap.value[taskId]) {
@@ -33,6 +38,9 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
         decisionEvents: [],
         decisionEventIds: new Set<string>(),
         approvalState: 'idle',
+        approvalNonce: '',
+        approvalSubmittedAt: 0,
+        lastWsUpdate: 0,
       }
     }
     return taskStateMap.value[taskId]
@@ -59,12 +67,23 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
     const full = await api.getTask(taskId)
     const state = ensureState(taskId)
     mergeDecisionEvents(state, full.decision_events || [])
-    state.task = {
-      ...full,
-      decision_events: state.decisionEvents.slice(),
+
+    const apiTime = full.updated_at ?? ''
+    const localTime = state.task?.updated_at ?? ''
+    const wsRecent = Date.now() - state.lastWsUpdate < 4000
+
+    if (!state.task || (!wsRecent && apiTime >= localTime)) {
+      state.task = { ...full, decision_events: state.decisionEvents.slice() }
+    } else {
+      state.task = {
+        ...state.task,
+        findings: full.findings ?? state.task.findings,
+        report_path: full.report_path ?? state.task.report_path,
+        decision_events: state.decisionEvents.slice(),
+      }
     }
-    const freshLogs = full.phase_log || []
-    for (const line of freshLogs) {
+
+    for (const line of (full.phase_log || [])) {
       pushLog(state, line)
     }
     taskListStore.upsertTask(full)
@@ -94,6 +113,7 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
         }
       }
       if ((event as { type?: string }).type === 'phase_update') {
+        state.lastWsUpdate = Date.now()
         const patch = event as {
           phase?: string
           status?: string
@@ -139,22 +159,28 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
         }
       }
       if ((event as { type?: string }).type === 'approval_required') {
+        state.lastWsUpdate = Date.now()
+        const incomingNonce = (event as { nonce?: string }).nonce || `ar-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
         taskListStore.upsertTask({ task_id: taskId, current_phase: 'awaiting_approval', status: 'running' })
         if (state.task) {
           state.task = { ...state.task, current_phase: 'awaiting_approval' }
         }
-        if (state.approvalState === 'submitted') {
+
+        const withinProtection = Date.now() - state.approvalSubmittedAt < APPROVAL_PROTECTION_MS
+        if (state.approvalState === 'submitted' && !withinProtection) {
+          state.approvalNonce = incomingNonce
           state.approvalState = 'idle'
+        } else if (state.approvalState === 'idle') {
+          state.approvalNonce = incomingNonce
         }
+
         const approvalEvent: DecisionEvent = {
-          id: `approval-req-${taskId}`,
+          id: `approval-req-${taskId}-${incomingNonce}`,
           timestamp: new Date().toLocaleTimeString(),
           phase: 'awaiting_approval',
           action: 'approval_required',
           message: '系统检测到可利用路径，等待人工审批。',
           tone: 'warning',
-          findings_count: (event as { findings_count?: number }).findings_count,
-          exploitable_count: (event as { exploitable_count?: number }).exploitable_count,
         } as DecisionEvent
         mergeDecisionEvents(state, [approvalEvent])
         if (state.task) {
@@ -190,12 +216,14 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
     try {
       await api.approveTask(taskId, approved)
       s.approvalState = 'submitted'
+      s.approvalSubmittedAt = Date.now()
       ElMessage.success(approved ? '已批准继续利用' : '已拒绝利用阶段')
     } catch (e: unknown) {
       const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
       const msg = detail || (e as Error)?.message || '审批失败'
       if (detail && /已在执行/.test(detail)) {
         s.approvalState = 'submitted'
+        s.approvalSubmittedAt = Date.now()
         ElMessage.info('审批已在执行中')
       } else {
         s.approvalState = 'error'

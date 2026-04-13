@@ -1,10 +1,12 @@
 <template>
   <div class="decision-page" v-loading="loading" element-loading-background="rgba(13,17,23,0.9)">
     <header class="decision-header">
-      <el-button link @click="router.push(`/tasks/${taskId}`)" class="back-btn">
-        <el-icon><ArrowLeft /></el-icon>
-        返回任务详情
-      </el-button>
+      <el-breadcrumb separator="/" class="page-breadcrumb">
+        <el-breadcrumb-item :to="{ path: '/dashboard' }">首页</el-breadcrumb-item>
+        <el-breadcrumb-item :to="{ path: '/tasks' }">任务列表</el-breadcrumb-item>
+        <el-breadcrumb-item :to="{ path: `/tasks/${taskId}` }">{{ task?.target || '任务详情' }}</el-breadcrumb-item>
+        <el-breadcrumb-item>决策视图</el-breadcrumb-item>
+      </el-breadcrumb>
       <div class="header-title-row">
         <div>
           <h2 class="target-title">{{ task?.target || '...' }}</h2>
@@ -445,9 +447,8 @@ onUnmounted(() => {
   background: var(--bg-elevated);
 }
 
-.back-btn {
-  color: var(--text-secondary) !important;
-  margin-bottom: 6px;
+.page-breadcrumb {
+  margin-bottom: 10px;
 }
 
 .header-title-row {

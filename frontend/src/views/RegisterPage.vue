@@ -65,7 +65,7 @@ async function submit() {
   try {
     const res = await api.authRegister(u, p, form.value.nickname.trim())
     auth.setAuth(res.token, res.user)
-    router.push('/start')
+    router.push('/dashboard')
   } catch (e) {
     errorMsg.value = e?.response?.data?.detail || e.message || '注册失败'
   } finally {

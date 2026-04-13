@@ -164,6 +164,7 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { api } from '@/api'
 import { trackEvent } from '@/metrics/tracker'
+import { useChartTheme } from '@/composables/useChartTheme'
 
 import VChart from 'vue-echarts'
 import { use } from 'echarts/core'
@@ -181,18 +182,10 @@ use([
   TitleComponent, TooltipComponent, LegendComponent, GridComponent,
 ])
 
-const C = {
-  cyan:   '#58b8c9',
-  teal:   '#4a9ea8',
-  mint:   '#5cbda3',
-  slate:  '#6889a0',
-  indigo: '#7680b8',
-  mauve:  '#8878a8',
-  ember:  '#a86070',
-  amber:  '#9c8a62',
-  dim:    '#4e5c68',
-}
-const PALETTE = [C.cyan, C.teal, C.mint, C.slate, C.indigo, C.mauve, C.amber, C.dim]
+const chartTheme = useChartTheme()
+const C = computed(() => chartTheme.colors())
+const PALETTE = computed(() => chartTheme.palette())
+const TIP_STYLE = computed(() => chartTheme.tooltipStyle())
 
 const autoRefresh = ref(true)
 const loading = ref(false)
@@ -242,39 +235,38 @@ const backendRows = computed(() =>
 
 // ── Chart Options ──
 
-const TIP_STYLE = {
-  backgroundColor: 'rgba(10,16,22,0.94)',
-  borderColor: 'rgba(88,184,201,0.18)',
-  textStyle: { color: '#9ab4c0', fontSize: 12 },
-}
-
 const taskDonutOption = computed(() => {
+  const c = C.value
+  const tip = TIP_STYLE.value
   const running = Number(system.value.running_tasks || 0)
   const completed = Number(system.value.completed_tasks || 0)
   const failed = Number(system.value.failed_tasks || 0)
   const total = running + completed + failed
+  const labelColor = chartTheme.textColor()
+  const mutedColor = chartTheme.mutedTextColor()
+  const bg = chartTheme.bgBase()
 
   return {
-    tooltip: { trigger: 'item', ...TIP_STYLE },
+    tooltip: { trigger: 'item', ...tip },
     legend: {
       bottom: 4,
       itemWidth: 10,
       itemHeight: 10,
-      textStyle: { color: '#8b9caa', fontSize: 11 },
+      textStyle: { color: labelColor, fontSize: 11 },
     },
     series: [{
       type: 'pie',
       radius: ['48%', '72%'],
       center: ['50%', '45%'],
       avoidLabelOverlap: true,
-      itemStyle: { borderRadius: 4, borderColor: '#0d1117', borderWidth: 2 },
+      itemStyle: { borderRadius: 4, borderColor: bg, borderWidth: 2 },
       label: {
         show: true,
         position: 'center',
         formatter: `{big|${total}}\n{sub|任务总数}`,
         rich: {
-          big: { fontSize: 22, fontWeight: 700, color: '#c0d4de', fontFamily: 'JetBrains Mono, monospace', lineHeight: 28 },
-          sub: { fontSize: 11, color: '#6a8090', lineHeight: 18 },
+          big: { fontSize: 22, fontWeight: 700, color: labelColor, fontFamily: 'JetBrains Mono, monospace', lineHeight: 28 },
+          sub: { fontSize: 11, color: mutedColor, lineHeight: 18 },
         },
       },
       emphasis: {
@@ -282,17 +274,19 @@ const taskDonutOption = computed(() => {
         itemStyle: { shadowBlur: 16, shadowColor: 'rgba(88,184,201,0.25)' },
       },
       data: [
-        { value: running, name: '运行中', itemStyle: { color: C.cyan } },
-        { value: completed, name: '已完成', itemStyle: { color: C.mint } },
-        { value: failed, name: '失败', itemStyle: { color: C.ember } },
+        { value: running, name: '运行中', itemStyle: { color: c.cyan } },
+        { value: completed, name: '已完成', itemStyle: { color: c.mint } },
+        { value: failed, name: '失败', itemStyle: { color: c.ember } },
       ].filter(d => d.value > 0),
     }],
   }
 })
 
 const successGaugeOption = computed(() => {
+  const c = C.value
   const rate = Number(invocation.value.success_rate || 0)
-  const gaugeColor = rate >= 85 ? C.cyan : rate >= 60 ? C.teal : C.ember
+  const gaugeColor = rate >= 85 ? c.cyan : rate >= 60 ? c.teal : c.ember
+  const mutedColor = chartTheme.mutedTextColor()
   return {
     series: [{
       type: 'gauge',
@@ -318,7 +312,7 @@ const successGaugeOption = computed(() => {
       title: {
         show: true,
         offsetCenter: [0, '68%'],
-        color: '#6a8090',
+        color: mutedColor,
         fontSize: 11,
       },
       detail: {
@@ -336,32 +330,36 @@ const successGaugeOption = computed(() => {
 })
 
 const topToolsBarOption = computed(() => {
+  const c = C.value
+  const tip = TIP_STYLE.value
+  const labelColor = chartTheme.textColor()
+  const mutedColor = chartTheme.mutedTextColor()
   const tools = (invocation.value.top_tools || []).slice(0, 8).reverse()
   if (!tools.length) {
-    return { title: { text: '暂无调用数据', left: 'center', top: 'center', textStyle: { color: '#6a8090', fontSize: 12, fontWeight: 400 } } }
+    return { title: { text: '暂无调用数据', left: 'center', top: 'center', textStyle: { color: mutedColor, fontSize: 12, fontWeight: 400 } } }
   }
   return {
     tooltip: {
       trigger: 'axis',
       axisPointer: { type: 'shadow' },
-      ...TIP_STYLE,
+      ...tip,
       formatter: (params) => {
         const p = params[0]
         const tool = tools[p.dataIndex]
-        return `<b style="color:#c0d4de">${tool.tool}</b><br/>调用: ${tool.calls} 次<br/>成功率: ${tool.success_rate}%<br/>平均耗时: ${Math.round(tool.avg_elapsed_ms)} ms`
+        return `<b style="color:${labelColor}">${tool.tool}</b><br/>调用: ${tool.calls} 次<br/>成功率: ${tool.success_rate}%<br/>平均耗时: ${Math.round(tool.avg_elapsed_ms)} ms`
       },
     },
     grid: { left: 8, right: 24, top: 8, bottom: 8, containLabel: true },
     xAxis: {
       type: 'value',
-      axisLabel: { color: '#6a8090', fontSize: 10 },
+      axisLabel: { color: mutedColor, fontSize: 10 },
       axisLine: { show: false },
       splitLine: { lineStyle: { color: 'rgba(88,184,201,0.06)' } },
     },
     yAxis: {
       type: 'category',
       data: tools.map(t => t.tool),
-      axisLabel: { color: '#8b9caa', fontSize: 11, width: 100, overflow: 'truncate' },
+      axisLabel: { color: labelColor, fontSize: 11, width: 100, overflow: 'truncate' },
       axisLine: { show: false },
       axisTick: { show: false },
     },
@@ -371,7 +369,7 @@ const topToolsBarOption = computed(() => {
       data: tools.map(t => ({
         value: t.calls,
         itemStyle: {
-          color: t.success_rate >= 80 ? C.cyan : t.success_rate >= 50 ? C.teal : C.ember,
+          color: t.success_rate >= 80 ? c.cyan : t.success_rate >= 50 ? c.teal : c.ember,
           borderRadius: [0, 4, 4, 0],
         },
       })),
@@ -380,25 +378,30 @@ const topToolsBarOption = computed(() => {
 })
 
 const categoryPieOption = computed(() => {
+  const tip = TIP_STYLE.value
+  const pal = PALETTE.value
+  const labelColor = chartTheme.textColor()
+  const mutedColor = chartTheme.mutedTextColor()
+  const bg = chartTheme.bgBase()
   const entries = categoryRows.value
   if (!entries.length) {
-    return { title: { text: '暂无工具数据', left: 'center', top: 'center', textStyle: { color: '#6a8090', fontSize: 12, fontWeight: 400 } } }
+    return { title: { text: '暂无工具数据', left: 'center', top: 'center', textStyle: { color: mutedColor, fontSize: 12, fontWeight: 400 } } }
   }
   return {
-    tooltip: { trigger: 'item', ...TIP_STYLE },
+    tooltip: { trigger: 'item', ...tip },
     legend: {
       orient: 'vertical',
       right: 8,
       top: 'center',
       itemWidth: 10,
       itemHeight: 10,
-      textStyle: { color: '#8b9caa', fontSize: 11 },
+      textStyle: { color: labelColor, fontSize: 11 },
     },
     series: [{
       type: 'pie',
       radius: ['36%', '66%'],
       center: ['35%', '50%'],
-      itemStyle: { borderRadius: 4, borderColor: '#0d1117', borderWidth: 2 },
+      itemStyle: { borderRadius: 4, borderColor: bg, borderWidth: 2 },
       label: { show: false },
       emphasis: {
         itemStyle: { shadowBlur: 16, shadowColor: 'rgba(88,184,201,0.20)' },
@@ -406,7 +409,7 @@ const categoryPieOption = computed(() => {
       data: entries.map((e, i) => ({
         value: e.count,
         name: e.name,
-        itemStyle: { color: PALETTE[i % PALETTE.length] },
+        itemStyle: { color: pal[i % pal.length] },
       })),
     }],
   }

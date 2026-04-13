@@ -206,6 +206,19 @@ class PentestState(BaseModel):
 	path_contents: list[dict[str, Any]] = Field(default_factory=list)
 	dirlist_tree: str = ""
 	dirlist_interesting_files: list[str] = Field(default_factory=list)
+
+	# ── LLM 自适应目录探测引擎产出 ──────────────────────
+	dir_scan_strategy: dict = Field(default_factory=dict)
+	dir_intel: dict = Field(default_factory=dict)
+	supplementary_dir_scan_done: bool = False
+
+	# ── intel_harvest 阶段产出 ──────────────────────────
+	# 文件情报提取结果: [{"path": "/backup/db.sql", "content_snippet": "...", "intel": {LLM结果}}]
+	intel_files: list[dict[str, Any]] = Field(default_factory=list)
+	# 页面参数发现+验证: [{"url": "http://x/info.php?file=", "param_name": "file",
+	#   "method": "GET", "vuln_type": "lfi", "verified": True, "evidence": "..."}]
+	page_params: list[dict[str, Any]] = Field(default_factory=list)
+
 	subdomains: list[str] = Field(default_factory=list)
 	raw_recon: dict = Field(default_factory=dict)
 
@@ -229,6 +242,7 @@ class PentestState(BaseModel):
 	foothold_status: str = "none"
 	credential_store: list[dict[str, Any]] = Field(default_factory=list)
 	loot_store: list[dict[str, Any]] = Field(default_factory=list)
+
 	privesc_hypotheses: list[dict[str, Any]] = Field(default_factory=list)
 	# user_proof / root_proof / report_ready 等
 	objective_status: dict[str, Any] = Field(default_factory=dict)

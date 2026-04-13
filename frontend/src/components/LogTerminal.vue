@@ -16,10 +16,11 @@
             <CopyDocument/>
           </el-icon>
         </el-button>
-        <el-button link size="small" @click="clearView" class="action-btn">
+        <el-button link size="small" @click="toggleHidden" class="action-btn">
           <el-icon>
-            <Delete/>
+            <component :is="hidden ? 'Monitor' : 'Remove'" />
           </el-icon>
+          <span class="action-label">{{ hidden ? '显示日志' : '隐藏日志' }}</span>
         </el-button>
       </div>
     </div>
@@ -74,9 +75,9 @@ const props = defineProps({
 
 const terminalRef = ref()
 const autoScroll = ref(true)
-const cleared = ref(false)
+const hidden = ref(false)
 
-const displayLogs = computed(() => cleared.value ? [] : props.logs)
+const displayLogs = computed(() => hidden.value ? [] : props.logs)
 const keyEvents = computed(() =>
   props.logs
     .filter(line =>
@@ -106,23 +107,28 @@ function getLineClass(line) {
   return ''
 }
 
+function escapeHtml(text) {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+}
+
 function formatLine(line) {
-  // Highlight timestamp [HH:MM:SS]
-  let out = line.replace(
+  let out = escapeHtml(line)
+  out = out.replace(
       /\[(\d{2}:\d{2}:\d{2})\]/g,
       '<span class="ts">[$1]</span>'
   )
-  // Highlight phase tags [phase_name]
   out = out.replace(
       /\[([a-z_]+)\]/g,
       '<span class="phase-tag">[$1]</span>'
   )
-  // Highlight IP/URL
   out = out.replace(
       /(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d+)?)/g,
       '<span class="hl-ip">$1</span>'
   )
-  // Highlight numbers with units
   out = out.replace(
       /\b(\d+)\s*(个|端口|漏洞|条|ms|s)\b/g,
       '<span class="hl-num">$1</span>$2'
@@ -135,8 +141,8 @@ function copyLogs() {
   ElMessage.success('日志已复制')
 }
 
-function clearView() {
-  cleared.value = true
+function toggleHidden() {
+  hidden.value = !hidden.value
 }
 </script>
 
@@ -202,6 +208,10 @@ function clearView() {
 
 .action-btn:hover {
   color: var(--text-secondary) !important;
+}
+.action-label {
+  font-size: 11px;
+  margin-left: 2px;
 }
 
 .terminal-body {

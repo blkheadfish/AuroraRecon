@@ -3,8 +3,9 @@
     <router-view />
   </div>
 
-  <el-container v-else class="app-layout">
-    <el-aside :width="sidebarCollapsed ? '64px' : '220px'" class="sidebar" :class="{ collapsed: sidebarCollapsed }">
+  <el-container v-else class="app-layout" :class="{ 'mobile-layout': isMobile }">
+    <div v-if="isMobile && !sidebarCollapsed" class="mobile-overlay" @click="uiPrefs.sidebarCollapsed = true"></div>
+    <el-aside :width="sidebarCollapsed ? (isMobile ? '0px' : '64px') : '220px'" class="sidebar" :class="{ collapsed: sidebarCollapsed, 'mobile-sidebar': isMobile }">
       <div class="sidebar-logo">
         <el-icon class="logo-icon"><Monitor /></el-icon>
         <transition name="fade-text">
@@ -85,22 +86,43 @@
     </el-aside>
 
     <el-main class="main-content">
+      <div v-if="isMobile" class="mobile-topbar">
+        <el-button link @click="uiPrefs.sidebarCollapsed = !uiPrefs.sidebarCollapsed" class="hamburger-btn">
+          <el-icon :size="20"><Expand /></el-icon>
+        </el-button>
+        <span class="mobile-title">AuroraRecon</span>
+      </div>
       <router-view />
     </el-main>
   </el-container>
 </template>
 
 <script setup>
-import { computed, ref, onMounted } from 'vue'
+import { computed, ref, watch, onMounted, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { api } from '@/api'
 import { useTheme } from '@/composables/useTheme'
 import { useUiPrefsStore } from '@/stores/uiPrefs'
 import { storeToRefs } from 'pinia'
 
+const MOBILE_BREAKPOINT = 768
+
 const route = useRoute()
 const uiPrefs = useUiPrefsStore()
 const { sidebarCollapsed } = storeToRefs(uiPrefs)
+const isMobile = ref(window.innerWidth < MOBILE_BREAKPOINT)
+
+function onResize() {
+  const nowMobile = window.innerWidth < MOBILE_BREAKPOINT
+  if (nowMobile && !isMobile.value) {
+    uiPrefs.sidebarCollapsed = true
+  }
+  isMobile.value = nowMobile
+}
+
+watch(() => route.path, () => {
+  if (isMobile.value) uiPrefs.sidebarCollapsed = true
+})
 
 const hideSidebar = computed(() =>
   ['/start', '/login', '/register'].includes(route.path)
@@ -127,10 +149,19 @@ async function checkApi() {
   }
 }
 
+let apiCheckTimer = null
+
 onMounted(() => {
   initTheme()
   checkApi()
-  setInterval(checkApi, 30000)
+  apiCheckTimer = setInterval(checkApi, 30000)
+  window.addEventListener('resize', onResize)
+  onResize()
+})
+
+onUnmounted(() => {
+  if (apiCheckTimer) clearInterval(apiCheckTimer)
+  window.removeEventListener('resize', onResize)
 })
 </script>
 
@@ -330,5 +361,53 @@ onMounted(() => {
 .fade-text-enter-from,
 .fade-text-leave-to {
   opacity: 0;
+}
+
+/* ── Mobile ── */
+.mobile-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 999;
+  background: rgba(0, 0, 0, 0.45);
+}
+
+.mobile-sidebar {
+  position: fixed !important;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  z-index: 1000;
+}
+
+.mobile-sidebar.collapsed {
+  width: 0 !important;
+  overflow: hidden;
+}
+
+.mobile-topbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-surface);
+}
+
+.hamburger-btn {
+  color: var(--text-secondary) !important;
+  padding: 4px !important;
+}
+
+.mobile-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text-primary);
+  font-family: var(--font-orbitron);
+}
+
+@media (max-width: 768px) {
+  .summary-grid {
+    grid-template-columns: repeat(2, 1fr) !important;
+  }
 }
 </style>

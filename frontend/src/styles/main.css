@@ -3,7 +3,7 @@
    Theme: Dark (default) + Light mode
    ========================================== */
 
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&family=Orbitron:wght@500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&family=Orbitron:wght@500;600;700&display=swap');
 
 /* ── Dark Theme (default) ────────────────────────── */
 :root,
@@ -61,8 +61,7 @@
 
     --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
     --font-sans: 'Inter', -apple-system, sans-serif;
-    --font-display: 'Space Grotesk', 'Inter', -apple-system, sans-serif;
-    --font-orbitron: 'Orbitron', 'Space Grotesk', 'Inter', -apple-system, sans-serif;
+    --font-orbitron: 'Orbitron', 'Inter', -apple-system, sans-serif;
     --start-grid-line: rgba(139, 148, 158, 0.2);
     --start-scanline: rgba(56, 139, 253, 0.14);
     --start-panel-bg: rgba(22, 27, 34, 0.72);
@@ -226,255 +225,254 @@ html, body, #app {
 .hljs-params { color: var(--hljs-fg) !important; }
 
 /* ── Element Plus dynamic theme overrides ──────── */
-.el-menu {
-    background-color: var(--bg-surface) !important;
-    border-right-color: var(--border) !important;
+#app .el-menu {
+    background-color: var(--bg-surface);
+    border-right-color: var(--border);
 }
-.el-menu-item {
-    color: var(--text-secondary) !important;
-    height: 44px !important;
-    line-height: 44px !important;
+#app .el-menu-item {
+    color: var(--text-secondary);
+    height: 44px;
+    line-height: 44px;
 }
-.el-menu-item:hover,
-.el-menu-item.is-active {
-    background-color: var(--bg-hover) !important;
-    color: var(--text-primary) !important;
+#app .el-menu-item:hover,
+#app .el-menu-item.is-active {
+    background-color: var(--bg-hover);
+    color: var(--text-primary);
 }
-.el-menu-item.is-active {
-    color: var(--accent-blue) !important;
-}
-
-.el-card {
-    background: var(--bg-surface) !important;
-    border-color: var(--border) !important;
-    color: var(--text-primary) !important;
-}
-.el-card__header {
-    border-bottom-color: var(--border) !important;
-    padding: 14px 20px !important;
-}
-.el-card__body {
-    padding: 16px 20px !important;
+#app .el-menu-item.is-active {
+    color: var(--accent-blue);
 }
 
-.el-dialog {
-    background: var(--bg-surface) !important;
-    border: 1px solid var(--border) !important;
-    border-radius: var(--radius-lg) !important;
+#app .el-card {
+    background: var(--bg-surface);
+    border-color: var(--border);
+    color: var(--text-primary);
 }
-.el-dialog__header {
-    border-bottom: 1px solid var(--border) !important;
-    padding: 18px 24px 16px !important;
+#app .el-card__header {
+    border-bottom-color: var(--border);
+    padding: 14px 20px;
 }
-.el-dialog__title {
-    color: var(--text-primary) !important;
-    font-weight: 600 !important;
-}
-.el-dialog__body {
-    padding: 24px !important;
-    color: var(--text-primary) !important;
-}
-.el-dialog__footer {
-    border-top: 1px solid var(--border) !important;
-    padding: 16px 24px !important;
+#app .el-card__body {
+    padding: 16px 20px;
 }
 
-.el-form-item__label {
-    color: var(--text-secondary) !important;
-    font-size: 13px !important;
+#app .el-dialog {
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
 }
-.el-input__wrapper {
-    background: var(--bg-elevated) !important;
-    box-shadow: 0 0 0 1px var(--border) !important;
+#app .el-dialog__header {
+    border-bottom: 1px solid var(--border);
+    padding: 18px 24px 16px;
 }
-.el-input__wrapper:hover {
-    box-shadow: 0 0 0 1px var(--text-muted) !important;
+#app .el-dialog__title {
+    color: var(--text-primary);
+    font-weight: 600;
 }
-.el-input__wrapper.is-focus {
-    box-shadow: 0 0 0 1px var(--accent-blue) !important;
+#app .el-dialog__body {
+    padding: 24px;
+    color: var(--text-primary);
 }
-.el-select__wrapper {
-    background: var(--bg-elevated) !important;
-    box-shadow: 0 0 0 1px var(--border) !important;
-}
-.el-select__wrapper:hover {
-    box-shadow: 0 0 0 1px var(--text-muted) !important;
-}
-.el-select__wrapper.is-focused {
-    box-shadow: 0 0 0 1px var(--accent-blue) !important;
-}
-.el-select__placeholder {
-    color: var(--text-muted) !important;
-}
-.el-input__inner {
-    color: var(--text-primary) !important;
-    background: transparent !important;
-    font-family: var(--font-sans) !important;
-}
-.el-textarea__inner {
-    background: var(--bg-elevated) !important;
-    color: var(--text-primary) !important;
-    border-color: var(--border) !important;
-}
-.el-textarea__inner:focus {
-    border-color: var(--accent-blue) !important;
+#app .el-dialog__footer {
+    border-top: 1px solid var(--border);
+    padding: 16px 24px;
 }
 
-.el-button {
-    border-radius: var(--radius-md) !important;
-    font-weight: 500 !important;
+#app .el-form-item__label {
+    color: var(--text-secondary);
+    font-size: 13px;
 }
-.el-button:not(.el-button--primary):not(.el-button--danger):not(.is-text):not(.is-link):not(.btn-approve) {
-    background: var(--bg-elevated) !important;
-    border-color: var(--border) !important;
-    color: var(--text-primary) !important;
+#app .el-input__wrapper {
+    background: var(--bg-elevated);
+    box-shadow: 0 0 0 1px var(--border);
 }
-.el-button:not(.el-button--primary):not(.el-button--danger):not(.is-text):not(.is-link):not(.btn-approve):hover {
-    background: var(--bg-hover) !important;
-    border-color: var(--text-muted) !important;
+#app .el-input__wrapper:hover {
+    box-shadow: 0 0 0 1px var(--text-muted);
 }
-/* Force custom pale-green approval button, overriding generic button skin. */
-.approval-wrap .right .el-button.btn-approve:not(.el-button--primary):not(.el-button--danger):not(.is-text):not(.is-link) {
-    background: color-mix(in srgb, var(--accent-green) 18%, var(--bg-elevated)) !important;
-    border-color: color-mix(in srgb, var(--accent-green) 52%, var(--border)) !important;
-    color: color-mix(in srgb, var(--accent-green) 84%, var(--text-primary)) !important;
-    font-weight: 600 !important;
+#app .el-input__wrapper.is-focus {
+    box-shadow: 0 0 0 1px var(--accent-blue);
 }
-.approval-wrap .right .el-button.btn-approve:not(.el-button--primary):not(.el-button--danger):not(.is-text):not(.is-link):hover,
-.approval-wrap .right .el-button.btn-approve:not(.el-button--primary):not(.el-button--danger):not(.is-text):not(.is-link):focus-visible,
-.approval-wrap .right .el-button.btn-approve:not(.el-button--primary):not(.el-button--danger):not(.is-text):not(.is-link):active {
-    background: color-mix(in srgb, var(--accent-green) 28%, var(--bg-hover)) !important;
-    border-color: color-mix(in srgb, var(--accent-green) 70%, var(--border)) !important;
-    color: color-mix(in srgb, var(--accent-green) 92%, var(--text-primary)) !important;
+#app .el-select__wrapper {
+    background: var(--bg-elevated);
+    box-shadow: 0 0 0 1px var(--border);
 }
-.approval-wrap .right .el-button.btn-approve.is-disabled,
-.approval-wrap .right .el-button.btn-approve.is-loading {
-    background: color-mix(in srgb, var(--accent-green) 12%, var(--bg-elevated)) !important;
-    border-color: color-mix(in srgb, var(--accent-green) 40%, var(--border)) !important;
-    color: color-mix(in srgb, var(--accent-green) 64%, var(--text-muted)) !important;
+#app .el-select__wrapper:hover {
+    box-shadow: 0 0 0 1px var(--text-muted);
+}
+#app .el-select__wrapper.is-focused {
+    box-shadow: 0 0 0 1px var(--accent-blue);
+}
+#app .el-select__placeholder {
+    color: var(--text-muted);
+}
+#app .el-input__inner {
+    color: var(--text-primary);
+    background: transparent;
+    font-family: var(--font-sans);
+}
+#app .el-textarea__inner {
+    background: var(--bg-elevated);
+    color: var(--text-primary);
+    border-color: var(--border);
+}
+#app .el-textarea__inner:focus {
+    border-color: var(--accent-blue);
+}
+
+#app .el-button {
+    border-radius: var(--radius-md);
+    font-weight: 500;
+}
+#app .el-button:not(.el-button--primary):not(.el-button--danger):not(.is-text):not(.is-link):not(.btn-approve) {
+    background: var(--bg-elevated);
+    border-color: var(--border);
+    color: var(--text-primary);
+}
+#app .el-button:not(.el-button--primary):not(.el-button--danger):not(.is-text):not(.is-link):not(.btn-approve):hover {
+    background: var(--bg-hover);
+    border-color: var(--text-muted);
+}
+#app .approval-wrap .right .el-button.btn-approve {
+    background: color-mix(in srgb, var(--accent-green) 18%, var(--bg-elevated));
+    border-color: color-mix(in srgb, var(--accent-green) 52%, var(--border));
+    color: color-mix(in srgb, var(--accent-green) 84%, var(--text-primary));
+    font-weight: 600;
+}
+#app .approval-wrap .right .el-button.btn-approve:hover,
+#app .approval-wrap .right .el-button.btn-approve:focus-visible,
+#app .approval-wrap .right .el-button.btn-approve:active {
+    background: color-mix(in srgb, var(--accent-green) 28%, var(--bg-hover));
+    border-color: color-mix(in srgb, var(--accent-green) 70%, var(--border));
+    color: color-mix(in srgb, var(--accent-green) 92%, var(--text-primary));
+}
+#app .approval-wrap .right .el-button.btn-approve.is-disabled,
+#app .approval-wrap .right .el-button.btn-approve.is-loading {
+    background: color-mix(in srgb, var(--accent-green) 12%, var(--bg-elevated));
+    border-color: color-mix(in srgb, var(--accent-green) 40%, var(--border));
+    color: color-mix(in srgb, var(--accent-green) 64%, var(--text-muted));
     opacity: 0.9;
 }
-.el-button--primary {
-    background: color-mix(in srgb, var(--accent-blue) 88%, var(--bg-surface)) !important;
-    border-color: color-mix(in srgb, var(--accent-blue) 94%, var(--bg-surface)) !important;
+#app .el-button--primary {
+    background: color-mix(in srgb, var(--accent-blue) 88%, var(--bg-surface));
+    border-color: color-mix(in srgb, var(--accent-blue) 94%, var(--bg-surface));
 }
-.el-button--primary:hover {
-    background: color-mix(in srgb, var(--accent-blue) 97%, var(--bg-surface)) !important;
-    border-color: color-mix(in srgb, var(--accent-blue) 100%, var(--bg-surface)) !important;
+#app .el-button--primary:hover {
+    background: color-mix(in srgb, var(--accent-blue) 97%, var(--bg-surface));
+    border-color: color-mix(in srgb, var(--accent-blue) 100%, var(--bg-surface));
     opacity: 1;
 }
-.el-button--danger {
-    background: transparent !important;
-    border-color: var(--accent-red) !important;
-    color: var(--accent-red) !important;
+#app .el-button--danger {
+    background: transparent;
+    border-color: var(--accent-red);
+    color: var(--accent-red);
 }
-.el-button.is-link {
-    color: color-mix(in srgb, var(--accent-blue) 84%, var(--text-primary)) !important;
+#app .el-button.is-link {
+    color: color-mix(in srgb, var(--accent-blue) 84%, var(--text-primary));
 }
-.el-button.is-link:hover {
-    color: color-mix(in srgb, var(--accent-blue) 92%, #ffffff) !important;
-}
-
-.el-table {
-    background: var(--bg-surface) !important;
-    color: var(--text-primary) !important;
-    --el-table-border-color: var(--border-muted) !important;
-    --el-table-header-bg-color: var(--bg-elevated) !important;
-    --el-table-row-hover-bg-color: var(--bg-hover) !important;
-    --el-table-bg-color: var(--bg-surface) !important;
-    --el-table-tr-bg-color: var(--bg-surface) !important;
-    --el-table-text-color: var(--text-primary) !important;
-    --el-table-header-text-color: var(--text-secondary) !important;
-}
-.el-table tr,
-.el-table th.el-table__cell {
-    background: var(--bg-surface) !important;
-}
-.el-table td.el-table__cell,
-.el-table th.el-table__cell {
-    border-bottom-color: var(--border-muted) !important;
-}
-.el-table .el-table__row:hover > td.el-table__cell {
-    background: var(--bg-hover) !important;
-}
-.el-table__header-wrapper th {
-    color: var(--text-secondary) !important;
-    font-size: 12px !important;
-    text-transform: uppercase !important;
-    letter-spacing: 0.05em !important;
-    background: var(--bg-elevated) !important;
+#app .el-button.is-link:hover {
+    color: color-mix(in srgb, var(--accent-blue) 92%, #ffffff);
 }
 
-.el-tabs__nav-wrap::after {
-    background: var(--border) !important;
+#app .el-table {
+    --el-table-border-color: var(--border-muted);
+    --el-table-header-bg-color: var(--bg-elevated);
+    --el-table-row-hover-bg-color: var(--bg-hover);
+    --el-table-bg-color: var(--bg-surface);
+    --el-table-tr-bg-color: var(--bg-surface);
+    --el-table-text-color: var(--text-primary);
+    --el-table-header-text-color: var(--text-secondary);
+    background: var(--bg-surface);
+    color: var(--text-primary);
 }
-.el-tabs__item {
-    color: var(--text-secondary) !important;
+#app .el-table tr,
+#app .el-table th.el-table__cell {
+    background: var(--bg-surface);
 }
-.el-tabs__item.is-active {
-    color: var(--text-primary) !important;
+#app .el-table td.el-table__cell,
+#app .el-table th.el-table__cell {
+    border-bottom-color: var(--border-muted);
 }
-.el-tabs__active-bar {
-    background: var(--accent-blue) !important;
+#app .el-table .el-table__row:hover > td.el-table__cell {
+    background: var(--bg-hover);
 }
-
-.el-tag {
-    border-radius: var(--radius-sm) !important;
-    font-family: var(--font-mono) !important;
-    font-size: 11px !important;
-}
-.el-tag--success {
-    background: color-mix(in srgb, var(--accent-green) 24%, var(--bg-elevated)) !important;
-    border-color: color-mix(in srgb, var(--accent-green) 52%, var(--border)) !important;
-    color: color-mix(in srgb, var(--accent-green) 86%, var(--text-primary)) !important;
-}
-.el-tag--warning {
-    background: color-mix(in srgb, var(--accent-yellow) 20%, var(--bg-elevated)) !important;
-    border-color: color-mix(in srgb, var(--accent-yellow) 48%, var(--border)) !important;
-    color: color-mix(in srgb, var(--accent-yellow) 84%, var(--text-primary)) !important;
-}
-.el-tag--danger {
-    background: color-mix(in srgb, var(--accent-red) 20%, var(--bg-elevated)) !important;
-    border-color: color-mix(in srgb, var(--accent-red) 48%, var(--border)) !important;
-    color: color-mix(in srgb, var(--accent-red) 86%, var(--text-primary)) !important;
-}
-.el-tag--info {
-    background: color-mix(in srgb, var(--bg-hover) 86%, var(--bg-elevated)) !important;
-    border-color: var(--border) !important;
-    color: var(--text-secondary) !important;
-}
-.el-empty__description p {
-    color: var(--text-muted) !important;
+#app .el-table__header-wrapper th {
+    color: var(--text-secondary);
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    background: var(--bg-elevated);
 }
 
-.el-tooltip__popper {
-    background: var(--bg-elevated) !important;
-    border-color: var(--border) !important;
-    color: var(--text-primary) !important;
+#app .el-tabs__nav-wrap::after {
+    background: var(--border);
 }
-.el-select-dropdown,
-.el-dropdown-menu {
-    background: var(--bg-surface) !important;
-    border-color: var(--border) !important;
+#app .el-tabs__item {
+    color: var(--text-secondary);
 }
-.el-select-dropdown__item {
-    color: var(--text-primary) !important;
+#app .el-tabs__item.is-active {
+    color: var(--text-primary);
 }
-.el-select-dropdown__item.hover,
-.el-select-dropdown__item:hover {
-    background: var(--bg-hover) !important;
+#app .el-tabs__active-bar {
+    background: var(--accent-blue);
 }
-.el-dropdown-menu__item {
-    color: var(--text-primary) !important;
+
+#app .el-tag {
+    border-radius: var(--radius-sm);
+    font-family: var(--font-mono);
+    font-size: 11px;
 }
-.el-dropdown-menu__item:hover {
-    background: var(--bg-hover) !important;
+#app .el-tag--success {
+    background: color-mix(in srgb, var(--accent-green) 24%, var(--bg-elevated));
+    border-color: color-mix(in srgb, var(--accent-green) 52%, var(--border));
+    color: color-mix(in srgb, var(--accent-green) 86%, var(--text-primary));
 }
-.el-loading-mask {
-    background-color: var(--el-mask-color) !important;
+#app .el-tag--warning {
+    background: color-mix(in srgb, var(--accent-yellow) 20%, var(--bg-elevated));
+    border-color: color-mix(in srgb, var(--accent-yellow) 48%, var(--border));
+    color: color-mix(in srgb, var(--accent-yellow) 84%, var(--text-primary));
 }
-.el-skeleton__item {
-    background: var(--bg-hover) !important;
+#app .el-tag--danger {
+    background: color-mix(in srgb, var(--accent-red) 20%, var(--bg-elevated));
+    border-color: color-mix(in srgb, var(--accent-red) 48%, var(--border));
+    color: color-mix(in srgb, var(--accent-red) 86%, var(--text-primary));
+}
+#app .el-tag--info {
+    background: color-mix(in srgb, var(--bg-hover) 86%, var(--bg-elevated));
+    border-color: var(--border);
+    color: var(--text-secondary);
+}
+#app .el-empty__description p {
+    color: var(--text-muted);
+}
+
+#app .el-tooltip__popper {
+    background: var(--bg-elevated);
+    border-color: var(--border);
+    color: var(--text-primary);
+}
+#app .el-select-dropdown,
+#app .el-dropdown-menu {
+    background: var(--bg-surface);
+    border-color: var(--border);
+}
+#app .el-select-dropdown__item {
+    color: var(--text-primary);
+}
+#app .el-select-dropdown__item.hover,
+#app .el-select-dropdown__item:hover {
+    background: var(--bg-hover);
+}
+#app .el-dropdown-menu__item {
+    color: var(--text-primary);
+}
+#app .el-dropdown-menu__item:hover {
+    background: var(--bg-hover);
+}
+#app .el-loading-mask {
+    background-color: var(--el-mask-color);
+}
+#app .el-skeleton__item {
+    background: var(--bg-hover);
 }
 
 /* Severity badges */
@@ -492,11 +490,11 @@ html, body, #app {
 .phase-report   { color: var(--phase-report); }
 
 /* Switch override for dark/light */
-.el-switch {
-    --el-switch-on-color: var(--accent-blue) !important;
+#app .el-switch {
+    --el-switch-on-color: var(--accent-blue);
 }
 
 /* Popconfirm */
-.el-popconfirm {
-    background: var(--bg-surface) !important;
+#app .el-popconfirm {
+    background: var(--bg-surface);
 }

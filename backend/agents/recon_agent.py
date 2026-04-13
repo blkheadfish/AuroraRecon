@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress as _ipaddress
+import json
 import logging
 import os
 import re
@@ -111,6 +112,7 @@ class ReconAgent:
 		raw_gobuster = ""
 		dir_coverage: dict = {}
 
+		scan_strategy: dict = {}
 		if web_ports:
 			primary_scheme = "https" if web_ports[0].port in (443, 8443) else "http"
 			primary_target = f"{primary_scheme}://{target}:{web_ports[0].port}"
@@ -120,6 +122,11 @@ class ReconAgent:
 			)
 			tech_hints = await self._quick_fingerprint(
 				target, web_ports, task_id, log_callback,
+			)
+
+			# ── Phase 1: LLM Pre-Scan Strategy ──
+			scan_strategy = await self._llm_plan_dir_strategy(
+				primary_target, tech_hints, ports, has_waf, log_callback,
 			)
 
 			aggregator = PathAggregator()
@@ -136,6 +143,8 @@ class ReconAgent:
 				_, raw_out, coverage_rpt, port_aggregator = await self._dir_scan(
 					web_target, task_id, log_callback,
 					has_waf=has_waf, tech_hints=tech_hints,
+					scan_strategy=scan_strategy,
+					record_callback=record_callback,
 				)
 				raw_outputs_all.append(raw_out)
 				coverage_reports.append(coverage_rpt.to_log_dict())
@@ -144,6 +153,13 @@ class ReconAgent:
 						aggregator._entries[p_entry.path].merge(p_entry)
 					else:
 						aggregator._entries[p_entry.path] = p_entry
+
+			# ── Phase 3: Post-Scan Deep Dive ──
+			await self._llm_deep_dive(
+				primary_target, tech_hints, aggregator,
+				task_id, log_callback, record_callback,
+				scan_strategy=scan_strategy,
+			)
 
 			path_contents = await self._probe_path_contents(
 				web_target=primary_target,
@@ -170,6 +186,7 @@ class ReconAgent:
 			"nmap_vuln_hints": nmap_vuln_hints,
 			"dir_coverage": dir_coverage,
 			"llm_recon_hints": llm_recon_hints,
+			"scan_strategy": scan_strategy,
 		}
 
 	async def _nmap_scan(
@@ -602,8 +619,12 @@ class ReconAgent:
 		log_callback: LogCallback = None,
 		has_waf: bool = False,
 		tech_hints: list[str] | None = None,
+		scan_strategy: dict | None = None,
+		record_callback: RecordCallback = None,
 	) -> tuple[list[str], str, CoverageReport, PathAggregator]:
-		"""Planner-driven multi-tool directory discovery chain."""
+		"""LLM-in-the-loop adaptive directory discovery via DirScanOrchestrator."""
+		from backend.tools.dir_scan_orchestrator import DirScanOrchestrator
+
 		planner = ToolCoveragePlanner(
 			categories=["dir_discovery"],
 			max_tools=6,
@@ -611,94 +632,389 @@ class ReconAgent:
 		)
 		plan = planner.build_plan(
 			web_target, has_waf=has_waf, tech_hints=tech_hints,
+			scan_strategy=scan_strategy,
 		)
 		aggregator = PathAggregator()
-		raw_outputs: list[str] = []
 
-		for tool_spec in plan:
-			should, skip_reason = planner.should_run(tool_spec)
-			if not should:
-				planner.record_result(
-					tool_spec["name"], "skipped", skip_reason=skip_reason,
-				)
-				if log_callback:
-					await log_callback(
-						f"[ReconAgent] 跳过 {tool_spec['name']}: {skip_reason}"
-					)
-				continue
+		orchestrator = DirScanOrchestrator(
+			executor=self.executor,
+			aggregator=aggregator,
+			planner=planner,
+			log_callback=log_callback,
+			record_callback=record_callback,
+			task_id=task_id,
+		)
+		result = await orchestrator.run(plan, web_target, scan_strategy)
 
-			tool_name = tool_spec["name"]
-			runtime_command = str(tool_spec.get("runtime_command") or tool_spec.get("script") or "").strip()
-			command_preview = " ".join(runtime_command.split())
-			if len(command_preview) > 260:
-				command_preview = command_preview[:260] + "..."
-			if log_callback:
-				await log_callback(
-					f"[ReconAgent] 目录发现: 执行 {tool_name} | "
-					f"timeout={tool_spec['timeout']}s | cmd={command_preview}"
-				)
-			t0 = time.monotonic()
-			try:
-				result: ExecuteResult = await self.executor.run_script(
-					script_content=tool_spec["script"],
-					timeout=tool_spec["timeout"],
-					task_id=task_id,
-					log_callback=log_callback,
-					record_purpose=f"{tool_name}_dir_scan",
-					record_runtime_command=runtime_command,
-				)
-				elapsed = time.monotonic() - t0
-				stdout = result.stdout or ""
-				raw_outputs.append(f"=== {tool_name} ===\n{stdout}")
-
-				new_count = aggregator.ingest(tool_name, stdout, web_target)
-				actionable_count = len(aggregator.get_actionable_paths())
-				planner.record_result(
-					tool_name, "executed",
-					paths_found=new_count,
-					actionable_found=actionable_count,
-					raw_len=len(stdout),
-					elapsed=elapsed,
-				)
-				if log_callback:
-					await log_callback(
-						f"[ReconAgent] {tool_name} 完成: "
-						f"+{new_count} 路径 (累计 {aggregator.count}), "
-						f"{elapsed:.1f}s"
-					)
-			except asyncio.TimeoutError:
-				elapsed = time.monotonic() - t0
-				planner.record_result(
-					tool_name, "timeout", elapsed=elapsed,
-					skip_reason=f"timeout after {elapsed:.0f}s",
-				)
-				if log_callback:
-					await log_callback(
-						f"[ReconAgent] {tool_name} 超时 ({elapsed:.0f}s)"
-					)
-			except Exception as e:
-				elapsed = time.monotonic() - t0
-				planner.record_result(
-					tool_name, "failed",
-					skip_reason=str(e)[:200], elapsed=elapsed,
-				)
-				logger.warning(f"[ReconAgent] {tool_name} 异常: {e}")
-
-		report = planner.coverage_report()
-		paths = aggregator.get_actionable_paths()
-		combined_raw = "\n".join(raw_outputs)
-
-		if log_callback:
-			await log_callback(
-				f"[ReconAgent] 目录发现完成: {len(paths)} 路径, "
-				f"覆盖率{'达标' if report.satisfied else '未达标'} "
-				f"({report.total_elapsed:.0f}s)"
-			)
-		if not report.satisfied:
-			for v in report.violations:
+		if not result.coverage_report.satisfied:
+			for v in result.coverage_report.violations:
 				logger.warning(f"[ReconAgent] 覆盖率不足: {v}")
 
-		return paths, combined_raw, report, aggregator
+		return result.paths, result.raw_output, result.coverage_report, result.aggregator
+
+	# ── Phase 1: LLM Pre-Scan Strategy ──────────────────────
+
+	async def _llm_plan_dir_strategy(
+		self,
+		primary_target: str,
+		tech_hints: list[str],
+		ports: list[PortInfo],
+		has_waf: bool,
+		log_callback: LogCallback = None,
+	) -> dict:
+		"""Ask LLM to plan directory scanning strategy based on fingerprint intel."""
+		try:
+			from backend.llm.router import LLMRouter
+			from backend.llm.prompts.templates import DIR_SCAN_STRATEGY
+
+			service_info = ", ".join(
+				f"{p.port}/{p.service}({p.version[:40]})" for p in ports[:15]
+			)
+			initial_resp = ""
+			try:
+				probe = await self.executor.run_script(
+					script_content=(
+						f'curl -sS -L --max-time 6 -D - -o /dev/null "{primary_target}" 2>/dev/null '
+						f'| head -20'
+					),
+					timeout=12,
+				)
+				initial_resp = (probe.stdout or "")[:800]
+			except Exception:
+				pass
+
+			prompt = DIR_SCAN_STRATEGY.format(
+				target_url=primary_target,
+				tech_hints=", ".join(tech_hints) if tech_hints else "未检测到",
+				service_info=service_info or "无",
+				waf_status="检测到 WAF" if has_waf else "未检测到 WAF",
+				initial_response=initial_resp or "无",
+			)
+
+			llm = LLMRouter()
+			raw = await llm.chat(
+				prompt, response_format="json", temperature=0.1, max_tokens=1536,
+			)
+			strategy = json.loads(raw)
+			if log_callback:
+				assessment = strategy.get("tech_assessment", "")
+				profile = strategy.get("scan_profile", "balanced")
+				n_priority = len(strategy.get("priority_paths", []))
+				await log_callback(
+					f"[ReconAgent] LLM 扫描策略: {assessment} "
+					f"(profile={profile}, priority_paths={n_priority})"
+				)
+			return strategy
+		except Exception as exc:
+			logger.warning(f"[ReconAgent] LLM dir strategy failed, using defaults: {exc}")
+			if log_callback:
+				await log_callback(
+					f"[ReconAgent] LLM 策略规划失败，使用默认策略: {exc}"
+				)
+			return {}
+
+	# ── Phase 3: Post-Scan Deep Dive ────────────────────────
+
+	async def _llm_deep_dive(
+		self,
+		base_url: str,
+		tech_hints: list[str],
+		aggregator: PathAggregator,
+		task_id: Optional[str],
+		log_callback: LogCallback = None,
+		record_callback: RecordCallback = None,
+		scan_strategy: dict | None = None,
+	) -> None:
+		"""Ask LLM to plan post-scan deep dive actions and execute them."""
+		try:
+			from backend.llm.router import LLMRouter
+			from backend.llm.prompts.templates import DIR_DEEP_DIVE_PLAN
+
+			inventory = aggregator.get_inventory(min_confidence=0.4)
+			path_inventory_text = "\n".join(
+				f"  {item['path']} (status={item.get('status', 0)}, "
+				f"hints={','.join(item.get('hints', []))}, "
+				f"conf={item.get('confidence', 0):.2f})"
+				for item in inventory[:50]
+			)
+
+			special_results = []
+			special_checks = (scan_strategy or {}).get("special_checks", [])
+			for chk in special_checks:
+				ctype = chk.get("type", "") if isinstance(chk, dict) else ""
+				special_results.append(f"  {ctype}: 待检查")
+
+			prompt = DIR_DEEP_DIVE_PLAN.format(
+				base_url=base_url,
+				tech_stack=", ".join(tech_hints) if tech_hints else "未知",
+				total_count=aggregator.count,
+				path_inventory=path_inventory_text or "  无发现",
+				dirlist_summary="  无目录列表检测结果",
+				special_checks_results="\n".join(special_results) if special_results else "  无",
+			)
+
+			llm = LLMRouter()
+			raw = await llm.chat(
+				prompt, response_format="json", temperature=0.1, max_tokens=1536,
+			)
+			deep_plan = json.loads(raw)
+			if log_callback:
+				summary = deep_plan.get("priority_summary", "")
+				await log_callback(f"[ReconAgent] LLM 深挖规划: {summary}")
+
+			await self._execute_deep_dive_actions(
+				base_url, deep_plan, aggregator,
+				task_id, log_callback, record_callback,
+			)
+		except Exception as exc:
+			logger.warning(f"[ReconAgent] LLM deep dive planning failed: {exc}")
+			if log_callback:
+				await log_callback(f"[ReconAgent] LLM 深挖规划失败: {exc}")
+
+	async def _execute_deep_dive_actions(
+		self,
+		base_url: str,
+		deep_plan: dict,
+		aggregator: PathAggregator,
+		task_id: Optional[str],
+		log_callback: LogCallback = None,
+		record_callback: RecordCallback = None,
+	) -> None:
+		"""Execute deep dive actions from LLM plan concurrently."""
+		tasks: list[asyncio.Task] = []
+
+		# Recursive subdirectory scans
+		for scan in deep_plan.get("recursive_scans", [])[:3]:
+			sub_base = scan.get("base", "")
+			if not sub_base:
+				continue
+			tasks.append(asyncio.create_task(
+				self._deep_recursive_scan(
+					base_url, sub_base, scan.get("depth", 2),
+					aggregator, task_id, log_callback, record_callback,
+				)
+			))
+
+		# Info source actions (robots, sitemap, git, api schema)
+		for action in deep_plan.get("info_source_actions", []):
+			atype = action.get("type", "") if isinstance(action, dict) else ""
+			if atype == "parse_robots":
+				tasks.append(asyncio.create_task(
+					self._parse_robots_txt(
+						base_url, aggregator, task_id, log_callback, record_callback,
+					)
+				))
+			elif atype == "parse_sitemap":
+				tasks.append(asyncio.create_task(
+					self._parse_sitemap_xml(
+						base_url, aggregator, task_id, log_callback, record_callback,
+					)
+				))
+			elif atype == "git_dump":
+				tasks.append(asyncio.create_task(
+					self._check_git_exposure(
+						base_url, aggregator, task_id, log_callback, record_callback,
+					)
+				))
+
+		# API schema discovery
+		api_checks = deep_plan.get("api_schema_checks", [])
+		if api_checks:
+			tasks.append(asyncio.create_task(
+				self._check_api_schemas(
+					base_url, api_checks, aggregator, task_id, log_callback, record_callback,
+				)
+			))
+
+		if tasks:
+			if log_callback:
+				await log_callback(
+					f"[ReconAgent] 深挖: 并发执行 {len(tasks)} 个子任务"
+				)
+			await asyncio.gather(*tasks, return_exceptions=True)
+
+	async def _deep_recursive_scan(
+		self,
+		base_url: str,
+		sub_path: str,
+		depth: int,
+		aggregator: PathAggregator,
+		task_id: Optional[str],
+		log_callback: LogCallback = None,
+		record_callback: RecordCallback = None,
+	) -> None:
+		sub_url = f"{base_url.rstrip('/')}{sub_path}"
+		script = (
+			f'WL="/usr/share/wordlists/dirb/common.txt"; '
+			f'feroxbuster -u "{sub_url}" -w "$WL" -t 30 --depth {min(depth, 3)} '
+			f'--no-state -q -C 404 --silent 2>/dev/null'
+		)
+		try:
+			result = await self.executor.run_script(
+				script_content=script, timeout=120, task_id=task_id,
+				log_callback=log_callback,
+				record_callback=record_callback,
+				record_phase="recon",
+				record_purpose=f"deep_scan_{sub_path.strip('/')}",
+			)
+			new = aggregator.ingest("feroxbuster", result.stdout or "", base_url)
+			if log_callback:
+				await log_callback(f"[ReconAgent] 深扫 {sub_path}: +{new} 路径")
+		except Exception as e:
+			logger.warning(f"[ReconAgent] Deep scan {sub_path} failed: {e}")
+
+	async def _parse_robots_txt(
+		self, base_url: str, aggregator: PathAggregator,
+		task_id: Optional[str], log_callback: LogCallback = None,
+		record_callback: RecordCallback = None,
+	) -> None:
+		try:
+			result = await self.executor.run_script(
+				script_content=f'curl -sS --max-time 8 "{base_url}/robots.txt" 2>/dev/null',
+				timeout=15, task_id=task_id,
+				log_callback=log_callback,
+				record_callback=record_callback,
+				record_phase="recon", record_purpose="parse_robots",
+			)
+			body = result.stdout or ""
+			if not body or "<html" in body.lower():
+				return
+			paths = []
+			for line in body.splitlines():
+				line = line.strip()
+				if line.lower().startswith(("disallow:", "allow:")):
+					path = line.split(":", 1)[1].strip()
+					if path and path != "/" and not path.startswith("#"):
+						path = path.split("#")[0].strip()
+						path = path.split("*")[0].strip()
+						if path and path.startswith("/"):
+							paths.append(path)
+				elif line.lower().startswith("sitemap:"):
+					url = line.split(":", 1)[1].strip()
+					if url:
+						parsed = urlparse(url)
+						if parsed.path:
+							paths.append(parsed.path)
+			if paths:
+				aggregator.add_paths(paths, source="robots_txt", status=0)
+				if log_callback:
+					await log_callback(
+						f"[ReconAgent] robots.txt 解析: +{len(paths)} 路径"
+					)
+		except Exception as e:
+			logger.debug(f"[ReconAgent] robots.txt parse failed: {e}")
+
+	async def _parse_sitemap_xml(
+		self, base_url: str, aggregator: PathAggregator,
+		task_id: Optional[str], log_callback: LogCallback = None,
+		record_callback: RecordCallback = None,
+	) -> None:
+		try:
+			result = await self.executor.run_script(
+				script_content=(
+					f'curl -sS --max-time 10 "{base_url}/sitemap.xml" 2>/dev/null '
+					f'| head -c 50000'
+				),
+				timeout=18, task_id=task_id,
+				log_callback=log_callback,
+				record_callback=record_callback,
+				record_phase="recon", record_purpose="parse_sitemap",
+			)
+			body = result.stdout or ""
+			if not body or "<urlset" not in body.lower():
+				return
+			loc_re = re.compile(r"<loc>\s*(https?://[^<]+)\s*</loc>", re.IGNORECASE)
+			paths = []
+			for m in loc_re.finditer(body):
+				parsed = urlparse(m.group(1))
+				if parsed.path and parsed.path != "/":
+					paths.append(parsed.path)
+			if paths:
+				aggregator.add_paths(paths[:100], source="sitemap_xml", status=0)
+				if log_callback:
+					await log_callback(
+						f"[ReconAgent] sitemap.xml 解析: +{len(paths)} 路径"
+					)
+		except Exception as e:
+			logger.debug(f"[ReconAgent] sitemap.xml parse failed: {e}")
+
+	async def _check_git_exposure(
+		self, base_url: str, aggregator: PathAggregator,
+		task_id: Optional[str], log_callback: LogCallback = None,
+		record_callback: RecordCallback = None,
+	) -> None:
+		try:
+			result = await self.executor.run_script(
+				script_content=(
+					f'HEAD_CODE=$(curl -sS -o /dev/null -w "%{{http_code}}" '
+					f'--max-time 5 "{base_url}/.git/HEAD" 2>/dev/null); '
+					f'echo "HEAD:$HEAD_CODE"; '
+					f'if [ "$HEAD_CODE" = "200" ]; then '
+					f'  curl -sS --max-time 5 "{base_url}/.git/HEAD" 2>/dev/null; '
+					f'  echo "---CONFIG---"; '
+					f'  curl -sS --max-time 5 "{base_url}/.git/config" 2>/dev/null; '
+					f'fi'
+				),
+				timeout=20, task_id=task_id,
+				log_callback=log_callback,
+				record_callback=record_callback,
+				record_phase="recon", record_purpose="git_exposure",
+			)
+			body = result.stdout or ""
+			if "HEAD:200" in body and "ref:" in body.lower():
+				aggregator.add_paths(
+					["/.git/HEAD", "/.git/config", "/.git/"],
+					source="git_exposure", status=200,
+				)
+				if log_callback:
+					await log_callback(
+						"[ReconAgent] .git 泄露确认! 源码可能可提取"
+					)
+		except Exception as e:
+			logger.debug(f"[ReconAgent] git exposure check failed: {e}")
+
+	async def _check_api_schemas(
+		self, base_url: str, schema_paths: list[str],
+		aggregator: PathAggregator,
+		task_id: Optional[str], log_callback: LogCallback = None,
+		record_callback: RecordCallback = None,
+	) -> None:
+		default_schemas = [
+			"/swagger.json", "/openapi.yaml", "/openapi.json",
+			"/api-docs", "/v2/api-docs", "/v3/api-docs",
+			"/.well-known/openid-configuration",
+		]
+		targets = list(dict.fromkeys(
+			[p for p in schema_paths if isinstance(p, str)] + default_schemas
+		))[:12]
+
+		probe_cmds = []
+		for p in targets:
+			p = p if p.startswith("/") else f"/{p}"
+			probe_cmds.append(
+				f'CODE=$(curl -s -o /dev/null -w "%{{http_code}}" '
+				f'--max-time 5 "{base_url}{p}"); '
+				f'[ "$CODE" = "200" ] && echo "{p} $CODE"'
+			)
+		script = "set +e\n" + "\n".join(probe_cmds)
+		try:
+			result = await self.executor.run_script(
+				script_content=script, timeout=40, task_id=task_id,
+				log_callback=log_callback,
+				record_callback=record_callback,
+				record_phase="recon", record_purpose="api_schema_check",
+			)
+			found = 0
+			if result.stdout:
+				for line in result.stdout.strip().splitlines():
+					parts = line.strip().split()
+					if len(parts) >= 2:
+						aggregator.add_paths([parts[0]], source="api_schema", status=200)
+						found += 1
+			if found and log_callback:
+				await log_callback(f"[ReconAgent] API Schema 发现: {found} 个端点")
+		except Exception as e:
+			logger.debug(f"[ReconAgent] API schema check failed: {e}")
 
 	def _pick_content_probe_candidates(
 		self,

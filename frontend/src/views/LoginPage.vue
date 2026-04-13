@@ -59,7 +59,7 @@ async function submit() {
   try {
     const res = await api.authLogin(u, p)
     auth.setAuth(res.token, res.user)
-    router.push('/start')
+    router.push('/dashboard')
   } catch (e) {
     errorMsg.value = e?.response?.data?.detail || e.message || '登录失败'
   } finally {

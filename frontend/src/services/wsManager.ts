@@ -74,14 +74,19 @@ function connect(taskId: string) {
         channel.firstMessageAfterReconnect = false
         channel.retries = 0
         api.getTask(taskId)
-          .then((task) => broadcast(taskId, {
-            type: 'phase_update',
-            phase: task.current_phase || 'unknown',
-            status: task.status,
-            findings_count: task.findings_count,
-            got_shell: task.got_shell,
-            logs: [],
-          }))
+          .then((task) => {
+            broadcast(taskId, {
+              type: 'phase_update',
+              phase: task.current_phase || 'unknown',
+              status: task.status,
+              findings_count: task.findings_count,
+              got_shell: task.got_shell,
+              logs: [],
+            })
+            if (task.current_phase === 'awaiting_approval') {
+              broadcast(taskId, { type: 'approval_required' })
+            }
+          })
           .catch(() => {})
       }
       const event = dedupeLogs(rawEvent, channel.seenLogs)
@@ -94,14 +99,19 @@ function connect(taskId: string) {
       if (!latest) return
       if (latest.retries >= MAX_RETRIES) {
         api.getTask(taskId)
-          .then((task) => broadcast(taskId, {
-            type: 'phase_update',
-            phase: task.current_phase || 'unknown',
-            status: task.status,
-            findings_count: task.findings_count,
-            got_shell: task.got_shell,
-            logs: [],
-          }))
+          .then((task) => {
+            broadcast(taskId, {
+              type: 'phase_update',
+              phase: task.current_phase || 'unknown',
+              status: task.status,
+              findings_count: task.findings_count,
+              got_shell: task.got_shell,
+              logs: [],
+            })
+            if (task.current_phase === 'awaiting_approval') {
+              broadcast(taskId, { type: 'approval_required' })
+            }
+          })
           .catch(() => {})
         return
       }

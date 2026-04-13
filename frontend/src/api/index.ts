@@ -228,9 +228,22 @@ export function createWsConnection(
   const wsBase = getWsBase()
   const url = `${wsBase}/ws/${taskId}`
 
+  const PING_INTERVAL = 15000
+  const PONG_TIMEOUT = 5000
+
   let ws: WebSocket | null = null
   let heartbeatTimer: number | undefined
+  let pongTimer: number | undefined
+  let awaitingPong = false
   let destroyed = false
+
+  function clearTimers() {
+    if (heartbeatTimer) window.clearInterval(heartbeatTimer)
+    if (pongTimer) window.clearTimeout(pongTimer)
+    heartbeatTimer = undefined
+    pongTimer = undefined
+    awaitingPong = false
+  }
 
   function connect() {
     if (destroyed) return
@@ -240,25 +253,37 @@ export function createWsConnection(
       heartbeatTimer = window.setInterval(() => {
         if (ws?.readyState === WebSocket.OPEN) {
           ws.send('ping')
+          awaitingPong = true
+          pongTimer = window.setTimeout(() => {
+            if (awaitingPong && !destroyed) {
+              ws?.close()
+            }
+          }, PONG_TIMEOUT)
         }
-      }, 15000)
+      }, PING_INTERVAL)
     }
 
     ws.onmessage = (e) => {
       try {
         const data = JSON.parse(e.data) as WsTaskEvent
         const t = (data as { type?: string }).type
-        if (t === 'heartbeat' || t === 'pong') return
+        if (t === 'heartbeat' || t === 'pong') {
+          awaitingPong = false
+          if (pongTimer) { window.clearTimeout(pongTimer); pongTimer = undefined }
+          return
+        }
         onMessage?.(data)
       } catch {
-        // Ignore non-JSON frames.
+        // Ignore non-JSON frames; treat raw text as possible pong
+        if (typeof e.data === 'string' && e.data.trim() === 'pong') {
+          awaitingPong = false
+          if (pongTimer) { window.clearTimeout(pongTimer); pongTimer = undefined }
+        }
       }
     }
 
     ws.onclose = () => {
-      if (heartbeatTimer) {
-        window.clearInterval(heartbeatTimer)
-      }
+      clearTimers()
       if (!destroyed) {
         onClose?.()
       }
@@ -274,9 +299,7 @@ export function createWsConnection(
   return {
     close() {
       destroyed = true
-      if (heartbeatTimer) {
-        window.clearInterval(heartbeatTimer)
-      }
+      clearTimers()
       ws?.close()
     },
     get readyState() {
