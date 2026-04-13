@@ -333,6 +333,23 @@ async def node_recon(state: PentestState) -> PentestState:
                     "tone": "info" if t["status"] == "executed" else "warn",
                 })
 
+    # Emit LLM recon analysis hints if available
+    llm_hints = result.get("llm_recon_hints") or {}
+    if llm_hints:
+        vectors = llm_hints.get("potential_attack_vectors", [])
+        rec_tools = llm_hints.get("recommended_next_tools", [])
+        state.push_decision({
+            "action": "thought",
+            "phase": "recon",
+            "thinking": (
+                f"LLM 侦察分析: OS推测={llm_hints.get('os_guess', 'N/A')}, "
+                f"攻击向量: {'; '.join(vectors[:5]) if vectors else '无'}"
+            ),
+            "purpose": "LLM 侦察智能分析",
+            "plan": [f"推荐工具: {', '.join(rec_tools[:5])}"] if rec_tools else [],
+            "message": f"LLM 分析: {len(vectors)} 攻击向量, 推荐 {', '.join(rec_tools[:3]) if rec_tools else '无'}",
+        })
+
     state.log(f"侦察完成: {len(state.open_ports)} 端口, OS={state.target_os}")
 
     # Emit recon summary thought event
@@ -340,6 +357,7 @@ async def node_recon(state: PentestState) -> PentestState:
         f"{p.port}/{p.service}" for p in state.open_ports[:15]
     )
     web_count = len(state.web_paths or [])
+    sub_count = len(state.subdomains or [])
     state.push_decision({
         "action": "thought",
         "phase": "recon",
@@ -347,11 +365,13 @@ async def node_recon(state: PentestState) -> PentestState:
             f"侦察完成: 发现 {len(state.open_ports)} 个开放端口 ({ports_summary}), "
             f"OS推断={state.target_os}, 发现 {web_count} 条Web路径. "
             f"路径内容探测采集 {len(state.path_contents or [])} 条."
+            + (f" 子域名: {sub_count} 个." if sub_count else "")
         ),
         "purpose": "侦察阶段总结",
         "plan": [
             f"开放端口: {len(state.open_ports)} 个",
             f"Web路径: {web_count} 条",
+            *([ f"子域名: {sub_count} 个"] if sub_count else []),
             f"下一步: 漏洞扫描",
         ],
         "message": f"侦察完成: {len(state.open_ports)} 端口, {web_count} 路径, OS={state.target_os}",
@@ -397,6 +417,89 @@ async def node_vuln_scan(state: PentestState) -> PentestState:
     return state
 
 
+# ── Tech-adaptive sensitive file probe list ──────────────────────
+_TECH_SENSITIVE_MAP: dict[str, list[str]] = {
+    "PHP": [
+        "phpinfo.php", "config.php", "settings.php", "wp-config.php",
+        "configuration.php", "local.php", "database.php",
+    ],
+    "WordPress": [
+        "wp-config.php", "wp-login.php", "xmlrpc.php",
+        "wp-content/debug.log", "wp-includes/version.php",
+    ],
+    "JSP": ["WEB-INF/web.xml", "WEB-INF/classes/", "status"],
+    "Tomcat": [
+        "manager/html", "host-manager/html", "WEB-INF/web.xml",
+        "META-INF/context.xml", "status",
+    ],
+    "Spring": [
+        "actuator", "actuator/env", "actuator/health", "actuator/info",
+        "actuator/mappings", "actuator/configprops", "actuator/beans",
+        "env", "trace", "heapdump",
+    ],
+    "Django": [
+        "admin/", "settings.py", "__debug__/", "static/admin/",
+    ],
+    "Flask": [
+        "console", "static/", "config.py",
+    ],
+    "IIS": [
+        "web.config", "iisstart.htm", "aspnet_client/",
+        "trace.axd", "elmah.axd",
+    ],
+    "ASP": [
+        "web.config", "Global.asax", "App_Data/",
+    ],
+    "JBoss": [
+        "jmx-console/", "web-console/", "invoker/JMXInvokerServlet",
+        "status", "WEB-INF/web.xml",
+    ],
+    "WebLogic": [
+        "console/", "wls-wsat/CoordinatorPortType",
+        "bea_wls_internal/", "_async/AsyncResponseService",
+    ],
+    "Node": [
+        "package.json", ".npmrc", "server.js", "app.js",
+    ],
+}
+
+_BASE_SENSITIVE_PATHS = [
+    ".env", "robots.txt", "sitemap.xml", ".htaccess", ".DS_Store",
+    "server-status", "backup", "backup.sql", "dump", "dump.sql",
+    "config", ".git/HEAD", ".git/config", ".svn/entries",
+    "admin", "console",
+]
+
+_BACKUP_SUFFIXES = ["", ".bak", ".old", ".backup", ".swp", ".save", ".orig", "~", ".1"]
+
+
+def _build_sensitive_paths(tech_hints: list[str]) -> list[str]:
+    """Generate a de-duplicated sensitive path list tailored to detected tech stack."""
+    hints_upper = {h.upper() for h in tech_hints if h}
+
+    tech_specific: list[str] = []
+    for tech_key, paths in _TECH_SENSITIVE_MAP.items():
+        if tech_key.upper() in hints_upper or any(
+            tech_key.upper() in h for h in hints_upper
+        ):
+            tech_specific.extend(paths)
+
+    base_names = list(_BASE_SENSITIVE_PATHS) + tech_specific
+
+    result: list[str] = []
+    for b in base_names:
+        for s in _BACKUP_SUFFIXES:
+            result.append(f"/{b}{s}")
+
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for p in result:
+        if p not in seen:
+            seen.add(p)
+            deduped.append(p)
+    return deduped
+
+
 async def node_surface_enum(state: PentestState) -> PentestState:
     """攻链：深度表面枚举 — planner-driven web probing + sensitive file detection."""
     import time as _time
@@ -417,6 +520,21 @@ async def node_surface_enum(state: PentestState) -> PentestState:
         or "http" in (p.service or "").lower()
     ]
 
+    # Extract tech hints from recon phase for dynamic probe list generation
+    _raw_recon = state.raw_recon or {}
+    _recon_tech_hints: list[str] = []
+    for _pi in state.open_ports:
+        for tok in ((_pi.version or "") + " " + (_pi.banner or "")).split():
+            if tok and len(tok) > 2:
+                _recon_tech_hints.append(tok)
+    _llm_hints = _raw_recon.get("llm_recon_hints") or {}
+    for _hv in _llm_hints.get("high_value_ports", []):
+        if isinstance(_hv, dict):
+            if _hv.get("service"):
+                _recon_tech_hints.append(_hv["service"])
+            if _hv.get("attack_surface"):
+                _recon_tech_hints.append(_hv["attack_surface"])
+
     if web_ports:
         executor = ToolExecutor()
         host = state.target_host or state.target
@@ -430,44 +548,7 @@ async def node_surface_enum(state: PentestState) -> PentestState:
             scheme = "https" if wp.port in (443, 8443) else "http"
             base_url = f"{scheme}://{host}:{wp.port}"
 
-            # ── Sensitive file probe (fast, parallel curl checks) ──
-            # Pattern-driven probe list: base names × common backup suffixes.
-            # Keep a few special paths that don't fit suffix expansion.
-            probe_basenames = [
-                ".env",
-                "phpinfo.php",
-                "web.config",
-                "robots.txt",
-                "sitemap.xml",
-                ".htaccess",
-                ".DS_Store",
-                "server-status",
-                "backup",
-                "backup.sql",
-                "dump",
-                "dump.sql",
-                "config",
-                "config.php",
-                "settings",
-                "settings.php",
-                "wp-config.php",
-            ]
-            backup_suffixes = ["", ".bak", ".old", ".backup", ".swp", ".save", ".orig", "~", ".1"]
-            sensitive_paths = [f"/{b}{s}" for b in probe_basenames for s in backup_suffixes]
-            sensitive_paths += [
-                "/.git/HEAD",
-                "/.git/config",
-                "/.svn/entries",
-                "/WEB-INF/web.xml",
-                "/actuator",
-                "/actuator/env",
-                "/console",
-                "/admin",
-                "/manager/html",
-            ]
-            # de-dup while preserving order
-            _seen_sp: set[str] = set()
-            sensitive_paths = [p for p in sensitive_paths if not (p in _seen_sp or _seen_sp.add(p))]
+            sensitive_paths = _build_sensitive_paths(_recon_tech_hints)
             probe_cmds = []
             for sp in sensitive_paths:
                 probe_cmds.append(

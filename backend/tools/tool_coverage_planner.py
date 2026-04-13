@@ -29,24 +29,24 @@ _DIR_DISCOVERY_TOOLS: list[dict[str, Any]] = [
         "script": (
             'WL="/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt"; '
             '[ -f "$WL" ] || WL="/usr/share/wordlists/dirb/common.txt"; '
-            'feroxbuster -u "{url}" -w "$WL" -t 40 --depth 2 --no-state -q '
-            '-C 404,301,302 --silent 2>/dev/null'
+            'feroxbuster -u "{url}" -w "$WL" -t {threads} --depth {depth} --no-state -q '
+            '-C 404 --silent 2>/dev/null'
         ),
         "timeout": 180,
     },
     {
         "name": "dirsearch", "priority": 2, "must_run": True,
-        "script": 'dirsearch -u "{url}" -e php,jsp,asp,html,txt,bak,old,swp -t 30 -q --format plain 2>/dev/null',
+        "script": 'dirsearch -u "{url}" -e {extensions} -t {threads} -q --format plain 2>/dev/null',
         "timeout": 150,
     },
     {
         "name": "gobuster", "priority": 3, "must_run": True,
-        "script": 'gobuster dir -u "{url}" -w /usr/share/wordlists/dirb/common.txt -t 30 -q --no-error -b 404 2>/dev/null',
+        "script": 'gobuster dir -u "{url}" -w /usr/share/wordlists/dirb/common.txt -t {threads} -q --no-error -b 404 2>/dev/null',
         "timeout": 120,
     },
     {
         "name": "dirb", "priority": 4, "must_run": False,
-        "script": 'dirb "{url}" /usr/share/wordlists/dirb/common.txt -S -r -z 50 2>/dev/null',
+        "script": 'dirb "{url}" /usr/share/wordlists/dirb/common.txt -S -r -z {delay} 2>/dev/null',
         "timeout": 360,
     },
     {
@@ -54,7 +54,7 @@ _DIR_DISCOVERY_TOOLS: list[dict[str, Any]] = [
         "script": (
             'WL="/usr/share/seclists/Discovery/Web-Content/raft-small-files.txt"; '
             '[ -f "$WL" ] || WL="/usr/share/wordlists/dirb/common.txt"; '
-            'ffuf -u "{url}/FUZZ" -w "$WL" -mc 200,301,302,403,500 -t 40 -s 2>/dev/null'
+            'ffuf -u "{url}/FUZZ" -w "$WL" -mc 200,301,302,403,500 -t {threads} -s 2>/dev/null'
         ),
         "timeout": 120,
     },
@@ -146,8 +146,27 @@ class CoverageReport:
         }
 
 
-HIGH_CONFIDENCE_PATH_THRESHOLD = int(os.getenv("HIGH_CONFIDENCE_PATHS", "30"))
+HIGH_CONFIDENCE_PATH_THRESHOLD = int(os.getenv("HIGH_CONFIDENCE_PATHS", "50"))
 EARLY_STOP_MIN_TOOLS = int(os.getenv("EARLY_STOP_MIN_TOOLS", "3"))
+ACTIONABLE_PATH_THRESHOLD = int(os.getenv("ACTIONABLE_PATH_THRESHOLD", "20"))
+
+
+_TECH_EXTENSION_MAP: dict[str, str] = {
+    "PHP": "php,phtml,php5,php7,inc",
+    "JSP": "jsp,jspx,do,action",
+    "Spring": "jsp,do,action,html,json",
+    "Tomcat": "jsp,jspx,do,action,xml",
+    "WebLogic": "jsp,jspx,do,action,xml",
+    "JBoss": "jsp,jspx,do,action,war",
+    "WordPress": "php,phtml,txt,xml,sql",
+    "Django": "py,html,json,txt",
+    "Flask": "py,html,json,txt",
+    "IIS": "asp,aspx,ashx,asmx,config",
+    "ASP": "asp,aspx,ashx,asmx,config",
+    "Struts": "do,action,jsp,json",
+}
+
+_DEFAULT_EXTENSIONS = "php,jsp,asp,aspx,html,txt,bak,old,swp,json,xml,conf"
 
 
 class ToolCoveragePlanner:
@@ -174,22 +193,50 @@ class ToolCoveragePlanner:
         self._start_time: float = 0.0
         self._executed_count = 0
         self._total_paths = 0
+        self._actionable_paths = 0
 
-    def build_plan(self, url: str, existing_paths_count: int = 0) -> list[dict]:
+    def build_plan(
+        self,
+        url: str,
+        existing_paths_count: int = 0,
+        *,
+        has_waf: bool = False,
+        tech_hints: list[str] | None = None,
+    ) -> list[dict]:
         """Build an ordered list of tool specs to execute.
+
+        Args:
+            url: target URL
+            existing_paths_count: paths already discovered
+            has_waf: if True, reduce concurrency and add delays
+            tech_hints: detected technologies (e.g. ["PHP", "Tomcat"])
 
         Returns list of dicts with keys: name, category, script, timeout, must_run.
         """
+        threads = "10" if has_waf else "40"
+        depth = "3" if not has_waf else "2"
+        delay = "200" if has_waf else "50"
+
+        extensions = self._build_extensions(tech_hints)
+
+        fmt_vars = {
+            "url": url,
+            "threads": threads,
+            "depth": depth,
+            "delay": delay,
+            "extensions": extensions,
+        }
+
         plan: list[dict] = []
         for cat in self._categories:
             tools = CATEGORY_TOOLS.get(cat, [])
             for t in sorted(tools, key=lambda x: x["priority"]):
+                script = t["script"].format(**fmt_vars)
                 plan.append({
                     "name": t["name"],
                     "category": cat,
-                    "script": t["script"].format(url=url),
-                    # runtime_command 用于日志/前端展示真实执行命令
-                    "runtime_command": t["script"].format(url=url),
+                    "script": script,
+                    "runtime_command": script,
                     "timeout": min(t["timeout"], MAX_TOOL_TIMEOUT),
                     "must_run": t["must_run"],
                 })
@@ -200,7 +247,25 @@ class ToolCoveragePlanner:
         self._start_time = time.monotonic()
         self._executed_count = 0
         self._total_paths = existing_paths_count
+        self._actionable_paths = 0
         return plan
+
+    @staticmethod
+    def _build_extensions(tech_hints: list[str] | None) -> str:
+        if not tech_hints:
+            return _DEFAULT_EXTENSIONS
+        exts: list[str] = []
+        for tech in tech_hints:
+            mapped = _TECH_EXTENSION_MAP.get(tech, "")
+            if mapped:
+                for e in mapped.split(","):
+                    e = e.strip()
+                    if e and e not in exts:
+                        exts.append(e)
+        for fallback in ("html", "txt", "bak", "old", "swp", "json", "xml", "conf"):
+            if fallback not in exts:
+                exts.append(fallback)
+        return ",".join(exts)
 
     def should_run(self, tool_spec: dict) -> tuple[bool, str]:
         """Decide whether to run the next tool given current state.
@@ -208,7 +273,7 @@ class ToolCoveragePlanner:
         Checks (in order):
         1. Hard tool count limit
         2. Stage runtime budget
-        3. Confidence-based early stop (only for optional tools after min coverage)
+        3. Quality-based early stop (only for optional tools after min coverage)
         """
         if self._executed_count >= self._max_tools:
             return False, f"max tools ({self._max_tools}) reached"
@@ -219,16 +284,18 @@ class ToolCoveragePlanner:
 
         if not tool_spec.get("must_run", False) and self._can_early_stop():
             return False, (
-                f"early stop: {self._total_paths} paths found "
-                f"(>={HIGH_CONFIDENCE_PATH_THRESHOLD}) with "
+                f"early stop: {self._actionable_paths} actionable / "
+                f"{self._total_paths} total paths with "
                 f"{self._executed_count} tools run, min coverage met"
             )
 
         return True, ""
 
     def _can_early_stop(self) -> bool:
-        """Check if we can skip optional tools based on path confidence."""
+        """Quality-based early stop: requires enough *actionable* (non-static) paths."""
         if self._executed_count < EARLY_STOP_MIN_TOOLS:
+            return False
+        if self._actionable_paths < ACTIONABLE_PATH_THRESHOLD:
             return False
         if self._total_paths < HIGH_CONFIDENCE_PATH_THRESHOLD:
             return False
@@ -244,7 +311,8 @@ class ToolCoveragePlanner:
 
     def record_result(
         self, name: str, status: str, skip_reason: str = "",
-        paths_found: int = 0, raw_len: int = 0, elapsed: float = 0.0,
+        paths_found: int = 0, actionable_found: int = 0,
+        raw_len: int = 0, elapsed: float = 0.0,
     ) -> None:
         for r in self._records:
             if r.name == name and r.status == "pending":
@@ -256,6 +324,7 @@ class ToolCoveragePlanner:
                 if status == "executed":
                     self._executed_count += 1
                     self._total_paths += paths_found
+                    self._actionable_paths += (actionable_found or paths_found)
                 break
 
     def coverage_report(self) -> CoverageReport:

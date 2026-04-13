@@ -10,6 +10,7 @@ recon_agent.py
 from __future__ import annotations
 
 import asyncio
+import ipaddress as _ipaddress
 import logging
 import os
 import re
@@ -21,7 +22,6 @@ from urllib.parse import urljoin, urlparse
 from backend.agents.models import PortInfo
 from backend.tools.executor import ToolExecutor, ExecuteResult, LogCallback, RecordCallback
 from backend.tools.parsers.nmap_parser import NmapParser
-from backend.tools.parsers.gobuster_parser import GobusterParser
 from backend.tools.parsers.path_aggregator import PathAggregator
 from backend.tools.tool_coverage_planner import ToolCoveragePlanner, CoverageReport
 
@@ -32,7 +32,6 @@ class ReconAgent:
 	def __init__(self):
 		self.executor = ToolExecutor()
 		self.nmap_parser = NmapParser()
-		self.gobuster_parser = GobusterParser()
 
 	async def run(
 		self,
@@ -89,6 +88,10 @@ class ReconAgent:
 			ports_info=ports,
 		)
 
+		llm_recon_hints = await self._llm_analyze_nmap(
+			target, raw_nmap, ports, log_callback,
+		)
+
 		web_ports = [
 			p for p in ports
 			if p.service in ("http", "https")
@@ -109,30 +112,64 @@ class ReconAgent:
 		dir_coverage: dict = {}
 
 		if web_ports:
-			scheme = "https" if any(p.port in (443, 8443) for p in web_ports) else "http"
-			web_target = f"{scheme}://{target}:{web_ports[0].port}"
-			web_paths, raw_gobuster, coverage_rpt, aggregator = await self._dir_scan(
-				web_target, task_id, log_callback,
+			primary_scheme = "https" if web_ports[0].port in (443, 8443) else "http"
+			primary_target = f"{primary_scheme}://{target}:{web_ports[0].port}"
+
+			has_waf = await self._detect_waf(
+				primary_target, task_id, log_callback,
 			)
+			tech_hints = await self._quick_fingerprint(
+				target, web_ports, task_id, log_callback,
+			)
+
+			aggregator = PathAggregator()
+			raw_outputs_all: list[str] = []
+			coverage_reports: list[dict] = []
+
+			for wp in web_ports[:4]:
+				scheme = "https" if wp.port in (443, 8443) else "http"
+				web_target = f"{scheme}://{target}:{wp.port}"
+				if log_callback:
+					await log_callback(
+						f"[ReconAgent] 目录发现: 扫描 Web 端口 {wp.port} ({scheme})"
+					)
+				_, raw_out, coverage_rpt, port_aggregator = await self._dir_scan(
+					web_target, task_id, log_callback,
+					has_waf=has_waf, tech_hints=tech_hints,
+				)
+				raw_outputs_all.append(raw_out)
+				coverage_reports.append(coverage_rpt.to_log_dict())
+				for p_entry in port_aggregator._entries.values():
+					if p_entry.path in aggregator._entries:
+						aggregator._entries[p_entry.path].merge(p_entry)
+					else:
+						aggregator._entries[p_entry.path] = p_entry
+
 			path_contents = await self._probe_path_contents(
-				web_target=web_target,
+				web_target=primary_target,
 				aggregator=aggregator,
 				task_id=task_id,
 				log_callback=log_callback,
 			)
 			web_paths = aggregator.get_actionable_paths()
-			dir_coverage = coverage_rpt.to_log_dict()
+			raw_gobuster = "\n".join(raw_outputs_all)
+			dir_coverage = coverage_reports[0] if coverage_reports else {}
+
+		subdomains = await self._subdomain_enum(
+			target, task_id, log_callback,
+		)
 
 		return {
 			"ports": ports,
 			"os_info": os_info,
 			"web_paths": web_paths,
 			"path_contents": path_contents,
-			"subdomains": [],
+			"subdomains": subdomains,
 			"raw_nmap": raw_nmap,
 			"raw_gobuster": raw_gobuster,
 			"nmap_vuln_hints": nmap_vuln_hints,
 			"dir_coverage": dir_coverage,
+			"llm_recon_hints": llm_recon_hints,
 		}
 
 	async def _nmap_scan(
@@ -188,9 +225,7 @@ class ReconAgent:
 			logger.warning("两轮扫描均未发现开放端口")
 			return [], {}, precise_result.stdout or ""
 
-		# 对合并后的端口做精细探测（公网目标跳过 -O，降低脚本强度）
 		port_str = ",".join(str(p) for p in sorted(all_ports)[:50])
-		import ipaddress as _ipaddress
 		try:
 			_is_private = _ipaddress.ip_address(target).is_private
 		except ValueError:
@@ -324,11 +359,249 @@ class ReconAgent:
 			logger.info(f"[ReconAgent] Nmap vuln scan 共发现 {len(all_hints)} 个漏洞提示")
 		return all_hints
 
+	async def _llm_analyze_nmap(
+		self,
+		target: str,
+		raw_nmap: str,
+		ports: list[PortInfo],
+		log_callback: LogCallback = None,
+	) -> dict:
+		"""Use LLM to analyze nmap results and suggest next steps."""
+		if not raw_nmap or not ports:
+			return {}
+
+		nmap_snippet = raw_nmap[:4000]
+		try:
+			from backend.llm.router import LLMRouter
+			from backend.llm.prompts.templates import RECON_ANALYSIS
+
+			if log_callback:
+				await log_callback("[ReconAgent] LLM 分析 Nmap 扫描结果...")
+
+			llm = LLMRouter()
+			prompt = RECON_ANALYSIS.format(
+				target=target,
+				raw_output=nmap_snippet,
+			)
+			import json
+			response = await llm.chat(prompt, response_format="json")
+			hints = json.loads(response)
+			if log_callback:
+				vectors = hints.get("potential_attack_vectors", [])
+				tools = hints.get("recommended_next_tools", [])
+				await log_callback(
+					f"[ReconAgent] LLM 分析完成: "
+					f"攻击向量 {len(vectors)} 条, "
+					f"推荐工具 {', '.join(tools[:5]) if tools else '无'}"
+				)
+			return hints
+		except Exception as e:
+			logger.debug(f"[ReconAgent] LLM 分析 Nmap 失败 (非致命): {e}")
+			if log_callback:
+				await log_callback(f"[ReconAgent] LLM 分析跳过: {e}")
+			return {}
+
+	@staticmethod
+	def _is_ip_address(target: str) -> bool:
+		try:
+			_ipaddress.ip_address(target)
+			return True
+		except ValueError:
+			return False
+
+	async def _subdomain_enum(
+		self,
+		target: str,
+		task_id: Optional[str],
+		log_callback: LogCallback = None,
+	) -> list[str]:
+		"""Enumerate subdomains for domain targets using subfinder."""
+		if self._is_ip_address(target):
+			return []
+
+		if "." not in target:
+			return []
+
+		if log_callback:
+			await log_callback(f"[ReconAgent] 子域名枚举: {target}")
+
+		subdomains: list[str] = []
+
+		try:
+			result: ExecuteResult = await self.executor.run(
+				tool="subfinder",
+				args=["-d", target, "-silent", "-t", "20"],
+				timeout=60,
+				task_id=task_id,
+				log_callback=log_callback,
+			)
+			if result.success and result.stdout:
+				for line in result.stdout.strip().splitlines():
+					sub = line.strip().lower()
+					if sub and sub not in subdomains and target in sub:
+						subdomains.append(sub)
+		except Exception as e:
+			logger.debug(f"[ReconAgent] subfinder 失败: {e}")
+
+		if not subdomains:
+			try:
+				result = await self.executor.run(
+					tool="amass",
+					args=["enum", "-passive", "-d", target, "-timeout", "2"],
+					timeout=90,
+					task_id=task_id,
+					log_callback=log_callback,
+				)
+				if result.success and result.stdout:
+					for line in result.stdout.strip().splitlines():
+						sub = line.strip().lower()
+						if sub and sub not in subdomains and target in sub:
+							subdomains.append(sub)
+			except Exception as e:
+				logger.debug(f"[ReconAgent] amass 失败: {e}")
+
+		if log_callback:
+			await log_callback(
+				f"[ReconAgent] 子域名枚举完成: 发现 {len(subdomains)} 个子域名"
+			)
+		return subdomains[:100]
+
+	async def _detect_waf(
+		self,
+		web_target: str,
+		task_id: Optional[str],
+		log_callback: LogCallback = None,
+	) -> bool:
+		"""Run wafw00f to detect WAF presence. Returns True if WAF detected."""
+		if log_callback:
+			await log_callback("[ReconAgent] WAF 检测中...")
+		try:
+			result: ExecuteResult = await self.executor.run(
+				tool="wafw00f",
+				args=[web_target, "-o", "-"],
+				timeout=30,
+				task_id=task_id,
+				log_callback=log_callback,
+			)
+			stdout = (result.stdout or "").lower()
+			if result.success and ("is behind" in stdout or "waf detected" in stdout):
+				waf_name = ""
+				for line in (result.stdout or "").splitlines():
+					if "is behind" in line.lower():
+						waf_name = line.strip()
+						break
+				if log_callback:
+					await log_callback(
+						f"[ReconAgent] WAF 检测到: {waf_name or 'unknown'} — 将降低扫描并发"
+					)
+				return True
+			if log_callback:
+				await log_callback("[ReconAgent] 未检测到 WAF")
+		except Exception as e:
+			logger.debug(f"[ReconAgent] WAF 检测失败 (非致命): {e}")
+			if log_callback:
+				await log_callback(f"[ReconAgent] WAF 检测跳过: {e}")
+		return False
+
+	async def _quick_fingerprint(
+		self,
+		target: str,
+		web_ports: list[PortInfo],
+		task_id: Optional[str],
+		log_callback: LogCallback = None,
+	) -> list[str]:
+		"""Lightweight fingerprinting via whatweb/httpx before dir scan.
+
+		Returns a list of technology hints like ["PHP", "Tomcat", "WordPress"].
+		"""
+		tech_hints: list[str] = []
+		if log_callback:
+			await log_callback("[ReconAgent] 轻量级 Web 指纹识别...")
+
+		for wp in web_ports[:3]:
+			scheme = "https" if wp.port in (443, 8443) else "http"
+			url = f"{scheme}://{target}:{wp.port}"
+
+			try:
+				ww_result: ExecuteResult = await self.executor.run(
+					tool="whatweb",
+					args=[url, "--color=never", "-q"],
+					timeout=20,
+					task_id=task_id,
+				)
+				if ww_result.success and ww_result.stdout:
+					tech_hints.extend(
+						self._parse_whatweb_techs(ww_result.stdout)
+					)
+			except Exception as e:
+				logger.debug(f"[ReconAgent] whatweb 失败 (port {wp.port}): {e}")
+
+			try:
+				hx_result: ExecuteResult = await self.executor.run(
+					tool="httpx",
+					args=["-u", url, "-silent", "-tech-detect", "-status-code", "-title"],
+					timeout=20,
+					task_id=task_id,
+				)
+				if hx_result.success and hx_result.stdout:
+					tech_hints.extend(
+						self._parse_httpx_techs(hx_result.stdout)
+					)
+			except Exception as e:
+				logger.debug(f"[ReconAgent] httpx 失败 (port {wp.port}): {e}")
+
+			combined = f"{wp.service} {wp.version} {wp.banner}".lower()
+			tech_hints.extend(self._extract_tech_from_nmap(combined))
+
+		unique = list(dict.fromkeys(tech_hints))
+		if log_callback and unique:
+			await log_callback(
+				f"[ReconAgent] 指纹识别结果: {', '.join(unique)}"
+			)
+		return unique
+
+	@staticmethod
+	def _parse_whatweb_techs(output: str) -> list[str]:
+		known = {
+			"php": "PHP", "jsp": "JSP", "asp": "ASP",
+			"tomcat": "Tomcat", "apache": "Apache", "nginx": "Nginx",
+			"iis": "IIS", "wordpress": "WordPress", "drupal": "Drupal",
+			"joomla": "Joomla", "django": "Django", "flask": "Flask",
+			"spring": "Spring", "struts": "Struts", "weblogic": "WebLogic",
+			"jboss": "JBoss", "wildfly": "JBoss", "laravel": "PHP",
+			"rails": "Rails", "express": "Express", "next.js": "React",
+			"vue": "Vue", "react": "React", "thinkphp": "ThinkPHP",
+		}
+		text = output.lower()
+		return [label for kw, label in known.items() if kw in text]
+
+	@staticmethod
+	def _parse_httpx_techs(output: str) -> list[str]:
+		known = {
+			"php": "PHP", "tomcat": "Tomcat", "apache": "Apache",
+			"nginx": "Nginx", "iis": "IIS", "wordpress": "WordPress",
+			"django": "Django", "flask": "Flask", "spring": "Spring",
+			"weblogic": "WebLogic", "jboss": "JBoss",
+		}
+		text = output.lower()
+		return [label for kw, label in known.items() if kw in text]
+
+	@staticmethod
+	def _extract_tech_from_nmap(combined: str) -> list[str]:
+		known = {
+			"apache": "Apache", "nginx": "Nginx", "iis": "IIS",
+			"tomcat": "Tomcat", "weblogic": "WebLogic", "jboss": "JBoss",
+			"php": "PHP", "wordpress": "WordPress",
+		}
+		return [label for kw, label in known.items() if kw in combined]
+
 	async def _dir_scan(
 		self,
 		web_target: str,
 		task_id: Optional[str],
 		log_callback: LogCallback = None,
+		has_waf: bool = False,
+		tech_hints: list[str] | None = None,
 	) -> tuple[list[str], str, CoverageReport, PathAggregator]:
 		"""Planner-driven multi-tool directory discovery chain."""
 		planner = ToolCoveragePlanner(
@@ -336,7 +609,9 @@ class ReconAgent:
 			max_tools=6,
 			max_stage_runtime=480,
 		)
-		plan = planner.build_plan(web_target)
+		plan = planner.build_plan(
+			web_target, has_waf=has_waf, tech_hints=tech_hints,
+		)
 		aggregator = PathAggregator()
 		raw_outputs: list[str] = []
 
@@ -377,9 +652,11 @@ class ReconAgent:
 				raw_outputs.append(f"=== {tool_name} ===\n{stdout}")
 
 				new_count = aggregator.ingest(tool_name, stdout, web_target)
+				actionable_count = len(aggregator.get_actionable_paths())
 				planner.record_result(
 					tool_name, "executed",
 					paths_found=new_count,
+					actionable_found=actionable_count,
 					raw_len=len(stdout),
 					elapsed=elapsed,
 				)

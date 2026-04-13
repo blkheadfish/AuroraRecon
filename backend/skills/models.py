@@ -89,12 +89,15 @@ class ParseRule:
     set: dict[str, Any] = field(default_factory=dict)
 
     def evaluate(self, stdout: str, stderr: str, status_code: int) -> dict[str, Any]:
-        """评估规则，返回要设置的变量（空 dict = 未触发）"""
+        """评估规则，返回要设置的变量（空 dict = 未触发）。
+
+        支持 if_regex 捕获组: set 值中的 ``$1``, ``$2`` … 会被替换为
+        对应的正则匹配组内容，从而把探测结果动态传递给下游步骤。
+        """
         combined = f"{stdout} {stderr}".lower()
 
-        # Collect results for each configured condition block.
-        # All configured (non-empty) conditions must pass (AND semantics).
         checks: list[bool] = []
+        regex_groups: tuple[str, ...] = ()
 
         if self.if_contains:
             checks.append(
@@ -111,9 +114,10 @@ class ParseRule:
 
         if self.if_regex:
             combined_for_regex = stdout + "\n" + stderr
-            checks.append(
-                bool(re.search(self.if_regex, combined_for_regex, re.IGNORECASE))
-            )
+            m = re.search(self.if_regex, combined_for_regex, re.IGNORECASE)
+            checks.append(bool(m))
+            if m:
+                regex_groups = m.groups()
 
         if not checks:
             return {}
@@ -121,11 +125,17 @@ class ParseRule:
         if not all(checks):
             return {}
 
-        # 附加条件检查
         if self.and_body_not_empty and not stdout.strip():
             return {}
 
-        return dict(self.set)
+        result = dict(self.set)
+        if regex_groups:
+            for k, v in result.items():
+                if isinstance(v, str):
+                    for i, g in enumerate(regex_groups, 1):
+                        v = v.replace(f"${i}", g or "")
+                    result[k] = v
+        return result
 
 
 @dataclass
