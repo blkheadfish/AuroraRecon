@@ -194,6 +194,8 @@ class PentestState(BaseModel):
 	target_path: str = ""          # URL 路径
 	target_raw: str = ""           # 原始用户输入（= target，留作对照）
 
+	owner_id: str = ""
+
 	status: TaskStatus = TaskStatus.PENDING
 	current_phase: str = "init"
 	error_msg: str = ""

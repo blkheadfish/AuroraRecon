@@ -1,0 +1,190 @@
+"""
+routers/health.py —— 健康检查 + 指标概览
+"""
+from __future__ import annotations
+
+import logging
+from collections import defaultdict
+from datetime import datetime, timedelta
+
+from fastapi import APIRouter
+
+from backend.agents.models import PentestState, TaskStatus
+from backend.api.state import get_state_manager, TOOL_START_RE, TOOL_DONE_RE
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(tags=["health"])
+
+
+def _safe_rate(numerator: int, denominator: int) -> float:
+    if denominator <= 0:
+        return 0.0
+    return round((numerator / denominator) * 100.0, 2)
+
+
+def _parse_iso_ts(raw: str | None) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def _build_system_overview(tasks: list[PentestState], sm) -> dict:
+    def _is_root_priv(s: PentestState) -> bool:
+        return (s.privilege_level or "").lower() == "root" or bool(
+            (s.objective_status or {}).get("root_reached")
+        )
+
+    return {
+        "api_status": "ok",
+        "database": "connected" if sm.db_available else "unavailable",
+        "redis": "connected" if sm.redis_available else "unavailable",
+        "msf": "connected" if sm.msf_available else "unavailable",
+        "version": "2.0.0",
+        "total_tasks": len(tasks),
+        "running_tasks": sum(1 for t in tasks if t.status == TaskStatus.RUNNING),
+        "completed_tasks": sum(1 for t in tasks if t.status == TaskStatus.COMPLETED),
+        "failed_tasks": sum(1 for t in tasks if t.status == TaskStatus.FAILED),
+        "active_task_ids": sm.running_count,
+        "shells_obtained_tasks": sum(1 for t in tasks if t.got_shell),
+        "root_reached_tasks": sum(1 for t in tasks if _is_root_priv(t)),
+        "mean_privesc_rounds": round(
+            sum(t.privesc_attempt_count for t in tasks) / len(tasks), 2
+        ) if tasks else 0.0,
+    }
+
+
+def _build_tool_overview(sm) -> dict:
+    try:
+        registry = sm.get_tool_registry()
+        by_executor: dict[str, int] = defaultdict(int)
+        tools = []
+        for td in registry.list_all():
+            by_executor[td.executor] += 1
+            tools.append({
+                "name": td.name,
+                "category": td.category,
+                "executor": td.executor,
+                "timeout": td.timeout,
+            })
+        tools.sort(key=lambda item: (item["category"], item["name"]))
+        return {
+            "total_tools": registry.size,
+            "by_category": registry.summary(),
+            "by_executor": dict(by_executor),
+            "tools": tools,
+        }
+    except Exception as e:
+        logger.warning(f"[Metrics] 工具概览构建失败: {e}")
+        return {"total_tools": 0, "by_category": {}, "by_executor": {}, "tools": [], "error": str(e)}
+
+
+def _build_tool_invocation_overview(tasks: list[PentestState]) -> dict:
+    calls_by_tool: dict[str, int] = defaultdict(int)
+    backend_calls: dict[str, int] = defaultdict(int)
+    done_by_tool: dict[str, int] = defaultdict(int)
+    success_by_tool: dict[str, int] = defaultdict(int)
+    elapsed_sum_by_tool: dict[str, float] = defaultdict(float)
+    backend_by_tool: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+
+    total_calls = 0
+    success_calls = 0
+    failed_calls = 0
+    total_elapsed = 0.0
+    done_count = 0
+
+    for state in tasks:
+        for entry in state.phase_log:
+            start_match = TOOL_START_RE.search(entry)
+            if start_match:
+                tool_name = start_match.group(1).strip()
+                backend = start_match.group(2).strip()
+                calls_by_tool[tool_name] += 1
+                backend_calls[backend] += 1
+                backend_by_tool[tool_name][backend] += 1
+                total_calls += 1
+
+            done_match = TOOL_DONE_RE.search(entry)
+            if done_match:
+                tool_name = done_match.group(1).strip()
+                exit_code = int(done_match.group(2))
+                elapsed = float(done_match.group(3))
+                done_by_tool[tool_name] += 1
+                elapsed_sum_by_tool[tool_name] += elapsed
+                total_elapsed += elapsed
+                done_count += 1
+                if exit_code == 0:
+                    success_by_tool[tool_name] += 1
+                    success_calls += 1
+                else:
+                    failed_calls += 1
+
+    top_tools = []
+    for tool_name, calls in sorted(calls_by_tool.items(), key=lambda item: item[1], reverse=True):
+        completed = done_by_tool.get(tool_name, 0)
+        succeeded = success_by_tool.get(tool_name, 0)
+        avg_elapsed_ms = 0.0
+        if completed > 0:
+            avg_elapsed_ms = round((elapsed_sum_by_tool[tool_name] / completed) * 1000.0, 2)
+        top_tools.append({
+            "tool": tool_name,
+            "calls": calls,
+            "completed_calls": completed,
+            "success_rate": _safe_rate(succeeded, completed),
+            "avg_elapsed_ms": avg_elapsed_ms,
+            "backends": dict(backend_by_tool.get(tool_name, {})),
+        })
+
+    return {
+        "total_calls": total_calls,
+        "completed_calls": done_count,
+        "success_calls": success_calls,
+        "failed_calls": failed_calls,
+        "success_rate": _safe_rate(success_calls, done_count),
+        "avg_elapsed_ms": round((total_elapsed / done_count) * 1000.0, 2) if done_count > 0 else 0.0,
+        "by_backend": dict(sorted(backend_calls.items(), key=lambda item: item[1], reverse=True)),
+        "top_tools": top_tools[:10],
+    }
+
+
+@router.get("/health")
+async def health_check():
+    sm = get_state_manager()
+    return {
+        "status": "ok",
+        "version": "2.0.0",
+        "metrics_overview": True,
+        "metrics_paths": ["/metrics/overview", "/api/metrics/overview"],
+        "database": "connected" if sm.db_available else "unavailable",
+        "redis": "connected" if sm.redis_available else "unavailable",
+        "msf": "connected" if sm.msf_available else "unavailable",
+        "active_tasks": sm.running_count,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+
+@router.get("/metrics/overview")
+@router.get("/api/metrics/overview")
+async def get_metrics_overview(window_hours: int = 24):
+    sm = get_state_manager()
+    bounded_window = max(1, min(window_hours, 168))
+    now = datetime.utcnow()
+    cutoff = now - timedelta(hours=bounded_window)
+
+    all_tasks = sm.all_states()
+    scoped_tasks = []
+    for state in all_tasks:
+        task_ts = _parse_iso_ts(state.created_at)
+        if task_ts is None or task_ts >= cutoff:
+            scoped_tasks.append(state)
+
+    return {
+        "generated_at": now.isoformat(),
+        "window_hours": bounded_window,
+        "system_overview": _build_system_overview(all_tasks, sm),
+        "tool_overview": _build_tool_overview(sm),
+        "tool_invocation_overview": _build_tool_invocation_overview(scoped_tasks),
+    }

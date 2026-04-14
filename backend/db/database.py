@@ -14,8 +14,7 @@ from typing import Optional
 from uuid import uuid4
 
 from sqlalchemy import (
-    Column, String, Text, Integer, Boolean, DateTime, Enum as SAEnum,
-    create_engine, text,
+    String, Text, Integer, Boolean, DateTime, text,
 )
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -25,10 +24,13 @@ from backend.agents.models import PentestState, TaskStatus
 logger = logging.getLogger(__name__)
 
 # ── 连接配置 ──────────────────────────────────────────────
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql+asyncpg://pentest:pentest123@localhost:5432/pentestai",
-)
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+if not DATABASE_URL:
+    logger.warning(
+        "[DB] DATABASE_URL 未设置，使用默认开发配置。"
+        "生产环境请在 .env 中设置 DATABASE_URL。"
+    )
+    DATABASE_URL = "postgresql+asyncpg://pentest:pentest123@localhost:5432/pentestai"
 
 engine = create_async_engine(DATABASE_URL, echo=False, pool_size=10, max_overflow=20)
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -45,6 +47,7 @@ class TaskRecord(Base):
 
     task_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     target: Mapped[str] = mapped_column(String(256), nullable=False)
+    owner_id: Mapped[str] = mapped_column(String(36), default="", index=True)
     scope_note: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(32), default="pending")
     current_phase: Mapped[str] = mapped_column(String(64), default="init")
@@ -85,9 +88,31 @@ class UserRecord(Base):
 # ── 数据库操作 ────────────────────────────────────────────
 
 async def init_db():
-    """创建表（幂等）"""
+    """创建表（幂等）+ 增量迁移"""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+    # 增量迁移：为已有表添加新列（create_all 不会修改已有表结构）
+    migrations = [
+        ("tasks", "owner_id", "ALTER TABLE tasks ADD COLUMN owner_id VARCHAR(36) DEFAULT '' NOT NULL"),
+    ]
+    async with engine.begin() as conn:
+        for table, column, ddl in migrations:
+            try:
+                await conn.execute(text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = :t AND column_name = :c"
+                ), {"t": table, "c": column})
+                row = (await conn.execute(text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = :t AND column_name = :c"
+                ), {"t": table, "c": column})).fetchone()
+                if not row:
+                    await conn.execute(text(ddl))
+                    logger.info(f"[DB] 迁移: {table}.{column} 已添加")
+            except Exception as e:
+                logger.warning(f"[DB] 迁移 {table}.{column} 跳过: {e}")
+
     logger.info("[DB] 数据库表已就绪")
 
 
@@ -100,6 +125,7 @@ async def save_task(state: PentestState) -> None:
             session.add(record)
 
         record.target = state.target
+        record.owner_id = state.owner_id or ""
         record.scope_note = state.scope_note
         record.status = state.status.value
         record.current_phase = state.current_phase
