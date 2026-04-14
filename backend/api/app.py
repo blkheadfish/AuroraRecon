@@ -15,6 +15,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -125,6 +126,27 @@ async def lifespan(app: FastAPI):
 
 # ── 创建 App ──────────────────────────────────────────────
 app = FastAPI(title="PentestAI", version="2.0.0", lifespan=lifespan)
+
+# ── 全局异常处理 ──────────────────────────────────────────
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """将 Pydantic 校验错误转为统一的前端友好格式。"""
+    messages = []
+    for err in exc.errors():
+        field = ".".join(str(loc) for loc in err.get("loc", []) if loc != "body")
+        msg = err.get("msg", "").replace("Value error, ", "")
+        messages.append(f"{field}: {msg}" if field else msg)
+    detail = "；".join(messages) if messages else "请求参数校验失败"
+    return JSONResponse(status_code=422, content={"detail": detail})
+
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    """兜底：未捕获异常不暴露堆栈。"""
+    logger.error(f"[未处理异常] {request.method} {request.url.path}: {exc}", exc_info=True)
+    return JSONResponse(status_code=500, content={"detail": "服务器内部错误，请稍后重试"})
+
 
 # CORS（环境变量控制）
 ALLOWED_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
