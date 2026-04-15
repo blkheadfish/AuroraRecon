@@ -1142,6 +1142,36 @@ EOF_PATHS
 			await log_callback(
 				f"[ReconAgent] 路径内容探测完成: 采集 {len(probed)} 条, 新增候选路径 {new_paths} 条"
 			)
+
+		# Deep-crawl any discovered directory listing pages
+		dirlist_paths = [item["path"] for item in probed if item.get("dir_listing")]
+		if dirlist_paths:
+			from backend.tools.parsers.dirlist_crawler import crawl_directory_listings
+			try:
+				dirlist_result = await crawl_directory_listings(
+					base_url=web_target,
+					seed_paths=dirlist_paths,
+					executor=self.executor,
+					max_depth=4,
+					max_total_entries=150,
+					log_callback=log_callback,
+				)
+				for dl_entry in dirlist_result.entries:
+					aggregator.add_paths(
+						[dl_entry.path],
+						source="dirlist_deep_crawl",
+						status=200 if not dl_entry.is_dir else 0,
+					)
+				if log_callback:
+					interesting = [e for e in dirlist_result.entries if e.interesting]
+					await log_callback(
+						f"[ReconAgent] 目录列表深度爬取: "
+						f"{len(dirlist_result.entries)} 条目, "
+						f"{len(interesting)} 个有价值文件"
+					)
+			except Exception as e:
+				logger.warning(f"[ReconAgent] 目录列表深度爬取失败: {e}")
+
 		return probed
 
 	@staticmethod

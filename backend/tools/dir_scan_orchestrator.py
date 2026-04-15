@@ -26,6 +26,12 @@ logger = logging.getLogger(__name__)
 
 _BACKUP_SUFFIXES = [".bak", ".old", ".backup", ".swp", ".save", ".orig", "~", ".1"]
 
+_SOURCE_FILE_EXTS = frozenset({
+    ".php", ".jsp", ".jspx", ".asp", ".aspx", ".py", ".rb", ".cgi",
+    ".conf", ".cfg", ".ini", ".xml", ".yaml", ".yml", ".json",
+    ".properties", ".env", ".htaccess", ".sql", ".sh",
+})
+
 _HIGH_VALUE_HINTS = frozenset({
     "admin", "login", "backup", "config", "upload", "api", "leak", "info_disclosure",
 })
@@ -71,6 +77,7 @@ class DirScanOrchestrator:
         self._custom_entries: list[str] = []
         self._raw_outputs: list[str] = []
         self._recent_new_hints: set[str] = set()
+        self._active_plan: list[dict] = []
 
     async def run(
         self,
@@ -79,6 +86,7 @@ class DirScanOrchestrator:
         scan_strategy: dict | None = None,
     ) -> OrchestratorResult:
         scan_strategy = scan_strategy or {}
+        self._active_plan = plan
 
         # Step 0: probe LLM priority paths
         priority_paths = []
@@ -168,6 +176,11 @@ class DirScanOrchestrator:
                 logger.warning(f"[DirOrch] {tool_name} 异常: {e}")
                 self._round += 1
 
+        # Step 1.5: deterministic backup variant probe for all source/config files
+        source_files = self._collect_source_file_paths()
+        if source_files:
+            await self._probe_backup_variants(base_url, source_files)
+
         # Step 2: execute queued deep scans
         await self._execute_deep_scans(base_url)
 
@@ -200,11 +213,13 @@ class DirScanOrchestrator:
                     self._recent_new_hints.add(h)
 
     def _should_consult_llm(self, new_paths: int, tool_name: str, elapsed: float) -> bool:
-        if self._round <= 2:
-            return True
+        if self._round < 3:
+            return False
         if new_paths > 15:
             return True
         if self._recent_new_hints & _HIGH_VALUE_HINTS:
+            return True
+        if "dirlist" in self._recent_new_hints:
             return True
         return False
 
@@ -268,8 +283,14 @@ class DirScanOrchestrator:
 
         ext_adj = adaptation.get("extension_adjustment")
         if ext_adj and isinstance(ext_adj, str) and len(ext_adj) > 2:
+            updated = self.planner.update_pending_extensions(
+                self._active_plan, ext_adj,
+            )
             if self._log_cb:
-                await self._log_cb(f"[DirOrch] LLM 建议扩展名调整: {ext_adj}")
+                await self._log_cb(
+                    f"[DirOrch] LLM 扩展名调整: {ext_adj} "
+                    f"(已注入 {updated} 个待执行工具)"
+                )
 
         strategy = adaptation.get("strategy_change")
         if strategy == "early_stop_quality_sufficient":
@@ -322,6 +343,16 @@ class DirScanOrchestrator:
                 )
         except Exception as e:
             logger.warning(f"[DirOrch] Priority path probe failed: {e}")
+
+    def _collect_source_file_paths(self, max_items: int = 20) -> list[str]:
+        """Extract paths with code/config extensions from the aggregator for backup probing."""
+        candidates: list[str] = []
+        for entry in self.aggregator._entries.values():
+            lower = entry.path.lower().rstrip("/")
+            if any(lower.endswith(ext) for ext in _SOURCE_FILE_EXTS):
+                candidates.append(entry.path)
+        candidates.sort(key=lambda p: -self.aggregator._entries[p].confidence)
+        return candidates[:max_items]
 
     async def _probe_backup_variants(self, base_url: str, source_paths: list[str]) -> None:
         """Probe backup/swap file variants for discovered source files."""

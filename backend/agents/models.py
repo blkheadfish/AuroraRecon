@@ -220,6 +220,9 @@ class PentestState(BaseModel):
 	# 页面参数发现+验证: [{"url": "http://x/info.php?file=", "param_name": "file",
 	#   "method": "GET", "vuln_type": "lfi", "verified": True, "evidence": "..."}]
 	page_params: list[dict[str, Any]] = Field(default_factory=list)
+	# Paths discovered from file content analysis (new_paths from FILE_INTEL_EXTRACT),
+	# consumed by vuln_scan to expand the attack surface
+	intel_discovered_paths: list[str] = Field(default_factory=list)
 
 	subdomains: list[str] = Field(default_factory=list)
 	raw_recon: dict = Field(default_factory=dict)

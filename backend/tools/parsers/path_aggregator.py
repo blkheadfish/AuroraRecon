@@ -76,6 +76,13 @@ def _classify_path(path: str) -> list[str]:
     return hints
 
 
+_INTEL_HINT_MAP: dict[str, str] = {
+    "credentials":  "credential_confirmed",
+    "secrets":      "secret_confirmed",
+    "config_intel": "config_leak",
+    "attack_hints": "attack_lead",
+}
+
 _URL_RE = re.compile(r'(https?://[^\s\]\)]+)')
 _STATUS_CODE_RE = re.compile(r'\b([1-5]\d{2})\b')
 _FEROX_LINE_RE = re.compile(r'^\s*(\d{3})\s+\S+\s+\S+\s+\S+\s+(https?://\S+)')
@@ -163,6 +170,47 @@ class PathAggregator:
                 if any(h in e.hints for h in ("admin", "login", "leak", "upload", "api", "config", "backup"))
             ),
         }
+
+    def update_hints_from_intel(self, path: str, intel: dict) -> list[str]:
+        """Update path hints based on LLM intel analysis results.
+
+        Accepts the structured JSON returned by FILE_INTEL_EXTRACT and maps
+        confirmed high/medium-confidence findings to hint labels.  Only trusts
+        items whose ``confidence`` is ``"high"`` or ``"medium"`` to avoid
+        tagging example/placeholder content as real findings.
+
+        Returns the list of newly added hint strings.
+        """
+        entry = self._entries.get(_normalize_path(path))
+        if not entry:
+            return []
+        new_hints: list[str] = []
+
+        risk = intel.get("risk_level", "none")
+        if risk in ("critical", "high") and "high_risk_intel" not in entry.hints:
+            entry.hints.append("high_risk_intel")
+            new_hints.append("high_risk_intel")
+
+        for intel_key, hint_label in _INTEL_HINT_MAP.items():
+            items = intel.get(intel_key) or []
+            has_confirmed = any(
+                isinstance(item, dict)
+                and item.get("confidence") in ("high", "medium")
+                for item in items
+            )
+            if has_confirmed and hint_label not in entry.hints:
+                entry.hints.append(hint_label)
+                new_hints.append(hint_label)
+
+        file_type = intel.get("file_type", "")
+        if file_type == "sql_dump" and "db_dump" not in entry.hints:
+            entry.hints.append("db_dump")
+            new_hints.append("db_dump")
+
+        if entry.confidence < 0.85 and new_hints:
+            entry.confidence = min(1.0, entry.confidence + 0.2)
+
+        return new_hints
 
 
 def _normalize_path(raw: str) -> str:

@@ -463,6 +463,19 @@ async def node_vuln_scan(state: PentestState) -> PentestState:
     from backend.agents.vuln_agent import VulnAgent
     state.current_phase = "vuln_scan"
     _record_chain_visit(state, "vuln_scan")
+
+    # Consume paths discovered by intel_harvest and merge into attack surface
+    if state.intel_discovered_paths:
+        existing = set(state.web_paths or [])
+        new_count = 0
+        for p in state.intel_discovered_paths:
+            if p not in existing:
+                state.web_paths.append(p)
+                existing.add(p)
+                new_count += 1
+        if new_count:
+            state.log(f"情报回注: intel_harvest 新增 {new_count} 条路径到攻击面")
+
     state.log("开始漏洞扫描...")
     agent = VulnAgent()
     async def _on_tool_log(line: str):
@@ -878,6 +891,20 @@ def _classify_harvest_targets(state: PentestState) -> tuple[list[str], list[str]
             seen.add(p)
             page_candidates.append(p)
 
+    # LLM-confirmed high-value paths from intel analysis (via update_hints_from_intel)
+    _intel_confirmed = {
+        "high_risk_intel", "credential_confirmed", "secret_confirmed",
+        "config_leak", "db_dump", "attack_lead",
+    }
+    for item in (state.web_paths_inventory or []):
+        p = item.get("path", "")
+        if p in seen:
+            continue
+        item_hints = set(item.get("hints", []))
+        if item_hints & _intel_confirmed:
+            seen.add(p)
+            file_candidates.append(p)
+
     return file_candidates[:_MAX_FILE_TARGETS], page_candidates[:_MAX_PAGE_TARGETS]
 
 
@@ -966,6 +993,44 @@ def _check_verify_result(stdout: str, vuln_type: str) -> bool:
     if vuln_type == "cmdi":
         return "uid=" in s
     return False
+
+
+_INTEL_HINT_MAP = [
+    ("credentials", "credential_confirmed"),
+    ("secrets", "secret_confirmed"),
+    ("config_intel", "config_leak"),
+    ("attack_hints", "attack_lead"),
+]
+
+
+def _update_inventory_hints_from_intel(
+    state: PentestState, path: str, intel: dict,
+) -> None:
+    """Reflect LLM file-analysis conclusions back into web_paths_inventory hints.
+
+    Maps structured fields from FILE_INTEL_EXTRACT output to confirmed hint
+    labels, only trusting items with confidence high/medium.
+    """
+    new_hints: list[str] = []
+    risk = intel.get("risk_level", "none")
+    if risk in ("critical", "high"):
+        new_hints.append("high_risk_intel")
+    for intel_key, hint_label in _INTEL_HINT_MAP:
+        items = intel.get(intel_key) or []
+        if any(
+            isinstance(i, dict) and i.get("confidence") in ("high", "medium")
+            for i in items
+        ):
+            new_hints.append(hint_label)
+    if intel.get("file_type") == "sql_dump":
+        new_hints.append("db_dump")
+    if not new_hints:
+        return
+    for inv_item in (state.web_paths_inventory or []):
+        if inv_item.get("path") == path:
+            existing = set(inv_item.get("hints", []))
+            inv_item["hints"] = list(existing | set(new_hints))
+            break
 
 
 @retry_node()
@@ -1110,8 +1175,14 @@ async def node_intel_harvest(state: PentestState) -> PentestState:
             ))
 
         for np in (intel.get("new_paths") or []):
-            if np and np not in state.web_paths:
-                state.web_paths.append(np)
+            if np:
+                if np not in state.web_paths:
+                    state.web_paths.append(np)
+                if np not in state.intel_discovered_paths:
+                    state.intel_discovered_paths.append(np)
+
+        # Reflect LLM analysis conclusions back into inventory hints
+        _update_inventory_hints_from_intel(state, entry["path"], intel)
 
     # ── Step D + E (Pipeline B): verify params & inject findings ──
     for entry, audit in zip(page_entries, page_results):
@@ -1121,8 +1192,11 @@ async def node_intel_harvest(state: PentestState) -> PentestState:
         page_url = f"{base_url}{entry['path']}"
 
         for hp in (audit.get("hidden_paths") or []):
-            if hp and hp not in state.web_paths:
-                state.web_paths.append(hp)
+            if hp:
+                if hp not in state.web_paths:
+                    state.web_paths.append(hp)
+                if hp not in state.intel_discovered_paths:
+                    state.intel_discovered_paths.append(hp)
 
         for leak in (audit.get("leaked_info") or []):
             state.loot_store.append({"source": entry["path"], **leak})

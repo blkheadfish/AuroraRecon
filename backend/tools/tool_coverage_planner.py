@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -384,6 +385,35 @@ class ToolCoveragePlanner:
                 logger.debug(f"[Planner] Timeout upgrade applied (factor={factor})")
                 break
         self._timeout_factor = factor
+
+    def update_pending_extensions(self, plan: list[dict], new_extensions: str) -> int:
+        """Inject new file extensions into pending tool scripts.
+
+        Replaces the ``-e <extensions>`` argument for dirsearch and similar
+        tools that haven't been executed yet, making LLM extension advice
+        actually take effect.
+
+        Returns the number of tool scripts updated.
+        """
+        if not new_extensions or not plan:
+            return 0
+        pending_names = {r.name for r in self._records if r.status == "pending"}
+        if not pending_names:
+            return 0
+        _ext_flag_re = re.compile(r'-e\s+\S+')
+        updated = 0
+        for entry in plan:
+            if entry.get("name") not in pending_names:
+                continue
+            script = entry.get("script", "")
+            m = _ext_flag_re.search(script)
+            if m:
+                entry["script"] = script[:m.start()] + f"-e {new_extensions}" + script[m.end():]
+                entry["runtime_command"] = entry["script"]
+                updated += 1
+        if updated:
+            logger.info(f"[Planner] Updated extensions for {updated} pending tools -> {new_extensions}")
+        return updated
 
     @property
     def executed_count(self) -> int:
