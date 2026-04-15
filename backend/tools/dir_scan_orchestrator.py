@@ -36,6 +36,18 @@ _HIGH_VALUE_HINTS = frozenset({
     "admin", "login", "backup", "config", "upload", "api", "leak", "info_disclosure",
 })
 
+_LOG_PATH_PREVIEW = 28
+
+
+def _preview_paths(paths: list[str], limit: int = _LOG_PATH_PREVIEW) -> str:
+    if not paths:
+        return "(无)"
+    head = paths[:limit]
+    s = ", ".join(head)
+    if len(paths) > limit:
+        s += f" …(共 {len(paths)} 条)"
+    return s
+
 
 @dataclass
 class DeepScanTarget:
@@ -122,6 +134,7 @@ class DirScanOrchestrator:
 
             t0 = time.monotonic()
             try:
+                paths_before = set(self.aggregator._entries.keys())
                 result: ExecuteResult = await self.executor.run_script(
                     script_content=tool_spec["script"],
                     timeout=tool_spec["timeout"],
@@ -134,6 +147,10 @@ class DirScanOrchestrator:
                 stdout = result.stdout or ""
                 self._raw_outputs.append(f"=== {tool_name} ===\n{stdout}")
                 new_count = self.aggregator.ingest(tool_name, stdout, base_url)
+                new_paths_only = [
+                    p for p in self.aggregator._entries
+                    if p not in paths_before
+                ]
                 actionable_count = len(self.aggregator.get_actionable_paths())
                 self.planner.record_result(
                     tool_name, "executed",
@@ -142,11 +159,20 @@ class DirScanOrchestrator:
                     raw_len=len(stdout),
                     elapsed=elapsed,
                 )
+                detail = _preview_paths(new_paths_only)
+                logger.info(
+                    "[DirOrch] %s 完成 +%d 条新路径 (累计 %d 条) %.1fs | 新增: %s",
+                    tool_name, new_count, self.aggregator.count, elapsed, detail,
+                )
                 if self._log_cb:
                     await self._log_cb(
                         f"[DirOrch] {tool_name} 完成: +{new_count} 路径 "
                         f"(累计 {self.aggregator.count}), {elapsed:.1f}s"
                     )
+                    if new_paths_only:
+                        await self._log_cb(
+                            f"[DirOrch] {tool_name} 本轮新增路径: {detail}"
+                        )
 
                 self._round += 1
                 self._track_recent_hints(new_count)
@@ -179,6 +205,15 @@ class DirScanOrchestrator:
         # Step 1.5: deterministic backup variant probe for all source/config files
         source_files = self._collect_source_file_paths()
         if source_files:
+            logger.info(
+                "[DirOrch] Step1.5 确定性备份变体: 源文件 %d 个 — %s",
+                len(source_files), _preview_paths(source_files, 20),
+            )
+            if self._log_cb:
+                await self._log_cb(
+                    f"[DirOrch] 确定性备份变体: 基于 {len(source_files)} 个源文件 "
+                    f"({_preview_paths(source_files, 12)})"
+                )
             await self._probe_backup_variants(base_url, source_files)
 
         # Step 2: execute queued deep scans
@@ -195,6 +230,13 @@ class DirScanOrchestrator:
                 f"({report.total_elapsed:.0f}s), "
                 f"深扫任务 {len(self._deep_scan_queue)} 个"
             )
+            await self._log_cb(
+                f"[DirOrch] 可行动路径摘要 ({len(paths)} 条): {_preview_paths(paths, 40)}"
+            )
+        logger.info(
+            "[DirOrch] 扫描结束 base=%s | 可行动路径 %d 条 | %s",
+            base_url, len(paths), _preview_paths(paths, 50),
+        )
 
         return OrchestratorResult(
             paths=paths,
@@ -327,6 +369,7 @@ class DirScanOrchestrator:
                 record_purpose="llm_priority_probe",
             )
             found = 0
+            hits: list[str] = []
             if result.stdout:
                 for line in result.stdout.strip().splitlines():
                     parts = line.strip().split()
@@ -337,9 +380,15 @@ class DirScanOrchestrator:
                                 [path], source="llm_priority", status=int(code),
                             )
                             found += 1
+                            hits.append(f"{path}→{code}")
+            if found:
+                logger.info(
+                    "[DirOrch] 优先路径探测命中 %d 条: %s",
+                    found, _preview_paths(hits, 25),
+                )
             if self._log_cb and found:
                 await self._log_cb(
-                    f"[DirOrch] 优先路径探测: {found} 条有效"
+                    f"[DirOrch] 优先路径探测: {found} 条有效 — {_preview_paths(hits, 20)}"
                 )
         except Exception as e:
             logger.warning(f"[DirOrch] Priority path probe failed: {e}")
@@ -391,6 +440,7 @@ class DirScanOrchestrator:
                 record_purpose="backup_variant_probe",
             )
             found = 0
+            hit_lines: list[str] = []
             if result.stdout:
                 for line in result.stdout.strip().splitlines():
                     parts = line.strip().split()
@@ -399,9 +449,15 @@ class DirScanOrchestrator:
                             [parts[0]], source="backup_variant", status=int(parts[1]),
                         )
                         found += 1
+                        hit_lines.append(f"{parts[0]} HTTP {parts[1]}")
+            if found:
+                logger.info(
+                    "[DirOrch] 备份变体命中 %d 个: %s",
+                    found, _preview_paths(hit_lines, 30),
+                )
             if self._log_cb and found:
                 await self._log_cb(
-                    f"[DirOrch] 备份变体发现: {found} 个"
+                    f"[DirOrch] 备份变体发现 {found} 个: {_preview_paths(hit_lines, 24)}"
                 )
         except Exception as e:
             logger.warning(f"[DirOrch] Backup variant probe failed: {e}")
@@ -432,7 +488,7 @@ class DirScanOrchestrator:
             script = (
                 f'WL="{wl}"; [ -f "$WL" ] || WL="/usr/share/wordlists/dirb/common.txt"; '
                 f'feroxbuster -u "{sub_url}" -w "$WL" -t 30 --depth 2 '
-                f'--no-state -q -C 404 --silent 2>/dev/null'
+                f'--no-state -q -C 404 2>/dev/null'
             )
             if self._log_cb:
                 await self._log_cb(
@@ -449,11 +505,23 @@ class DirScanOrchestrator:
                     record_purpose=f"deep_scan_{target.path.strip('/')}",
                 )
                 stdout = result.stdout or ""
+                paths_before_ds = set(self.aggregator._entries.keys())
                 new_count = self.aggregator.ingest("feroxbuster", stdout, base_url)
+                new_only_ds = [
+                    p for p in self.aggregator._entries if p not in paths_before_ds
+                ]
                 self._raw_outputs.append(f"=== deep_scan {target.path} ===\n{stdout}")
+                logger.info(
+                    "[DirOrch] 深扫 %s +%d 条 | %s",
+                    target.path, new_count, _preview_paths(new_only_ds, 25),
+                )
                 if self._log_cb:
                     await self._log_cb(
                         f"[DirOrch] 深扫 {target.path}: +{new_count} 路径"
                     )
+                    if new_only_ds:
+                        await self._log_cb(
+                            f"[DirOrch] 深扫 {target.path} 新增: {_preview_paths(new_only_ds, 20)}"
+                        )
             except Exception as e:
                 logger.warning(f"[DirOrch] Deep scan {target.path} failed: {e}")

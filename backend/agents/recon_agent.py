@@ -29,6 +29,58 @@ from backend.tools.tool_coverage_planner import ToolCoveragePlanner, CoverageRep
 logger = logging.getLogger(__name__)
 
 
+def _preview_path_list(paths: list[str], limit: int = 24) -> str:
+	if not paths:
+		return "(无)"
+	head = paths[:limit]
+	s = ", ".join(head)
+	if len(paths) > limit:
+		s += f" …(共 {len(paths)} 条)"
+	return s
+
+
+def _normalize_deep_scan_root(scan_sub: str) -> str:
+	"""Normalize LLM-provided base path for prefix matching."""
+	r = (scan_sub or "/").strip()
+	if not r:
+		r = "/"
+	if not r.startswith("/"):
+		r = "/" + r
+	return r.rstrip("/") or "/"
+
+
+def _paths_under_deep_root(scan_root: str, paths: list[str]) -> list[str]:
+	"""Keep paths that live under scan_root (same path or descendant)."""
+	root = _normalize_deep_scan_root(scan_root)
+	out: list[str] = []
+	for p in paths:
+		pn = p if p.startswith("/") else "/" + p
+		if root == "/":
+			out.append(pn)
+		elif pn == root or pn.startswith(root + "/"):
+			out.append(pn)
+	return sorted(set(out))
+
+
+def _ferox_stdout_sample(stdout: str, max_lines: int = 22, max_chars: int = 3200) -> str:
+	"""Short, readable sample of feroxbuster lines for logs."""
+	lines = [ln.rstrip() for ln in (stdout or "").splitlines() if ln.strip()]
+	if not lines:
+		return "(ferox 无有效输出行)"
+		buf: list[str] = []
+	n = 0
+	for ln in lines:
+		if n >= max_lines:
+			buf.append(f"…(另有 {len(lines) - max_lines} 行未展示)")
+			break
+		buf.append(ln[:220])
+		n += 1
+	text = "\n".join(buf)
+	if len(text) > max_chars:
+		text = text[:max_chars] + "…"
+	return text
+
+
 class ReconAgent:
 	def __init__(self):
 		self.executor = ToolExecutor()
@@ -782,35 +834,65 @@ class ReconAgent:
 	) -> None:
 		"""Execute deep dive actions from LLM plan concurrently."""
 		tasks: list[asyncio.Task] = []
+		task_labels: list[str] = []
+
+		async def _emit_deep_detail(msg: str) -> None:
+			logger.info("[ReconAgent] %s", msg)
+			if log_callback:
+				await log_callback(f"[ReconAgent] {msg}")
 
 		# Recursive subdirectory scans
 		for scan in deep_plan.get("recursive_scans", [])[:3]:
 			sub_base = scan.get("base", "")
 			if not sub_base:
 				continue
+			reason = (scan.get("reason") or "").strip()
+			wl = scan.get("wordlist", "")
+			depth = scan.get("depth", 2)
+			label = (
+				f"深挖子任务 [递归目录爆破] base={sub_base} depth={depth}"
+				f"{f' wordlist={wl}' if wl else ''}"
+				f"{f' | 理由: {reason[:200]}' if reason else ''}"
+			)
+			task_labels.append(label)
 			tasks.append(asyncio.create_task(
 				self._deep_recursive_scan(
-					base_url, sub_base, scan.get("depth", 2),
+					base_url, sub_base, depth,
 					aggregator, task_id, log_callback, record_callback,
+					reason=reason,
 				)
 			))
 
 		# Info source actions (robots, sitemap, git, api schema)
 		for action in deep_plan.get("info_source_actions", []):
-			atype = action.get("type", "") if isinstance(action, dict) else ""
+			if not isinstance(action, dict):
+				continue
+			atype = action.get("type", "")
+			apath = action.get("path", "")
+			exp = action.get("expected_value", "")
 			if atype == "parse_robots":
+				label = "深挖子任务 [robots.txt] GET /robots.txt 解析 Disallow/Allow/Sitemap"
+				task_labels.append(label)
 				tasks.append(asyncio.create_task(
 					self._parse_robots_txt(
 						base_url, aggregator, task_id, log_callback, record_callback,
 					)
 				))
 			elif atype == "parse_sitemap":
+				label = "深挖子任务 [sitemap.xml] GET /sitemap.xml 提取 <loc> 路径"
+				task_labels.append(label)
 				tasks.append(asyncio.create_task(
 					self._parse_sitemap_xml(
 						base_url, aggregator, task_id, log_callback, record_callback,
 					)
 				))
 			elif atype == "git_dump":
+				p = apath or "/.git/"
+				label = (
+					f"深挖子任务 [.git 泄露检查] 探测 {p}HEAD / config"
+					f"{f' | 预期价值={exp}' if exp else ''}"
+				)
+				task_labels.append(label)
 				tasks.append(asyncio.create_task(
 					self._check_git_exposure(
 						base_url, aggregator, task_id, log_callback, record_callback,
@@ -820,6 +902,11 @@ class ReconAgent:
 		# API schema discovery
 		api_checks = deep_plan.get("api_schema_checks", [])
 		if api_checks:
+			preview = ", ".join(str(p) for p in api_checks[:8] if p)
+			if len(api_checks) > 8:
+				preview += f" …(+{len(api_checks) - 8})"
+			label = f"深挖子任务 [API 文档探测] 额外路径: {preview or '(仅默认列表)'}"
+			task_labels.append(label)
 			tasks.append(asyncio.create_task(
 				self._check_api_schemas(
 					base_url, api_checks, aggregator, task_id, log_callback, record_callback,
@@ -827,11 +914,33 @@ class ReconAgent:
 			))
 
 		if tasks:
-			if log_callback:
-				await log_callback(
-					f"[ReconAgent] 深挖: 并发执行 {len(tasks)} 个子任务"
+			await _emit_deep_detail(
+				f"深挖: 并发执行 {len(tasks)} 个子任务 — 明细如下:"
+			)
+			for i, line in enumerate(task_labels, 1):
+				await _emit_deep_detail(f"  ({i}/{len(task_labels)}) {line}")
+			# 攻击链提示（仅日志，不额外跑工具）
+			for hint in (deep_plan.get("attack_chain_hints") or [])[:5]:
+				if isinstance(hint, dict):
+					paths = hint.get("paths") or []
+					chain = hint.get("chain", "")
+					conf = hint.get("confidence", "")
+					await _emit_deep_detail(
+						f"深挖线索 [攻击链] paths={paths} confidence={conf} | {chain}"
+					)
+			results = await asyncio.gather(*tasks, return_exceptions=True)
+			failures = [r for r in results if isinstance(r, Exception)]
+			if failures:
+				for exc in failures:
+					logger.warning("[ReconAgent] 深挖子任务异常: %s", exc)
+					if log_callback:
+						await log_callback(
+							f"[ReconAgent] 深挖子任务异常: {exc}"
+						)
+			else:
+				await _emit_deep_detail(
+					f"深挖: {len(tasks)} 个子任务已全部结束（无未捕获异常）"
 				)
-			await asyncio.gather(*tasks, return_exceptions=True)
 
 	async def _deep_recursive_scan(
 		self,
@@ -842,14 +951,25 @@ class ReconAgent:
 		task_id: Optional[str],
 		log_callback: LogCallback = None,
 		record_callback: RecordCallback = None,
+		*,
+		reason: str = "",
 	) -> None:
 		sub_url = f"{base_url.rstrip('/')}{sub_path}"
+		d = min(depth, 3)
+		start_msg = (
+			f"深扫开始 feroxbuster url={sub_url} depth={d} timeout=120s"
+			f"{f' | {reason[:180]}' if reason else ''}"
+		)
+		logger.info("[ReconAgent] %s", start_msg)
+		if log_callback:
+			await log_callback(f"[ReconAgent] {start_msg}")
 		script = (
 			f'WL="/usr/share/wordlists/dirb/common.txt"; '
-			f'feroxbuster -u "{sub_url}" -w "$WL" -t 30 --depth {min(depth, 3)} '
-			f'--no-state -q -C 404 --silent 2>/dev/null'
+			f'feroxbuster -u "{sub_url}" -w "$WL" -t 30 --depth {d} '
+			f'--no-state -q -C 404 2>/dev/null'
 		)
 		try:
+			paths_before = set(aggregator._entries.keys())
 			result = await self.executor.run_script(
 				script_content=script, timeout=120, task_id=task_id,
 				log_callback=log_callback,
@@ -857,17 +977,51 @@ class ReconAgent:
 				record_phase="recon",
 				record_purpose=f"deep_scan_{sub_path.strip('/')}",
 			)
-			new = aggregator.ingest("feroxbuster", result.stdout or "", base_url)
+			raw_out = result.stdout or ""
+			new = aggregator.ingest("feroxbuster", raw_out, base_url)
+			new_paths = [p for p in aggregator._entries if p not in paths_before]
+			root_norm = _normalize_deep_scan_root(sub_path)
+			under_root = _paths_under_deep_root(sub_path, new_paths)
+			display_paths = under_root if under_root else new_paths
+			sample = _ferox_stdout_sample(raw_out)
+			logger.info(
+				"[ReconAgent] 深扫根=%s | 扫描 URL=%s | 本轮解析新增 %d 条 | "
+				"落在该根下 %d 条",
+				root_norm, sub_url, len(new_paths), len(under_root),
+			)
+			logger.info(
+				"[ReconAgent] 深扫根=%s 新增路径明细: %s",
+				root_norm, _preview_path_list(display_paths, 60),
+			)
+			logger.info(
+				"[ReconAgent] 深扫根=%s ferox 输出样本:\n%s",
+				root_norm, sample,
+			)
 			if log_callback:
-				await log_callback(f"[ReconAgent] 深扫 {sub_path}: +{new} 路径")
+				await log_callback(
+					f"[ReconAgent] 深扫根 {root_norm} → 新增 {len(new_paths)} 条 "
+					f"(根下 {len(under_root)} 条): {_preview_path_list(display_paths, 35)}"
+				)
+				await log_callback(
+					f"[ReconAgent] 深扫根 {root_norm} ferox 样本:\n{sample}"
+				)
 		except Exception as e:
 			logger.warning(f"[ReconAgent] Deep scan {sub_path} failed: {e}")
+			if log_callback:
+				await log_callback(
+					f"[ReconAgent] 深扫失败 {sub_path}: {e}"
+				)
 
 	async def _parse_robots_txt(
 		self, base_url: str, aggregator: PathAggregator,
 		task_id: Optional[str], log_callback: LogCallback = None,
 		record_callback: RecordCallback = None,
 	) -> None:
+		logger.info("[ReconAgent] robots.txt 开始 GET %s/robots.txt", base_url.rstrip("/"))
+		if log_callback:
+			await log_callback(
+				f"[ReconAgent] robots.txt 开始: {base_url.rstrip('/')}/robots.txt"
+			)
 		try:
 			result = await self.executor.run_script(
 				script_content=f'curl -sS --max-time 8 "{base_url}/robots.txt" 2>/dev/null',
@@ -878,6 +1032,9 @@ class ReconAgent:
 			)
 			body = result.stdout or ""
 			if not body or "<html" in body.lower():
+				logger.info("[ReconAgent] robots.txt无有效内容或返回 HTML，跳过解析")
+				if log_callback:
+					await log_callback("[ReconAgent] robots.txt: 无有效内容，跳过")
 				return
 			paths = []
 			for line in body.splitlines():
@@ -897,9 +1054,14 @@ class ReconAgent:
 							paths.append(parsed.path)
 			if paths:
 				aggregator.add_paths(paths, source="robots_txt", status=0)
+				logger.info(
+					"[ReconAgent] robots.txt 解析命中 %d 条: %s",
+					len(paths), _preview_path_list(paths, 30),
+				)
 				if log_callback:
 					await log_callback(
-						f"[ReconAgent] robots.txt 解析: +{len(paths)} 路径"
+						f"[ReconAgent] robots.txt 解析: +{len(paths)} 路径 — "
+						f"{_preview_path_list(paths, 25)}"
 					)
 		except Exception as e:
 			logger.debug(f"[ReconAgent] robots.txt parse failed: {e}")
@@ -909,6 +1071,11 @@ class ReconAgent:
 		task_id: Optional[str], log_callback: LogCallback = None,
 		record_callback: RecordCallback = None,
 	) -> None:
+		logger.info("[ReconAgent] sitemap.xml 开始 GET %s/sitemap.xml", base_url.rstrip("/"))
+		if log_callback:
+			await log_callback(
+				f"[ReconAgent] sitemap.xml 开始: {base_url.rstrip('/')}/sitemap.xml"
+			)
 		try:
 			result = await self.executor.run_script(
 				script_content=(
@@ -922,6 +1089,9 @@ class ReconAgent:
 			)
 			body = result.stdout or ""
 			if not body or "<urlset" not in body.lower():
+				logger.info("[ReconAgent] sitemap.xml 非标准或为空，跳过")
+				if log_callback:
+					await log_callback("[ReconAgent] sitemap.xml: 无有效 XML，跳过")
 				return
 			loc_re = re.compile(r"<loc>\s*(https?://[^<]+)\s*</loc>", re.IGNORECASE)
 			paths = []
@@ -931,9 +1101,14 @@ class ReconAgent:
 					paths.append(parsed.path)
 			if paths:
 				aggregator.add_paths(paths[:100], source="sitemap_xml", status=0)
+				logger.info(
+					"[ReconAgent] sitemap.xml 解析命中 %d 条: %s",
+					len(paths), _preview_path_list(paths, 35),
+				)
 				if log_callback:
 					await log_callback(
-						f"[ReconAgent] sitemap.xml 解析: +{len(paths)} 路径"
+						f"[ReconAgent] sitemap.xml 解析: +{len(paths)} 路径 — "
+						f"{_preview_path_list(paths, 25)}"
 					)
 		except Exception as e:
 			logger.debug(f"[ReconAgent] sitemap.xml parse failed: {e}")
@@ -943,6 +1118,10 @@ class ReconAgent:
 		task_id: Optional[str], log_callback: LogCallback = None,
 		record_callback: RecordCallback = None,
 	) -> None:
+		git_head = f"{base_url.rstrip('/')}/.git/HEAD"
+		logger.info("[ReconAgent] .git 检查开始 HEAD=%s", git_head)
+		if log_callback:
+			await log_callback(f"[ReconAgent] .git 检查开始: {git_head}")
 		try:
 			result = await self.executor.run_script(
 				script_content=(
@@ -962,14 +1141,24 @@ class ReconAgent:
 			)
 			body = result.stdout or ""
 			if "HEAD:200" in body and "ref:" in body.lower():
+				git_paths = ["/.git/HEAD", "/.git/config", "/.git/"]
 				aggregator.add_paths(
-					["/.git/HEAD", "/.git/config", "/.git/"],
+					git_paths,
 					source="git_exposure", status=200,
+				)
+				logger.info(
+					"[ReconAgent] .git 泄露确认 (HTTP 200 + ref:) | 关键路径: %s",
+					_preview_path_list(git_paths, 10),
 				)
 				if log_callback:
 					await log_callback(
-						"[ReconAgent] .git 泄露确认! 源码可能可提取"
+						"[ReconAgent] .git 泄露确认! 源码可能可提取 — "
+						f"{_preview_path_list(git_paths, 10)}"
 					)
+			else:
+				logger.info("[ReconAgent] .git 未发现泄露或 HEAD 非 200")
+				if log_callback:
+					await log_callback("[ReconAgent] .git: 未发现可访问的 HEAD/ref")
 		except Exception as e:
 			logger.debug(f"[ReconAgent] git exposure check failed: {e}")
 
@@ -997,6 +1186,12 @@ class ReconAgent:
 				f'[ "$CODE" = "200" ] && echo "{p} $CODE"'
 			)
 		script = "set +e\n" + "\n".join(probe_cmds)
+		tgt_str = ", ".join(targets[:10])
+		if len(targets) > 10:
+			tgt_str += f" …共{len(targets)}个"
+		logger.info("[ReconAgent] API Schema 探测开始 targets=[%s]", tgt_str)
+		if log_callback:
+			await log_callback(f"[ReconAgent] API Schema 探测: {tgt_str}")
 		try:
 			result = await self.executor.run_script(
 				script_content=script, timeout=40, task_id=task_id,
@@ -1005,14 +1200,27 @@ class ReconAgent:
 				record_phase="recon", record_purpose="api_schema_check",
 			)
 			found = 0
+			hit_list: list[str] = []
 			if result.stdout:
 				for line in result.stdout.strip().splitlines():
 					parts = line.strip().split()
 					if len(parts) >= 2:
 						aggregator.add_paths([parts[0]], source="api_schema", status=200)
 						found += 1
+						hit_list.append(f"{parts[0]}→200")
+			if found:
+				logger.info(
+					"[ReconAgent] API Schema 命中 %d: %s",
+					found, ", ".join(hit_list[:12]),
+				)
+			else:
+				logger.info("[ReconAgent] API Schema无 HTTP 200 命中")
 			if found and log_callback:
-				await log_callback(f"[ReconAgent] API Schema 发现: {found} 个端点")
+				await log_callback(
+					f"[ReconAgent] API Schema 发现 {found} 个: {', '.join(hit_list[:10])}"
+				)
+			elif log_callback and not found:
+				await log_callback("[ReconAgent] API Schema: 未发现 200 端点")
 		except Exception as e:
 			logger.debug(f"[ReconAgent] API schema check failed: {e}")
 
@@ -1054,9 +1262,15 @@ class ReconAgent:
 		if not path_lines:
 			return []
 
+		cand_paths = [item.get("path", "") for item in candidates if item.get("path")]
+		logger.info(
+			"[ReconAgent] 路径内容探测 base=%s | 候选 %d 条: %s",
+			base_url, len(cand_paths), _preview_path_list(cand_paths, 30),
+		)
 		if log_callback:
 			await log_callback(
-				f"[ReconAgent] 路径内容探测: 准备探测 {len(candidates)} 条高价值路径"
+				f"[ReconAgent] 路径内容探测: 准备探测 {len(candidates)} 条 — "
+				f"{_preview_path_list(cand_paths, 20)}"
 			)
 
 		probe_script = f"""
@@ -1137,7 +1351,21 @@ EOF_PATHS
 				"content_snippet": body[:500],
 				"dir_listing": is_dirlist,
 			})
+			tshort = (title or "")[:72].replace("\n", " ")
+			logger.info(
+				"[ReconAgent] 探测 %s | HTTP %s | dirlist=%s | title=%s",
+				path, code, is_dirlist, tshort or "(无标题)",
+			)
+			if log_callback:
+				await log_callback(
+					f"[ReconAgent] 探测 {path} → HTTP {code} "
+					f"{'[目录列表]' if is_dirlist else ''} | {tshort or '—'}"
+				)
 
+		logger.info(
+			"[ReconAgent] 路径内容探测完成: %d 条响应, 从页面链接新增路径 %d 条",
+			len(probed), new_paths,
+		)
 		if log_callback:
 			await log_callback(
 				f"[ReconAgent] 路径内容探测完成: 采集 {len(probed)} 条, 新增候选路径 {new_paths} 条"
@@ -1146,6 +1374,14 @@ EOF_PATHS
 		# Deep-crawl any discovered directory listing pages
 		dirlist_paths = [item["path"] for item in probed if item.get("dir_listing")]
 		if dirlist_paths:
+			logger.info(
+				"[ReconAgent] 目录列表深扫种子 %d 个: %s",
+				len(dirlist_paths), _preview_path_list(dirlist_paths, 15),
+			)
+			if log_callback:
+				await log_callback(
+					f"[ReconAgent] 目录列表深扫种子: {_preview_path_list(dirlist_paths, 12)}"
+				)
 			from backend.tools.parsers.dirlist_crawler import crawl_directory_listings
 			try:
 				dirlist_result = await crawl_directory_listings(
@@ -1162,12 +1398,25 @@ EOF_PATHS
 						source="dirlist_deep_crawl",
 						status=200 if not dl_entry.is_dir else 0,
 					)
+				interesting = [e for e in dirlist_result.entries if e.interesting]
+				all_entry_paths = [e.path for e in dirlist_result.entries]
+				int_paths = [e.path for e in interesting]
+				logger.info(
+					"[ReconAgent] 目录列表深扫完成: 总条目 %d, 高价值文件 %d | 条目: %s",
+					len(dirlist_result.entries), len(interesting),
+					_preview_path_list(all_entry_paths, 35),
+				)
+				if int_paths:
+					logger.info(
+						"[ReconAgent] 目录列表高价值文件: %s",
+						_preview_path_list(int_paths, 25),
+					)
 				if log_callback:
-					interesting = [e for e in dirlist_result.entries if e.interesting]
 					await log_callback(
 						f"[ReconAgent] 目录列表深度爬取: "
 						f"{len(dirlist_result.entries)} 条目, "
-						f"{len(interesting)} 个有价值文件"
+						f"{len(interesting)} 个有价值 — "
+						f"{_preview_path_list(int_paths or all_entry_paths, 25)}"
 					)
 			except Exception as e:
 				logger.warning(f"[ReconAgent] 目录列表深度爬取失败: {e}")

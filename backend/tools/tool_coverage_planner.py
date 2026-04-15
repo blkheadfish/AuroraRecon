@@ -31,7 +31,7 @@ _DIR_DISCOVERY_TOOLS: list[dict[str, Any]] = [
             'WL="/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt"; '
             '[ -f "$WL" ] || WL="/usr/share/wordlists/dirb/common.txt"; '
             'feroxbuster -u "{url}" -w "$WL" -t {threads} --depth {depth} --no-state -q '
-            '-C 404 --silent 2>/dev/null'
+            '-C 404 2>/dev/null'
         ),
         "timeout": 180,
     },
