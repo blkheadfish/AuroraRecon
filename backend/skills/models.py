@@ -433,6 +433,7 @@ class SkillContext:
     lhost: str = ""
     can_reverse: bool = False
     task_id: Optional[str] = None  # 任务 ID，用于持久容器执行
+    log_callback: Any = None       # 可选日志回调，用于推送命令/输出到前端
 
     # 动态变量（探测阶段设置，决策树使用）
     variables: dict[str, Any] = field(default_factory=dict)
