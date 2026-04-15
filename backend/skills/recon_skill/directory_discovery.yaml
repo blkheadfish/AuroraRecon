@@ -13,17 +13,16 @@ principle: |
 
 match:
   rules:
-    - fingerprint_contains: ["http"]
-    - fingerprint_contains: ["nginx"]
-    - fingerprint_contains: ["apache"]
     - evidence_contains: ["directory listing"]
     - evidence_contains: ["目录遍历"]
     - evidence_contains: ["directory traversal"]
     - evidence_contains: ["index of"]
-    - evidence_contains: ["information disclosure"]
+    - evidence_contains: ["information disclosure", "sensitive"]
     - evidence_contains: ["sensitive file"]
     - evidence_contains: ["敏感路径"]
     - evidence_contains: ["敏感文件"]
+    - evidence_contains: [".git", "exposed"]
+    - evidence_contains: [".env", "exposed"]
 
 probes:
   - id: quick_dir_scan

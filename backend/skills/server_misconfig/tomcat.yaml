@@ -204,7 +204,7 @@ exploit_paths:
           echo "$result2" | grep -q "uid=" && echo "TOMCAT_RCE_CONFIRMED"
         timeout: 20
         success_criteria:
-          stdout_contains_any: ["uid=", "TOMCAT_RCE_CONFIRMED"]
+          stdout_regex: "(uid=\\d+\\(\\w+\\)|TOMCAT_RCE_CONFIRMED)"
         on_success: conclude_success
         on_fail: next_path
         evidence_capture:
@@ -235,7 +235,7 @@ exploit_paths:
           if echo "$result2" | grep -q "uid="; then echo "TOMCAT_PUT_RCE"; fi
         timeout: 30
         success_criteria:
-          stdout_contains_any: ["uid=", "TOMCAT_PUT_RCE"]
+          stdout_regex: "(uid=\\d+\\(\\w+\\)|TOMCAT_PUT_RCE)"
         on_success: conclude_success
         on_fail: next_path
         evidence_capture:

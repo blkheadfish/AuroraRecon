@@ -15,6 +15,9 @@ Skill 注册表
 from __future__ import annotations
 
 import logging
+import os
+import threading
+from pathlib import Path
 from typing import Optional
 
 from backend.agents.models import VulnFinding
@@ -162,8 +165,11 @@ class SkillRegistry:
         ]
 
     def reload(self) -> None:
-        self._loaded = False
-        self.ensure_loaded()
+        """Atomic reload: load into a new list first, then swap."""
+        new_skills = load_all_skills()
+        self._skills = new_skills
+        self._loaded = True
+        logger.info(f"[SkillRegistry] 重载完成，共 {len(new_skills)} 个 Skill")
 
     # ─────────────────────────────────────────────────────
 
@@ -276,13 +282,76 @@ class SkillRegistry:
         )
 
 
-# ── Module-level singleton ──────────────────────────────
+# ── Module-level singleton (thread-safe) ─────────────────
+_registry_lock = threading.Lock()
 _registry_singleton: SkillRegistry | None = None
 
 
 def get_registry() -> SkillRegistry:
     global _registry_singleton
-    if _registry_singleton is None:
-        _registry_singleton = SkillRegistry()
-        _registry_singleton.ensure_loaded()
+    if _registry_singleton is not None:
+        return _registry_singleton
+    with _registry_lock:
+        if _registry_singleton is None:
+            reg = SkillRegistry()
+            reg.ensure_loaded()
+            _registry_singleton = reg
+            if os.getenv("DEV_MODE", "").lower() in ("1", "true", "yes"):
+                _start_yaml_watcher(reg)
     return _registry_singleton
+
+
+# ── Dev-mode YAML hot-reload watcher ────────────────────
+_watcher_started = False
+
+
+def _start_yaml_watcher(registry: SkillRegistry) -> None:
+    """Start a background thread that watches skill YAML files for changes."""
+    global _watcher_started
+    if _watcher_started:
+        return
+
+    try:
+        from watchdog.observers import Observer
+        from watchdog.events import FileSystemEventHandler
+    except ImportError:
+        logger.info("[SkillRegistry] watchdog not installed, hot-reload disabled")
+        return
+
+    skills_dir = Path(__file__).resolve().parent
+    if not skills_dir.is_dir():
+        return
+
+    class _YamlReloadHandler(FileSystemEventHandler):
+        def __init__(self, reg: SkillRegistry):
+            self._reg = reg
+            self._debounce_timer: threading.Timer | None = None
+
+        def _schedule_reload(self) -> None:
+            if self._debounce_timer is not None:
+                self._debounce_timer.cancel()
+            self._debounce_timer = threading.Timer(1.0, self._do_reload)
+            self._debounce_timer.daemon = True
+            self._debounce_timer.start()
+
+        def _do_reload(self) -> None:
+            logger.info("[SkillRegistry] YAML change detected, reloading skills")
+            try:
+                self._reg.reload()
+            except Exception:
+                logger.warning("[SkillRegistry] Hot-reload failed", exc_info=True)
+
+        def on_modified(self, event):
+            if event.src_path.endswith((".yaml", ".yml")):
+                self._schedule_reload()
+
+        def on_created(self, event):
+            if event.src_path.endswith((".yaml", ".yml")):
+                self._schedule_reload()
+
+    observer = Observer()
+    observer.schedule(_YamlReloadHandler(registry), str(skills_dir), recursive=True)
+    observer.daemon = True
+    observer.start()
+    _watcher_started = True
+    logger.info(f"[SkillRegistry] YAML hot-reload watcher started on {skills_dir}")

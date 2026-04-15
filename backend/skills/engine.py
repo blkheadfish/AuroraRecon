@@ -17,6 +17,7 @@ Skill 执行引擎
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -35,6 +36,7 @@ from backend.skills.models import (
     SkillContext,
     StepOutcome,
 )
+from backend.skills.execution_log import persist_execution
 from backend.tools.executor import DecisionCallback, ExecuteResult, TaskContainerManager, ToolExecutor
 
 logger = logging.getLogger(__name__)
@@ -52,6 +54,8 @@ class SkillEngine:
     def __init__(self):
         self.executor = ToolExecutor()
 
+    _GLOBAL_TIMEOUT = int(os.getenv("SKILL_GLOBAL_TIMEOUT", "900"))
+
     async def execute(
         self,
         skill: Skill,
@@ -64,20 +68,53 @@ class SkillEngine:
         decision_callback: DecisionCallback = None,
     ) -> ExploitResult:
         """
-        执行 Skill 完整流程。
-
-        Args:
-            skill:           匹配到的 Skill 定义
-            finding:         漏洞发现信息
-            target_url:      实际的目标 URL（VulnAgent 探测到的）
-            env_can_reverse: 攻击机是否有公网 IP
-            lhost:           攻击机 IP
-            target_os:       目标操作系统
-            task_id:         任务 ID（容器隔离用）
-
-        Returns:
-            ExploitResult
+        执行 Skill 完整流程，带全局超时保护。
         """
+        t0 = time.monotonic()
+        result: ExploitResult
+        try:
+            result = await asyncio.wait_for(
+                self._execute_inner(
+                    skill, finding, target_url, env_can_reverse,
+                    lhost, target_os, task_id, decision_callback,
+                ),
+                timeout=self._GLOBAL_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[SkillEngine] Skill {skill.skill_id} 全局超时 "
+                f"({self._GLOBAL_TIMEOUT}s)"
+            )
+            result = ExploitResult(
+                vuln_id=finding.vuln_id,
+                success=False,
+                evidence=f"Skill {skill.skill_id} global timeout ({self._GLOBAL_TIMEOUT}s)",
+                commands_run=[],
+                command_records=[],
+            )
+
+        elapsed = round(time.monotonic() - t0, 2)
+        persist_execution({
+            "skill_id": skill.skill_id,
+            "target": target_url,
+            "success": result.success,
+            "total_elapsed": elapsed,
+            "commands_count": len(result.commands_run),
+            "evidence_preview": (result.evidence or "")[:200],
+        })
+        return result
+
+    async def _execute_inner(
+        self,
+        skill: Skill,
+        finding: VulnFinding,
+        target_url: str,
+        env_can_reverse: bool = False,
+        lhost: str = "",
+        target_os: str = "unknown",
+        task_id: Optional[str] = None,
+        decision_callback: DecisionCallback = None,
+    ) -> ExploitResult:
         self._decision_callback = decision_callback
 
         # ── 初始化上下文 ──────────────────────────────
@@ -119,7 +156,7 @@ class SkillEngine:
                     skill, finding, ctx, path.max_rounds
                 )
 
-            # 条件检查
+            # 条件检查: conditions (AND) + conditions_any (OR groups)
             if path.conditions and not ctx.check(path.conditions):
                 unmet = {k: v for k, v in path.conditions.items()
                          if not ctx.check({k: v})}
@@ -128,6 +165,14 @@ class SkillEngine:
                     f"条件不满足: {unmet}"
                 )
                 continue
+
+            if path.conditions_any:
+                if not any(ctx.check(group) for group in path.conditions_any):
+                    logger.info(
+                        f"[SkillEngine] ⏭ 路径 [{path.path_id}] {path.name} — "
+                        f"conditions_any 无匹配组"
+                    )
+                    continue
 
             if path.skip_if and ctx.check(path.skip_if):
                 logger.info(
@@ -163,6 +208,7 @@ class SkillEngine:
             evidence=self._build_failure_summary(skill, ctx),
             commands_run=ctx.commands_run,
             command_records=ctx.step_records,
+            session_info={"probe_variables": dict(ctx.variables)},
         )
 
     # ================================================================
@@ -175,29 +221,53 @@ class SkillEngine:
         ctx: SkillContext,
         task_id: Optional[str],
     ) -> None:
-        """依次执行探测，结果写入上下文"""
-        for probe in probes:
-            # 前置条件检查
+        """Execute probes, running independent ones concurrently."""
+        independent: list[Probe] = []
+        dependent: list[Probe] = []
+        for p in probes:
+            if p.depends_on or p.requires:
+                dependent.append(p)
+            else:
+                independent.append(p)
+
+        if len(independent) > 1:
+            logger.info(
+                f"[SkillEngine] 并发执行 {len(independent)} 个独立探测"
+            )
+            await asyncio.gather(
+                *(self._run_single_probe(p, ctx, task_id) for p in independent)
+            )
+        else:
+            for p in independent:
+                await self._run_single_probe(p, ctx, task_id)
+
+        for probe in dependent:
             if probe.depends_on and not ctx.check(probe.depends_on):
                 logger.debug(f"[SkillEngine] 探测 {probe.id} 依赖不满足，跳过")
                 continue
-
             if probe.requires and not ctx.check(probe.requires):
                 logger.debug(f"[SkillEngine] 探测 {probe.id} 环境不满足，跳过")
                 continue
+            await self._run_single_probe(probe, ctx, task_id)
 
-            logger.info(f"[SkillEngine] 执行探测: {probe.id} — {probe.description[:60]}")
-
-            if probe.steps:
-                for i, step in enumerate(probe.steps):
-                    logger.info(f"[SkillEngine]   探测子步骤 {i+1}/{len(probe.steps)}")
-                    await self._run_probe_command(
-                        step.command, step.parse_rules, step.timeout, ctx, task_id
-                    )
-            elif probe.command:
+    async def _run_single_probe(
+        self,
+        probe: Probe,
+        ctx: SkillContext,
+        task_id: Optional[str],
+    ) -> None:
+        """Execute one probe (single or multi-step)."""
+        logger.info(f"[SkillEngine] 执行探测: {probe.id} — {probe.description[:60]}")
+        if probe.steps:
+            for i, step in enumerate(probe.steps):
+                logger.info(f"[SkillEngine]   探测子步骤 {i+1}/{len(probe.steps)}")
                 await self._run_probe_command(
-                    probe.command, probe.parse_rules, probe.timeout, ctx, task_id
+                    step.command, step.parse_rules, step.timeout, ctx, task_id
                 )
+        elif probe.command:
+            await self._run_probe_command(
+                probe.command, probe.parse_rules, probe.timeout, ctx, task_id
+            )
 
     async def _run_probe_command(
         self,

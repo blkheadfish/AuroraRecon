@@ -226,7 +226,8 @@ export function createWsConnection(
   onClose?: () => void,
 ): WsConnection {
   const wsBase = getWsBase()
-  const url = `${wsBase}/ws/${taskId}`
+  const token = localStorage.getItem(TOKEN_KEY) ?? ''
+  const url = `${wsBase}/ws/${taskId}${token ? `?token=${encodeURIComponent(token)}` : ''}`
 
   const PING_INTERVAL = 15000
   const PONG_TIMEOUT = 5000

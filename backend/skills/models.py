@@ -46,6 +46,14 @@ def _compare_version(actual: str, expression: str) -> bool:
     return ops.get(op, False)
 
 
+_PLAIN_VERSION_RE = re.compile(r'^\d+(\.\d+)*$')
+
+
+def _is_plain_version(value: str) -> bool:
+    """Return True if value looks like a plain version number (e.g. '1.2.47')."""
+    return bool(_PLAIN_VERSION_RE.match(value.strip()))
+
+
 _SHELL_SAFE_RE = re.compile(r'^[A-Za-z0-9._/:\-=+@,]+$')
 
 
@@ -54,6 +62,30 @@ def _needs_shell_quoting(value: str) -> bool:
     if not value:
         return True
     return not _SHELL_SAFE_RE.match(value)
+
+
+def _is_inside_quotes(template: str, placeholder: str) -> bool:
+    """Check if the placeholder is already inside single or double quotes."""
+    idx = template.find(placeholder)
+    if idx < 0:
+        return False
+    before = template[:idx]
+    single_count = before.count("'") - before.count("\\'")
+    if single_count % 2 == 1:
+        return True
+    double_count = before.count('"') - before.count('\\"')
+    if double_count % 2 == 1:
+        return True
+    return False
+
+
+def _safe_substitute(template: str, placeholder: str, value: str) -> str:
+    """Apply shlex.quote() unless the placeholder is already inside quotes."""
+    if not _needs_shell_quoting(value):
+        return value
+    if _is_inside_quotes(template, placeholder):
+        return value
+    return shlex.quote(value)
 
 
 # ─────────────────────────────────────────────────────────
@@ -257,6 +289,9 @@ class ExploitPath:
     # 前置条件（全部满足才选择此路径）
     conditions: dict[str, Any] = field(default_factory=dict)
 
+    # OR 条件组：列表中任一 dict 全部满足即可（与 conditions AND 关系）
+    conditions_any: list[dict[str, Any]] = field(default_factory=list)
+
     # 排除条件（满足任一则跳过）
     skip_if: dict[str, Any] = field(default_factory=dict)
 
@@ -421,9 +456,10 @@ class SkillContext:
         检查条件是否满足。
 
         支持的 key 格式：
-          - "fastjson_confirmed": true        → 检查 variables
-          - "env.can_reverse": true            → 检查环境属性
-          - "fastjson_version_range": ">=1.2.68" → 不做精确比较，检查变量值
+          - "fastjson_confirmed": true              → 布尔比较
+          - "env.can_reverse": true                  → 检查环境属性
+          - "version_tier": "lte_1.2.47"            → 字符串等值比较（推荐）
+          - "fastjson_version": ">= 1.2.68"         → 版本比较（actual 必须是纯版本号）
         """
         for key, expected in conditions.items():
             if key.startswith("env."):
@@ -435,18 +471,24 @@ class SkillContext:
             if actual is None:
                 return False
 
-            # 布尔比较
             if isinstance(expected, bool):
                 if bool(actual) != expected:
                     return False
             elif isinstance(expected, str):
                 exp_stripped = expected.strip()
-                if exp_stripped and exp_stripped[0] in ('>','<','!','=') and re.match(r'^[><!]=?\s*[\d.]', exp_stripped):
-                    if not _compare_version(str(actual), exp_stripped):
+                is_version_expr = (
+                    exp_stripped
+                    and exp_stripped[0] in ('>', '<', '!', '=')
+                    and re.match(r'^[><!]=?\s*[\d.]', exp_stripped)
+                )
+                if is_version_expr:
+                    actual_str = str(actual)
+                    if not _is_plain_version(actual_str):
+                        return False
+                    if not _compare_version(actual_str, exp_stripped):
                         return False
                 elif str(actual) != expected:
                     return False
-            # 其他类型
             else:
                 if actual != expected:
                     return False
@@ -466,7 +508,6 @@ class SkillContext:
         """
         result = template
 
-        # 固定变量
         replacements = {
             "{ENDPOINT}": self.endpoint,
             "{TARGET_IP}": self.target_ip,
@@ -476,14 +517,15 @@ class SkillContext:
         }
 
         for placeholder, value in replacements.items():
-            result = result.replace(placeholder, value)
+            if placeholder in result:
+                safe_val = _safe_substitute(result, placeholder, value)
+                result = result.replace(placeholder, safe_val)
 
-        # 动态变量（from probe results — shell-escape to prevent injection)
         for key, value in self.variables.items():
             placeholder = f"{{{key}}}"
             if placeholder in result:
                 str_val = str(value)
-                safe_val = shlex.quote(str_val) if _needs_shell_quoting(str_val) else str_val
+                safe_val = _safe_substitute(result, placeholder, str_val)
                 result = result.replace(placeholder, safe_val)
 
         return result

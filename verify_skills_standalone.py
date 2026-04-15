@@ -206,6 +206,50 @@ def load_and_validate():
 
     print(f"  ✅ 变量检查完成")
 
+    # ── 探测-条件变量一致性检查 ────────────────────────────
+    print(f"\n[4] 探测-条件变量一致性检查\n")
+
+    env_vars = {"env.can_reverse", "env.lhost", "env.target_os"}
+    var_issues_found = False
+
+    for rel, data in skills:
+        sid = data["skill_id"]
+
+        produced_vars: set[str] = set()
+        for probe in data.get("probes", []):
+            for rule in probe.get("parse_rules", []):
+                produced_vars.update(rule.get("set", {}).keys())
+            for step in probe.get("steps", []):
+                for rule in step.get("parse_rules", []):
+                    produced_vars.update(rule.get("set", {}).keys())
+
+        consumed_vars: set[str] = set()
+        for probe in data.get("probes", []):
+            consumed_vars.update(probe.get("depends_on", {}).keys())
+            consumed_vars.update(probe.get("requires", {}).keys())
+        for path in data.get("exploit_paths", []):
+            consumed_vars.update(path.get("conditions", {}).keys())
+            consumed_vars.update(path.get("skip_if", {}).keys())
+            for group in path.get("conditions_any", []):
+                consumed_vars.update(group.keys())
+
+        consumed_non_env = {v for v in consumed_vars if not v.startswith("env.")}
+
+        orphan_conditions = consumed_non_env - produced_vars
+        if orphan_conditions:
+            print(f"  ⚠  {sid}: 条件引用了未被任何探测设置的变量: {orphan_conditions}")
+            var_issues_found = True
+
+        dead_vars = produced_vars - consumed_non_env
+        if dead_vars:
+            trivial = {"json_endpoint_active"}
+            real_dead = dead_vars - trivial
+            if real_dead:
+                print(f"  ℹ  {sid}: 探测设置的变量未被任何条件消费: {real_dead}")
+
+    if not var_issues_found:
+        print(f"  ✅ 所有条件变量均有对应的探测来源")
+
     # ── 总结 ─────────────────────────────────────────────
     print(f"\n{'='*60}")
     print(f"加载: {len(skills)} 个 Skill")

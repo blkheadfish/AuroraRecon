@@ -168,7 +168,7 @@ exploit_paths:
             2>&1 | tail -30
         timeout: 120
         success_criteria:
-          stdout_contains_any: ["uid=", "www-data", "root", "os-shell"]
+          stdout_regex: "(uid=\\d+\\(\\w+\\)|www-data|os-shell)"
         on_success: conclude_success
         on_fail: sqlmap_file_read
         evidence_capture:

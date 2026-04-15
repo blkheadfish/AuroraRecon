@@ -16,11 +16,21 @@ logger = logging.getLogger(__name__)
 
 # ── JWT 配置 ──────────────────────────────────────────────
 
+_MIN_SECRET_LEN = 32
+
 _JWT_SECRET = os.getenv("JWT_SECRET", "")
 if not _JWT_SECRET:
     logger.critical(
         "[安全] JWT_SECRET 未设置！使用随机值，重启后所有 token 失效。"
-        "生产环境请在 .env 中设置 JWT_SECRET。"
+        "生产环境请在 .env 中设置 JWT_SECRET（至少 %d 字符）。", _MIN_SECRET_LEN,
+    )
+    _JWT_SECRET = secrets.token_urlsafe(32)
+elif len(_JWT_SECRET) < _MIN_SECRET_LEN:
+    logger.critical(
+        "[安全] JWT_SECRET 仅 %d 字符，低于最低要求 %d 字符！"
+        "已自动替换为随机值，重启后所有 token 失效。"
+        "请在 .env 中设置更长的 JWT_SECRET。",
+        len(_JWT_SECRET), _MIN_SECRET_LEN,
     )
     _JWT_SECRET = secrets.token_urlsafe(32)
 

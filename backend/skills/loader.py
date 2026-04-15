@@ -60,7 +60,7 @@ def load_skill(path: Path) -> Skill:
     if not skill_id:
         raise ValueError(f"缺少 skill_id: {path}")
 
-    return Skill(
+    skill = Skill(
         skill_id=skill_id,
         name=raw.get("name", skill_id),
         category=raw.get("category", ""),
@@ -72,6 +72,8 @@ def load_skill(path: Path) -> Skill:
         remediation=raw.get("remediation", ""),
         source_file=str(path),
     )
+    _validate_variable_consistency(skill, path)
+    return skill
 
 
 # ─────────────────────────────────────────────────────────
@@ -141,6 +143,7 @@ def _parse_paths(raw_list: list) -> list[ExploitPath]:
             priority=raw.get("priority", 10),
             principle=raw.get("principle", ""),
             conditions=raw.get("conditions", {}),
+            conditions_any=raw.get("conditions_any", []),
             skip_if=raw.get("skip_if", {}),
             steps=[_parse_step(s) for s in raw.get("steps", [])],
             mode=raw.get("mode", ""),
@@ -180,3 +183,33 @@ def _ensure_list(value: Any) -> list:
     if isinstance(value, list):
         return value
     return [value]
+
+
+def _validate_variable_consistency(skill: Skill, path: Path) -> None:
+    """Warn at load time if conditions reference variables not set by any probe."""
+    produced: set[str] = set()
+    for probe in skill.probes:
+        for rule in probe.parse_rules:
+            produced.update(rule.set.keys())
+        for step in probe.steps:
+            for rule in step.parse_rules:
+                produced.update(rule.set.keys())
+
+    consumed: set[str] = set()
+    for probe in skill.probes:
+        consumed.update(probe.depends_on.keys())
+        consumed.update(probe.requires.keys())
+    for ep in skill.exploit_paths:
+        consumed.update(ep.conditions.keys())
+        consumed.update(ep.skip_if.keys())
+        for group in ep.conditions_any:
+            consumed.update(group.keys())
+
+    consumed_non_env = {v for v in consumed if not v.startswith("env.")}
+    orphans = consumed_non_env - produced
+    if orphans:
+        logger.warning(
+            "[SkillLoader] %s (%s): conditions reference variables "
+            "never set by probes: %s",
+            skill.skill_id, path.name, orphans,
+        )

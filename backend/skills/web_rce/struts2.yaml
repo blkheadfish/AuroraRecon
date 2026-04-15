@@ -38,7 +38,6 @@ match:
     - fingerprint_contains: ["Showcase"]
     - evidence_contains: ["struts"]
     - evidence_contains: ["S2-"]
-    - evidence_contains: [".action"]
     - evidence_contains: ["OGNL"]
     - evidence_contains: ["opensymphony"]
     - evidence_contains: ["showcase"]
@@ -118,7 +117,7 @@ exploit_paths:
             --max-time 15
         timeout: 20
         success_criteria:
-          stdout_contains_any: ["uid=", "gid="]
+          stdout_regex: "uid=\\d+\\(\\w+\\)"
         on_success: conclude_success
         on_fail: next_path
         evidence_capture:
@@ -156,7 +155,7 @@ exploit_paths:
             --max-time 15
         timeout: 20
         success_criteria:
-          stdout_contains_any: ["uid="]
+          stdout_regex: "uid=\\d+\\(\\w+\\)"
         on_success: conclude_success
         on_fail: next_path
         evidence_capture:
@@ -180,7 +179,7 @@ exploit_paths:
             --max-time 15
         timeout: 20
         success_criteria:
-          stdout_contains_any: ["uid="]
+          stdout_regex: "uid=\\d+\\(\\w+\\)"
         on_success: conclude_success
         on_fail: next_path
         evidence_capture:

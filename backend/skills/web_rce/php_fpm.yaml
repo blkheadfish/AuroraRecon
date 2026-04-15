@@ -171,7 +171,7 @@ exploit_paths:
           echo "VERIFY_FAILED"
         timeout: 120
         success_criteria:
-          stdout_contains_any: ["uid=", "PHP_FPM_RCE_OK"]
+          stdout_regex: "(uid=\\d+\\(\\w+\\)|PHP_FPM_RCE_OK)"
         on_success: conclude_success
         on_fail: conclude_fail
         evidence_capture:
@@ -219,7 +219,7 @@ exploit_paths:
           echo "VERIFY_FAILED"
         timeout: 90
         success_criteria:
-          stdout_contains_any: ["uid=", "PHP_FPM_RCE_OK"]
+          stdout_regex: "(uid=\\d+\\(\\w+\\)|PHP_FPM_RCE_OK)"
         on_success: conclude_success
         on_fail: next_path
         evidence_capture:
@@ -258,7 +258,7 @@ exploit_paths:
           echo "MANUAL_FAILED"
         timeout: 120
         success_criteria:
-          stdout_contains_any: ["uid=", "MANUAL_RCE_OK"]
+          stdout_regex: "(uid=\\d+\\(\\w+\\)|MANUAL_RCE_OK)"
         on_success: conclude_success
         on_fail: next_path
         evidence_capture:

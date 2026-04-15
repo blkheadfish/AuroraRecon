@@ -37,6 +37,16 @@ async def reload_skills():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/skills/stats")
+async def skills_stats():
+    """Aggregated success-rate statistics from execution logs."""
+    try:
+        from backend.skills.execution_log import get_stats
+        return get_stats()
+    except Exception as e:
+        return {"total": 0, "skills": {}, "error": str(e)}
+
+
 @router.get("/skills/{skill_id}/raw")
 async def get_skill_raw(skill_id: str):
     try:

@@ -84,7 +84,8 @@ RUN (curl -fsSL --retry 3 --max-time 120 \
 COPY jndi_fastjson.sh /opt/jndi_fastjson.sh
 COPY bcel_fastjson.py /opt/bcel_fastjson.py
 COPY shiro_exploit.py /opt/shiro_exploit.py
-RUN chmod +x /opt/jndi_fastjson.sh /opt/bcel_fastjson.py /opt/shiro_exploit.py
+COPY shiro_webshell_brute.sh /opt/shiro_webshell_brute.sh
+RUN chmod +x /opt/jndi_fastjson.sh /opt/bcel_fastjson.py /opt/shiro_exploit.py /opt/shiro_webshell_brute.sh
 
 # ---------- Metasploit（包较大，加重试）----------
 RUN apt-get update \

