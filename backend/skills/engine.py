@@ -458,10 +458,25 @@ class SkillEngine:
                 # 记录成功的利用命令模板
                 ctx.exploit_cmd_template = step.command
 
+                shell_type = evidence_data.get("shell_type", "rce")
+                _exploit_level_map = {
+                    "rce": "rce",
+                    "rce_data_wrapper": "rce",
+                    "rce_input_wrapper": "rce",
+                    "rce_ssh_log_poison": "rce",
+                    "rce_apache_log_poison": "rce",
+                    "file_read": "file_read",
+                    "source_read": "source_read",
+                }
+                exploit_level = _exploit_level_map.get(
+                    shell_type, "rce" if "rce" in shell_type else "info_leak"
+                )
+
                 return ExploitResult(
                     vuln_id=finding.vuln_id,
                     success=True,
-                    shell_type=evidence_data.get("shell_type", "rce"),
+                    shell_type=shell_type,
+                    exploit_level=exploit_level,
                     session_info={
                         "method": f"skill:{path.path_id}",
                         "current_user": evidence_data.get("current_user", ""),

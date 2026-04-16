@@ -146,6 +146,11 @@ async def run_task(
             await _maybe_save_db(task_id, state, force=True)
     finally:
         sm.mark_stopped(task_id)
+        try:
+            from backend.tools.executor import TaskContainerManager
+            await TaskContainerManager.stop(task_id)
+        except Exception:
+            pass
 
     # 检测 LangGraph interrupt 暂停（等待人工审批）
     state = sm.get(task_id)
@@ -222,6 +227,11 @@ async def resume_task(task_id: str, approved: bool):
     finally:
         sm.mark_stopped(task_id)
         sm.clear_approval_inflight(task_id)
+        try:
+            from backend.tools.executor import TaskContainerManager
+            await TaskContainerManager.stop(task_id)
+        except Exception:
+            pass
 
     # 最终持久化
     state = sm.get(task_id)

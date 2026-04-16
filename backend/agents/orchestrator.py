@@ -260,9 +260,16 @@ def _build_exploit_context(state: PentestState) -> dict[str, Any]:
 
 
 def _sync_foothold_state(state: PentestState) -> None:
-    """根据 exploit 结果同步 foothold_status（与 got_shell 一致）。"""
+    """根据 exploit 结果同步 foothold_status（区分 RCE 与 file_read）。"""
     if not state.got_shell:
-        state.foothold_status = "none"
+        file_read_results = [
+            r for r in state.exploit_results
+            if r.success and r.exploit_level == "file_read"
+        ]
+        if file_read_results:
+            state.foothold_status = "file_read"
+        else:
+            state.foothold_status = "none"
         return
     successes = [r for r in state.exploit_results if r.success]
     if not successes:
@@ -1432,16 +1439,25 @@ async def node_foothold_attempt(state: PentestState) -> PentestState:
         )
         state.exploit_results = results
         successes = [r for r in results if r.success]
-        state.got_shell = len(successes) > 0
+        rce_successes = [r for r in successes if r.exploit_level in ("rce", "")]
+        state.got_shell = len(rce_successes) > 0
         if state.got_shell:
-            si = successes[0].session_info or {}
+            si = rce_successes[0].session_info or {}
             state.privilege_level = si.get("privilege") or (
                 "root" if "root" in str(si.get("current_user", "")).lower() else "user"
             )
             state.log(f"成功获取 shell，权限: {state.privilege_level}")
             state.secondary_elided = True
         else:
-            state.log("所有利用尝试均未成功")
+            file_reads = [r for r in successes if r.exploit_level == "file_read"]
+            if file_reads:
+                state.log(
+                    f"LFI 文件读取已确认 ({len(file_reads)} 条), "
+                    f"但未获得 RCE，继续深入利用"
+                )
+                state.foothold_status = "file_read"
+            else:
+                state.log("所有利用尝试均未成功")
         _sync_foothold_state(state)
     except Exception as e:
         state.error_msg = str(e)
@@ -1480,6 +1496,18 @@ async def node_secondary_attack(state: PentestState) -> PentestState:
         agent = ExploitAgent()
         exploit_context = _build_exploit_context(state)
         exploit_context["secondary_pass"] = True
+        if state.foothold_status == "file_read":
+            exploit_context["lfi_escalation"] = True
+            exploit_context["lfi_hint"] = (
+                "前序利用已通过 LFI 确认文件读取能力，但未获得 RCE。"
+                "请集中尝试: PHP Wrappers → 日志注入 → 已读取凭据的复用"
+            )
+            file_read_results = [
+                r for r in state.exploit_results
+                if r.success and r.exploit_level == "file_read"
+            ]
+            if file_read_results:
+                exploit_context["prior_file_reads"] = file_read_results[0].evidence[:2000]
         async def _on_tool_log(line: str):
             state.log(line)
         async def _on_exec_record(record: dict):
@@ -1507,15 +1535,20 @@ async def node_secondary_attack(state: PentestState) -> PentestState:
                 by_id[nr.vuln_id] = nr
         state.exploit_results = list(by_id.values())
         successes = [r for r in state.exploit_results if r.success]
-        state.got_shell = len(successes) > 0
+        rce_successes = [r for r in successes if r.exploit_level in ("rce", "")]
+        state.got_shell = len(rce_successes) > 0
         if state.got_shell:
-            si = successes[0].session_info or {}
+            si = rce_successes[0].session_info or {}
             state.privilege_level = si.get("privilege") or (
                 "root" if "root" in str(si.get("current_user", "")).lower() else "user"
             )
             state.log(f"二次攻击后成功获取 shell，权限: {state.privilege_level}")
         else:
-            state.log("二次攻击仍未成功")
+            file_reads = [r for r in successes if r.exploit_level == "file_read"]
+            if file_reads:
+                state.log("二次攻击: LFI 文件读取确认，但仍未获得 RCE")
+            else:
+                state.log("二次攻击仍未成功")
         _sync_foothold_state(state)
     except Exception as e:
         state.error_msg = str(e)
@@ -1686,6 +1719,11 @@ def edge_after_foothold(state: PentestState) -> str:
         return "report"
     if state.got_shell:
         return "post_foothold_enum"
+    # File-read foothold: escalate LFI → RCE via secondary attack
+    if state.foothold_status == "file_read":
+        if not state.secondary_attack_done:
+            return "secondary_attack"
+        return "report"
     if not state.secondary_attack_done and any(f.exploitable for f in state.findings):
         return "secondary_attack"
     return "report"
@@ -1834,6 +1872,12 @@ class Orchestrator:
             initial_state.status = TaskStatus.FAILED
             initial_state.error_msg = f"任务超时（>{TASK_TIMEOUT}s）"
             initial_state.log(initial_state.error_msg)
+            try:
+                from backend.tools.executor import TaskContainerManager
+                await TaskContainerManager.stop(initial_state.task_id)
+                initial_state.log("超时后容器已清理")
+            except Exception:
+                pass
             return initial_state
         return final_state
 

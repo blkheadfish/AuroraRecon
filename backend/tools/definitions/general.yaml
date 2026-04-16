@@ -103,3 +103,24 @@
   category: general
   timeout: 60
   description: "代理链工具，流量转发过 SOCKS/HTTP 代理"
+
+- name: sshpass
+  executor: container
+  command: "sshpass"
+  category: general
+  timeout: 30
+  description: "非交互式 SSH 密码认证（供 SSH 爆破/日志注入/凭据复用使用）"
+
+- name: ssh
+  executor: container
+  command: "ssh"
+  category: general
+  timeout: 60
+  description: "SSH 客户端（密钥登录/凭据复用）"
+
+- name: apache2ctl
+  executor: container
+  command: "apache2ctl"
+  category: general
+  timeout: 30
+  description: "Apache HTTP 服务器控制（攻击机侧，用于向靶机提供 exp/payload）"

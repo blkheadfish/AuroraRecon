@@ -93,6 +93,15 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"[启动] 恢复任务失败: {e}")
 
+    # Orphan container cleanup
+    try:
+        from backend.tools.executor import TaskContainerManager
+        cleaned = await TaskContainerManager.cleanup_orphans()
+        if cleaned:
+            logger.info(f"[启动] 清理 {cleaned} 个孤儿容器")
+    except Exception as e:
+        logger.warning(f"[启动] 孤儿容器清理失败: {e}")
+
     _lhost = os.getenv("LHOST", "")
     if not _lhost or _lhost in ("127.0.0.1", "0.0.0.0", "localhost"):
         logger.warning("[启动] LHOST 未设置或为本地地址，反弹类利用将不可用")

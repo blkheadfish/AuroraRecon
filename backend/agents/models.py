@@ -90,6 +90,7 @@ class ExploitResult(BaseModel):
 	vuln_id: str
 	success: bool
 	shell_type: str = ""
+	exploit_level: str = ""  # "rce" | "file_read" | "source_read" | "info_leak" | ""
 	session_info: dict = Field(default_factory=dict)
 	evidence: str = ""
 	commands_run: list[str] = Field(default_factory=list)
