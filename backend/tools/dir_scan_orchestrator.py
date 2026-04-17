@@ -497,7 +497,7 @@ class DirScanOrchestrator:
             try:
                 result = await self.executor.run_script(
                     script_content=script,
-                    timeout=120,
+                    timeout=300,
                     task_id=self._task_id,
                     log_callback=self._log_cb,
                     record_callback=self._rec_cb,

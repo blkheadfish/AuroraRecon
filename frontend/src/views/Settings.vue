@@ -170,6 +170,44 @@
         </template>
 
         <el-card class="settings-card">
+          <template #header><span class="card-title">操作员角色</span></template>
+
+          <el-form :model="workflow" label-width="160px" class="settings-form">
+            <el-form-item label="角色模式">
+              <el-radio-group v-model="workflow.operator_role" @change="onRoleChange">
+                <el-radio-button value="pentest_engineer">渗透工程师</el-radio-button>
+                <el-radio-button value="ctf_expert">CTF 高手</el-radio-button>
+              </el-radio-group>
+              <div class="form-tip">
+                渗透工程师：低误报、保守策略、强证据闭环；CTF 高手：高命中、激进探索、更多重试
+              </div>
+            </el-form-item>
+
+            <el-form-item label="成功门控策略">
+              <el-select v-model="workflow.success_gate">
+                <el-option label="严格（仅 confirmed RCE）" value="strict" />
+                <el-option label="中等（含 probable RCE）" value="medium" />
+                <el-option label="宽松（含 file_read）" value="lenient" />
+              </el-select>
+              <div class="form-tip">控制 EvidenceVerifier 对利用成功的判定标准</div>
+            </el-form-item>
+
+            <el-form-item label="ReAct 最大轮次">
+              <el-input-number v-model="workflow.max_react_rounds" :min="5" :max="50" />
+            </el-form-item>
+
+            <el-form-item label="自由探索轮次">
+              <el-input-number v-model="workflow.max_explore_rounds" :min="3" :max="30" />
+            </el-form-item>
+
+            <el-form-item label="风险操作预算">
+              <el-input-number v-model="workflow.risk_budget" :min="1" :max="10" />
+              <div class="form-tip">单次任务允许的高风险操作数量上限</div>
+            </el-form-item>
+          </el-form>
+        </el-card>
+
+        <el-card class="settings-card">
           <template #header><span class="card-title">Agent 行为配置</span></template>
 
           <el-form :model="workflow" label-width="160px" class="settings-form">
@@ -318,7 +356,34 @@ const workflow = ref({
   max_retries:      3,
   default_scope:    'CTF/授权靶场测试',
   report_lang:      'zh',
+  operator_role:    'pentest_engineer',
+  success_gate:     'strict',
+  max_react_rounds: 25,
+  max_explore_rounds: 15,
+  risk_budget:      3,
 })
+
+const ROLE_PRESETS = {
+  pentest_engineer: {
+    success_gate: 'strict',
+    max_react_rounds: 25,
+    max_explore_rounds: 10,
+    risk_budget: 3,
+    require_approval: true,
+  },
+  ctf_expert: {
+    success_gate: 'medium',
+    max_react_rounds: 35,
+    max_explore_rounds: 20,
+    risk_budget: 8,
+    require_approval: false,
+  },
+}
+
+function onRoleChange(role) {
+  const preset = ROLE_PRESETS[role]
+  if (preset) Object.assign(workflow.value, preset)
+}
 
 // 团队演示数据
 const demoMembers = [

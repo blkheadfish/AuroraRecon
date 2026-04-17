@@ -26,6 +26,7 @@ from datetime import datetime
 from typing import Any, Optional
 from urllib.parse import urlparse
 
+from backend.agents.evidence_verifier import EvidenceVerifier, GatePolicy, get_verifier
 from backend.agents.models import ExploitResult, VulnFinding
 from backend.skills.models import (
     ExploitPath,
@@ -55,7 +56,7 @@ class SkillEngine:
         self.executor = ToolExecutor()
         self._log_callback: LogCallback = None
 
-    _GLOBAL_TIMEOUT = int(os.getenv("SKILL_GLOBAL_TIMEOUT", "900"))
+    _GLOBAL_TIMEOUT = int(os.getenv("SKILL_GLOBAL_TIMEOUT", "1800"))
 
     async def _emit(self, ctx: "SkillContext", msg: str) -> None:
         """Push a log message through log_callback (if available) and logger."""
@@ -76,6 +77,7 @@ class SkillEngine:
         target_os: str = "unknown",
         task_id: Optional[str] = None,
         decision_callback: DecisionCallback = None,
+        operator_role: str = "pentest_engineer",
     ) -> ExploitResult:
         """
         执行 Skill 完整流程，带全局超时保护。
@@ -111,6 +113,9 @@ class SkillEngine:
             "total_elapsed": elapsed,
             "commands_count": len(result.commands_run),
             "evidence_preview": (result.evidence or "")[:200],
+            "operator_role": operator_role,
+            "evidence_level": getattr(result, "exploit_level", ""),
+            "rounds": len(result.command_records) if result.command_records else 0,
         })
         return result
 
@@ -654,30 +659,52 @@ class SkillEngine:
                 })
 
             if action == "conclude_success":
-                logger.info(f"[SkillEngine] 🤖 LLM 判定利用成功，执行 id 命令二次验证...")
-                verify = await self.executor.run_script(
-                    "id",
-                    timeout=10,
-                    task_id=ctx.task_id,
+                logger.info(f"[SkillEngine] 🤖 LLM 判定利用成功，通过 EvidenceVerifier 验证...")
+                last_stdout = ""
+                last_stderr = ""
+                if ctx.step_records:
+                    last_stdout = ctx.step_records[-1].get("stdout", "")
+                    last_stderr = ctx.step_records[-1].get("stderr", "")
+                verifier = get_verifier()
+                vr = verifier.verify(
+                    stdout=last_stdout,
+                    stderr=last_stderr,
+                    shell_type=decision.get("shell_type", "rce"),
+                    all_records=ctx.step_records,
                 )
-                if "uid=" not in (verify.stdout or ""):
-                    logger.warning("[SkillEngine] 二次验证失败: id 命令未返回 uid=")
+                if not vr.passed:
+                    logger.warning(
+                        f"[SkillEngine] EvidenceVerifier 拒绝: level={vr.level.value}, "
+                        f"reason={vr.reason}"
+                    )
                     conversation.append({
                         "role": "user",
-                        "content": "无法通过 id 命令确认 shell 访问（输出中未见 uid=），请重新评估。",
+                        "content": (
+                            f"证据验证未通过 (level={vr.level.value}, reason={vr.reason})。"
+                            "请提供更强的证据或重新评估利用结果。"
+                        ),
                     })
                     continue
-                logger.info(f"[SkillEngine] ✅ 二次验证通过: {verify.stdout.strip()[:200]}")
+                logger.info(
+                    f"[SkillEngine] ✅ EvidenceVerifier 通过: "
+                    f"level={vr.level.value}, snippets={vr.evidence_snippets}"
+                )
                 return ExploitResult(
                     vuln_id=finding.vuln_id,
                     success=True,
-                    shell_type="rce",
+                    shell_type=decision.get("shell_type", "rce"),
+                    exploit_level=vr.level.value.replace("confirmed_", "").replace("probable_", ""),
                     session_info={
                         "method": f"skill:{skill.skill_id}:llm_freeform",
                         "current_user": decision.get("current_user", ""),
                         "rounds": round_num + 1,
+                        "evidence_level": vr.level.value,
+                        "evidence_snippets": vr.evidence_snippets,
                     },
-                    evidence=f"{decision.get('evidence', '')} [verified: {verify.stdout.strip()[:100]}]",
+                    evidence=(
+                        f"{decision.get('evidence', '')} "
+                        f"[verified: {vr.level.value} — {vr.reason}]"
+                    ),
                     commands_run=ctx.commands_run,
                     command_records=ctx.step_records,
                 )

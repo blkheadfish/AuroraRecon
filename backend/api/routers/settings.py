@@ -48,6 +48,11 @@ DEFAULT_SETTINGS = {
         "max_retries":      3,
         "default_scope":    "CTF/授权靶场测试",
         "report_lang":      "zh",
+        "operator_role":    os.getenv("OPERATOR_ROLE", "pentest_engineer"),
+        "success_gate":     os.getenv("SUCCESS_GATE", "strict"),
+        "max_react_rounds": int(os.getenv("MAX_REACT_ROUNDS", "25")),
+        "max_explore_rounds": int(os.getenv("MAX_EXPLORE_ROUNDS", "15")),
+        "risk_budget":      int(os.getenv("RISK_BUDGET", "3")),
     },
 }
 
@@ -135,6 +140,17 @@ async def save_settings(data: dict):
     lhost = merged.get("executor", {}).get("lhost")
     if lhost:
         os.environ["LHOST"] = lhost
+    wf = merged.get("workflow", {})
+    if wf.get("operator_role"):
+        os.environ["OPERATOR_ROLE"] = str(wf["operator_role"])
+    if wf.get("success_gate"):
+        os.environ["SUCCESS_GATE"] = str(wf["success_gate"])
+    if wf.get("max_react_rounds"):
+        os.environ["MAX_REACT_ROUNDS"] = str(wf["max_react_rounds"])
+    if wf.get("max_explore_rounds"):
+        os.environ["MAX_EXPLORE_ROUNDS"] = str(wf["max_explore_rounds"])
+    if wf.get("risk_budget"):
+        os.environ["RISK_BUDGET"] = str(wf["risk_budget"])
     return {"status": "ok"}
 
 

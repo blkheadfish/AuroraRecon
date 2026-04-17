@@ -228,6 +228,10 @@ def _build_exploit_context(state: PentestState) -> dict[str, Any]:
         "extra_hint": state.extra_hint,
         "user_prompt": state.user_prompt,
         "workflow_mode": state.workflow_mode,
+        "operator_role": state.operator_role,
+        "success_gate_level": state.success_gate_level,
+        "risk_budget": state.risk_budget,
+        "max_explore_rounds": state.max_explore_rounds,
         "attack_chain_mode": True,
         "attack_chain_hint": (
             "主机攻链优先：以「立足点→枚举→提权→目标」为主线；"
@@ -1367,22 +1371,16 @@ async def node_exploit_decision(state: PentestState) -> PentestState:
 
 async def node_human_approval(state: PentestState) -> PentestState:
     """
-    人工审批节点。
-    流程：
-      1. 图执行到此节点前，interrupt_before 暂停整个图
-      2. 前端收到 current_phase=awaiting_approval 后显示审批按钮
-      3. 用户点击「批准/拒绝」→ POST /tasks/{id}/approve
-      4. API 调用 orchestrator.resume(task_id, approved=True/False)
-      5. LangGraph 以更新后的 state 重新进入此节点执行
-      6. 此时 state.approved 已被 resume 注入，节点根据结果决定后续
+    人工审批节点（角色感知）。
+
+    pentest_engineer: 必须人工审批
+    ctf_expert:       可按 workflow 设置自动跳过审批
     """
     state.current_phase = "awaiting_approval"
     _record_chain_visit(state, "awaiting_approval")
     exploitable = [f for f in state.findings if f.exploitable]
 
     if not state.approved:
-        # 首次进入（interrupt 前的 pre-check），记录等待日志
-        # 实际上 interrupt_before 会在这行之前暂停，这里是 resume 后才运行
         state.log(f"⏸ 收到审批请求：{len(exploitable)} 个漏洞待利用")
 
     if state.approved:
@@ -1417,7 +1415,28 @@ async def node_foothold_attempt(state: PentestState) -> PentestState:
                 f"（tool={php_fpm[0].tool}）"
             )
 
-    state.log(f"攻链: 立足点尝试 — 利用 {len(exploitable)} 个漏洞条目（战术层）")
+    # Pre-sweep: synthesize service-level findings for open ports without
+    # matching vulns, so ExploitAgent can match port-based Skills
+    existing_ports = {f.port for f in state.findings if f.port}
+    for p in state.open_ports:
+        if p.port in existing_ports:
+            continue
+        if p.service and p.service.lower() not in ("unknown", "tcpwrapped"):
+            synthetic = VulnFinding(
+                name=f"{p.service.upper()} Service",
+                severity="low",
+                port=p.port,
+                target=f"{state.target_host or state.target}:{p.port}",
+                description=f"Service: {p.service} {p.version}",
+                evidence=f"nmap: {p.port}/{p.protocol} {p.service} {p.version}",
+                exploitable=True,
+                tool="service-sweep",
+            )
+            state.findings.append(synthetic)
+            existing_ports.add(p.port)
+
+    exploitable = [f for f in state.findings if f.exploitable]
+    state.log(f"攻链: 立足点尝试 — 利用 {len(exploitable)} 个漏洞条目（含服务级 finding）")
     try:
         agent = ExploitAgent()
         exploit_context = _build_exploit_context(state)
@@ -1836,6 +1855,11 @@ class Orchestrator:
         task_id: Optional[str],
     ) -> PentestState:
         """创建并解析 PentestState，统一入口。"""
+        operator_role = os.getenv("OPERATOR_ROLE", "pentest_engineer")
+        success_gate = os.getenv("SUCCESS_GATE", "strict")
+        risk_budget = int(os.getenv("RISK_BUDGET", "3"))
+        max_explore = int(os.getenv("MAX_EXPLORE_ROUNDS", "15"))
+
         state = PentestState(
             target=target,
             scope_note=scope_note,
@@ -1843,9 +1867,17 @@ class Orchestrator:
             user_prompt=user_prompt,
             workflow_mode=workflow_mode,
             task_id=task_id or str(uuid.uuid4()),
+            operator_role=operator_role,
+            success_gate_level=success_gate,
+            risk_budget=risk_budget,
+            max_explore_rounds=max_explore,
         )
         # ── 关键：在 recon 之前统一解析目标 ──────────────
         _apply_parsed_target(state)
+        state.log(
+            f"角色策略: role={operator_role}, gate={success_gate}, "
+            f"risk_budget={risk_budget}, explore_rounds={max_explore}"
+        )
         return state
 
     async def run(

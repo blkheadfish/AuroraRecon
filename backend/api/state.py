@@ -178,14 +178,21 @@ class TaskStateManager:
             "chain_summary": state.chain_summary,
             "chain_visited": state.chain_visited,
             "secondary_elided": state.secondary_elided,
+            "operator_role": state.operator_role,
+            "success_gate_level": state.success_gate_level,
         })
-        # stdout/stderr 截断（避免 MB 级响应）
+        # stdout/stderr 截断（避免 MB 级响应）+ 标注 truncated_reason
         for rec in base.get("tool_records", []):
             for field in ("stdout", "stderr"):
                 val = rec.get(field, "")
                 if len(val) > 2000:
+                    original_len = len(val)
                     rec[field] = val[:2000] + "\n...(truncated)"
                     rec["truncated"] = True
+                    rec.setdefault(
+                        "truncated_reason",
+                        f"API 层截断: {field} {original_len}→2000 字符",
+                    )
         return base
 
     def ws_phase_payload(self, state: PentestState, log_tail: int = 5) -> dict:

@@ -43,6 +43,18 @@ _SERVICE_FINDING_NAMES = frozenset({
     "redis service", "mongodb service", "snmp service", "vnc service",
 })
 
+# Role-based matching configuration
+_ROLE_MATCH_CONFIG: dict[str, dict] = {
+    "pentest_engineer": {
+        "min_score": 20,       # require stronger evidence
+        "weak_signal_boost": 0,
+    },
+    "ctf_expert": {
+        "min_score": 5,        # accept weaker signals
+        "weak_signal_boost": 10,  # boost low-confidence matches
+    },
+}
+
 
 class SkillRegistry:
     def __init__(self):
@@ -66,10 +78,14 @@ class SkillRegistry:
         finding: VulnFinding,
         fingerprint: str = "",
         json_probe: str = "",
+        operator_role: str = "pentest_engineer",
     ) -> Optional[Skill]:
         """
-        根据漏洞发现匹配最适用的 Skill（评分制）。
+        根据漏洞发现匹配最适用的 Skill（评分制 + 角色权重）。
 
+        Args:
+            operator_role: "pentest_engineer" requires higher threshold,
+                          "ctf_expert" accepts weaker signals.
         Returns:
             评分最高的 Skill，未匹配返回 None
         """
@@ -82,11 +98,17 @@ class SkillRegistry:
             finding.evidence[:500],
         ]))
 
+        # Role-based minimum threshold and score boost
+        min_threshold = _ROLE_MATCH_CONFIG.get(operator_role, {}).get("min_score", 10)
+        weak_signal_boost = _ROLE_MATCH_CONFIG.get(operator_role, {}).get("weak_signal_boost", 0)
+
         scored: list[tuple[int, Skill]] = []
 
         for skill in self._skills:
             score = self._score_skill(skill, finding, combined_fp, json_probe)
-            if score > 0:
+            if score > 0 and weak_signal_boost and score < 60:
+                score += weak_signal_boost
+            if score >= min_threshold:
                 scored.append((score, skill))
 
         if not scored:

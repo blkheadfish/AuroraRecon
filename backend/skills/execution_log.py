@@ -54,14 +54,19 @@ def read_all_records() -> list[dict[str, Any]]:
 
 
 def get_stats() -> dict[str, Any]:
-    """Aggregate success rates per skill_id."""
+    """Aggregate success rates per skill_id, with role-dimension breakdown."""
     records = read_all_records()
     if not records:
-        return {"total": 0, "skills": {}}
+        return {"total": 0, "skills": {}, "by_role": {}}
 
     per_skill: dict[str, dict] = {}
+    per_role: dict[str, dict] = {}
+
     for r in records:
         sid = r.get("skill_id", "unknown")
+        role = r.get("operator_role", "unknown")
+
+        # Per-skill stats
         entry = per_skill.setdefault(sid, {"total": 0, "success": 0, "avg_elapsed": 0.0})
         entry["total"] += 1
         if r.get("success"):
@@ -71,7 +76,34 @@ def get_stats() -> dict[str, Any]:
             (entry["avg_elapsed"] * (entry["total"] - 1) + elapsed) / entry["total"]
         )
 
+        # Per-role stats
+        role_entry = per_role.setdefault(role, {
+            "total": 0, "success": 0, "false_positives": 0,
+            "avg_rounds": 0.0, "evidence_completeness": 0.0,
+        })
+        role_entry["total"] += 1
+        if r.get("success"):
+            role_entry["success"] += 1
+        evidence_level = r.get("evidence_level", "")
+        if r.get("success") and evidence_level in ("failed", ""):
+            role_entry["false_positives"] += 1
+        rounds = r.get("rounds", 0) or 0
+        role_entry["avg_rounds"] = (
+            (role_entry["avg_rounds"] * (role_entry["total"] - 1) + rounds) / role_entry["total"]
+        )
+        has_evidence = 1.0 if evidence_level and evidence_level != "failed" else 0.0
+        role_entry["evidence_completeness"] = (
+            (role_entry["evidence_completeness"] * (role_entry["total"] - 1) + has_evidence)
+            / role_entry["total"]
+        )
+
     for v in per_skill.values():
         v["success_rate"] = round(v["success"] / v["total"], 3) if v["total"] else 0
 
-    return {"total": len(records), "skills": per_skill}
+    for v in per_role.values():
+        v["success_rate"] = round(v["success"] / v["total"], 3) if v["total"] else 0
+        v["false_positive_rate"] = (
+            round(v["false_positives"] / v["total"], 3) if v["total"] else 0
+        )
+
+    return {"total": len(records), "skills": per_skill, "by_role": per_role}

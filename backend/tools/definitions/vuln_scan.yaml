@@ -1,31 +1,32 @@
 # ============================================
 # 漏洞扫描类工具
+# 超时策略：漏洞扫描普遍耗时，timeout 放宽到与真实用例一致
 # ============================================
 
 - name: nuclei
   executor: container
   command: "nuclei"
   category: vuln_scan
-  timeout: 600
-  description: "模板驱动漏洞扫描器"
+  timeout: 1200
+  description: "模板驱动漏洞扫描器（全模板扫描可能 20 分钟以上）"
 
 - name: nikto
   executor: container
   command: "nikto"
   category: vuln_scan
-  timeout: 90
+  timeout: 300
   description: "Web 服务器安全扫描"
 
 - name: sqlmap
   executor: container
   command: "sqlmap"
   category: vuln_scan
-  timeout: 300
-  description: "SQL 注入自动化检测与利用"
+  timeout: 900
+  description: "SQL 注入自动化检测与利用（level/risk 调高时非常慢）"
 
 - name: wpscan
   executor: container
   command: "wpscan"
   category: vuln_scan
-  timeout: 120
+  timeout: 600
   description: "WordPress 安全扫描"

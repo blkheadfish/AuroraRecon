@@ -25,6 +25,11 @@ export interface WorkflowSettings {
   max_retries: number
   default_scope: string
   report_lang: 'zh' | 'en' | string
+  operator_role: 'pentest_engineer' | 'ctf_expert' | string
+  success_gate: 'strict' | 'medium' | 'lenient' | string
+  max_react_rounds: number
+  max_explore_rounds: number
+  risk_budget: number
 }
 
 export interface SettingsPayload {

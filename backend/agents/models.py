@@ -188,6 +188,14 @@ class PentestState(BaseModel):
 	workflow_mode: str = "standard"
 	created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
 
+	# ── 角色策略（双角色驱动）──────────────────────────
+	operator_role: str = "pentest_engineer"  # pentest_engineer | ctf_expert
+	success_gate_level: str = "strict"       # strict | medium | lenient
+	risk_budget: int = 3                     # max allowed risky operations
+	max_explore_rounds: int = Field(
+		default_factory=lambda: int(os.getenv("MAX_EXPLORE_ROUNDS", "15"))
+	)
+
 	# ── 解析后的目标信息（parse_target 写入）──────────
 	target_host: str = ""          # 纯 host/IP，各 agent 统一使用
 	target_port: Optional[int] = None  # 用户显式指定的端口，None = 未指定
