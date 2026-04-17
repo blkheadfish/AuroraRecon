@@ -25,6 +25,39 @@ THOUGHT_RE = re.compile(
 )
 
 
+def _command_preview(command: str, max_len: int = 280) -> str:
+    """Compress command while retaining suspicious fragments for debugging."""
+    normalized = " ".join((command or "").split())
+    if not normalized:
+        return ""
+    if len(normalized) <= max_len:
+        return normalized
+
+    markers = (
+        "<?php",
+        "system($_GET",
+        "sshpass -p",
+        "auth.log",
+        "User-Agent:",
+    )
+    marker_pos = -1
+    for marker in markers:
+        marker_pos = normalized.find(marker)
+        if marker_pos >= 0:
+            break
+
+    if marker_pos >= 0:
+        head_len = min(90, max_len // 3)
+        tail_len = min(90, max_len // 3)
+        window_len = max_len - head_len - tail_len - len(" ...  ... ")
+        start = max(0, marker_pos - window_len // 3)
+        mid = normalized[start:start + window_len]
+        return f"{normalized[:head_len]} ... {mid} ... {normalized[-tail_len:]}"
+
+    keep = max_len // 2
+    return f"{normalized[:keep]} ... {normalized[-keep:]}"
+
+
 class TaskStateManager:
     """进程内任务状态容器（单例）"""
 
@@ -310,7 +343,7 @@ class TaskStateManager:
                 "round": round_no,
                 "truncated": truncated,
                 "total_len": total_len_val,
-                "message": f"命令执行: {tool} {cmd[:120]}".strip(),
+                "message": f"命令执行: {tool} {_command_preview(cmd)}".strip(),
                 "raw": "",
                 "tone": "success" if exit_code == 0 else "danger",
             })
@@ -362,7 +395,7 @@ class TaskStateManager:
                     "round": round_no,
                     "truncated": truncated,
                     "total_len": total_len_val,
-                    "message": f"命令执行: {cmd[:120]}",
+                    "message": f"命令执行: {_command_preview(cmd)}",
                     "raw": "",
                     "tone": "success" if exit_code == 0 else "danger",
                 })

