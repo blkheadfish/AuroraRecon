@@ -224,7 +224,17 @@ class PentestState(BaseModel):
 	supplementary_dir_scan_done: bool = False
 
 	# ── intel_harvest 阶段产出 ──────────────────────────
-	# 结构化的 PHP 运行时事实 (phpinfo_parser 输出):
+	# 通用 service-info 事实桶（per-service）：
+	#   runtime_facts["php"]    -> phpinfo_parser 抽取结果（等价于旧 php_runtime）
+	#   runtime_facts["apache"] -> server-status/server-info
+	#   runtime_facts["nginx"]  -> stub_status + Server 头
+	#   runtime_facts["tomcat"] -> manager/status + manager/serverinfo
+	#   runtime_facts["spring"] -> actuator/env|mappings|info|health|configprops
+	#   runtime_facts["env_file"] -> .env 类配置文件抽取
+	# 每个桶内都带 ``_attack_surface`` 子字段作为高层约束提示。
+	runtime_facts: dict[str, dict[str, Any]] = Field(default_factory=dict)
+	# 结构化的 PHP 运行时事实 (phpinfo_parser 输出)，保留为 ``runtime_facts['php']``
+	# 的兼容别名，旧代码/测试仍能访问：
 	#   php_version, sapi, doc_root, disable_functions(list),
 	#   allow_url_include(bool), allow_url_fopen(bool), open_basedir,
 	#   session_save_path, upload_tmp_dir, loaded_extensions(list), ...

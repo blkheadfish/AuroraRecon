@@ -444,6 +444,11 @@ class SkillContext:
 
     # 从 phpinfo_parser 得到的 PHP 运行时事实（只读，供 check/substitute 使用）
     php_runtime: dict[str, Any] = field(default_factory=dict)
+    # 通用 service-info 事实桶（per-service）：
+    #   runtime_facts["php"] / ["apache"] / ["nginx"] / ["tomcat"] /
+    #   ["spring"] / ["env_file"]
+    # 每个桶里都带 _attack_surface 子字段，供 env.<kind>.<key> 条件匹配。
+    runtime_facts: dict[str, dict[str, Any]] = field(default_factory=dict)
     # 前序利用已确认的事实（lfi/services/creds），供 check/substitute 及
     # 条件判断使用，保证二次利用不重复探测
     confirmed_facts: dict[str, Any] = field(default_factory=dict)
@@ -481,6 +486,25 @@ class SkillContext:
             if key.startswith("env.php."):
                 attr = key[len("env.php."):]
                 actual = (self.php_runtime or {}).get(attr)
+            elif key.startswith("env.") and key[4:].split(".", 1)[0] in (
+                "apache", "nginx", "tomcat", "spring", "env_file"
+            ):
+                kind, _, rest = key[4:].partition(".")
+                bucket = (self.runtime_facts or {}).get(kind) or {}
+                cur: Any = bucket
+                for part in (rest.split(".") if rest else []):
+                    if isinstance(cur, dict) and part in cur:
+                        cur = cur[part]
+                    else:
+                        cur = None
+                        break
+                actual = cur
+            elif key.startswith("env.surface."):
+                rest = key[len("env.surface."):]
+                kind, _, attr = rest.partition(".")
+                bucket = (self.runtime_facts or {}).get(kind) or {}
+                surface = bucket.get("_attack_surface") or {}
+                actual = surface.get(attr)
             elif key.startswith("env."):
                 attr = key[4:]
                 actual = getattr(self, attr, None)

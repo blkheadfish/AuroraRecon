@@ -81,6 +81,7 @@ class SkillEngine:
         php_runtime: Optional[dict] = None,
         confirmed_facts: Optional[dict] = None,
         prior_probe_variables: Optional[dict] = None,
+        runtime_facts: Optional[dict] = None,
     ) -> ExploitResult:
         """
         执行 Skill 完整流程，带全局超时保护。
@@ -93,6 +94,7 @@ class SkillEngine:
                     skill, finding, target_url, env_can_reverse,
                     lhost, target_os, task_id, decision_callback,
                     php_runtime, confirmed_facts, prior_probe_variables,
+                    runtime_facts,
                 ),
                 timeout=self._GLOBAL_TIMEOUT,
             )
@@ -136,11 +138,16 @@ class SkillEngine:
         php_runtime: Optional[dict] = None,
         confirmed_facts: Optional[dict] = None,
         prior_probe_variables: Optional[dict] = None,
+        runtime_facts: Optional[dict] = None,
     ) -> ExploitResult:
         self._decision_callback = decision_callback
 
         # ── 初始化上下文 ──────────────────────────────
         parsed = urlparse(target_url)
+        # runtime_facts 优先，php_runtime 作为 runtime_facts["php"] 的兼容来源
+        _rf: dict = dict(runtime_facts or {})
+        if php_runtime and "php" not in _rf:
+            _rf["php"] = dict(php_runtime)
         ctx = SkillContext(
             endpoint=target_url,
             target_ip=parsed.hostname or "",
@@ -150,7 +157,8 @@ class SkillEngine:
             can_reverse=env_can_reverse,
             task_id=task_id,
             log_callback=self._log_callback,
-            php_runtime=dict(php_runtime or {}),
+            php_runtime=dict((_rf.get("php") or php_runtime) or {}),
+            runtime_facts=_rf,
             confirmed_facts=dict(confirmed_facts or {}),
         )
 

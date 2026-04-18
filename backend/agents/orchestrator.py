@@ -234,6 +234,7 @@ def _build_exploit_context(state: PentestState) -> dict[str, Any]:
         "risk_budget": state.risk_budget,
         "max_explore_rounds": state.max_explore_rounds,
         "php_runtime": state.php_runtime or {},
+        "runtime_facts": state.runtime_facts or {},
         "confirmed_facts": state.confirmed_facts or {},
         "prior_probe_variables": state.exploit_probe_variables or {},
         "prior_failed_commands": state.failed_commands_by_vuln or {},
@@ -1050,7 +1051,7 @@ def _update_inventory_hints_from_intel(
 
 
 from backend.agents.fact_hooks import (
-    apply_phpinfo_extraction as _apply_phpinfo_extraction,
+    apply_service_info_extraction as _apply_service_info_extraction,
     make_fact_sink as _make_fact_sink,
 )
 
@@ -1117,8 +1118,10 @@ async def node_intel_harvest(state: PentestState) -> PentestState:
 
     state.log(f"情报采集: 下载完成, 共 {len(harvested)} 个目标")
 
-    # ── Step C.0: deterministic phpinfo extraction (before LLM) ──
-    _apply_phpinfo_extraction(state, harvested, base_url, wp.port)
+    # ── Step C.0: deterministic service-info extraction (before LLM) ──
+    # phpinfo / apache server-status / nginx stub_status / tomcat manager /
+    # spring actuator / .env 一次性过完所有 parser，写入 state.runtime_facts
+    _apply_service_info_extraction(state, harvested, base_url, wp.port)
 
     # ── Step C: LLM analysis (concurrent, semaphore=3) ──
     llm = LLMRouter()

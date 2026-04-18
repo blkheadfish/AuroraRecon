@@ -250,72 +250,39 @@ def make_fact_sink(state: PentestState):
     return _sink
 
 
-# ── phpinfo extraction hook ───────────────────────────────
+# ── service-info extraction hook ──────────────────────────
 
-_PHPINFO_PATH_RE = re.compile(r'(?:^|/)(?:phpinfo|info)(?:\.php|$)', re.IGNORECASE)
-
-
-def apply_phpinfo_extraction(
-    state: PentestState,
-    harvested: list[dict[str, Any]],
-    base_url: str,
-    port: int,
-) -> None:
-    """Deterministically extract phpinfo facts from harvested pages/files.
-
-    Writes ``state.php_runtime`` (merged across multiple phpinfo endpoints)
-    and sprouts high-value findings (e.g. ``allow_url_include=On`` ⇒ RFI)
-    without waiting for the per-entry LLM audit.
-    """
-    try:
-        from backend.tools.parsers import phpinfo_parser as _pp
-    except Exception as exc:
-        logger.warning(f"[IntelHarvest] phpinfo_parser import failed: {exc}")
-        return
-
-    matches: list[dict[str, Any]] = []
-    for entry in harvested:
-        body = entry.get("body") or ""
-        path = entry.get("path") or ""
-        if not body:
-            continue
-        looks_like = bool(_PHPINFO_PATH_RE.search(path)) or _pp.is_phpinfo_content(body)
-        if not looks_like:
-            continue
-        facts = _pp.parse_phpinfo(body)
-        if not facts:
-            continue
-        matches.append({"path": path, "facts": facts})
-
-    if not matches:
-        return
-
-    merged: dict[str, Any] = dict(state.php_runtime or {})
-    for m in matches:
-        for k, v in m["facts"].items():
-            if isinstance(v, list):
-                existing = merged.get(k)
-                if isinstance(existing, list):
-                    merged[k] = sorted(set(existing) | set(v), key=str)
-                else:
-                    merged[k] = v
+def _merge_facts(dst: dict[str, Any], src: dict[str, Any]) -> dict[str, Any]:
+    """Shallow merge with list-union semantics. ``dst`` is mutated and returned."""
+    for k, v in (src or {}).items():
+        if isinstance(v, list):
+            existing = dst.get(k)
+            if isinstance(existing, list):
+                merged_list = list(existing)
+                seen = {str(x) for x in existing}
+                for item in v:
+                    if str(item) not in seen:
+                        merged_list.append(item)
+                        seen.add(str(item))
+                dst[k] = merged_list
             else:
-                merged[k] = v
-    state.php_runtime = merged
-    surface = _pp.derive_attack_surface(merged)
-    if surface:
-        merged["_attack_surface"] = surface
+                dst[k] = list(v)
+        elif isinstance(v, dict):
+            existing = dst.get(k)
+            if isinstance(existing, dict):
+                dst[k] = _merge_facts(dict(existing), v)
+            else:
+                dst[k] = dict(v)
+        else:
+            dst[k] = v
+    return dst
 
-    paths_str = ", ".join(m["path"] for m in matches[:3])
-    state.log(f"情报采集: phpinfo 结构化抽取完成 ({paths_str})")
 
-    if merged.get("php_version") or merged.get("sapi"):
-        version = merged.get("php_version") or "unknown"
-        sapi = merged.get("sapi") or "unknown"
-        state.log(f"情报采集: PHP {version} / SAPI {sapi}")
-
+def _emit_php_findings(state: PentestState, matches, merged, base_url, port) -> None:
+    """Translate high-value PHP attack-surface into VulnFinding + logs."""
+    surface = merged.get("_attack_surface") or {}
     if surface.get("rfi_possible"):
-        finding_target = f"{base_url}{matches[0]['path']}"
+        finding_target = f"{base_url}{matches[0].path}"
         if not any(f.name.startswith("allow_url_include=On") for f in state.findings):
             state.findings.append(VulnFinding(
                 name="allow_url_include=On (可能 RFI)",
@@ -326,7 +293,7 @@ def apply_phpinfo_extraction(
                     "phpinfo 披露 allow_url_include=On，若存在 include 类可控参数，"
                     "可直接通过 http/php://input 进行远程文件包含达到 RCE。"
                 ),
-                evidence=(f"来源: {matches[0]['path']}；"
+                evidence=(f"来源: {matches[0].path}；"
                           f"allow_url_fopen={merged.get('allow_url_fopen')}"),
                 exploitable=True,
                 tool="phpinfo_parser",
@@ -336,12 +303,212 @@ def apply_phpinfo_extraction(
     disabled = merged.get("disable_functions") or []
     if isinstance(disabled, list) and disabled:
         cmd_funcs = {"system", "exec", "passthru", "shell_exec", "popen", "proc_open"}
-        disabled_set = {d.lower() for d in disabled}
-        if cmd_funcs.issubset(disabled_set):
+        if cmd_funcs.issubset({d.lower() for d in disabled}):
             state.log(
                 "情报采集: disable_functions 禁用所有 shell 执行函数，"
                 "优先走 include/assert/file_put_contents 路径"
             )
-
     if merged.get("open_basedir"):
         state.log(f"情报采集: open_basedir={merged['open_basedir']}，文件系统访问受限")
+
+    if merged.get("php_version") or merged.get("sapi"):
+        state.log(
+            f"情报采集: PHP {merged.get('php_version', 'unknown')} / "
+            f"SAPI {merged.get('sapi', 'unknown')}"
+        )
+
+
+def _emit_apache_findings(state: PentestState, matches, merged, base_url, port) -> None:
+    surface = merged.get("_attack_surface") or {}
+    ver = merged.get("server_version") or surface.get("version")
+    if ver:
+        state.log(f"情报采集: Apache 版本 {ver}")
+    if surface.get("cve_2021_41773_candidate"):
+        if not any("CVE-2021-41773" in f.name for f in state.findings):
+            state.findings.append(VulnFinding(
+                name="Apache 2.4.49/50 路径遍历候选 (CVE-2021-41773)",
+                severity="high",
+                target=f"{base_url}{matches[0].path}",
+                port=port,
+                description="Apache 版本落在 CVE-2021-41773 / 42013 受影响区间，若启用 mod_cgi 可达到 RCE。",
+                evidence=f"server_version={ver}",
+                exploitable=True,
+                tool="apache_status_parser",
+            ))
+    if surface.get("webdav_enabled"):
+        state.log("情报采集: Apache mod_dav(_fs) 已加载 → WebDAV 上传路径潜在可用")
+    if surface.get("cgi_enabled"):
+        state.log("情报采集: Apache mod_cgi(d) 已加载 → CGI 路径是 RCE 优先通路")
+    if merged.get("request_samples"):
+        state.log(f"情报采集: Apache scoreboard 样本 URI: "
+                  f"{', '.join(merged['request_samples'][:5])}")
+
+
+def _emit_nginx_findings(state: PentestState, matches, merged, base_url, port) -> None:
+    ver = merged.get("nginx_version")
+    if ver:
+        state.log(f"情报采集: Nginx 版本 nginx/{ver}")
+    surface = merged.get("_attack_surface") or {}
+    if surface.get("version_disclosure"):
+        state.log("情报采集: Nginx Server 头泄露精确版本号")
+
+
+def _emit_tomcat_findings(state: PentestState, matches, merged, base_url, port) -> None:
+    surface = merged.get("_attack_surface") or {}
+    ver = merged.get("tomcat_version") or surface.get("version")
+    if ver:
+        state.log(f"情报采集: Apache Tomcat/{ver}")
+    if surface.get("ghostcat_risk") or surface.get("cve_2020_1938_ghostcat_candidate"):
+        if not any("Ghostcat" in f.name for f in state.findings):
+            state.findings.append(VulnFinding(
+                name="Tomcat Ghostcat 文件读取 (CVE-2020-1938) 候选",
+                severity="high",
+                target=f"{base_url}{matches[0].path}",
+                port=port,
+                description="AJP Connector 暴露 + 受影响 Tomcat 版本，Ghostcat 可任意读取 /WEB-INF。",
+                evidence=f"tomcat_version={ver}, ajp={surface.get('ajp_connector')}",
+                exploitable=True,
+                tool="tomcat_status_parser",
+            ))
+    if surface.get("manager_reachable"):
+        if not any("manager" in f.name.lower() for f in state.findings):
+            state.findings.append(VulnFinding(
+                name="Tomcat Manager 暴露 (可能弱口令 RCE)",
+                severity="high",
+                target=f"{base_url}{matches[0].path}",
+                port=port,
+                description="Tomcat /manager 可访问，若存在弱口令/默认凭据，可上传 WAR 达到 RCE。",
+                evidence=f"endpoint={matches[0].path}",
+                exploitable=True,
+                tool="tomcat_status_parser",
+            ))
+
+
+def _emit_spring_findings(state: PentestState, matches, merged, base_url, port) -> None:
+    surface = merged.get("_attack_surface") or {}
+    if surface.get("credential_leak"):
+        if not any("Actuator" in f.name for f in state.findings):
+            state.findings.append(VulnFinding(
+                name="Spring Actuator 凭据泄露",
+                severity="high",
+                target=f"{base_url}{matches[0].path}",
+                port=port,
+                description=(
+                    "Spring Boot Actuator 端点（/env 或 /configprops）暴露敏感凭据，"
+                    "可直接用于数据库/中间件登录。"
+                ),
+                evidence=f"endpoints={merged.get('endpoints_seen')}",
+                exploitable=True,
+                tool="spring_actuator_parser",
+            ))
+    if surface.get("heapdump_exposed"):
+        if not any("heapdump" in f.name.lower() for f in state.findings):
+            state.findings.append(VulnFinding(
+                name="Spring Actuator Heapdump 暴露 (可离线提取凭据)",
+                severity="high",
+                target=f"{base_url}/actuator/heapdump",
+                port=port,
+                description="可下载 JVM heapdump，通过 JDumpSpider 等工具离线提取密码/密钥。",
+                evidence="/actuator/heapdump HTTP 200",
+                exploitable=True,
+                tool="spring_actuator_parser",
+            ))
+    if surface.get("dev_profile_active"):
+        state.log("情报采集: Spring 当前激活 dev profile，建议关注调试端点与默认凭据")
+
+
+def _emit_env_file_findings(state: PentestState, matches, merged, base_url, port) -> None:
+    surface = merged.get("_attack_surface") or {}
+    if surface.get("credential_leak"):
+        key_count = surface.get("credential_count", 0)
+        if not any(".env 凭据泄露" in f.name for f in state.findings):
+            state.findings.append(VulnFinding(
+                name=f".env 凭据泄露 (共 {key_count} 条)",
+                severity="high" if surface.get("prod_credential_leak") else "medium",
+                target=f"{base_url}{matches[0].path}",
+                port=port,
+                description=(
+                    ".env 文件对外可读，包含数据库/JWT/云厂商等凭据，"
+                    "直接转化为横向移动或后端登录凭据池。"
+                ),
+                evidence=(
+                    f"path={matches[0].path}, "
+                    f"frameworks={merged.get('frameworks')}, "
+                    f"deployment_env={merged.get('deployment_env')}"
+                ),
+                exploitable=True,
+                tool="env_file_parser",
+            ))
+    if surface.get("debug_mode"):
+        state.log("情报采集: .env 披露 APP_DEBUG=true / DEBUG=true，生产环境不应开启")
+
+
+_EMIT_DISPATCH = {
+    "php":      _emit_php_findings,
+    "apache":   _emit_apache_findings,
+    "nginx":    _emit_nginx_findings,
+    "tomcat":   _emit_tomcat_findings,
+    "spring":   _emit_spring_findings,
+    "env_file": _emit_env_file_findings,
+}
+
+
+def apply_service_info_extraction(
+    state: PentestState,
+    harvested: list[dict[str, Any]],
+    base_url: str,
+    port: int,
+) -> None:
+    """Deterministic service-info extraction across all known disclosure surfaces.
+
+    Fans out to per-technology parsers (phpinfo / apache / nginx / tomcat /
+    spring actuator / .env) via ``service_info_dispatcher`` and merges results
+    into ``state.runtime_facts[kind]``. Also writes the PHP bucket back into
+    ``state.php_runtime`` for backward-compat so existing downstream code
+    (LFI gate, ExploitAgent `_build_php_runtime_block`, skills `env.php.*` checks)
+    keeps working unchanged.
+    """
+    try:
+        from backend.tools.parsers import service_info_dispatcher as _dispatcher
+    except Exception as exc:
+        logger.warning(f"[IntelHarvest] service_info_dispatcher import failed: {exc}")
+        return
+
+    matches = _dispatcher.parse_harvested(harvested or [])
+    if not matches:
+        return
+
+    by_kind: dict[str, list] = {}
+    for m in matches:
+        by_kind.setdefault(m.kind, []).append(m)
+
+    runtime_facts: dict[str, dict[str, Any]] = dict(state.runtime_facts or {})
+    for kind, match_list in by_kind.items():
+        merged: dict[str, Any] = dict(runtime_facts.get(kind) or {})
+        for m in match_list:
+            _merge_facts(merged, m.facts)
+        runtime_facts[kind] = merged
+
+        emitter = _EMIT_DISPATCH.get(kind)
+        if emitter:
+            try:
+                emitter(state, match_list, merged, base_url, port)
+            except Exception as exc:
+                logger.warning(f"[IntelHarvest] emit_{kind}_findings failed: {exc}")
+
+        paths_str = ", ".join(m.path for m in match_list[:3])
+        state.log(f"情报采集: {kind} 结构化抽取完成 ({paths_str})")
+
+    state.runtime_facts = runtime_facts
+    if "php" in runtime_facts:
+        state.php_runtime = runtime_facts["php"]
+
+
+def apply_phpinfo_extraction(
+    state: PentestState,
+    harvested: list[dict[str, Any]],
+    base_url: str,
+    port: int,
+) -> None:
+    """Backward-compat alias — delegates to the generalised dispatcher."""
+    apply_service_info_extraction(state, harvested, base_url, port)
