@@ -23,6 +23,7 @@ import functools
 import json
 import logging
 import os
+import re
 import uuid
 from datetime import datetime
 from typing import Any, Optional
@@ -232,6 +233,10 @@ def _build_exploit_context(state: PentestState) -> dict[str, Any]:
         "success_gate_level": state.success_gate_level,
         "risk_budget": state.risk_budget,
         "max_explore_rounds": state.max_explore_rounds,
+        "php_runtime": state.php_runtime or {},
+        "confirmed_facts": state.confirmed_facts or {},
+        "prior_probe_variables": state.exploit_probe_variables or {},
+        "prior_failed_commands": state.failed_commands_by_vuln or {},
         "attack_chain_mode": True,
         "attack_chain_hint": (
             "主机攻链优先：以「立足点→枚举→提权→目标」为主线；"
@@ -1044,6 +1049,12 @@ def _update_inventory_hints_from_intel(
             break
 
 
+from backend.agents.fact_hooks import (
+    apply_phpinfo_extraction as _apply_phpinfo_extraction,
+    make_fact_sink as _make_fact_sink,
+)
+
+
 @retry_node()
 async def node_intel_harvest(state: PentestState) -> PentestState:
     """Pipeline between surface_enum and vuln_scan: download files + audit page source."""
@@ -1105,6 +1116,9 @@ async def node_intel_harvest(state: PentestState) -> PentestState:
         return state
 
     state.log(f"情报采集: 下载完成, 共 {len(harvested)} 个目标")
+
+    # ── Step C.0: deterministic phpinfo extraction (before LLM) ──
+    _apply_phpinfo_extraction(state, harvested, base_url, wp.port)
 
     # ── Step C: LLM analysis (concurrent, semaphore=3) ──
     llm = LLMRouter()
@@ -1455,6 +1469,7 @@ async def node_foothold_attempt(state: PentestState) -> PentestState:
             log_callback=_on_tool_log,
             record_callback=_on_exec_record,
             decision_callback=_on_decision,
+            fact_sink=_make_fact_sink(state),
         )
         state.exploit_results = results
         successes = [r for r in results if r.success]
@@ -1542,6 +1557,7 @@ async def node_secondary_attack(state: PentestState) -> PentestState:
             log_callback=_on_tool_log,
             record_callback=_on_exec_record,
             decision_callback=_on_decision,
+            fact_sink=_make_fact_sink(state),
         )
         by_id: dict[str, ExploitResult] = {r.vuln_id: r for r in state.exploit_results}
         for nr in new_results:

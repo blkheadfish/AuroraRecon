@@ -224,6 +224,21 @@ class PentestState(BaseModel):
 	supplementary_dir_scan_done: bool = False
 
 	# ── intel_harvest 阶段产出 ──────────────────────────
+	# 结构化的 PHP 运行时事实 (phpinfo_parser 输出):
+	#   php_version, sapi, doc_root, disable_functions(list),
+	#   allow_url_include(bool), allow_url_fopen(bool), open_basedir,
+	#   session_save_path, upload_tmp_dir, loaded_extensions(list), ...
+	php_runtime: dict[str, Any] = Field(default_factory=dict)
+	# 利用阶段可复用的「已确认事实」：
+	#   {"lfi": {"param": ..., "depth": ..., "style": ...,
+	#             "readable_files": [...]},
+	#    "services": {"ssh_port": 22, "log_readable": [...]},
+	#    "creds": [{"user":..., "source":..., "value":...}]}
+	confirmed_facts: dict[str, Any] = Field(default_factory=dict)
+	# 每个 finding.id 首轮产出的原始 Skill 探测变量（如 lfi_param/lfi_depth…）
+	exploit_probe_variables: dict[str, dict[str, Any]] = Field(default_factory=dict)
+	# 每个 finding.id 已知失败的命令集合，二次利用避开
+	failed_commands_by_vuln: dict[str, list[str]] = Field(default_factory=dict)
 	# 文件情报提取结果: [{"path": "/backup/db.sql", "content_snippet": "...", "intel": {LLM结果}}]
 	intel_files: list[dict[str, Any]] = Field(default_factory=list)
 	# 页面参数发现+验证: [{"url": "http://x/info.php?file=", "param_name": "file",

@@ -51,10 +51,48 @@ _GATE_PASS: dict[GatePolicy, set[EvidenceLevel]] = {
 
 # ── Hard-evidence patterns ────────────────────────────────
 
-_UID_RE = re.compile(r"uid=\d+\(\w+\)\s+gid=\d+\(\w+\)")
+_UID_RE = re.compile(r"uid=\d+\([a-z0-9_.-]+\)\s+gid=\d+\([a-z0-9_.-]+\)", re.IGNORECASE)
 _WHOAMI_RE = re.compile(r"^[a-z_][a-z0-9_.-]{0,31}$", re.MULTILINE)
-_PASSWD_LINE_RE = re.compile(r"^[a-z_][\w.-]*:[^:]*:\d+:\d+:", re.MULTILINE)
-_SHADOW_LINE_RE = re.compile(r"^[a-z_][\w.-]*:[\$!\*]", re.MULTILINE)
+_PASSWD_LINE_RE = re.compile(
+    r"[a-z_][\w.-]*:[^:\s]{0,2}:\d+:\d+:[^:\n]{0,64}:/[^\n]{1,200}",
+    re.IGNORECASE | re.MULTILINE,
+)
+_SHADOW_LINE_RE = re.compile(
+    r"[a-z_][\w.-]*:[\$!\*][^\s:]{6,}",
+    re.IGNORECASE | re.MULTILINE,
+)
+_KNOWN_SYSTEM_ACCOUNTS = frozenset([
+    "root", "daemon", "bin", "sys", "sync", "games", "man", "lp", "mail",
+    "news", "uucp", "proxy", "www-data", "backup", "list", "irc", "gnats",
+    "nobody", "systemd-network", "syslog", "messagebus", "landscape",
+    "pollinate", "sshd", "ftp", "postfix", "dovecot", "mysql", "postgres",
+    "apache", "nginx", "operator", "adm",
+])
+_KNOWN_SHELLS = frozenset([
+    "/bin/bash", "/bin/sh", "/usr/sbin/nologin", "/bin/false",
+    "/usr/bin/false", "/bin/sync", "/usr/sbin/login",
+])
+
+
+def _passwd_content_detected(text: str) -> bool:
+    """Return True when text contains plausible /etc/passwd content.
+
+    Uses structural uniqueness of passwd lines (7 colon-separated fields) plus
+    a sanity gate: at least one known system account OR a recognised shell path
+    must appear among the matched lines.  This avoids false positives from
+    log lines or gecos text that happens to contain colons.
+    """
+    matches = _PASSWD_LINE_RE.findall(text)
+    if not matches:
+        return False
+    for m in matches:
+        username = m.split(":")[0].lower()
+        if username in _KNOWN_SYSTEM_ACCOUNTS:
+            return True
+        for shell in _KNOWN_SHELLS:
+            if shell in m:
+                return True
+    return False
 _SSH_KEY_RE = re.compile(
     r"-----BEGIN (?:RSA |OPENSSH |EC )?PRIVATE KEY-----"
 )
@@ -169,7 +207,7 @@ class EvidenceVerifier:
                     return EvidenceLevel.PROBABLE_RCE, f"probable RCE keyword: {kw}", snippets
 
         # ── Check file read ──────────────────────────────
-        if _PASSWD_LINE_RE.search(combined):
+        if _passwd_content_detected(combined):
             snippets.append("/etc/passwd content detected")
             return EvidenceLevel.FILE_READ_ONLY, "passwd file content readable", snippets
 
@@ -181,11 +219,10 @@ class EvidenceVerifier:
             snippets.append("SSH private key detected")
             return EvidenceLevel.FILE_READ_ONLY, "SSH private key readable", snippets
 
-        # Also check all_records for file-read evidence
         if all_records:
             for rec in all_records:
                 rec_out = str(rec.get("stdout", ""))
-                if _PASSWD_LINE_RE.search(rec_out):
+                if _passwd_content_detected(rec_out):
                     snippets.append(f"[round {rec.get('round', '?')}] /etc/passwd readable")
                     return EvidenceLevel.FILE_READ_ONLY, "file read in prior round", snippets
 

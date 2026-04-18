@@ -244,6 +244,10 @@ class Probe:
     # 环境要求：如 env.can_reverse = true
     requires: dict[str, Any] = field(default_factory=dict)
 
+    # 跳过条件：满足时不执行（典型用法：{variable_present: "lfi_depth"}，
+    # 表示已经有别的来源确认过 lfi_depth，此探测无需重复）
+    skip_if: dict[str, Any] = field(default_factory=dict)
+
 
 # ─────────────────────────────────────────────────────────
 # 利用步骤和路径
@@ -438,6 +442,12 @@ class SkillContext:
     # 动态变量（探测阶段设置，决策树使用）
     variables: dict[str, Any] = field(default_factory=dict)
 
+    # 从 phpinfo_parser 得到的 PHP 运行时事实（只读，供 check/substitute 使用）
+    php_runtime: dict[str, Any] = field(default_factory=dict)
+    # 前序利用已确认的事实（lfi/services/creds），供 check/substitute 及
+    # 条件判断使用，保证二次利用不重复探测
+    confirmed_facts: dict[str, Any] = field(default_factory=dict)
+
     # 执行记录
     probe_records: list[dict] = field(default_factory=list)
     step_records: list[dict] = field(default_factory=list)
@@ -463,9 +473,27 @@ class SkillContext:
           - "fastjson_version": ">= 1.2.68"         → 版本比较（actual 必须是纯版本号）
         """
         for key, expected in conditions.items():
-            if key.startswith("env."):
+            if key == "variable_present":
+                name = str(expected)
+                if name in self.variables and self.variables.get(name) not in (None, ""):
+                    continue
+                return False
+            if key.startswith("env.php."):
+                attr = key[len("env.php."):]
+                actual = (self.php_runtime or {}).get(attr)
+            elif key.startswith("env."):
                 attr = key[4:]
                 actual = getattr(self, attr, None)
+            elif key.startswith("confirmed."):
+                path = key[len("confirmed."):].split(".")
+                cur: Any = self.confirmed_facts or {}
+                for part in path:
+                    if isinstance(cur, dict) and part in cur:
+                        cur = cur[part]
+                    else:
+                        cur = None
+                        break
+                actual = cur
             else:
                 actual = self.variables.get(key)
 

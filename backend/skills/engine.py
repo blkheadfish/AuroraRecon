@@ -78,6 +78,9 @@ class SkillEngine:
         task_id: Optional[str] = None,
         decision_callback: DecisionCallback = None,
         operator_role: str = "pentest_engineer",
+        php_runtime: Optional[dict] = None,
+        confirmed_facts: Optional[dict] = None,
+        prior_probe_variables: Optional[dict] = None,
     ) -> ExploitResult:
         """
         执行 Skill 完整流程，带全局超时保护。
@@ -89,6 +92,7 @@ class SkillEngine:
                 self._execute_inner(
                     skill, finding, target_url, env_can_reverse,
                     lhost, target_os, task_id, decision_callback,
+                    php_runtime, confirmed_facts, prior_probe_variables,
                 ),
                 timeout=self._GLOBAL_TIMEOUT,
             )
@@ -129,6 +133,9 @@ class SkillEngine:
         target_os: str = "unknown",
         task_id: Optional[str] = None,
         decision_callback: DecisionCallback = None,
+        php_runtime: Optional[dict] = None,
+        confirmed_facts: Optional[dict] = None,
+        prior_probe_variables: Optional[dict] = None,
     ) -> ExploitResult:
         self._decision_callback = decision_callback
 
@@ -143,7 +150,28 @@ class SkillEngine:
             can_reverse=env_can_reverse,
             task_id=task_id,
             log_callback=self._log_callback,
+            php_runtime=dict(php_runtime or {}),
+            confirmed_facts=dict(confirmed_facts or {}),
         )
+
+        # Preload probe variables from prior attempts / confirmed facts so that
+        # Skill steps can 'skip_if: {variable_present: "lfi_depth"}' immediately.
+        if prior_probe_variables:
+            skill_prior = prior_probe_variables.get(skill.skill_id) or \
+                          prior_probe_variables.get(finding.vuln_id) or {}
+            if isinstance(skill_prior, dict):
+                for k, v in skill_prior.items():
+                    ctx.variables.setdefault(k, v)
+
+        lfi = (confirmed_facts or {}).get("lfi") or {}
+        if lfi.get("param"):
+            ctx.variables.setdefault("lfi_param", lfi["param"])
+        if lfi.get("depth"):
+            ctx.variables.setdefault("lfi_depth", str(lfi["depth"]))
+        if lfi.get("style"):
+            ctx.variables.setdefault("lfi_style", lfi["style"])
+        if lfi.get("path"):
+            ctx.variables.setdefault("lfi_path", lfi["path"])
 
         logger.info(
             f"[SkillEngine] 开始执行 Skill: {skill.skill_id} "
@@ -246,18 +274,34 @@ class SkillEngine:
             else:
                 independent.append(p)
 
-        if len(independent) > 1:
+        runnable_independent: list[Probe] = []
+        for p in independent:
+            if p.skip_if and ctx.check(p.skip_if):
+                await self._emit(
+                    ctx,
+                    f"探测 {p.id} 命中跳过条件 {p.skip_if}，已由先验事实满足，跳过"
+                )
+                continue
+            runnable_independent.append(p)
+
+        if len(runnable_independent) > 1:
             logger.info(
-                f"[SkillEngine] 并发执行 {len(independent)} 个独立探测"
+                f"[SkillEngine] 并发执行 {len(runnable_independent)} 个独立探测"
             )
             await asyncio.gather(
-                *(self._run_single_probe(p, ctx, task_id) for p in independent)
+                *(self._run_single_probe(p, ctx, task_id) for p in runnable_independent)
             )
         else:
-            for p in independent:
+            for p in runnable_independent:
                 await self._run_single_probe(p, ctx, task_id)
 
         for probe in dependent:
+            if probe.skip_if and ctx.check(probe.skip_if):
+                await self._emit(
+                    ctx,
+                    f"探测 {probe.id} 命中跳过条件 {probe.skip_if}，已由先验事实满足，跳过"
+                )
+                continue
             if probe.depends_on and not ctx.check(probe.depends_on):
                 await self._emit(ctx, f"探测 {probe.id} 依赖不满足，跳过 (需要: {probe.depends_on})")
                 continue

@@ -110,6 +110,7 @@ def _parse_probes(raw_list: list) -> list[Probe]:
             steps=[_parse_probe_step(s) for s in raw.get("steps", [])],
             depends_on=raw.get("depends_on", {}),
             requires=raw.get("requires", {}),
+            skip_if=raw.get("skip_if", {}),
         )
         probes.append(probe)
     return probes
