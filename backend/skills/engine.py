@@ -185,6 +185,12 @@ class SkillEngine:
             ctx.variables.setdefault("lfi_style", lfi["style"])
         if lfi.get("path"):
             ctx.variables.setdefault("lfi_path", lfi["path"])
+        # lfi_probe gate 一旦锁住 param/depth/style，就等价于 LFI 已确认；
+        # 此时 detect_lfi 探针会被 skip_if: {variable_present: lfi_depth} 跳过，
+        # 如果不在这里显式同步 lfi_confirmed，所有 conditions: {lfi_confirmed: true}
+        # 的利用路径（log_poison / cred_reuse / sensitive_read / ...）会被静默跳过。
+        if lfi.get("param") or lfi.get("depth") or lfi.get("path"):
+            ctx.variables.setdefault("lfi_confirmed", True)
 
         logger.info(
             f"[SkillEngine] 开始执行 Skill: {skill.skill_id} "

