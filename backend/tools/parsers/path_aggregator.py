@@ -87,7 +87,10 @@ _URL_RE = re.compile(r'(https?://[^\s\]\)]+)')
 _STATUS_CODE_RE = re.compile(r'\b([1-5]\d{2})\b')
 _FEROX_LINE_RE = re.compile(r'^\s*(\d{3})\s+\S+\s+\S+\s+\S+\s+(https?://\S+)')
 _GOBUSTER_RE = re.compile(r'^(/\S+)\s+\(Status:\s*(\d{3})\)')
-_DIRB_RE = re.compile(r'^\+\s+(https?://\S+)\s+\(CODE:(\d{3})')
+# dirb 在 TTY 检测失败或某些版本里会输出 ANSI 颜色码（ESC[...m），
+# 需要在匹配前剥掉；同时允许行首空白，兼容少数带缩进的构建。
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
+_DIRB_RE = re.compile(r'^\s*\+\s+(https?://\S+)\s+\(CODE:(\d{3})')
 _DIRB_DIRECTORY_RE = re.compile(r'^\s*==>\s*DIRECTORY:\s*(https?://\S+)', re.IGNORECASE)
 _FFUF_RE = re.compile(r'^\s*(\S+)\s+\[Status:\s*(\d{3})')
 _DIRSEARCH_RE = re.compile(r'^\s*(\d{3})\s+\S+\s+\S+\s+(\S+)')
@@ -275,8 +278,25 @@ def _parse_dirsearch(raw: str, base_url: str) -> list[tuple[str, int]]:
 
 def _parse_dirb(raw: str, base_url: str) -> list[tuple[str, int]]:
     results: list[tuple[str, int]] = []
-    for line in raw.splitlines():
-        stripped = line.strip()
+    # 环境级故障（二进制/字典缺失）优先抛出，避免被当成 "扫完 0 命中" 掩盖掉
+    if "__DIRB_NOT_INSTALLED__" in raw:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "[PathAggregator] dirb 未安装于 toolbox 容器 — 将静默返回 0 条，请在 toolbox 镜像里 apt install dirb 后重建"
+        )
+        return results
+    if "__DIRB_WORDLIST_MISSING__" in raw:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "[PathAggregator] dirb 字典文件 /usr/share/wordlists/dirb/common.txt 不存在 — 需要在 toolbox 镜像里 apt install wordlists 或装 seclists"
+        )
+        return results
+
+    for raw_line in raw.splitlines():
+        # 某些 dirb 版本对终端检测失败时会带 ANSI 颜色序列
+        # 例如 "\x1b[1;32m+\x1b[0m http://... (CODE:200|SIZE:123)"
+        # 先剥色码，再 strip 去前导空白
+        stripped = _ANSI_RE.sub("", raw_line).strip()
         m = _DIRB_RE.match(stripped)
         if m:
             results.append((m.group(1), int(m.group(2))))

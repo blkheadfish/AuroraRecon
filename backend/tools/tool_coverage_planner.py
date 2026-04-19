@@ -47,7 +47,19 @@ _DIR_DISCOVERY_TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "dirb", "priority": 4, "must_run": False,
-        "script": 'dirb "{url}" /usr/share/wordlists/dirb/common.txt -S -r -z {delay} 2>/dev/null',
+        # 说明：
+        #   1) `-S` 静默模式只打 hit；`-r` 关闭递归；`-w` 忽略 WARN；`-z` = 毫秒级请求间隔
+        #   2) 先断言二进制与字典都存在，缺哪个就打明显的标记退出，避免壳子静默 0 命中
+        #   3) **stderr 合进 stdout**（原来 2>/dev/null 把关键失败吞了，导致只看到 "+0 条"）
+        "script": (
+            'set +e; '
+            'command -v dirb >/dev/null 2>&1 || '
+            '{{ echo "__DIRB_NOT_INSTALLED__"; exit 0; }}; '
+            'WL="/usr/share/wordlists/dirb/common.txt"; '
+            '[ -f "$WL" ] || WL="/usr/share/seclists/Discovery/Web-Content/common.txt"; '
+            '[ -f "$WL" ] || {{ echo "__DIRB_WORDLIST_MISSING__"; exit 0; }}; '
+            'dirb "{url}" "$WL" -S -r -w -z {delay} 2>&1'
+        ),
         "timeout": 360,
     },
     {
