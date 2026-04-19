@@ -20,16 +20,17 @@ export interface EmbeddingSettings {
   model: string
 }
 
+/**
+ * 全局 workflow 设置块只保留"新建任务默认值"类属性,
+ * 不再承载会直接写回 os.environ 的 operator_role / success_gate 等字段。
+ * 每个任务的审批策略 / 证据门槛 / 轮次上限都是 per-task,
+ * 通过 CreateTaskRequest 传给后端。
+ */
 export interface WorkflowSettings {
-  require_approval: boolean
+  default_mode: 'pentest_engineer' | 'ctf_expert' | string
   max_retries: number
   default_scope: string
   report_lang: 'zh' | 'en' | string
-  operator_role: 'pentest_engineer' | 'ctf_expert' | string
-  success_gate: 'strict' | 'medium' | 'lenient' | string
-  max_react_rounds: number
-  max_explore_rounds: number
-  risk_budget: number
 }
 
 export interface SettingsPayload {

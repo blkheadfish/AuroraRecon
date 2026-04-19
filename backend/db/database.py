@@ -176,17 +176,22 @@ async def load_task(task_id: str) -> Optional[PentestState]:
             )
 
 
-async def list_tasks_from_db() -> list[dict]:
-    """列出所有任务摘要"""
+async def list_tasks_from_db(owner_id: str | None = None) -> list[dict]:
+    """列出任务摘要,若指定 owner_id 则只返回该用户创建的任务。"""
+    sql = """
+        SELECT task_id, target, status, current_phase,
+               findings_count, got_shell, report_path,
+               privilege_level, created_at, updated_at, owner_id
+        FROM tasks
+    """
+    params: dict[str, str] = {}
+    if owner_id:
+        sql += " WHERE owner_id = :owner_id"
+        params["owner_id"] = owner_id
+    sql += " ORDER BY created_at DESC"
+
     async with async_session() as session:
-        result = await session.execute(
-            text("""
-                SELECT task_id, target, status, current_phase,
-                       findings_count, got_shell, report_path,
-                       privilege_level, created_at, updated_at
-                FROM tasks ORDER BY created_at DESC
-            """)
-        )
+        result = await session.execute(text(sql), params)
         rows = result.fetchall()
         return [
             {
@@ -200,6 +205,7 @@ async def list_tasks_from_db() -> list[dict]:
                 "privilege_level": r.privilege_level or "",
                 "created_at": r.created_at.isoformat() if r.created_at else "",
                 "updated_at": r.updated_at.isoformat() if r.updated_at else "",
+                "owner_id": r.owner_id or "",
             }
             for r in rows
         ]

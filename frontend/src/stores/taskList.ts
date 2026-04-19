@@ -1,7 +1,22 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { api } from '@/api'
-import type { TaskSummary } from '@/types/task'
+import type { TaskSummary, WorkflowMode } from '@/types/task'
+
+export interface CreateTaskParams {
+  target: string
+  scopeNote?: string
+  extraHint?: string
+  userPrompt?: string
+  workflowMode?: WorkflowMode
+  autoApprove?: boolean | null
+  successGateLevel?: 'strict' | 'medium' | 'lenient' | null
+  riskBudget?: number | null
+  maxReactRounds?: number | null
+  maxExploreRounds?: number | null
+  skillMinScore?: number | null
+  skillWeakBoost?: number | null
+}
 
 export const useTaskListStore = defineStore('taskList', () => {
   const tasks = ref<TaskSummary[]>([])
@@ -23,14 +38,21 @@ export const useTaskListStore = defineStore('taskList', () => {
     }
   }
 
-  async function createTask(
-    target: string,
-    scopeNote: string,
-    extraHint = '',
-    userPrompt = '',
-    workflowMode = 'standard',
-  ) {
-    const task = await api.createTask(target, scopeNote, extraHint, userPrompt, workflowMode)
+  async function createTask(params: CreateTaskParams) {
+    const task = await api.createTask({
+      target:             params.target,
+      note:               params.scopeNote,
+      extraHint:          params.extraHint,
+      userPrompt:         params.userPrompt,
+      workflowMode:       params.workflowMode ?? 'pentest_engineer',
+      autoApprove:        params.autoApprove ?? null,
+      successGateLevel:   params.successGateLevel ?? null,
+      riskBudget:         params.riskBudget ?? null,
+      maxReactRounds:     params.maxReactRounds ?? null,
+      maxExploreRounds:   params.maxExploreRounds ?? null,
+      skillMinScore:      params.skillMinScore ?? null,
+      skillWeakBoost:     params.skillWeakBoost ?? null,
+    })
     tasks.value.unshift(task)
     return task
   }

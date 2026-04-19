@@ -229,10 +229,13 @@ def _build_exploit_context(state: PentestState) -> dict[str, Any]:
         "extra_hint": state.extra_hint,
         "user_prompt": state.user_prompt,
         "workflow_mode": state.workflow_mode,
-        "operator_role": state.operator_role,
+        "auto_approve": state.auto_approve,
         "success_gate_level": state.success_gate_level,
         "risk_budget": state.risk_budget,
+        "max_react_rounds": state.max_react_rounds,
         "max_explore_rounds": state.max_explore_rounds,
+        "skill_min_score": state.skill_min_score,
+        "skill_weak_boost": state.skill_weak_boost,
         "php_runtime": state.php_runtime or {},
         "runtime_facts": state.runtime_facts or {},
         "confirmed_facts": state.confirmed_facts or {},
@@ -1388,22 +1391,29 @@ async def node_exploit_decision(state: PentestState) -> PentestState:
 
 async def node_human_approval(state: PentestState) -> PentestState:
     """
-    人工审批节点（角色感知）。
+    人工审批节点。
 
-    pentest_engineer: 必须人工审批
-    ctf_expert:       可按 workflow 设置自动跳过审批
+    - 当 state.auto_approve=True(例如 CTF 模式/用户显式勾选"自动通过")时,
+      节点会直接把 approved 置为 True 并跳过人工等待。实际跳过发生在
+      `build_graph` 的 `interrupt_before` 动态判定里,本节点只负责记录日志与
+      推进状态。
+    - 否则保持原行为:LangGraph 在本节点前中断,前端 /approve 设置 approved
+      后再恢复执行。
     """
     state.current_phase = "awaiting_approval"
     _record_chain_visit(state, "awaiting_approval")
     exploitable = [f for f in state.findings if f.exploitable]
 
-    if not state.approved:
-        state.log(f"⏸ 收到审批请求：{len(exploitable)} 个漏洞待利用")
+    if state.auto_approve and not state.approved:
+        state.approved = True
+        state.log(f"✅ auto_approve 生效,跳过人工审批({len(exploitable)} 个待利用漏洞)")
+    elif not state.approved:
+        state.log(f"⏸ 收到审批请求:{len(exploitable)} 个漏洞待利用")
 
     if state.approved:
-        state.log("✅ 已获授权，继续利用阶段")
+        state.log("✅ 已获授权,继续利用阶段")
     else:
-        state.log("⚠ 未获授权，跳过利用阶段")
+        state.log("⚠ 未获授权,跳过利用阶段")
         for f in state.findings:
             f.exploitable = False
     return state
@@ -1741,9 +1751,21 @@ async def node_report(state: PentestState) -> PentestState:
 # ───────────────────────────────────────────────────────
 
 def edge_should_exploit(state: PentestState) -> str:
+    """
+    决策阶段结束后的路由:
+      - 任务已失败 → report
+      - 无可利用 finding → report
+      - 有可利用 finding 且 auto_approve=True → 直接进入 foothold_attempt,
+        不经过 human_approval interrupt(避免 LangGraph 暂停等待)
+      - 其余情况 → human_approval(会在 interrupt_before 处暂停)
+    """
     if state.status == TaskStatus.FAILED:
         return "report"
-    return "human_approval" if any(f.exploitable for f in state.findings) else "report"
+    if not any(f.exploitable for f in state.findings):
+        return "report"
+    if state.auto_approve:
+        return "foothold_attempt"
+    return "human_approval"
 
 
 def edge_after_approval(state: PentestState) -> str:
@@ -1811,7 +1833,11 @@ def build_graph(checkpointer=None):
     graph.add_edge("vuln_scan", "exploit_decision")
     graph.add_conditional_edges(
         "exploit_decision", edge_should_exploit,
-        {"human_approval": "human_approval", "report": "report"},
+        {
+            "human_approval": "human_approval",
+            "foothold_attempt": "foothold_attempt",  # auto_approve 直通
+            "report": "report",
+        },
     )
     graph.add_conditional_edges(
         "human_approval", edge_after_approval,
@@ -1864,56 +1890,32 @@ class Orchestrator:
                 checkpointer = MemorySaver()
                 self._graph = build_graph(checkpointer=checkpointer)
 
-    def _prepare_state(
-        self,
-        target: str,
-        scope_note: str,
-        extra_hint: str,
-        user_prompt: str,
-        workflow_mode: str,
-        task_id: Optional[str],
-    ) -> PentestState:
-        """创建并解析 PentestState，统一入口。"""
-        operator_role = os.getenv("OPERATOR_ROLE", "pentest_engineer")
-        success_gate = os.getenv("SUCCESS_GATE", "strict")
-        risk_budget = int(os.getenv("RISK_BUDGET", "3"))
-        max_explore = int(os.getenv("MAX_EXPLORE_ROUNDS", "15"))
-
-        state = PentestState(
-            target=target,
-            scope_note=scope_note,
-            extra_hint=extra_hint,
-            user_prompt=user_prompt,
-            workflow_mode=workflow_mode,
-            task_id=task_id or str(uuid.uuid4()),
-            operator_role=operator_role,
-            success_gate_level=success_gate,
-            risk_budget=risk_budget,
-            max_explore_rounds=max_explore,
+    def _prepare_state(self, initial_state: PentestState) -> PentestState:
+        """
+        对 Router 已构造好的 initial_state 做最后一次统一预处理:
+          - 确保 task_id 存在
+          - 解析 target 结构化信息
+          - 记录启动日志,回显 workflow_mode 与关键策略字段
+        不再读取任何 OPERATOR_ROLE/SUCCESS_GATE/RISK_BUDGET 环境变量。
+        """
+        if not initial_state.task_id:
+            initial_state.task_id = str(uuid.uuid4())
+        _apply_parsed_target(initial_state)
+        initial_state.log(
+            f"workflow_mode={initial_state.workflow_mode}, "
+            f"auto_approve={initial_state.auto_approve}, "
+            f"gate={initial_state.success_gate_level}, "
+            f"risk_budget={initial_state.risk_budget}, "
+            f"react_rounds={initial_state.max_react_rounds}, "
+            f"explore_rounds={initial_state.max_explore_rounds}"
         )
-        # ── 关键：在 recon 之前统一解析目标 ──────────────
-        _apply_parsed_target(state)
-        state.log(
-            f"角色策略: role={operator_role}, gate={success_gate}, "
-            f"risk_budget={risk_budget}, explore_rounds={max_explore}"
-        )
-        return state
+        return initial_state
 
-    async def run(
-        self,
-        target: str,
-        scope_note: str = "CTF/授权靶场测试",
-        extra_hint: str = "",
-        user_prompt: str = "",
-        workflow_mode: str = "standard",
-        task_id: Optional[str] = None,
-    ) -> PentestState:
+    async def run(self, initial_state: PentestState) -> PentestState:
         await self._ensure_graph()
-        initial_state = self._prepare_state(
-            target, scope_note, extra_hint, user_prompt, workflow_mode, task_id,
-        )
+        initial_state = self._prepare_state(initial_state)
         config = {"configurable": {"thread_id": initial_state.task_id}}
-        initial_state.log(f"任务启动，目标: {target}")
+        initial_state.log(f"任务启动,目标: {initial_state.target}")
         try:
             final_state: PentestState = await asyncio.wait_for(
                 self._graph.ainvoke(initial_state, config=config),
@@ -1921,7 +1923,7 @@ class Orchestrator:
             )
         except asyncio.TimeoutError:
             initial_state.status = TaskStatus.FAILED
-            initial_state.error_msg = f"任务超时（>{TASK_TIMEOUT}s）"
+            initial_state.error_msg = f"任务超时(>{TASK_TIMEOUT}s)"
             initial_state.log(initial_state.error_msg)
             try:
                 from backend.tools.executor import TaskContainerManager
@@ -1932,19 +1934,9 @@ class Orchestrator:
             return initial_state
         return final_state
 
-    async def run_stream(
-        self,
-        target: str,
-        scope_note: str = "CTF/授权靶场测试",
-        extra_hint: str = "",
-        user_prompt: str = "",
-        workflow_mode: str = "standard",
-        task_id: Optional[str] = None,
-    ):
+    async def run_stream(self, initial_state: PentestState):
         await self._ensure_graph()
-        initial_state = self._prepare_state(
-            target, scope_note, extra_hint, user_prompt, workflow_mode, task_id,
-        )
+        initial_state = self._prepare_state(initial_state)
         config = {"configurable": {"thread_id": initial_state.task_id}}
 
         async for event in self._graph.astream(initial_state, config=config):

@@ -63,19 +63,33 @@ export const api = {
     http.put('/auth/me', data),
 
   healthCheck: (): Promise<HealthInfo> => http.get('/health'),
-  createTask: (
-    target: string,
-    note: string,
-    extraHint = '',
-    userPrompt = '',
-    workflowMode = 'standard',
-  ): Promise<TaskSummary> =>
+  createTask: (payload: {
+    target: string
+    note?: string
+    extraHint?: string
+    userPrompt?: string
+    workflowMode?: 'pentest_engineer' | 'ctf_expert'
+    autoApprove?: boolean | null
+    successGateLevel?: 'strict' | 'medium' | 'lenient' | null
+    riskBudget?: number | null
+    maxReactRounds?: number | null
+    maxExploreRounds?: number | null
+    skillMinScore?: number | null
+    skillWeakBoost?: number | null
+  }): Promise<TaskSummary> =>
     http.post('/tasks', {
-      target,
-      scope_note: note,
-      extra_hint: extraHint,
-      user_prompt: userPrompt,
-      workflow_mode: workflowMode,
+      target:              payload.target,
+      scope_note:          payload.note ?? 'CTF/授权靶场测试',
+      extra_hint:          payload.extraHint ?? '',
+      user_prompt:         payload.userPrompt ?? '',
+      workflow_mode:       payload.workflowMode ?? 'pentest_engineer',
+      auto_approve:        payload.autoApprove ?? null,
+      success_gate_level:  payload.successGateLevel ?? null,
+      risk_budget:         payload.riskBudget ?? null,
+      max_react_rounds:    payload.maxReactRounds ?? null,
+      max_explore_rounds:  payload.maxExploreRounds ?? null,
+      skill_min_score:     payload.skillMinScore ?? null,
+      skill_weak_boost:    payload.skillWeakBoost ?? null,
     }),
   getTask: (id: string): Promise<TaskDetail> => http.get(`/tasks/${id}`),
   listTasks: (): Promise<TaskSummary[]> => http.get('/tasks'),

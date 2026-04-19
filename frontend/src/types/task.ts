@@ -1,5 +1,7 @@
 export type TaskStatus = 'pending' | 'running' | 'completed' | 'failed'
 
+export type WorkflowMode = 'pentest_engineer' | 'ctf_expert'
+
 export interface PortInfo {
   port: number
   protocol?: string
@@ -32,6 +34,8 @@ export interface TaskSummary {
   report_path?: string | null
   created_at?: string
   updated_at?: string
+  workflow_mode?: WorkflowMode | string
+  auto_approve?: boolean
 }
 
 export interface TaskDetail extends TaskSummary {
@@ -65,8 +69,14 @@ export interface TaskDetail extends TaskSummary {
   scope_note?: string
   extra_hint?: string
   user_prompt?: string
-  workflow_mode?: string
   privilege_level?: string
+  // per-task 运行时参数(回显用,不允许中途改)
+  success_gate_level?: 'strict' | 'medium' | 'lenient' | string
+  risk_budget?: number
+  max_react_rounds?: number
+  max_explore_rounds?: number
+  skill_min_score?: number
+  skill_weak_boost?: number
   foothold_status?: string
   chain_visited?: string[]
   secondary_elided?: boolean

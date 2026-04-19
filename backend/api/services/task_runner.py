@@ -82,28 +82,21 @@ async def _cache_redis_incremental(task_id: str, state: PentestState):
 
 # ── 主任务执行 ────────────────────────────────────────────
 
-async def run_task(
-    task_id: str,
-    target: str,
-    scope_note: str,
-    extra_hint: str = "",
-    user_prompt: str = "",
-    workflow_mode: str = "standard",
-):
+async def run_task(task_id: str, initial_state: PentestState):
+    """
+    运行一个任务的主协程。
+
+    调用方(tasks.create_task)负责把 workflow_mode 默认值和 per-task 覆盖项
+    已经填入 initial_state;本函数只负责把它交给 Orchestrator 并把流式更新
+    推给事件总线 / DB / Redis。
+    """
     sm = get_state_manager()
     bus = get_event_bus()
     sm.mark_running(task_id)
     orchestrator = get_orchestrator()
 
     try:
-        async for node_name, raw_state in orchestrator.run_stream(
-            target=target,
-            scope_note=scope_note,
-            extra_hint=extra_hint,
-            user_prompt=user_prompt,
-            workflow_mode=workflow_mode,
-            task_id=task_id,
-        ):
+        async for node_name, raw_state in orchestrator.run_stream(initial_state):
             # 检查取消
             if sm.redis_available:
                 try:
@@ -137,8 +130,10 @@ async def run_task(
                 **sm.ws_phase_payload(state, log_tail=5),
             })
 
+    except asyncio.CancelledError:
+        logger.info(f"[API] 任务 {task_id} 被取消(CancelledError)")
     except Exception as e:
-        logger.error(f"[API] 任务 {task_id} 执行异常: {e}")
+        logger.error(f"[API] 任务 {task_id} 执行异常: {e}", exc_info=True)
         state = sm.get(task_id)
         if state:
             state.status = TaskStatus.FAILED
@@ -146,17 +141,14 @@ async def run_task(
             await _maybe_save_db(task_id, state, force=True)
     finally:
         sm.mark_stopped(task_id)
-        try:
-            from backend.tools.executor import TaskContainerManager
-            await TaskContainerManager.stop(task_id)
-        except Exception:
-            pass
+        sm.unregister_bg_task(task_id)
 
-    # 检测 LangGraph interrupt 暂停（等待人工审批）
+    # 检测 LangGraph interrupt 暂停(等待人工审批)
+    # auto_approve=True 的任务不会走到这里:edge_should_exploit 已经直通 foothold_attempt
     state = sm.get(task_id)
-    if state and state.status == TaskStatus.RUNNING:
+    if state and state.status == TaskStatus.RUNNING and not state.auto_approve:
         state.current_phase = "awaiting_approval"
-        state.log("⏸ 等待人工审批，请在前端点击「授权并继续」")
+        state.log("⏸ 等待人工审批,请在前端点击「授权并继续」")
         sm.set(task_id, state)
         await bus.publish(task_id, {
             "type": "approval_required",
@@ -168,9 +160,16 @@ async def run_task(
         })
         await _maybe_save_db(task_id, state, force=True)
         logger.info(f"[API] 任务 {task_id} 等待人工审批")
+        # 待审批期间不关容器:恢复后继续利用还要用同一个工具环境
         return
 
-    # 最终持久化（正常完成 / 失败）
+    # 正常完成 / 失败 / 取消 → 统一关容器
+    try:
+        from backend.tools.executor import TaskContainerManager
+        await TaskContainerManager.stop(task_id)
+    except Exception:
+        pass
+
     if state:
         await _maybe_save_db(task_id, state, force=True)
         await bus.publish(task_id, {
@@ -216,8 +215,10 @@ async def resume_task(task_id: str, approved: bool):
                 **sm.ws_phase_payload(state, log_tail=5),
             })
 
+    except asyncio.CancelledError:
+        logger.info(f"[API] Resume 任务 {task_id} 被取消(CancelledError)")
     except Exception as e:
-        logger.error(f"[API] Resume 任务 {task_id} 异常: {e}")
+        logger.error(f"[API] Resume 任务 {task_id} 异常: {e}", exc_info=True)
         state = sm.get(task_id)
         if state:
             state.status = TaskStatus.FAILED
@@ -227,6 +228,7 @@ async def resume_task(task_id: str, approved: bool):
     finally:
         sm.mark_stopped(task_id)
         sm.clear_approval_inflight(task_id)
+        sm.unregister_bg_task(task_id)
         try:
             from backend.tools.executor import TaskContainerManager
             await TaskContainerManager.stop(task_id)

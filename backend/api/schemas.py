@@ -4,18 +4,39 @@ schemas.py —— 所有 API 请求/响应 Pydantic 模型
 from __future__ import annotations
 
 import re
+from typing import Literal, Optional
+
 from pydantic import BaseModel, field_validator
-from backend.agents.models import parse_target
+from backend.agents.models import WorkflowMode, parse_target
 
 
 # ── 任务相关 ──────────────────────────────────────────────
 
 class CreateTaskRequest(BaseModel):
+    """
+    创建任务请求。
+
+    workflow_mode 决定一组默认值(审批策略 / 证据门槛 / 风险预算 / 轮次
+    上限 / Skill 匹配阈值);用户可以同时在 `auto_approve` / `success_gate_level`
+    / `risk_budget` / `max_react_rounds` / `max_explore_rounds` 等字段上
+    显式覆盖,缺省(None)则使用 mode 默认值。这些参数均为 per-task,
+    不会写回全局环境变量。
+    """
+
     target: str
     scope_note: str = "CTF/授权靶场测试"
     extra_hint: str = ""
     user_prompt: str = ""
-    workflow_mode: str = "standard"
+    workflow_mode: WorkflowMode = "pentest_engineer"
+
+    # 以下字段为可选覆盖项,不传则沿用 workflow_mode 的默认值
+    auto_approve: Optional[bool] = None
+    success_gate_level: Optional[Literal["strict", "medium", "lenient"]] = None
+    risk_budget: Optional[int] = None
+    max_react_rounds: Optional[int] = None
+    max_explore_rounds: Optional[int] = None
+    skill_min_score: Optional[int] = None
+    skill_weak_boost: Optional[int] = None
 
     @field_validator("target")
     @classmethod
@@ -66,6 +87,8 @@ class TaskSummary(BaseModel):
     privilege_level: str = ""
     created_at: str = ""
     updated_at: str = ""
+    workflow_mode: str = "pentest_engineer"
+    auto_approve: bool = False
 
 
 class TaskDetail(TaskSummary):
@@ -82,6 +105,11 @@ class TaskDetail(TaskSummary):
     post_findings: dict = {}
     report_md: str = ""
     phase_log: list = []
+    # per-task 运行时参数(用于回显与调试,不允许中途修改)
+    success_gate_level: str = "strict"
+    risk_budget: int = 3
+    max_react_rounds: int = 25
+    max_explore_rounds: int = 15
 
 
 class TaskStats(BaseModel):

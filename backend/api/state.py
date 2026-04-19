@@ -6,6 +6,7 @@ state.py —— 全局状态管理器
 """
 from __future__ import annotations
 
+import asyncio
 import re
 import logging
 from datetime import datetime
@@ -77,6 +78,10 @@ class TaskStateManager:
         self._decision_cache: dict[str, list[dict]] = {}
         self._decision_cursor: dict[str, tuple[int, int, int]] = {}
 
+        # 后台任务句柄注册表(run_task / resume_task 的 asyncio.Task)
+        # cancel / delete 时可以精确取消对应协程,避免 zombie 残留。
+        self._bg_tasks: dict[str, asyncio.Task] = {}
+
     # ── 任务 CRUD ─────────────────────────────────────────
 
     def get(self, task_id: str) -> Optional[PentestState]:
@@ -120,6 +125,26 @@ class TaskStateManager:
     def clear_approval_inflight(self, task_id: str):
         self._approval_inflight.pop(task_id, None)
 
+    # ── 后台任务注册表 ────────────────────────────────────
+
+    def register_bg_task(self, task_id: str, task: asyncio.Task) -> None:
+        """注册一个后台协程(若已有旧句柄则先取消,避免泄漏)。"""
+        old = self._bg_tasks.get(task_id)
+        if old and not old.done():
+            old.cancel()
+        self._bg_tasks[task_id] = task
+
+    def unregister_bg_task(self, task_id: str) -> None:
+        self._bg_tasks.pop(task_id, None)
+
+    def cancel_bg_task(self, task_id: str) -> bool:
+        """主动取消 run_task/resume_task 协程。返回是否发起了取消。"""
+        task = self._bg_tasks.pop(task_id, None)
+        if not task or task.done():
+            return False
+        task.cancel()
+        return True
+
     # ── 工具注册表缓存 ────────────────────────────────────
 
     def get_tool_registry(self):
@@ -143,6 +168,8 @@ class TaskStateManager:
             privilege_level=state.privilege_level,
             created_at=state.created_at,
             updated_at=datetime.utcnow().isoformat(),
+            workflow_mode=state.workflow_mode,
+            auto_approve=state.auto_approve,
         ).model_dump()
 
     def to_detail(self, state: PentestState) -> dict:
@@ -152,7 +179,6 @@ class TaskStateManager:
             "scope_note": state.scope_note,
             "extra_hint": state.extra_hint,
             "user_prompt": state.user_prompt,
-            "workflow_mode": state.workflow_mode,
             "error_msg": state.error_msg,
             "open_ports": [p.model_dump() for p in state.open_ports],
             "os_info": state.os_info,
@@ -178,8 +204,13 @@ class TaskStateManager:
             "chain_summary": state.chain_summary,
             "chain_visited": state.chain_visited,
             "secondary_elided": state.secondary_elided,
-            "operator_role": state.operator_role,
+            # per-task 运行时参数(workflow_mode/auto_approve 已在 summary 里)
             "success_gate_level": state.success_gate_level,
+            "risk_budget": state.risk_budget,
+            "max_react_rounds": state.max_react_rounds,
+            "max_explore_rounds": state.max_explore_rounds,
+            "skill_min_score": state.skill_min_score,
+            "skill_weak_boost": state.skill_weak_boost,
         })
         # stdout/stderr 截断（避免 MB 级响应）+ 标注 truncated_reason
         for rec in base.get("tool_records", []):

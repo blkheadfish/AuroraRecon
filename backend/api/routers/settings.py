@@ -43,16 +43,14 @@ DEFAULT_SETTINGS = {
         "persistent_container": True,
         "lhost":                os.getenv("LHOST", ""),
     },
+    # workflow 块里保留全局"默认值"(给前端新建任务对话框预填),
+    # 但这些字段都是 per-task 的,不会再写回 os.environ。
+    # 真正的策略源是 models._MODE_DEFAULTS,此处仅用于 UI 显示。
     "workflow": {
-        "require_approval": True,
-        "max_retries":      3,
-        "default_scope":    "CTF/授权靶场测试",
-        "report_lang":      "zh",
-        "operator_role":    os.getenv("OPERATOR_ROLE", "pentest_engineer"),
-        "success_gate":     os.getenv("SUCCESS_GATE", "strict"),
-        "max_react_rounds": int(os.getenv("MAX_REACT_ROUNDS", "25")),
-        "max_explore_rounds": int(os.getenv("MAX_EXPLORE_ROUNDS", "15")),
-        "risk_budget":      int(os.getenv("RISK_BUDGET", "3")),
+        "default_mode":       "pentest_engineer",   # pentest_engineer | ctf_expert
+        "max_retries":        3,
+        "default_scope":      "CTF/授权靶场测试",
+        "report_lang":        "zh",
     },
 }
 
@@ -140,17 +138,7 @@ async def save_settings(data: dict):
     lhost = merged.get("executor", {}).get("lhost")
     if lhost:
         os.environ["LHOST"] = lhost
-    wf = merged.get("workflow", {})
-    if wf.get("operator_role"):
-        os.environ["OPERATOR_ROLE"] = str(wf["operator_role"])
-    if wf.get("success_gate"):
-        os.environ["SUCCESS_GATE"] = str(wf["success_gate"])
-    if wf.get("max_react_rounds"):
-        os.environ["MAX_REACT_ROUNDS"] = str(wf["max_react_rounds"])
-    if wf.get("max_explore_rounds"):
-        os.environ["MAX_EXPLORE_ROUNDS"] = str(wf["max_explore_rounds"])
-    if wf.get("risk_budget"):
-        os.environ["RISK_BUDGET"] = str(wf["risk_budget"])
+    # workflow 设置全部改为 per-task,不再通过 os.environ 广播给引擎
     return {"status": "ok"}
 
 

@@ -158,19 +158,45 @@
           <el-input v-model="form.target" placeholder="IP / 域名 / IP:端口 / URL" clearable />
           <div class="form-tip">仅在合法授权范围内使用。</div>
         </el-form-item>
-        <el-form-item label="任务角色模式（预留）">
-          <el-radio-group v-model="form.workflowMode">
-            <el-radio-button label="standard">标准模式</el-radio-button>
-            <el-radio-button label="poc_only" disabled>PoC验证（即将支持）</el-radio-button>
-            <el-radio-button label="ctf_flag" disabled>CTF拿Flag（即将支持）</el-radio-button>
+        <el-form-item label="工作流模式（workflow_mode）">
+          <el-radio-group v-model="form.workflowMode" @change="onWorkflowModeChange">
+            <el-radio-button label="pentest_engineer">渗透工程师</el-radio-button>
+            <el-radio-button label="ctf_expert">CTF 选手</el-radio-button>
           </el-radio-group>
+          <div class="form-tip">
+            决定审批策略 / 证据门槛 / 轮次上限等默认值。下方选项可单项覆盖,只对本任务生效。
+          </div>
         </el-form-item>
-        <el-form-item label="执行模式">
-          <el-radio-group v-model="uiPrefs.executionMode">
-            <el-radio-button label="manual">手动审核</el-radio-button>
-            <el-radio-button label="auto">全自动</el-radio-button>
+        <el-form-item label="审批模式">
+          <el-radio-group v-model="form.autoApprove">
+            <el-radio-button :label="false">手动审批</el-radio-button>
+            <el-radio-button :label="true">全自动（跳过人工审批）</el-radio-button>
           </el-radio-group>
+          <div class="form-tip">
+            渗透工程师默认手动、CTF 选手默认全自动;此处显式选择会覆盖 mode 默认值。
+          </div>
         </el-form-item>
+        <el-collapse>
+          <el-collapse-item title="高级参数（覆盖 workflow_mode 默认值）" name="advanced">
+            <el-form-item label="证据门槛 success_gate_level">
+              <el-radio-group v-model="form.successGateLevel">
+                <el-radio-button label="">沿用默认</el-radio-button>
+                <el-radio-button label="strict">严格</el-radio-button>
+                <el-radio-button label="medium">中等</el-radio-button>
+                <el-radio-button label="lenient">宽松</el-radio-button>
+              </el-radio-group>
+            </el-form-item>
+            <el-form-item label="风险预算 risk_budget">
+              <el-input-number v-model="form.riskBudget" :min="0" :max="50" controls-position="right" />
+            </el-form-item>
+            <el-form-item label="ReAct 最大轮次 max_react_rounds">
+              <el-input-number v-model="form.maxReactRounds" :min="1" :max="200" controls-position="right" />
+            </el-form-item>
+            <el-form-item label="探索最大轮次 max_explore_rounds">
+              <el-input-number v-model="form.maxExploreRounds" :min="1" :max="200" controls-position="right" />
+            </el-form-item>
+          </el-collapse-item>
+        </el-collapse>
         <el-form-item label="授权说明">
           <el-input v-model="form.scopeNote" type="textarea" :rows="3" />
         </el-form-item>
@@ -205,27 +231,41 @@ import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Search } from '@element-plus/icons-vue'
 import { useTaskListStore } from '@/stores/taskList'
-import { useUiPrefsStore } from '@/stores/uiPrefs'
 import { trackEvent } from '@/metrics/tracker'
 import StatusBadge from '@/components/StatusBadge.vue'
 import PhaseBadge from '@/components/PhaseBadge.vue'
 
 const router = useRouter()
 const listStore = useTaskListStore()
-const uiPrefs = useUiPrefsStore()
 
 const showCreate = ref(false)
 const creating = ref(false)
 const formRef = ref()
 const selectedRows = ref([])
 
+// workflow_mode 默认值矩阵,必须与后端 models._MODE_DEFAULTS 保持一致
+const MODE_DEFAULTS = {
+  pentest_engineer: { autoApprove: false },
+  ctf_expert:       { autoApprove: true },
+}
+
 const form = ref({
   target: '',
   scopeNote: 'CTF/授权靶场测试',
   extraHint: '',
   userPrompt: '',
-  workflowMode: 'standard',
+  workflowMode: 'pentest_engineer',
+  autoApprove: MODE_DEFAULTS.pentest_engineer.autoApprove,
+  successGateLevel: '',
+  riskBudget: null,
+  maxReactRounds: null,
+  maxExploreRounds: null,
 })
+
+function onWorkflowModeChange(mode) {
+  const defaults = MODE_DEFAULTS[mode] || MODE_DEFAULTS.pentest_engineer
+  form.value.autoApprove = defaults.autoApprove
+}
 
 function isValidIPv4(host) {
   const parts = host.split('.')
@@ -347,17 +387,22 @@ async function handleCreate() {
   await formRef.value.validate()
   creating.value = true
   try {
-    const task = await listStore.createTask(
-      form.value.target,
-      form.value.scopeNote,
-      form.value.extraHint,
-      form.value.userPrompt,
-      form.value.workflowMode,
-    )
+    const task = await listStore.createTask({
+      target:           form.value.target,
+      scopeNote:        form.value.scopeNote,
+      extraHint:        form.value.extraHint,
+      userPrompt:       form.value.userPrompt,
+      workflowMode:     form.value.workflowMode,
+      autoApprove:      form.value.autoApprove,
+      successGateLevel: form.value.successGateLevel || null,
+      riskBudget:       form.value.riskBudget,
+      maxReactRounds:   form.value.maxReactRounds,
+      maxExploreRounds: form.value.maxExploreRounds,
+    })
     trackEvent('task.create', {
       target: form.value.target,
-      mode: uiPrefs.executionMode,
       workflowMode: form.value.workflowMode,
+      autoApprove: form.value.autoApprove,
       taskId: task.task_id,
     })
     ElMessage.success(`任务已创建：${task.target}`)
@@ -367,7 +412,12 @@ async function handleCreate() {
       scopeNote: 'CTF/授权靶场测试',
       extraHint: '',
       userPrompt: '',
-      workflowMode: 'standard',
+      workflowMode: 'pentest_engineer',
+      autoApprove: MODE_DEFAULTS.pentest_engineer.autoApprove,
+      successGateLevel: '',
+      riskBudget: null,
+      maxReactRounds: null,
+      maxExploreRounds: null,
     }
     router.push(`/tasks/${task.task_id}`)
   } catch (e) {

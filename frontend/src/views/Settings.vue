@@ -170,58 +170,27 @@
         </template>
 
         <el-card class="settings-card">
-          <template #header><span class="card-title">操作员角色</span></template>
+          <template #header><span class="card-title">新建任务默认值</span></template>
+          <el-alert
+              type="info"
+              :closable="false"
+              show-icon
+              style="margin-bottom: 16px"
+              title="workflow_mode 是 per-task 的"
+              description="所有审批策略/证据门槛/轮次/Skill 阈值都在「创建任务」对话框里设置,并且只影响该任务。
+                          这里只设置新建任务对话框里默认勾选哪个 mode,不再写回全局环境变量。"
+          />
 
           <el-form :model="workflow" label-width="160px" class="settings-form">
-            <el-form-item label="角色模式">
-              <el-radio-group v-model="workflow.operator_role" @change="onRoleChange">
+            <el-form-item label="新建任务默认模式">
+              <el-radio-group v-model="workflow.default_mode">
                 <el-radio-button value="pentest_engineer">渗透工程师</el-radio-button>
                 <el-radio-button value="ctf_expert">CTF 高手</el-radio-button>
               </el-radio-group>
-              <div class="form-tip">
-                渗透工程师：低误报、保守策略、强证据闭环；CTF 高手：高命中、激进探索、更多重试
-              </div>
             </el-form-item>
-
-            <el-form-item label="成功门控策略">
-              <el-select v-model="workflow.success_gate">
-                <el-option label="严格（仅 confirmed RCE）" value="strict" />
-                <el-option label="中等（含 probable RCE）" value="medium" />
-                <el-option label="宽松（含 file_read）" value="lenient" />
-              </el-select>
-              <div class="form-tip">控制 EvidenceVerifier 对利用成功的判定标准</div>
-            </el-form-item>
-
-            <el-form-item label="ReAct 最大轮次">
-              <el-input-number v-model="workflow.max_react_rounds" :min="5" :max="50" />
-            </el-form-item>
-
-            <el-form-item label="自由探索轮次">
-              <el-input-number v-model="workflow.max_explore_rounds" :min="3" :max="30" />
-            </el-form-item>
-
-            <el-form-item label="风险操作预算">
-              <el-input-number v-model="workflow.risk_budget" :min="1" :max="10" />
-              <div class="form-tip">单次任务允许的高风险操作数量上限</div>
-            </el-form-item>
-          </el-form>
-        </el-card>
-
-        <el-card class="settings-card">
-          <template #header><span class="card-title">Agent 行为配置</span></template>
-
-          <el-form :model="workflow" label-width="160px" class="settings-form">
-            <el-form-item label="利用前人工确认">
-              <el-switch v-model="workflow.require_approval"
-                         active-text="开启（推荐，防止误操作）"
-                         inactive-text="关闭（全自动）" />
-              <div class="form-tip">开启后，Agent 在利用漏洞前暂停并等待操作员确认</div>
-            </el-form-item>
-
             <el-form-item label="节点失败重试次数">
               <el-input-number v-model="workflow.max_retries" :min="0" :max="5" />
             </el-form-item>
-
             <el-form-item label="默认授权范围说明">
               <el-input
                   v-model="workflow.default_scope"
@@ -230,7 +199,6 @@
                   placeholder="CTF/授权靶场测试"
               />
             </el-form-item>
-
             <el-form-item label="报告语言">
               <el-select v-model="workflow.report_lang">
                 <el-option label="中文" value="zh" />
@@ -238,6 +206,18 @@
               </el-select>
             </el-form-item>
           </el-form>
+        </el-card>
+
+        <el-card class="settings-card">
+          <template #header><span class="card-title">workflow_mode 默认值矩阵(只读)</span></template>
+          <el-table :data="modeMatrixRows" size="small" stripe>
+            <el-table-column prop="field" label="参数" width="200" />
+            <el-table-column prop="pentest_engineer" label="渗透工程师" />
+            <el-table-column prop="ctf_expert" label="CTF 高手" />
+          </el-table>
+          <div class="form-tip" style="margin-top: 8px">
+            真实下发路径 = workflow_mode 默认值 → 创建任务对话框的高级参数覆盖 → PentestState。
+          </div>
         </el-card>
       </el-tab-pane>
 
@@ -352,38 +332,51 @@ const executor = ref({
 })
 
 const workflow = ref({
-  require_approval: true,
-  max_retries:      3,
-  default_scope:    'CTF/授权靶场测试',
-  report_lang:      'zh',
-  operator_role:    'pentest_engineer',
-  success_gate:     'strict',
-  max_react_rounds: 25,
-  max_explore_rounds: 15,
-  risk_budget:      3,
+  default_mode:  'pentest_engineer',
+  max_retries:   3,
+  default_scope: 'CTF/授权靶场测试',
+  report_lang:   'zh',
 })
 
-const ROLE_PRESETS = {
+// 与后端 models._MODE_DEFAULTS 保持同步,仅供只读展示。
+// 如果后端调整,这里应同步修改,否则 UI 可能误导用户。
+const MODE_DEFAULTS_TABLE = {
   pentest_engineer: {
-    success_gate: 'strict',
-    max_react_rounds: 25,
-    max_explore_rounds: 10,
-    risk_budget: 3,
-    require_approval: true,
+    auto_approve:       false,
+    success_gate_level: 'strict',
+    risk_budget:        3,
+    max_react_rounds:   25,
+    max_explore_rounds: 15,
+    skill_min_score:    20,
+    skill_weak_boost:   0,
   },
   ctf_expert: {
-    success_gate: 'medium',
-    max_react_rounds: 35,
-    max_explore_rounds: 20,
-    risk_budget: 8,
-    require_approval: false,
+    auto_approve:       true,
+    success_gate_level: 'lenient',
+    risk_budget:        10,
+    max_react_rounds:   40,
+    max_explore_rounds: 25,
+    skill_min_score:    5,
+    skill_weak_boost:   10,
   },
 }
 
-function onRoleChange(role) {
-  const preset = ROLE_PRESETS[role]
-  if (preset) Object.assign(workflow.value, preset)
-}
+const modeMatrixRows = computed(() => {
+  const fields = [
+    ['auto_approve',       '自动审批'],
+    ['success_gate_level', '证据门槛'],
+    ['risk_budget',        '风险预算'],
+    ['max_react_rounds',   'ReAct 最大轮次'],
+    ['max_explore_rounds', '自由探索最大轮次'],
+    ['skill_min_score',    'Skill 匹配下限'],
+    ['skill_weak_boost',   '弱信号加权'],
+  ]
+  return fields.map(([key, label]) => ({
+    field:             label,
+    pentest_engineer:  String(MODE_DEFAULTS_TABLE.pentest_engineer[key]),
+    ctf_expert:        String(MODE_DEFAULTS_TABLE.ctf_expert[key]),
+  }))
+})
 
 // 团队演示数据
 const demoMembers = [

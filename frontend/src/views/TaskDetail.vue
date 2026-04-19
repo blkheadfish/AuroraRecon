@@ -226,7 +226,7 @@ const decisionItems = computed(() => {
       tone: 'info',
       title: '任务偏好与策略',
       desc: [
-        `workflow_mode: ${task.value.workflow_mode || 'standard'}`,
+        `workflow_mode: ${task.value.workflow_mode || 'pentest_engineer'}`,
         `extra_hint: ${task.value.extra_hint || '无'}`,
         `user_prompt: ${task.value.user_prompt || '无'}`,
       ].join('\n'),

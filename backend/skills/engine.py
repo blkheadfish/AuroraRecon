@@ -77,7 +77,7 @@ class SkillEngine:
         target_os: str = "unknown",
         task_id: Optional[str] = None,
         decision_callback: DecisionCallback = None,
-        operator_role: str = "pentest_engineer",
+        workflow_mode: str = "pentest_engineer",
         php_runtime: Optional[dict] = None,
         confirmed_facts: Optional[dict] = None,
         prior_probe_variables: Optional[dict] = None,
@@ -119,7 +119,7 @@ class SkillEngine:
             "total_elapsed": elapsed,
             "commands_count": len(result.commands_run),
             "evidence_preview": (result.evidence or "")[:200],
-            "operator_role": operator_role,
+            "workflow_mode": workflow_mode,
             "evidence_level": getattr(result, "exploit_level", ""),
             "rounds": len(result.command_records) if result.command_records else 0,
         })
@@ -367,6 +367,18 @@ class SkillEngine:
         if result.stderr.strip():
             stderr_preview = result.stderr.strip().replace('\n', ' ')[:500]
             await self._emit(ctx, f"  stderr: {stderr_preview}")
+
+        # 对探测步骤打印逐行完整输出，方便排查 LFI 深度/参数之类的多轮探测
+        if result.stdout.strip():
+            logger.info(
+                "[SkillEngine] 探测完整输出（%dB）开始 ==============",
+                len(result.stdout),
+            )
+            for raw_line in result.stdout.splitlines():
+                line = raw_line.rstrip()
+                if line:
+                    logger.info("[SkillEngine] probe| %s", line[:400])
+            logger.info("[SkillEngine] 探测完整输出结束 ==============")
 
         # 记录
         ctx.probe_records.append(self._build_exec_record(

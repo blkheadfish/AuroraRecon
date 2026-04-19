@@ -9,10 +9,70 @@ import re
 import uuid
 from datetime import datetime
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, field_validator
+
+
+# ───────────────────────────────────────────────────────
+# 工作流模式(workflow_mode)常量与默认值矩阵
+# 说明:
+#   一次任务只携带一个 workflow_mode,它决定默认的审批策略 / 证据门槛 /
+#   风险预算 / 轮次上限 / Skill 匹配阈值。用户也可以在创建任务时对单项
+#   进行覆盖,覆盖值会被 `apply_mode_defaults` 保留。
+# ───────────────────────────────────────────────────────
+
+WorkflowMode = Literal["pentest_engineer", "ctf_expert"]
+
+_MODE_DEFAULTS: dict[str, dict[str, Any]] = {
+	"pentest_engineer": {
+		"auto_approve":        False,      # 企业渗透默认强制人工审批
+		"success_gate_level":  "strict",   # 严格证据门槛,避免误报
+		"risk_budget":         3,          # 高风险操作额度
+		"max_react_rounds":    25,         # ReAct 单漏洞最大轮次
+		"max_explore_rounds":  15,         # 探索阶段最大轮次
+		"skill_min_score":     20,         # Skill 匹配下限(需要较强信号)
+		"skill_weak_boost":    0,          # 不额外加权弱信号
+	},
+	"ctf_expert": {
+		"auto_approve":        True,       # CTF/靶场跳过审批,一把梭
+		"success_gate_level":  "lenient",  # 放宽证据门槛(拿 flag 优先)
+		"risk_budget":         10,
+		"max_react_rounds":    40,
+		"max_explore_rounds":  25,
+		"skill_min_score":     5,          # 接受弱信号匹配
+		"skill_weak_boost":    10,         # 对弱信号命中额外加权
+	},
+}
+
+
+def mode_defaults(workflow_mode: str) -> dict[str, Any]:
+	"""返回指定 workflow_mode 的默认值,非法 mode 回退到 pentest_engineer。"""
+	return dict(_MODE_DEFAULTS.get(workflow_mode, _MODE_DEFAULTS["pentest_engineer"]))
+
+
+def apply_mode_defaults(
+	state: "PentestState",
+	overrides: Optional[dict[str, Any]] = None,
+) -> "PentestState":
+	"""
+	将 workflow_mode 的默认值填入 state,随后以 `overrides` 里的非空值覆盖。
+
+	设计要点:
+	  - 只写入未被覆盖(或仍为默认零值/None)的字段,避免覆盖用户显式传入的参数。
+	  - 调用链:router 收到 CreateTaskRequest → 构造 state(只填 workflow_mode)
+	    → 再调用本函数,把 mode 默认值 + 用户显式覆盖写入。
+	"""
+	defaults = mode_defaults(state.workflow_mode)
+	overrides = {k: v for k, v in (overrides or {}).items() if v is not None}
+
+	for key, val in defaults.items():
+		if key in overrides:
+			setattr(state, key, overrides[key])
+		else:
+			setattr(state, key, val)
+	return state
 
 
 class TaskStatus(str, Enum):
@@ -185,16 +245,18 @@ class PentestState(BaseModel):
 	scope_note: str = ""
 	extra_hint: str = ""
 	user_prompt: str = ""
-	workflow_mode: str = "standard"
+	# ── 工作流模式 + per-task 运行时策略 ───────────────
+	# workflow_mode 决定一组默认值(见 _MODE_DEFAULTS),
+	# 其余字段允许在创建任务时显式覆盖,不再依赖全局环境变量。
+	workflow_mode: WorkflowMode = "pentest_engineer"
+	auto_approve: bool = False                        # 自动通过审批(CTF 模式默认 True)
+	success_gate_level: str = "strict"                # strict | medium | lenient
+	risk_budget: int = 3                              # 允许的高风险操作次数
+	max_react_rounds: int = 25                        # ReAct 单漏洞最大轮次
+	max_explore_rounds: int = 15                      # 探索阶段最大轮次
+	skill_min_score: int = 20                         # SkillRegistry 匹配下限
+	skill_weak_boost: int = 0                         # 弱信号命中的额外加权
 	created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
-
-	# ── 角色策略（双角色驱动）──────────────────────────
-	operator_role: str = "pentest_engineer"  # pentest_engineer | ctf_expert
-	success_gate_level: str = "strict"       # strict | medium | lenient
-	risk_budget: int = 3                     # max allowed risky operations
-	max_explore_rounds: int = Field(
-		default_factory=lambda: int(os.getenv("MAX_EXPLORE_ROUNDS", "15"))
-	)
 
 	# ── 解析后的目标信息（parse_target 写入）──────────
 	target_host: str = ""          # 纯 host/IP，各 agent 统一使用

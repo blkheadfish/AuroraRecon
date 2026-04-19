@@ -43,15 +43,18 @@ _SERVICE_FINDING_NAMES = frozenset({
     "redis service", "mongodb service", "snmp service", "vnc service",
 })
 
-# Role-based matching configuration
-_ROLE_MATCH_CONFIG: dict[str, dict] = {
+# workflow_mode → Skill matching thresholds
+# 这些只是"兜底默认值",真正生效的是从 PentestState 里传下来的
+# skill_min_score / skill_weak_boost(per-task)。match() 里优先使用外部
+# 显式传入的阈值,只有当外部没传时才回落到这张表。
+_MODE_MATCH_CONFIG: dict[str, dict] = {
     "pentest_engineer": {
-        "min_score": 20,       # require stronger evidence
+        "min_score": 20,
         "weak_signal_boost": 0,
     },
     "ctf_expert": {
-        "min_score": 5,        # accept weaker signals
-        "weak_signal_boost": 10,  # boost low-confidence matches
+        "min_score": 5,
+        "weak_signal_boost": 10,
     },
 }
 
@@ -78,16 +81,17 @@ class SkillRegistry:
         finding: VulnFinding,
         fingerprint: str = "",
         json_probe: str = "",
-        operator_role: str = "pentest_engineer",
+        workflow_mode: str = "pentest_engineer",
+        min_score: Optional[int] = None,
+        weak_signal_boost: Optional[int] = None,
     ) -> Optional[Skill]:
         """
-        根据漏洞发现匹配最适用的 Skill（评分制 + 角色权重）。
+        根据漏洞发现匹配最适用的 Skill(评分制 + mode 权重)。
 
         Args:
-            operator_role: "pentest_engineer" requires higher threshold,
-                          "ctf_expert" accepts weaker signals.
-        Returns:
-            评分最高的 Skill，未匹配返回 None
+            workflow_mode: pentest_engineer / ctf_expert,用作阈值兜底。
+            min_score: 任务显式指定的下限(per-task,覆盖 mode 默认值)。
+            weak_signal_boost: 任务显式指定的弱信号加权。
         """
         self.ensure_loaded()
 
@@ -98,16 +102,16 @@ class SkillRegistry:
             finding.evidence[:500],
         ]))
 
-        # Role-based minimum threshold and score boost
-        min_threshold = _ROLE_MATCH_CONFIG.get(operator_role, {}).get("min_score", 10)
-        weak_signal_boost = _ROLE_MATCH_CONFIG.get(operator_role, {}).get("weak_signal_boost", 0)
+        cfg = _MODE_MATCH_CONFIG.get(workflow_mode) or _MODE_MATCH_CONFIG["pentest_engineer"]
+        min_threshold = cfg["min_score"] if min_score is None else int(min_score)
+        boost = cfg["weak_signal_boost"] if weak_signal_boost is None else int(weak_signal_boost)
 
         scored: list[tuple[int, Skill]] = []
 
         for skill in self._skills:
             score = self._score_skill(skill, finding, combined_fp, json_probe)
-            if score > 0 and weak_signal_boost and score < 60:
-                score += weak_signal_boost
+            if score > 0 and boost and score < 60:
+                score += boost
             if score >= min_threshold:
                 scored.append((score, skill))
 
