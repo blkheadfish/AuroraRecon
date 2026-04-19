@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import Any, Optional
 
 from backend.agents.models import PortInfo, VulnFinding
@@ -1767,11 +1768,41 @@ $PHUIP "{web_url}/index.php" 2>&1
 
             if analysis.get("confirmed"):
                 logger.info(f"[VulnAgent] LLM 确认漏洞: {vuln_name}")
+
+                # 从 verify_command 里抽出真正的漏洞 URL（含路径+查询），
+                # 否则下游 LFI 探针/SkillEngine 只能拿到 http://host:port，
+                # 会把探测打到网站根而不是漏洞端点。
+                resolved_target = ""
+                resolved_port = port
+                url_match = re.search(
+                    r"https?://[^\s'\"`|><;)}\\]+",
+                    command,
+                )
+                if url_match:
+                    resolved_target = url_match.group(0).rstrip(".,;)\"'`")
+                    try:
+                        from urllib.parse import urlparse as _urlparse
+                        _pu = _urlparse(resolved_target)
+                        if _pu.port:
+                            resolved_port = _pu.port
+                        elif _pu.hostname and not resolved_port:
+                            resolved_port = 443 if _pu.scheme == "https" else 80
+                    except Exception:
+                        pass
+                if not resolved_target:
+                    resolved_target = (
+                        f"http://{target}:{port}" if port else target
+                    )
+                logger.info(
+                    "[VulnAgent] 解析漏洞目标 %s -> target=%s port=%s",
+                    vuln_name, resolved_target, resolved_port,
+                )
+
                 findings.append(VulnFinding(
                     name=vuln_name,
                     severity=severity,
-                    target=f"http://{target}:{port}" if port else target,
-                    port=port,
+                    target=resolved_target,
+                    port=resolved_port,
                     description=description,
                     evidence="\n\n".join([
                         f"Command\n{command}",
