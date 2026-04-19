@@ -77,6 +77,7 @@ class SkillEngine:
         target_os: str = "unknown",
         task_id: Optional[str] = None,
         decision_callback: DecisionCallback = None,
+        log_callback: LogCallback = None,
         workflow_mode: str = "pentest_engineer",
         php_runtime: Optional[dict] = None,
         confirmed_facts: Optional[dict] = None,
@@ -93,6 +94,7 @@ class SkillEngine:
                 self._execute_inner(
                     skill, finding, target_url, env_can_reverse,
                     lhost, target_os, task_id, decision_callback,
+                    log_callback,
                     php_runtime, confirmed_facts, prior_probe_variables,
                     runtime_facts,
                 ),
@@ -135,12 +137,15 @@ class SkillEngine:
         target_os: str = "unknown",
         task_id: Optional[str] = None,
         decision_callback: DecisionCallback = None,
+        log_callback: LogCallback = None,
         php_runtime: Optional[dict] = None,
         confirmed_facts: Optional[dict] = None,
         prior_probe_variables: Optional[dict] = None,
         runtime_facts: Optional[dict] = None,
     ) -> ExploitResult:
         self._decision_callback = decision_callback
+        # 保留实例级引用作为兜底，优先使用调用方显式传入的 log_callback
+        effective_log_callback = log_callback if log_callback is not None else self._log_callback
 
         # ── 初始化上下文 ──────────────────────────────
         parsed = urlparse(target_url)
@@ -156,7 +161,7 @@ class SkillEngine:
             lhost=lhost,
             can_reverse=env_can_reverse,
             task_id=task_id,
-            log_callback=self._log_callback,
+            log_callback=effective_log_callback,
             php_runtime=dict((_rf.get("php") or php_runtime) or {}),
             runtime_facts=_rf,
             confirmed_facts=dict(confirmed_facts or {}),

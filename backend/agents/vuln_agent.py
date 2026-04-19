@@ -1730,15 +1730,40 @@ $PHUIP "{web_url}/index.php" 2>&1
                 f"stdout:\n```\n{exec_result.stdout[:2000]}\n```\n\n"
                 f"stderr:\n```\n{exec_result.stderr[:500]}\n```\n\n"
                 f"exit_code: {exec_result.exit_code}\n\n"
-                f"返回 JSON（不含代码块）：\n"
+                f"判定标准：\n"
+                f"- confirmed=true：输出中出现预期证据（如 /etc/passwd 的 root:x:0:0、"
+                f"phpinfo、SQL 报错、命令回显等），足以证明漏洞存在。\n"
+                f"- exploitable=true：漏洞可被进一步利用于渗透路径，包括但不限于：\n"
+                f"  * LFI / 任意文件读（可读敏感文件、配置、session、日志链 RCE）\n"
+                f"  * SQLi（可出数据或堆叠注入）\n"
+                f"  * RCE / 命令注入 / 反序列化 / SSTI / 上传绕过\n"
+                f"  * 已知 CVE 且探测成功\n"
+                f"  注意：即便没有直接 shell，只要能进入下一步利用链（如 LFI→log poisoning、"
+                f"LFI→session 读取、LFI→配置文件泄漏凭据），也应判 exploitable=true。\n"
+                f"- 仅当 confirmed=false 或只是信息泄露（banner/version/目录列举）时才 "
+                f"exploitable=false。\n\n"
+                f"只返回 JSON（不要代码块、不要解释）：\n"
                 f'{{"confirmed": true或false, "evidence": "判断依据", "exploitable": true或false}}'
             )
 
+            analysis_raw: Optional[str] = None
             try:
                 analysis_raw = await self.llm.chat(analyze_prompt, response_format="json")
                 analysis = json.loads(analysis_raw)
-            except Exception:
+            except Exception as e:
+                logger.warning(
+                    "[VulnAgent] LLM 分析 JSON 解析失败 vuln=%s err=%s raw=%r",
+                    vuln_name, e, (analysis_raw[:500] if analysis_raw else None),
+                )
                 analysis = {"confirmed": False}
+
+            logger.info(
+                "[VulnAgent] LLM 判定 %s: confirmed=%s exploitable=%s evidence=%s",
+                vuln_name,
+                analysis.get("confirmed"),
+                analysis.get("exploitable"),
+                (analysis.get("evidence") or "")[:120],
+            )
 
             if analysis.get("confirmed"):
                 logger.info(f"[VulnAgent] LLM 确认漏洞: {vuln_name}")
