@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import asyncio
+import uuid
 import ipaddress as _ipaddress
 import logging
 from contextlib import asynccontextmanager
@@ -170,13 +171,18 @@ app.add_middleware(
 # ── 认证中间件 ────────────────────────────────────────────
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
+    request.state.trace_id = request.headers.get("x-trace-id", "") or uuid.uuid4().hex[:16]
     path = request.url.path
     if request.method == "OPTIONS":
-        return await call_next(request)
+        response = await call_next(request)
+        response.headers["x-trace-id"] = request.state.trace_id
+        return response
     if any(path.startswith(p) for p in _AUTH_WHITELIST_PREFIXES):
         return await call_next(request)
     if path.startswith("/ws/"):
-        return await call_next(request)
+        response = await call_next(request)
+        response.headers["x-trace-id"] = request.state.trace_id
+        return response
 
     auth_header = request.headers.get("authorization", "")
     if not auth_header.startswith("Bearer "):
@@ -187,11 +193,14 @@ async def auth_middleware(request: Request, call_next):
         return JSONResponse(status_code=401, content={"detail": "登录已过期，请重新登录"})
     request.state.user_id = claims.get("sub", "")
     request.state.username = claims.get("username", "")
-    return await call_next(request)
+    request.state.tenant_id = claims.get("tenant_id", "default")
+    response = await call_next(request)
+    response.headers["x-trace-id"] = request.state.trace_id
+    return response
 
 
 # ── 挂载路由 ──────────────────────────────────────────────
-from backend.api.routers import health, tasks, ws, auth, settings, skills, knowledge, team
+from backend.api.routers import health, tasks, ws, auth, settings, skills, knowledge, team, prompts
 
 app.include_router(health.router)
 app.include_router(tasks.router)
@@ -200,4 +209,5 @@ app.include_router(auth.router)
 app.include_router(settings.router)
 app.include_router(skills.router)
 app.include_router(knowledge.router)
+app.include_router(prompts.router)
 app.include_router(team.router)

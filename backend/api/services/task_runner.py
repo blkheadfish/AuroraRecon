@@ -49,8 +49,9 @@ async def _maybe_save_db(task_id: str, state: PentestState, force: bool = False)
 
 async def _save_db_fire_and_forget(state: PentestState):
     try:
-        from backend.db.database import save_task
+        from backend.db.database import save_task, save_task_facts
         await save_task(state)
+        await save_task_facts(state)
     except Exception as e:
         logger.warning(f"[DB] 异步保存失败: {e}")
 

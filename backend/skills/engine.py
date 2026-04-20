@@ -37,6 +37,7 @@ from backend.skills.models import (
     SkillContext,
     StepOutcome,
 )
+from backend.skills.guard import NoReprobeGuard
 from backend.skills.execution_log import persist_execution
 from backend.tools.executor import DecisionCallback, ExecuteResult, LogCallback, TaskContainerManager, ToolExecutor
 
@@ -55,6 +56,7 @@ class SkillEngine:
     def __init__(self):
         self.executor = ToolExecutor()
         self._log_callback: LogCallback = None
+        self.guard = NoReprobeGuard()
 
     _GLOBAL_TIMEOUT = int(os.getenv("SKILL_GLOBAL_TIMEOUT", "1800"))
 
@@ -176,7 +178,15 @@ class SkillEngine:
                 for k, v in skill_prior.items():
                     ctx.variables.setdefault(k, v)
 
+        failed_commands: list[str] = []
+        if isinstance(prior_probe_variables, dict):
+            fc = prior_probe_variables.get("_failed_commands")
+            if isinstance(fc, list):
+                failed_commands = [str(c) for c in fc if c]
+        ctx.variables.setdefault("_failed_commands", failed_commands)
+
         lfi = (confirmed_facts or {}).get("lfi") or {}
+        services = (confirmed_facts or {}).get("services") or {}
         if lfi.get("param"):
             ctx.variables.setdefault("lfi_param", lfi["param"])
         if lfi.get("depth"):
@@ -191,6 +201,8 @@ class SkillEngine:
         # 的利用路径（log_poison / cred_reuse / sensitive_read / ...）会被静默跳过。
         if lfi.get("param") or lfi.get("depth") or lfi.get("path"):
             ctx.variables.setdefault("lfi_confirmed", True)
+        if services.get("ssh_port"):
+            ctx.variables.setdefault("ssh_port", str(services.get("ssh_port")))
 
         logger.info(
             f"[SkillEngine] 开始执行 Skill: {skill.skill_id} "
@@ -358,6 +370,26 @@ class SkillEngine:
     ) -> None:
         """执行单条探测命令并应用解析规则"""
         command = ctx.substitute(command_template)
+        guard_decision = self.guard.evaluate(
+            command,
+            confirmed_facts=ctx.confirmed_facts,
+            failed_commands=ctx.variables.get("_failed_commands") or [],
+        )
+        if not guard_decision.allowed:
+            await self._emit(
+                ctx,
+                f"  Guard 拦截探测命令({guard_decision.code}): {guard_decision.reason}",
+            )
+            if self._decision_callback:
+                await self._decision_callback({
+                    "action": "guard_block",
+                    "phase": "foothold_attempt",
+                    "message": guard_decision.reason,
+                    "guard_code": guard_decision.code,
+                    "command": command[:300],
+                    "tone": "warning",
+                })
+            return
 
         cmd_preview = " ".join(command.split())[:500]
         await self._emit(ctx, f"  探测命令: {cmd_preview}")
@@ -458,6 +490,33 @@ class SkillEngine:
             await self._emit(ctx, f"  步骤 [{step.id}]: {step.description}")
 
             command = ctx.substitute(step.command)
+            guard_decision = self.guard.evaluate(
+                command,
+                confirmed_facts=ctx.confirmed_facts,
+                failed_commands=ctx.variables.get("_failed_commands") or [],
+            )
+            if not guard_decision.allowed:
+                await self._emit(
+                    ctx,
+                    f"    Guard 拦截执行({guard_decision.code}): {guard_decision.reason}",
+                )
+                if self._decision_callback:
+                    await self._decision_callback({
+                        "action": "guard_block",
+                        "phase": "foothold_attempt",
+                        "message": guard_decision.reason,
+                        "guard_code": guard_decision.code,
+                        "command": command[:300],
+                        "tone": "warning",
+                    })
+                outcome = step.on_fail or "next_path"
+                if outcome == "next_step":
+                    current_idx += 1
+                    continue
+                if outcome in step_map:
+                    current_idx = step_map[outcome]
+                    continue
+                return ExploitResult(vuln_id=finding.vuln_id, success=False)
             ctx.commands_run.append(command)
 
             cmd_preview = " ".join(command.split())[:500]
@@ -798,6 +857,30 @@ class SkillEngine:
 
             cmd = decision.get("command", "").strip()
             if not cmd:
+                continue
+            guard_decision = self.guard.evaluate(
+                cmd,
+                confirmed_facts=ctx.confirmed_facts,
+                failed_commands=ctx.variables.get("_failed_commands") or [],
+            )
+            if not guard_decision.allowed:
+                conversation.append({
+                    "role": "user",
+                    "content": (
+                        f"该命令被执行前置 Guard 拒绝({guard_decision.code}): "
+                        f"{guard_decision.reason}。请基于已确认事实重新规划。"
+                    ),
+                })
+                if self._decision_callback:
+                    await self._decision_callback({
+                        "action": "guard_block",
+                        "phase": "foothold_attempt",
+                        "round": round_num + 1,
+                        "message": guard_decision.reason,
+                        "guard_code": guard_decision.code,
+                        "command": cmd[:300],
+                        "tone": "warning",
+                    })
                 continue
 
             cmd_preview = " ".join(cmd.split())[:500]

@@ -49,10 +49,11 @@ from datetime import datetime, timedelta
 import jwt as _jwt
 
 
-def create_jwt(user_id: str, username: str) -> str:
+def create_jwt(user_id: str, username: str, tenant_id: str = "default") -> str:
     payload = {
         "sub": user_id,
         "username": username,
+        "tenant_id": tenant_id or "default",
         "exp": datetime.utcnow() + timedelta(days=JWT_EXPIRE_DAYS),
         "iat": datetime.utcnow(),
     }

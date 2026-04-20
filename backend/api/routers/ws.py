@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 
 from backend.api.deps import decode_jwt
 from backend.api.state import get_state_manager, TaskStateManager, TOOL_START_RE, TOOL_DONE_RE
@@ -29,13 +29,33 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
     token = websocket.query_params.get("token", "")
     claims = decode_jwt(token) if token else None
     if not claims:
-        # 兼容旧版无 token 的连接（不中断，但记录警告）
-        logger.warning(f"[WS] 未认证连接: task_id={task_id}")
-
-    await websocket.accept()
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="invalid token")
+        logger.warning(f"[WS] rejected unauthenticated connection: task_id={task_id}")
+        return
 
     sm = get_state_manager()
     bus = get_event_bus()
+    owner_id = claims.get("sub", "")
+    state = sm.get(task_id)
+    if state is None and sm.db_available:
+        try:
+            from backend.db.database import load_task
+            state = await load_task(task_id)
+            if state:
+                sm.set(task_id, state)
+        except Exception:
+            state = None
+    if state is None:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="task not found")
+        return
+    if (state.owner_id or "") and (state.owner_id or "") != owner_id:
+        logger.warning(
+            f"[WS] blocked cross-owner subscribe: task={task_id}, owner={state.owner_id}, actor={owner_id}"
+        )
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="forbidden")
+        return
+
+    await websocket.accept()
 
     async def _send(payload: dict) -> bool:
         try:

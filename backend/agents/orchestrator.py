@@ -186,6 +186,7 @@ def _build_dir_intel(state: PentestState) -> dict[str, Any]:
 
 
 def _build_exploit_context(state: PentestState) -> dict[str, Any]:
+    _normalize_and_dedupe_state_facts(state, source_node="build_exploit_context")
     path_contents = state.path_contents or []
     path_content_summary = "无"
     if path_contents:
@@ -1056,6 +1057,7 @@ def _update_inventory_hints_from_intel(
 from backend.agents.fact_hooks import (
     apply_service_info_extraction as _apply_service_info_extraction,
     make_fact_sink as _make_fact_sink,
+    normalize_and_dedupe_state_facts as _normalize_and_dedupe_state_facts,
 )
 
 
@@ -1424,6 +1426,7 @@ async def node_foothold_attempt(state: PentestState) -> PentestState:
     state.current_phase = "foothold_attempt"
     _record_chain_visit(state, "foothold_attempt")
     exploitable = [f for f in state.findings if f.exploitable]
+    _normalize_and_dedupe_state_facts(state, source_node="foothold_attempt_pre")
 
     php_fpm = [
         f for f in state.findings
@@ -1472,6 +1475,10 @@ async def node_foothold_attempt(state: PentestState) -> PentestState:
         async def _on_exec_record(record: dict):
             _append_tool_record(state, record, default_phase="foothold_attempt")
         async def _on_decision(event: dict):
+            if (event or {}).get("action") == "guard_block":
+                code = (event or {}).get("guard_code") or "unknown"
+                key = f"guard_block:{code}"
+                state.guard_stats[key] = int(state.guard_stats.get(key, 0)) + 1
             state.push_decision(event)
         results = await agent.run(
             target=state.target_host or state.target,
@@ -1506,6 +1513,7 @@ async def node_foothold_attempt(state: PentestState) -> PentestState:
             else:
                 state.log("所有利用尝试均未成功")
         _sync_foothold_state(state)
+        _normalize_and_dedupe_state_facts(state, source_node="foothold_attempt_post")
     except Exception as e:
         state.error_msg = str(e)
         state.log(f"利用阶段异常: {e}")
@@ -1518,6 +1526,7 @@ async def node_secondary_attack(state: PentestState) -> PentestState:
     state.current_phase = "secondary_attack"
     _record_chain_visit(state, "secondary_attack")
     state.secondary_attack_done = True
+    _normalize_and_dedupe_state_facts(state, source_node="secondary_attack_pre")
 
     if state.got_shell:
         state.log("已有 shell，跳过二次攻击")
@@ -1560,6 +1569,10 @@ async def node_secondary_attack(state: PentestState) -> PentestState:
         async def _on_exec_record(record: dict):
             _append_tool_record(state, record, default_phase="secondary_attack")
         async def _on_decision(event: dict):
+            if (event or {}).get("action") == "guard_block":
+                code = (event or {}).get("guard_code") or "unknown"
+                key = f"guard_block:{code}"
+                state.guard_stats[key] = int(state.guard_stats.get(key, 0)) + 1
             state.push_decision(event)
         new_results = await agent.run(
             target=state.target_host or state.target,
@@ -1598,6 +1611,7 @@ async def node_secondary_attack(state: PentestState) -> PentestState:
             else:
                 state.log("二次攻击仍未成功")
         _sync_foothold_state(state)
+        _normalize_and_dedupe_state_facts(state, source_node="secondary_attack_post")
     except Exception as e:
         state.error_msg = str(e)
         state.log(f"二次攻击异常: {e}")

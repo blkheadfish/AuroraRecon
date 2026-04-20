@@ -7,12 +7,14 @@ without having to import the full LangGraph pipeline (which pulls in
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
+from datetime import datetime
 from typing import Any
 
 from backend.agents.evidence_verifier import _passwd_content_detected
-from backend.agents.models import ExploitResult, PentestState, VulnFinding
+from backend.agents.models import ExploitResult, PentestState, TaskFact, VulnFinding
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +32,82 @@ _LFI_HIT_RE = re.compile(
 _SSH_PORT_RE = re.compile(r"\b(?:SSH|OpenSSH)\b[^\n]{0,80}?\bport\s*[=:]?\s*(\d{1,5})", re.IGNORECASE)
 _AUTH_LOG_RE = re.compile(r"(/var/log/(?:auth|secure|apache2/access)[\w./-]*)", re.IGNORECASE)
 
+
+def canonical_command_hash(command: str) -> str:
+    normalized = " ".join((command or "").strip().lower().split())
+    return hashlib.sha1(normalized.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+
+def _safe_fact_key(fact_type: str, value: Any) -> str:
+    return f"{fact_type}:{canonical_command_hash(str(value))}"
+
+
+def _project_confirmed_from_task_facts(task_facts: dict[str, TaskFact]) -> dict[str, Any]:
+    confirmed: dict[str, Any] = {"lfi": {}, "services": {}, "creds": []}
+    for fact in (task_facts or {}).values():
+        ft = fact.fact_type
+        val = fact.value
+        if ft == "lfi_param":
+            confirmed["lfi"]["param"] = val
+        elif ft == "lfi_depth":
+            confirmed["lfi"]["depth"] = val
+        elif ft == "lfi_style":
+            confirmed["lfi"]["style"] = val
+        elif ft == "lfi_readable_file":
+            confirmed["lfi"].setdefault("readable_files", [])
+            if val not in confirmed["lfi"]["readable_files"]:
+                confirmed["lfi"]["readable_files"].append(val)
+        elif ft == "service_ssh_port":
+            confirmed["services"]["ssh_port"] = val
+        elif ft == "service_log_readable":
+            confirmed["services"].setdefault("log_readable", [])
+            if val not in confirmed["services"]["log_readable"]:
+                confirmed["services"]["log_readable"].append(val)
+        elif ft == "credential" and isinstance(val, dict):
+            if val not in confirmed["creds"]:
+                confirmed["creds"].append(val)
+    if not confirmed["lfi"]:
+        confirmed.pop("lfi", None)
+    if not confirmed["services"]:
+        confirmed.pop("services", None)
+    if not confirmed["creds"]:
+        confirmed.pop("creds", None)
+    return confirmed
+
+
+def normalize_and_dedupe_state_facts(state: PentestState, source_node: str = "") -> None:
+    """Normalize task_facts and backfill compatibility projections."""
+    task_facts: dict[str, TaskFact] = dict(state.task_facts or {})
+    if not task_facts:
+        # bootstrap from legacy confirmed_facts fields
+        lfi = (state.confirmed_facts or {}).get("lfi") or {}
+        services = (state.confirmed_facts or {}).get("services") or {}
+        creds = (state.confirmed_facts or {}).get("creds") or []
+        if lfi.get("param"):
+            k = _safe_fact_key("lfi_param", lfi["param"])
+            task_facts[k] = TaskFact(fact_key=k, fact_type="lfi_param", value=lfi["param"], source="legacy", source_node=source_node or "legacy")
+        if lfi.get("depth"):
+            k = _safe_fact_key("lfi_depth", lfi["depth"])
+            task_facts[k] = TaskFact(fact_key=k, fact_type="lfi_depth", value=lfi["depth"], source="legacy", source_node=source_node or "legacy")
+        if lfi.get("style"):
+            k = _safe_fact_key("lfi_style", lfi["style"])
+            task_facts[k] = TaskFact(fact_key=k, fact_type="lfi_style", value=lfi["style"], source="legacy", source_node=source_node or "legacy")
+        for rf in (lfi.get("readable_files") or []):
+            k = _safe_fact_key("lfi_readable_file", rf)
+            task_facts[k] = TaskFact(fact_key=k, fact_type="lfi_readable_file", value=rf, source="legacy", source_node=source_node or "legacy")
+        if services.get("ssh_port"):
+            k = _safe_fact_key("service_ssh_port", services["ssh_port"])
+            task_facts[k] = TaskFact(fact_key=k, fact_type="service_ssh_port", value=services["ssh_port"], source="legacy", source_node=source_node or "legacy")
+        for lp in (services.get("log_readable") or []):
+            k = _safe_fact_key("service_log_readable", lp)
+            task_facts[k] = TaskFact(fact_key=k, fact_type="service_log_readable", value=lp, source="legacy", source_node=source_node or "legacy")
+        for c in creds:
+            k = _safe_fact_key("credential", c)
+            task_facts[k] = TaskFact(fact_key=k, fact_type="credential", value=c, source="legacy", source_node=source_node or "legacy")
+
+    state.task_facts = task_facts
+    state.confirmed_facts = _project_confirmed_from_task_facts(task_facts)
+    state.last_fact_normalized_at = datetime.utcnow().isoformat()
 
 def extract_discoveries_list(
     result: ExploitResult,
@@ -172,6 +250,7 @@ def extract_facts(result: ExploitResult, finding: VulnFinding) -> dict[str, Any]
 
 _LFI_REPROBE_PATTERNS = [
     re.compile(r"for\s+\w+\s+in\s+\$?\(?\s*seq\s+\d+\s+\d+", re.IGNORECASE),
+    re.compile(r"seq\s+\d+\s+\$\w+", re.IGNORECASE),
     re.compile(r"for\s+\w+\s+in\s+\{\s*\d+\s*\.\.\s*\d+\s*\}", re.IGNORECASE),
     re.compile(r"(\.\./\s*){3,}", re.IGNORECASE),
     re.compile(
@@ -189,11 +268,7 @@ def is_lfi_reprobe_command(cmd: str) -> bool:
     for pat in _LFI_REPROBE_PATTERNS:
         if pat.search(cmd):
             hits += 1
-    if hits >= 2:
-        return True
-    if hits >= 1 and cmd.count("../") >= 3:
-        return True
-    return False
+    return hits >= 2
 
 
 def make_fact_sink(state: PentestState):
@@ -212,6 +287,7 @@ def make_fact_sink(state: PentestState):
     def _sink(facts: dict) -> None:
         try:
             vuln_id = facts.get("vuln_id") or "*"
+            now = datetime.utcnow().isoformat()
             pv = facts.get("probe_variables") or {}
             if pv:
                 existing_pv = dict(state.exploit_probe_variables.get(vuln_id, {}))
@@ -219,31 +295,92 @@ def make_fact_sink(state: PentestState):
                 state.exploit_probe_variables[vuln_id] = existing_pv
 
             confirmed = facts.get("confirmed") or {}
-            cf: dict[str, Any] = dict(state.confirmed_facts or {})
+            task_facts: dict[str, TaskFact] = dict(state.task_facts or {})
             for section, payload in confirmed.items():
                 if section == "creds" and isinstance(payload, list):
-                    cf_creds = list(cf.get("creds", []))
                     for c in payload:
-                        if c not in cf_creds:
-                            cf_creds.append(c)
-                    cf["creds"] = cf_creds
-                elif isinstance(payload, dict):
-                    existing = dict(cf.get(section, {}))
-                    for k, v in payload.items():
-                        if isinstance(v, list):
-                            existing[k] = _merge_lists(existing.get(k, []), v)
+                        key = _safe_fact_key("credential", c)
+                        existing = task_facts.get(key)
+                        if existing:
+                            existing.last_seen_at = now
+                            existing.version += 1
                         else:
-                            existing.setdefault(k, v)
-                    cf[section] = existing
-            state.confirmed_facts = cf
+                            task_facts[key] = TaskFact(
+                                fact_key=key,
+                                fact_type="credential",
+                                value=c,
+                                source="fact_sink",
+                                source_node="exploit_agent",
+                                first_seen_at=now,
+                                last_seen_at=now,
+                            )
+                elif isinstance(payload, dict):
+                    for k, v in payload.items():
+                        if isinstance(v, list) and section == "lfi" and k == "readable_files":
+                            for item in v:
+                                key = _safe_fact_key("lfi_readable_file", item)
+                                existing = task_facts.get(key)
+                                if existing:
+                                    existing.last_seen_at = now
+                                    existing.version += 1
+                                else:
+                                    task_facts[key] = TaskFact(
+                                        fact_key=key,
+                                        fact_type="lfi_readable_file",
+                                        value=item,
+                                        source="fact_sink",
+                                        source_node="exploit_agent",
+                                        first_seen_at=now,
+                                        last_seen_at=now,
+                                    )
+                        elif section == "services" and k == "log_readable" and isinstance(v, list):
+                            for item in v:
+                                key = _safe_fact_key("service_log_readable", item)
+                                existing = task_facts.get(key)
+                                if existing:
+                                    existing.last_seen_at = now
+                                    existing.version += 1
+                                else:
+                                    task_facts[key] = TaskFact(
+                                        fact_key=key,
+                                        fact_type="service_log_readable",
+                                        value=item,
+                                        source="fact_sink",
+                                        source_node="exploit_agent",
+                                        first_seen_at=now,
+                                        last_seen_at=now,
+                                    )
+                        else:
+                            fact_type = f"{section}_{k}"
+                            key = _safe_fact_key(fact_type, v)
+                            existing = task_facts.get(key)
+                            if existing:
+                                existing.last_seen_at = now
+                                existing.version += 1
+                            else:
+                                task_facts[key] = TaskFact(
+                                    fact_key=key,
+                                    fact_type=fact_type,
+                                    value=v,
+                                    source="fact_sink",
+                                    source_node="exploit_agent",
+                                    first_seen_at=now,
+                                    last_seen_at=now,
+                                )
 
             failed = facts.get("failed_commands") or []
             if failed:
                 existing_f = list(state.failed_commands_by_vuln.get(vuln_id, []))
+                existing_hashes = {canonical_command_hash(c): c for c in existing_f}
                 for cmd in failed:
-                    if cmd not in existing_f:
+                    ch = canonical_command_hash(cmd)
+                    if ch not in existing_hashes:
                         existing_f.append(cmd)
+                        existing_hashes[ch] = cmd
                 state.failed_commands_by_vuln[vuln_id] = existing_f[-60:]
+            state.task_facts = task_facts
+            state.fact_version = int(state.fact_version or 0) + 1
+            normalize_and_dedupe_state_facts(state, source_node="fact_sink")
         except Exception as exc:
             logger.warning(f"[fact_sink] merge 失败: {exc}")
 

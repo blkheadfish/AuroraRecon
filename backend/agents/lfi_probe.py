@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 
 _CANDIDATE_PARAMS: list[str] = [
-    "page", "file", "include", "path", "image",
+    "page", "image", "file", "include", "path",
     "content", "template", "doc", "folder", "view",
 ]
 _CANDIDATE_DEPTHS: list[int] = list(range(1, 11))
@@ -157,6 +157,10 @@ async def probe_lfi_depth(
         p = (p or "").strip()
         if p and p not in params:
             params.append(p)
+    if doc_root and "file" in params:
+        params = ["file"] + [p for p in params if p != "file"]
+    elif "image" in (base_path or "").lower() and "image" in params:
+        params = ["image"] + [p for p in params if p != "image"]
 
     depths = _depth_order_from_doc_root(doc_root)
 

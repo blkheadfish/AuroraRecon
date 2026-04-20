@@ -150,6 +150,23 @@ def _build_tool_invocation_overview(tasks: list[PentestState]) -> dict:
     }
 
 
+def _build_guard_overview(tasks: list[PentestState]) -> dict:
+    guard_totals: dict[str, int] = defaultdict(int)
+    llm_rejects = 0
+    for state in tasks:
+        for k, v in (state.guard_stats or {}).items():
+            guard_totals[k] += int(v or 0)
+        for ev in (state.live_decision_events or []):
+            if ev.get("action") == "guard_block":
+                llm_rejects += 1
+    return {
+        "reprobe_intercept_count": sum(v for k, v in guard_totals.items() if "reprobe" in k or "enum" in k),
+        "repeat_failed_command_intercept_count": sum(v for k, v in guard_totals.items() if "repeat_failed" in k),
+        "llm_preflight_reject_count": llm_rejects,
+        "by_guard_code": dict(guard_totals),
+    }
+
+
 @router.get("/health")
 async def health_check():
     sm = get_state_manager()
@@ -187,4 +204,5 @@ async def get_metrics_overview(window_hours: int = 24):
         "system_overview": _build_system_overview(all_tasks, sm),
         "tool_overview": _build_tool_overview(sm),
         "tool_invocation_overview": _build_tool_invocation_overview(scoped_tasks),
+        "guard_overview": _build_guard_overview(scoped_tasks),
     }

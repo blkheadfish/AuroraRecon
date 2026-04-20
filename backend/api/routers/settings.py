@@ -15,6 +15,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from backend.api.deps import get_current_user
 from backend.api.schemas import ProfileUpdateRequest, PasswordChangeRequest
+from backend.api.tenant_store import resolve_scope
 
 logger = logging.getLogger(__name__)
 
@@ -108,17 +109,94 @@ def _save_profile(data: dict) -> None:
     PROFILE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-# ── 设置端点 ──────────────────────────────────────────────
-
-@router.get("/settings")
-async def get_settings():
+async def _load_user_settings(owner_id: str) -> dict:
+    from backend.api.state import get_state_manager
+    sm = get_state_manager()
+    if sm.db_available and owner_id:
+        try:
+            from backend.db.database import load_user_scoped_json
+            payload = await load_user_scoped_json(owner_id, "settings")
+            if isinstance(payload, dict):
+                return _deep_merge_dict(_load_settings(), payload)
+        except Exception as exc:
+            logger.warning(f"[Settings] load_user_scoped_json failed: {exc}")
     return _load_settings()
 
 
+async def _save_user_settings(owner_id: str, payload: dict) -> None:
+    from backend.api.state import get_state_manager
+    sm = get_state_manager()
+    if sm.db_available and owner_id:
+        from backend.db.database import append_audit_log, save_user_scoped_json
+        await save_user_scoped_json(owner_id, "settings", payload)
+        await append_audit_log(
+            owner_id=owner_id,
+            tenant_id="default",
+            action="settings_update",
+            resource_type="settings",
+            resource_key=owner_id,
+            detail={"keys": sorted(list((payload or {}).keys()))[:12]},
+        )
+    else:
+        _save_settings_to_file(payload)
+
+
+async def _load_user_profile(owner_id: str) -> dict:
+    from backend.api.state import get_state_manager
+    sm = get_state_manager()
+    if sm.db_available and owner_id:
+        try:
+            from backend.db.database import load_user_scoped_json
+            payload = await load_user_scoped_json(owner_id, "profile")
+            if isinstance(payload, dict):
+                return {
+                    "nickname": str(payload.get("nickname") or DEFAULT_PROFILE["nickname"]),
+                    "avatar": str(payload.get("avatar") or ""),
+                    "updated_at": str(payload.get("updated_at") or ""),
+                }
+        except Exception as exc:
+            logger.warning(f"[Settings] load user profile failed: {exc}")
+    return _load_profile()
+
+
+async def _save_user_profile(owner_id: str, profile: dict) -> None:
+    from backend.api.state import get_state_manager
+    sm = get_state_manager()
+    if sm.db_available and owner_id:
+        from backend.db.database import append_audit_log, save_user_scoped_json
+        await save_user_scoped_json(owner_id, "profile", profile)
+        await append_audit_log(
+            owner_id=owner_id,
+            tenant_id="default",
+            action="profile_update",
+            resource_type="profile",
+            resource_key=owner_id,
+            detail={"nickname": profile.get("nickname", "")},
+        )
+    else:
+        _save_profile(profile)
+
+
+# ── 设置端点 ──────────────────────────────────────────────
+
+@router.get("/settings")
+async def get_settings(request: Request):
+    owner_id, _tenant_id = resolve_scope(request)
+    return await _load_user_settings(owner_id)
+
+
 @router.post("/settings")
-async def save_settings(data: dict):
-    merged = _deep_merge_dict(_load_settings(), data or {})
-    _save_settings_to_file(merged)
+async def save_settings(data: dict, request: Request):
+    owner_id, _tenant_id = resolve_scope(request)
+    incoming = dict(data or {})
+    # allowlist: 禁止普通用户覆盖高风险运行时安全参数
+    if isinstance(incoming.get("executor"), dict):
+        blocked = {"docker_network", "toolbox_image", "persistent_container"}
+        for k in list(incoming["executor"].keys()):
+            if k in blocked:
+                incoming["executor"].pop(k, None)
+    merged = _deep_merge_dict(await _load_user_settings(owner_id), incoming)
+    await _save_user_settings(owner_id, merged)
     llm = merged.get("llm", {})
     if llm.get("api_key"):    os.environ["LLM_API_KEY"]   = llm["api_key"]
     if llm.get("model"):      os.environ["LLM_MODEL"]      = llm["model"]
@@ -156,12 +234,13 @@ async def test_llm_connection():
 # ── Profile 端点 ──────────────────────────────────────────
 
 @router.get("/profile")
-async def get_profile():
-    return _load_profile()
+async def get_profile(request: Request):
+    owner_id, _tenant_id = resolve_scope(request)
+    return await _load_user_profile(owner_id)
 
 
 @router.put("/profile")
-async def update_profile(req: ProfileUpdateRequest):
+async def update_profile(req: ProfileUpdateRequest, request: Request):
     nickname = req.nickname.strip()
     if not nickname:
         raise HTTPException(status_code=400, detail="昵称不能为空")
@@ -170,7 +249,8 @@ async def update_profile(req: ProfileUpdateRequest):
         "avatar": req.avatar.strip()[:1024],
         "updated_at": datetime.utcnow().isoformat(),
     }
-    _save_profile(profile)
+    owner_id, _tenant_id = resolve_scope(request)
+    await _save_user_profile(owner_id, profile)
     return {"status": "ok", "profile": profile}
 
 

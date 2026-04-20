@@ -164,6 +164,10 @@ export const api = {
     http.put(`/knowledge/${vulnId}/raw`, { json_content: jsonContent }),
   reloadKnowledge: (): Promise<{ status: string; total: number }> =>
     http.post('/knowledge/reload'),
+  getPrompts: (): Promise<{ prompts: Array<{ id: string; name: string; version: string; active: boolean; content: string }>; source: string }> =>
+    http.get('/prompts'),
+  savePrompts: (prompts: Array<{ id: string; name: string; version: string; active: boolean; content: string }>): Promise<{ status: string; count: number }> =>
+    http.post('/prompts', { prompts }),
 
   getKnowledgeSource: (vulnId: string): Promise<{
     vuln_id: string

@@ -14,7 +14,7 @@ from typing import Optional
 from uuid import uuid4
 
 from sqlalchemy import (
-    String, Text, Integer, Boolean, DateTime, text,
+    String, Text, Integer, Boolean, DateTime, text, UniqueConstraint, Index,
 )
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -48,6 +48,7 @@ class TaskRecord(Base):
     task_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     target: Mapped[str] = mapped_column(String(256), nullable=False)
     owner_id: Mapped[str] = mapped_column(String(36), default="", index=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), default="default", index=True)
     scope_note: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(32), default="pending")
     current_phase: Mapped[str] = mapped_column(String(64), default="init")
@@ -85,6 +86,69 @@ class UserRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class TaskFactRecord(Base):
+    __tablename__ = "task_facts"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    task_id: Mapped[str] = mapped_column(String(64), index=True)
+    owner_id: Mapped[str] = mapped_column(String(36), default="", index=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), default="default", index=True)
+    fact_key: Mapped[str] = mapped_column(String(256), index=True)
+    fact_type: Mapped[str] = mapped_column(String(64), default="")
+    value_json: Mapped[str] = mapped_column(Text, default="{}")
+    source: Mapped[str] = mapped_column(String(64), default="")
+    source_node: Mapped[str] = mapped_column(String(64), default="")
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("task_id", "fact_key", name="uq_task_fact_task_factkey"),
+    )
+
+
+class TenantAssetRecord(Base):
+    __tablename__ = "tenant_assets"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    asset_type: Mapped[str] = mapped_column(String(32), index=True)  # skill|knowledge|prompt
+    asset_key: Mapped[str] = mapped_column(String(128), index=True)
+    layer: Mapped[str] = mapped_column(String(32), default="user")  # global_template|tenant_override|user_override
+    owner_id: Mapped[str] = mapped_column(String(36), default="", index=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), default="default", index=True)
+    content: Mapped[str] = mapped_column(Text, default="")
+    is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("asset_type", "asset_key", "layer", "owner_id", "tenant_id", name="uq_asset_scope"),
+        Index("idx_asset_lookup", "asset_type", "asset_key", "tenant_id", "owner_id"),
+    )
+
+
+class UserSettingRecord(Base):
+    __tablename__ = "user_settings"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    owner_id: Mapped[str] = mapped_column(String(36), index=True)
+    scope: Mapped[str] = mapped_column(String(32), default="settings")  # settings|profile
+    data_json: Mapped[str] = mapped_column(Text, default="{}")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    __table_args__ = (
+        UniqueConstraint("owner_id", "scope", name="uq_owner_scope_settings"),
+    )
+
+
+class AuditLogRecord(Base):
+    __tablename__ = "audit_logs"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    owner_id: Mapped[str] = mapped_column(String(36), default="", index=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), default="default", index=True)
+    action: Mapped[str] = mapped_column(String(64), index=True)
+    resource_type: Mapped[str] = mapped_column(String(32), default="")
+    resource_key: Mapped[str] = mapped_column(String(128), default="")
+    detail_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
 # ── 数据库操作 ────────────────────────────────────────────
 
 async def init_db():
@@ -95,6 +159,7 @@ async def init_db():
     # 增量迁移：为已有表添加新列（create_all 不会修改已有表结构）
     migrations = [
         ("tasks", "owner_id", "ALTER TABLE tasks ADD COLUMN owner_id VARCHAR(36) DEFAULT '' NOT NULL"),
+        ("tasks", "tenant_id", "ALTER TABLE tasks ADD COLUMN tenant_id VARCHAR(64) DEFAULT 'default' NOT NULL"),
     ]
     async with engine.begin() as conn:
         for table, column, ddl in migrations:
@@ -126,6 +191,7 @@ async def save_task(state: PentestState) -> None:
 
         record.target = state.target
         record.owner_id = state.owner_id or ""
+        record.tenant_id = state.tenant_id or "default"
         record.scope_note = state.scope_note
         record.status = state.status.value
         record.current_phase = state.current_phase
@@ -165,6 +231,8 @@ async def load_task(task_id: str) -> Optional[PentestState]:
             return PentestState(
                 task_id=record.task_id,
                 target=record.target,
+                owner_id=record.owner_id or "",
+                tenant_id=record.tenant_id or "default",
                 scope_note=record.scope_note,
                 status=TaskStatus(record.status),
                 current_phase=record.current_phase,
@@ -181,7 +249,7 @@ async def list_tasks_from_db(owner_id: str | None = None) -> list[dict]:
     sql = """
         SELECT task_id, target, status, current_phase,
                findings_count, got_shell, report_path,
-               privilege_level, created_at, updated_at, owner_id
+               privilege_level, created_at, updated_at, owner_id, tenant_id
         FROM tasks
     """
     params: dict[str, str] = {}
@@ -206,6 +274,7 @@ async def list_tasks_from_db(owner_id: str | None = None) -> list[dict]:
                 "created_at": r.created_at.isoformat() if r.created_at else "",
                 "updated_at": r.updated_at.isoformat() if r.updated_at else "",
                 "owner_id": r.owner_id or "",
+                "tenant_id": r.tenant_id or "default",
             }
             for r in rows
         ]
@@ -246,6 +315,176 @@ async def get_task_stats() -> dict:
             "shells_obtained": row.shells_obtained,
             "total_findings": row.total_findings,
         }
+
+
+async def save_task_facts(state: PentestState) -> None:
+    task_facts = state.task_facts or {}
+    if not task_facts:
+        return
+    async with async_session() as session:
+        for fact in task_facts.values():
+            rid = f"{state.task_id}:{fact.fact_key}"[:64]
+            record = await session.get(TaskFactRecord, rid)
+            value_json = json.dumps(fact.value, ensure_ascii=False)
+            if not record:
+                record = TaskFactRecord(
+                    id=rid,
+                    task_id=state.task_id,
+                    owner_id=state.owner_id or "",
+                    tenant_id=state.tenant_id or "default",
+                    fact_key=fact.fact_key,
+                    fact_type=fact.fact_type or "",
+                    value_json=value_json,
+                    source=fact.source or "",
+                    source_node=fact.source_node or "",
+                    version=int(fact.version or 1),
+                )
+                session.add(record)
+            else:
+                record.owner_id = state.owner_id or ""
+                record.tenant_id = state.tenant_id or "default"
+                record.fact_type = fact.fact_type or record.fact_type
+                record.value_json = value_json
+                record.source = fact.source or record.source
+                record.source_node = fact.source_node or record.source_node
+                record.version = max(record.version + 1, int(fact.version or 1))
+                record.last_seen_at = datetime.utcnow()
+        await session.commit()
+
+
+async def upsert_tenant_asset(
+    *,
+    asset_type: str,
+    asset_key: str,
+    layer: str,
+    owner_id: str,
+    tenant_id: str,
+    content: str,
+) -> TenantAssetRecord:
+    rid = f"{asset_type}:{asset_key}:{layer}:{owner_id}:{tenant_id}"[:64]
+    async with async_session() as session:
+        record = await session.get(TenantAssetRecord, rid)
+        if not record:
+            record = TenantAssetRecord(
+                id=rid,
+                asset_type=asset_type,
+                asset_key=asset_key,
+                layer=layer,
+                owner_id=owner_id or "",
+                tenant_id=tenant_id or "default",
+                content=content,
+            )
+            session.add(record)
+        else:
+            record.content = content
+            record.is_deleted = False
+            record.updated_at = datetime.utcnow()
+        await session.commit()
+        await session.refresh(record)
+        return record
+
+
+async def list_tenant_assets(asset_type: str, owner_id: str, tenant_id: str = "default") -> list[TenantAssetRecord]:
+    async with async_session() as session:
+        result = await session.execute(
+            text(
+                "SELECT id FROM tenant_assets WHERE asset_type=:t AND is_deleted=false "
+                "AND (layer='global_template' OR (layer='tenant_override' AND tenant_id=:tenant_id) "
+                "OR (layer='user_override' AND owner_id=:owner_id AND tenant_id=:tenant_id))"
+            ),
+            {"t": asset_type, "owner_id": owner_id or "", "tenant_id": tenant_id or "default"},
+        )
+        ids = [r.id for r in result.fetchall()]
+        rows: list[TenantAssetRecord] = []
+        for rid in ids:
+            row = await session.get(TenantAssetRecord, rid)
+            if row:
+                rows.append(row)
+        return rows
+
+
+async def get_tenant_asset_resolved(
+    *,
+    asset_type: str,
+    asset_key: str,
+    owner_id: str,
+    tenant_id: str = "default",
+) -> TenantAssetRecord | None:
+    async with async_session() as session:
+        for layer, oid, tid in (
+            ("user_override", owner_id or "", tenant_id or "default"),
+            ("tenant_override", "", tenant_id or "default"),
+            ("global_template", "", "default"),
+        ):
+            result = await session.execute(
+                text(
+                    "SELECT id FROM tenant_assets WHERE asset_type=:t AND asset_key=:k "
+                    "AND layer=:layer AND owner_id=:owner_id AND tenant_id=:tenant_id "
+                    "AND is_deleted=false LIMIT 1"
+                ),
+                {
+                    "t": asset_type,
+                    "k": asset_key,
+                    "layer": layer,
+                    "owner_id": oid,
+                    "tenant_id": tid,
+                },
+            )
+            row = result.fetchone()
+            if row:
+                return await session.get(TenantAssetRecord, row.id)
+    return None
+
+
+async def save_user_scoped_json(owner_id: str, scope: str, payload: dict) -> None:
+    rid = f"{owner_id}:{scope}"[:64]
+    async with async_session() as session:
+        record = await session.get(UserSettingRecord, rid)
+        data_json = json.dumps(payload or {}, ensure_ascii=False)
+        if not record:
+            record = UserSettingRecord(id=rid, owner_id=owner_id, scope=scope, data_json=data_json)
+            session.add(record)
+        else:
+            record.data_json = data_json
+            record.updated_at = datetime.utcnow()
+        await session.commit()
+
+
+async def load_user_scoped_json(owner_id: str, scope: str) -> dict | None:
+    rid = f"{owner_id}:{scope}"[:64]
+    async with async_session() as session:
+        record = await session.get(UserSettingRecord, rid)
+        if not record:
+            return None
+        try:
+            return json.loads(record.data_json or "{}")
+        except Exception:
+            return {}
+
+
+async def append_audit_log(
+    *,
+    owner_id: str,
+    tenant_id: str,
+    action: str,
+    resource_type: str,
+    resource_key: str,
+    detail: dict,
+) -> None:
+    rid = uuid4().hex[:32]
+    async with async_session() as session:
+        session.add(
+            AuditLogRecord(
+                id=rid,
+                owner_id=owner_id or "",
+                tenant_id=tenant_id or "default",
+                action=action,
+                resource_type=resource_type,
+                resource_key=resource_key,
+                detail_json=json.dumps(detail or {}, ensure_ascii=False),
+            )
+        )
+        await session.commit()
 
 
 # ── 用户操作 ──────────────────────────────────────────────

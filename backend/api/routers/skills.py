@@ -7,9 +7,10 @@ import logging
 from pathlib import Path
 
 import yaml
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
 from backend.api.schemas import SkillRawUpdateRequest
+from backend.api.tenant_store import get_asset, resolve_scope, upsert_asset
 
 logger = logging.getLogger(__name__)
 
@@ -48,8 +49,21 @@ async def skills_stats():
 
 
 @router.get("/skills/{skill_id}/raw")
-async def get_skill_raw(skill_id: str):
+async def get_skill_raw(skill_id: str, request: Request):
     try:
+        owner_id, tenant_id = resolve_scope(request)
+        scoped = await get_asset(
+            asset_type="skill",
+            asset_key=skill_id,
+            owner_id=owner_id,
+            tenant_id=tenant_id,
+        )
+        if isinstance(scoped, dict) and scoped.get("yaml"):
+            return {
+                "skill_id": skill_id,
+                "source": f"tenant://{tenant_id}/{owner_id}/skill/{skill_id}",
+                "yaml": str(scoped.get("yaml") or ""),
+            }
         from backend.skills.registry import get_registry
         registry = get_registry()
         skill = registry.get_by_id(skill_id)
@@ -70,22 +84,8 @@ async def get_skill_raw(skill_id: str):
 
 
 @router.put("/skills/{skill_id}/raw")
-async def update_skill_raw(skill_id: str, req: SkillRawUpdateRequest):
+async def update_skill_raw(skill_id: str, req: SkillRawUpdateRequest, request: Request):
     try:
-        from backend.skills.registry import get_registry
-
-        registry = get_registry()
-        skill = registry.get_by_id(skill_id)
-        if not skill:
-            raise HTTPException(status_code=404, detail=f"Skill 不存在: {skill_id}")
-
-        source_path = Path(skill.source_file).resolve()
-        skills_root = (Path(__file__).resolve().parents[2] / "skills").resolve()
-        try:
-            source_path.relative_to(skills_root)
-        except Exception:
-            raise HTTPException(status_code=403, detail="Skill 文件路径非法，拒绝写入")
-
         try:
             parsed = yaml.safe_load(req.yaml)
         except yaml.YAMLError as ye:
@@ -101,10 +101,20 @@ async def update_skill_raw(skill_id: str, req: SkillRawUpdateRequest):
                 status_code=400,
                 detail=f"skill_id 不一致: path={skill_id}, yaml={file_skill_id}",
             )
-
-        source_path.write_text(req.yaml, encoding="utf-8")
-        registry.reload()
-        return {"status": "ok", "skill_id": skill_id, "source": str(source_path)}
+        owner_id, tenant_id = resolve_scope(request)
+        await upsert_asset(
+            asset_type="skill",
+            asset_key=skill_id,
+            layer="user_override",
+            owner_id=owner_id,
+            tenant_id=tenant_id,
+            payload={"skill_id": skill_id, "yaml": req.yaml},
+        )
+        return {
+            "status": "ok",
+            "skill_id": skill_id,
+            "source": f"tenant://{tenant_id}/{owner_id}/skill/{skill_id}",
+        }
     except HTTPException:
         raise
     except Exception as e:

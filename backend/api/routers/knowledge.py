@@ -9,7 +9,7 @@ import os
 import re
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
 from backend.api.schemas import (
     KnowledgeSourceCreateRequest,
@@ -18,6 +18,7 @@ from backend.api.schemas import (
     KnowledgeSourceUrlRequest,
     KnowledgeRawRequest,
 )
+from backend.api.tenant_store import get_asset, resolve_scope, upsert_asset
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,29 @@ def _save_custom_kb_sources(items: list[dict]) -> None:
     )
 
 
+async def _load_scoped_custom_kb_sources(owner_id: str, tenant_id: str) -> list[dict]:
+    scoped = await get_asset(
+        asset_type="knowledge_sources",
+        asset_key="kb_sources",
+        owner_id=owner_id,
+        tenant_id=tenant_id,
+    )
+    if isinstance(scoped, dict) and isinstance(scoped.get("items"), list):
+        return [item for item in scoped["items"] if isinstance(item, dict)]
+    return _load_custom_kb_sources()
+
+
+async def _save_scoped_custom_kb_sources(owner_id: str, tenant_id: str, items: list[dict]) -> None:
+    await upsert_asset(
+        asset_type="knowledge_sources",
+        asset_key="kb_sources",
+        layer="user_override",
+        owner_id=owner_id,
+        tenant_id=tenant_id,
+        payload={"items": items},
+    )
+
+
 def _collect_kb_sources():
     from backend.knowledge.builder import VulnSource, VULN_SOURCES
 
@@ -68,6 +92,27 @@ def _collect_kb_sources():
             fallback_content=str(row.get("fallback_content") or ""),
         )
     return list(merged.values()), custom_rows
+
+
+def _collect_kb_sources_with_rows(custom_rows: list[dict]):
+    from backend.knowledge.builder import VulnSource, VULN_SOURCES
+
+    merged: dict[str, VulnSource] = {src.vuln_id: src for src in VULN_SOURCES}
+    for row in custom_rows:
+        vuln_id = str(row.get("vuln_id") or "").strip()
+        if not vuln_id:
+            continue
+        urls = row.get("urls") or []
+        if not isinstance(urls, list):
+            urls = []
+        merged[vuln_id] = VulnSource(
+            vuln_id=vuln_id,
+            name=str(row.get("name") or vuln_id),
+            urls=[str(u).strip() for u in urls if str(u).strip()],
+            extra_context=str(row.get("extra_context") or ""),
+            fallback_content=str(row.get("fallback_content") or ""),
+        )
+    return list(merged.values())
 
 
 def _get_source_for_vuln(vuln_id: str) -> dict:
@@ -118,6 +163,51 @@ def _get_source_for_vuln(vuln_id: str) -> dict:
         }
 
 
+async def _get_source_for_vuln_scoped(vuln_id: str, owner_id: str, tenant_id: str) -> dict:
+    custom_rows = await _load_scoped_custom_kb_sources(owner_id, tenant_id)
+    custom_map: dict[str, dict] = {}
+    for row in custom_rows:
+        vid = str(row.get("vuln_id") or "").strip()
+        if vid:
+            custom_map[vid] = row
+
+    from backend.knowledge.builder import VULN_SOURCES
+    builtin_map = {s.vuln_id: s for s in VULN_SOURCES}
+    kb_dir = Path(__file__).resolve().parents[2] / "knowledge" / "kb_data"
+    custom = custom_map.get(vuln_id)
+    builtin = builtin_map.get(vuln_id)
+    if custom:
+        urls = custom.get("urls") or []
+        return {
+            "vuln_id": vuln_id,
+            "name": custom.get("name") or vuln_id,
+            "urls": urls if isinstance(urls, list) else [],
+            "extra_context": str(custom.get("extra_context") or ""),
+            "fallback_content": str(custom.get("fallback_content") or ""),
+            "is_custom": True,
+            "built": (kb_dir / f"{vuln_id}.json").exists(),
+        }
+    if builtin:
+        return {
+            "vuln_id": vuln_id,
+            "name": builtin.name,
+            "urls": builtin.urls,
+            "extra_context": builtin.extra_context,
+            "fallback_content": builtin.fallback_content,
+            "is_custom": False,
+            "built": (kb_dir / f"{vuln_id}.json").exists(),
+        }
+    return {
+        "vuln_id": vuln_id,
+        "name": vuln_id,
+        "urls": [],
+        "extra_context": "",
+        "fallback_content": "",
+        "is_custom": False,
+        "built": (kb_dir / f"{vuln_id}.json").exists(),
+    }
+
+
 def _upsert_custom_source(vuln_id: str, data: dict) -> None:
     custom_rows = _load_custom_kb_sources()
     replaced = False
@@ -156,9 +246,11 @@ async def list_knowledge_entries():
 
 @router.get("/knowledge/sources")
 @router.get("/api/knowledge/sources")
-async def list_knowledge_sources():
+async def list_knowledge_sources(request: Request):
+    owner_id, tenant_id = resolve_scope(request)
     kb_dir = Path(__file__).resolve().parents[2] / "knowledge" / "kb_data"
-    sources, custom_rows = _collect_kb_sources()
+    custom_rows = await _load_scoped_custom_kb_sources(owner_id, tenant_id)
+    sources = _collect_kb_sources_with_rows(custom_rows)
     custom_ids = {
         str(item.get("vuln_id") or "").strip()
         for item in custom_rows
@@ -182,7 +274,8 @@ async def list_knowledge_sources():
 
 @router.post("/knowledge/sources")
 @router.post("/api/knowledge/sources")
-async def add_knowledge_source(req: KnowledgeSourceCreateRequest):
+async def add_knowledge_source(req: KnowledgeSourceCreateRequest, request: Request):
+    owner_id, tenant_id = resolve_scope(request)
     urls = [str(u).strip() for u in (req.urls or []) if str(u).strip()]
     if not urls and not req.extra_context.strip() and not req.fallback_content.strip():
         raise HTTPException(400, "至少提供一个 URL，或填写额外上下文/兜底内容")
@@ -190,7 +283,7 @@ async def add_knowledge_source(req: KnowledgeSourceCreateRequest):
         if not re.match(r"^https?://", u, flags=re.IGNORECASE):
             raise HTTPException(400, f"URL 非法: {u}")
 
-    custom_rows = _load_custom_kb_sources()
+    custom_rows = await _load_scoped_custom_kb_sources(owner_id, tenant_id)
     upsert = {
         "vuln_id": req.vuln_id,
         "name": req.name,
@@ -206,7 +299,7 @@ async def add_knowledge_source(req: KnowledgeSourceCreateRequest):
             break
     if not replaced:
         custom_rows.append(upsert)
-    _save_custom_kb_sources(custom_rows)
+    await _save_scoped_custom_kb_sources(owner_id, tenant_id, custom_rows)
     return {"status": "saved", "source": upsert}
 
 
@@ -214,19 +307,21 @@ async def add_knowledge_source(req: KnowledgeSourceCreateRequest):
 
 @router.get("/knowledge/{vuln_id}/sources")
 @router.get("/api/knowledge/{vuln_id}/sources")
-async def get_knowledge_entry_source(vuln_id: str):
-    return _get_source_for_vuln(vuln_id)
+async def get_knowledge_entry_source(vuln_id: str, request: Request):
+    owner_id, tenant_id = resolve_scope(request)
+    return await _get_source_for_vuln_scoped(vuln_id, owner_id, tenant_id)
 
 
 @router.put("/knowledge/{vuln_id}/sources")
 @router.put("/api/knowledge/{vuln_id}/sources")
-async def save_knowledge_entry_source(vuln_id: str, req: KnowledgeSourceSaveRequest):
+async def save_knowledge_entry_source(vuln_id: str, req: KnowledgeSourceSaveRequest, request: Request):
+    owner_id, tenant_id = resolve_scope(request)
     urls = [str(u).strip() for u in (req.urls or []) if str(u).strip()]
     for u in urls:
         if not re.match(r"^https?://", u, flags=re.IGNORECASE):
             raise HTTPException(400, f"URL 非法: {u}")
 
-    current = _get_source_for_vuln(vuln_id)
+    current = await _get_source_for_vuln_scoped(vuln_id, owner_id, tenant_id)
     data = {
         "vuln_id": vuln_id,
         "name": req.name.strip() or current.get("name") or vuln_id,
@@ -234,18 +329,28 @@ async def save_knowledge_entry_source(vuln_id: str, req: KnowledgeSourceSaveRequ
         "extra_context": req.extra_context.strip(),
         "fallback_content": req.fallback_content.strip(),
     }
-    _upsert_custom_source(vuln_id, data)
+    custom_rows = await _load_scoped_custom_kb_sources(owner_id, tenant_id)
+    replaced = False
+    for idx, row in enumerate(custom_rows):
+        if str(row.get("vuln_id") or "").strip() == vuln_id:
+            custom_rows[idx] = data
+            replaced = True
+            break
+    if not replaced:
+        custom_rows.append(data)
+    await _save_scoped_custom_kb_sources(owner_id, tenant_id, custom_rows)
     return {"status": "saved", "source": data}
 
 
 @router.post("/knowledge/{vuln_id}/sources/url")
 @router.post("/api/knowledge/{vuln_id}/sources/url")
-async def add_knowledge_source_url(vuln_id: str, req: KnowledgeSourceUrlRequest):
+async def add_knowledge_source_url(vuln_id: str, req: KnowledgeSourceUrlRequest, request: Request):
+    owner_id, tenant_id = resolve_scope(request)
     url = req.url.strip()
     if not url or not re.match(r"^https?://", url, flags=re.IGNORECASE):
         raise HTTPException(400, "URL 必须以 http:// 或 https:// 开头")
 
-    current = _get_source_for_vuln(vuln_id)
+    current = await _get_source_for_vuln_scoped(vuln_id, owner_id, tenant_id)
     urls = list(current.get("urls") or [])
     if url not in urls:
         urls.append(url)
@@ -257,15 +362,25 @@ async def add_knowledge_source_url(vuln_id: str, req: KnowledgeSourceUrlRequest)
         "extra_context": current.get("extra_context") or "",
         "fallback_content": current.get("fallback_content") or "",
     }
-    _upsert_custom_source(vuln_id, data)
+    custom_rows = await _load_scoped_custom_kb_sources(owner_id, tenant_id)
+    replaced = False
+    for idx, row in enumerate(custom_rows):
+        if str(row.get("vuln_id") or "").strip() == vuln_id:
+            custom_rows[idx] = data
+            replaced = True
+            break
+    if not replaced:
+        custom_rows.append(data)
+    await _save_scoped_custom_kb_sources(owner_id, tenant_id, custom_rows)
     return {"status": "added", "url": url, "urls": urls}
 
 
 @router.delete("/knowledge/{vuln_id}/sources/url")
 @router.delete("/api/knowledge/{vuln_id}/sources/url")
-async def remove_knowledge_source_url(vuln_id: str, req: KnowledgeSourceUrlRequest):
+async def remove_knowledge_source_url(vuln_id: str, req: KnowledgeSourceUrlRequest, request: Request):
+    owner_id, tenant_id = resolve_scope(request)
     url = req.url.strip()
-    current = _get_source_for_vuln(vuln_id)
+    current = await _get_source_for_vuln_scoped(vuln_id, owner_id, tenant_id)
     urls = [u for u in (current.get("urls") or []) if u != url]
 
     data = {
@@ -275,17 +390,27 @@ async def remove_knowledge_source_url(vuln_id: str, req: KnowledgeSourceUrlReque
         "extra_context": current.get("extra_context") or "",
         "fallback_content": current.get("fallback_content") or "",
     }
-    _upsert_custom_source(vuln_id, data)
+    custom_rows = await _load_scoped_custom_kb_sources(owner_id, tenant_id)
+    replaced = False
+    for idx, row in enumerate(custom_rows):
+        if str(row.get("vuln_id") or "").strip() == vuln_id:
+            custom_rows[idx] = data
+            replaced = True
+            break
+    if not replaced:
+        custom_rows.append(data)
+    await _save_scoped_custom_kb_sources(owner_id, tenant_id, custom_rows)
     return {"status": "removed", "url": url, "urls": urls}
 
 
 @router.post("/knowledge/sources/new")
 @router.post("/api/knowledge/sources/new")
-async def create_knowledge_source(req: KnowledgeSourceCreateRequest):
+async def create_knowledge_source(req: KnowledgeSourceCreateRequest, request: Request):
+    owner_id, tenant_id = resolve_scope(request)
     from backend.knowledge.builder import VULN_SOURCES
 
     builtin_ids = {s.vuln_id for s in VULN_SOURCES}
-    custom_rows = _load_custom_kb_sources()
+    custom_rows = await _load_scoped_custom_kb_sources(owner_id, tenant_id)
     custom_ids = {str(r.get("vuln_id") or "").strip() for r in custom_rows}
 
     if req.vuln_id in builtin_ids or req.vuln_id in custom_ids:
@@ -304,7 +429,7 @@ async def create_knowledge_source(req: KnowledgeSourceCreateRequest):
         "fallback_content": req.fallback_content.strip(),
     }
     custom_rows.append(data)
-    _save_custom_kb_sources(custom_rows)
+    await _save_scoped_custom_kb_sources(owner_id, tenant_id, custom_rows)
     return {"status": "created", "source": data}
 
 
@@ -312,13 +437,15 @@ async def create_knowledge_source(req: KnowledgeSourceCreateRequest):
 
 @router.post("/knowledge/build")
 @router.post("/api/knowledge/build")
-async def build_knowledge(req: KnowledgeBuildRequest | None = None):
+async def build_knowledge(request: Request, req: KnowledgeBuildRequest | None = None):
     if not os.getenv("LLM_API_KEY", "").strip():
         raise HTTPException(400, "未配置 LLM_API_KEY，请先在系统设置中填写并保存")
 
     from backend.knowledge.builder import build_all, build_one
 
-    sources, _ = _collect_kb_sources()
+    owner_id, tenant_id = resolve_scope(request)
+    custom_rows = await _load_scoped_custom_kb_sources(owner_id, tenant_id)
+    sources = _collect_kb_sources_with_rows(custom_rows)
     source_map = {src.vuln_id: src for src in sources}
 
     target_vuln = (req.vuln_id or "").strip() if req else ""
@@ -350,15 +477,28 @@ async def build_knowledge(req: KnowledgeBuildRequest | None = None):
 
 @router.post("/knowledge/{vuln_id}/build")
 @router.post("/api/knowledge/{vuln_id}/build")
-async def build_one_knowledge(vuln_id: str):
-    return await build_knowledge(KnowledgeBuildRequest(vuln_id=vuln_id))
+async def build_one_knowledge(vuln_id: str, request: Request):
+    return await build_knowledge(request, KnowledgeBuildRequest(vuln_id=vuln_id))
 
 
 # ── 原始 JSON 读写 ────────────────────────────────────────
 
 @router.get("/knowledge/{vuln_id}/raw")
 @router.get("/api/knowledge/{vuln_id}/raw")
-async def get_knowledge_raw(vuln_id: str):
+async def get_knowledge_raw(vuln_id: str, request: Request):
+    owner_id, tenant_id = resolve_scope(request)
+    scoped = await get_asset(
+        asset_type="knowledge_raw",
+        asset_key=vuln_id,
+        owner_id=owner_id,
+        tenant_id=tenant_id,
+    )
+    if isinstance(scoped, dict) and scoped.get("json"):
+        return {
+            "vuln_id": vuln_id,
+            "source": f"tenant://{tenant_id}/{owner_id}/knowledge/{vuln_id}",
+            "json": str(scoped.get("json") or ""),
+        }
     kb_dir = Path(__file__).resolve().parents[2] / "knowledge" / "kb_data"
     target = kb_dir / f"{vuln_id}.json"
     if not target.exists() or not str(target.resolve()).startswith(str(kb_dir.resolve())):
@@ -369,19 +509,23 @@ async def get_knowledge_raw(vuln_id: str):
 
 @router.put("/knowledge/{vuln_id}/raw")
 @router.put("/api/knowledge/{vuln_id}/raw")
-async def save_knowledge_raw(vuln_id: str, req: KnowledgeRawRequest):
-    kb_dir = Path(__file__).resolve().parents[2] / "knowledge" / "kb_data"
-    target = kb_dir / f"{vuln_id}.json"
-    if not str(target.resolve()).startswith(str(kb_dir.resolve())):
-        raise HTTPException(400, "非法路径")
+async def save_knowledge_raw(vuln_id: str, req: KnowledgeRawRequest, request: Request):
     try:
         parsed = json.loads(req.json_content)
     except json.JSONDecodeError as e:
         raise HTTPException(400, f"JSON 解析失败: {e}")
     if parsed.get("vuln_id") != vuln_id:
         raise HTTPException(400, f"vuln_id 不匹配: 期望 {vuln_id}")
-    target.write_text(json.dumps(parsed, ensure_ascii=False, indent=2), encoding="utf-8")
-    return {"status": "saved", "vuln_id": vuln_id}
+    owner_id, tenant_id = resolve_scope(request)
+    await upsert_asset(
+        asset_type="knowledge_raw",
+        asset_key=vuln_id,
+        layer="user_override",
+        owner_id=owner_id,
+        tenant_id=tenant_id,
+        payload={"vuln_id": vuln_id, "json": json.dumps(parsed, ensure_ascii=False, indent=2)},
+    )
+    return {"status": "saved", "vuln_id": vuln_id, "source": f"tenant://{tenant_id}/{owner_id}/knowledge/{vuln_id}"}
 
 
 @router.post("/knowledge/reload")

@@ -59,6 +59,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { trackEvent } from '@/metrics/tracker'
+import { api } from '@/api'
 
 const promptKey = 'prompt.manage.v1'
 const snapshotKey = 'prompt.manage.snapshot'
@@ -84,23 +85,36 @@ function normalizeActivePrompt() {
 }
 
 function loadPrompts() {
-  const saved = localStorage.getItem(promptKey)
-  if (!saved) return
-  try {
-    const parsed = JSON.parse(saved)
-    if (Array.isArray(parsed) && parsed.length) {
-      prompts.value = parsed
-      normalizeActivePrompt()
-    }
-  } catch {
-    ElMessage.warning('本地 Prompt 缓存已损坏，已使用默认模板')
-  }
+  api.getPrompts()
+    .then((res) => {
+      const parsed = res?.prompts
+      if (Array.isArray(parsed) && parsed.length) {
+        prompts.value = parsed
+        normalizeActivePrompt()
+      }
+    })
+    .catch(() => {
+      const saved = localStorage.getItem(promptKey)
+      if (!saved) return
+      try {
+        const parsed = JSON.parse(saved)
+        if (Array.isArray(parsed) && parsed.length) {
+          prompts.value = parsed
+          normalizeActivePrompt()
+        }
+      } catch {
+        ElMessage.warning('Prompt 缓存加载失败，已使用默认模板')
+      }
+    })
 }
 
 function savePrompts() {
   const snapshot = JSON.stringify(prompts.value)
   localStorage.setItem(snapshotKey, snapshot)
   localStorage.setItem(promptKey, snapshot)
+  api.savePrompts(prompts.value).catch(() => {
+    ElMessage.warning('后端保存失败，仅已保存到本地缓存')
+  })
   trackEvent('prompts.save', { count: prompts.value.length })
   ElMessage.success('Prompt 版本已保存')
 }
@@ -124,6 +138,9 @@ function rollbackPrompt() {
 function publishPrompt() {
   prompts.value = prompts.value.map((p) => ({ ...p, active: p.id === selectedPromptId.value }))
   localStorage.setItem(promptKey, JSON.stringify(prompts.value))
+  api.savePrompts(prompts.value).catch(() => {
+    ElMessage.warning('后端保存失败，仅已保存到本地缓存')
+  })
   trackEvent('prompts.publish', { promptId: selectedPromptId.value })
   ElMessage.success('已设为激活版本')
 }

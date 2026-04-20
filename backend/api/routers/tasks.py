@@ -40,6 +40,24 @@ def _get_bus() -> TaskEventBus:
     return get_event_bus()
 
 
+def _enforce_task_owner(state: PentestState, request: Request, action: str) -> None:
+    owner_id = getattr(request.state, "user_id", "") or ""
+    tenant_id = getattr(request.state, "tenant_id", "") or "default"
+    if not owner_id:
+        raise HTTPException(status_code=401, detail="未登录")
+    if not (state.owner_id or ""):
+        # legacy task migration path: bind once when first accessed by authenticated owner
+        state.owner_id = owner_id
+        logger.info(f"[AuthZ] legacy task owner bound: task={state.task_id}, owner={owner_id}")
+        return
+    if (state.owner_id or "") != owner_id:
+        logger.warning(
+            f"[AuthZ] blocked cross-owner access action={action}, "
+            f"task={state.task_id}, owner={state.owner_id}, actor={owner_id}"
+        )
+        raise HTTPException(status_code=403, detail="无权访问该任务")
+
+
 async def _resolve_state(task_id: str) -> PentestState | None:
     sm = _get_sm()
     state = sm.get(task_id)
@@ -86,6 +104,8 @@ async def create_task(req: CreateTaskRequest, request: Request):
         user_prompt=req.user_prompt,
         workflow_mode=req.workflow_mode,
         owner_id=owner_id,
+        tenant_id=tenant_id,
+        trace_id=getattr(request.state, "trace_id", "") or "",
     )
     # 填入 workflow_mode 默认值,并用请求里显式传入的覆盖项替换
     apply_mode_defaults(
@@ -183,27 +203,33 @@ async def list_tasks(request: Request):
 
 
 @router.get("/tasks/{task_id}")
-async def get_task(task_id: str):
+async def get_task(task_id: str, request: Request):
     state = await _resolve_state(task_id)
     if not state:
         raise HTTPException(status_code=404, detail="任务不存在")
+    _enforce_task_owner(state, request, "get_task")
     sm = _get_sm()
     return sm.to_detail(state)
 
 
 @router.get("/tasks/{task_id}/report")
-async def get_report(task_id: str):
+async def get_report(task_id: str, request: Request):
     state = await _resolve_state(task_id)
     if not state:
         raise HTTPException(status_code=404, detail="任务不存在")
+    _enforce_task_owner(state, request, "get_report")
     if not state.report_md:
         raise HTTPException(status_code=404, detail="报告尚未生成")
     return {"markdown": state.report_md, "path": state.report_path}
 
 
 @router.get("/tasks/{task_id}/logs")
-async def get_logs(task_id: str):
+async def get_logs(task_id: str, request: Request):
     sm = _get_sm()
+    state = await _resolve_state(task_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    _enforce_task_owner(state, request, "get_logs")
     if sm.redis_available:
         try:
             from backend.db.redis_cache import get_task_logs
@@ -212,19 +238,17 @@ async def get_logs(task_id: str):
                 return {"logs": logs}
         except Exception:
             pass
-    state = sm.get(task_id)
-    if not state:
-        raise HTTPException(status_code=404, detail="任务不存在")
     return {"logs": state.phase_log}
 
 
 @router.post("/tasks/{task_id}/cancel")
-async def cancel_task(task_id: str):
+async def cancel_task(task_id: str, request: Request):
     sm = _get_sm()
     bus = _get_bus()
     state = sm.get(task_id)
     if not state:
         raise HTTPException(status_code=404, detail="任务不存在")
+    _enforce_task_owner(state, request, "cancel_task")
     if state.status not in (TaskStatus.RUNNING, TaskStatus.PENDING):
         raise HTTPException(status_code=400, detail="任务不在运行状态")
 
@@ -256,9 +280,15 @@ async def cancel_task(task_id: str):
 
 
 @router.delete("/tasks/{task_id}")
-async def delete_task(task_id: str):
+async def delete_task(task_id: str, request: Request):
     sm = _get_sm()
     state = sm.get(task_id)
+    if state:
+        _enforce_task_owner(state, request, "delete_task")
+    else:
+        state = await _resolve_state(task_id)
+        if state:
+            _enforce_task_owner(state, request, "delete_task")
     if state and state.status in (TaskStatus.RUNNING, TaskStatus.PENDING):
         raise HTTPException(status_code=400, detail="运行中的任务不能删除,请先取消")
 
@@ -292,7 +322,7 @@ async def delete_task(task_id: str):
 # ── 审批 ──────────────────────────────────────────────────
 
 @router.post("/tasks/{task_id}/approve")
-async def approve_task(task_id: str, req: ApproveRequest):
+async def approve_task(task_id: str, req: ApproveRequest, request: Request):
     """
     人工审批端点。
 
@@ -308,6 +338,7 @@ async def approve_task(task_id: str, req: ApproveRequest):
     state = sm.get(task_id)
     if not state:
         raise HTTPException(status_code=404, detail="任务不存在")
+    _enforce_task_owner(state, request, "approve_task")
 
     inflight_ts = sm.get_approval_inflight(task_id)
     if inflight_ts is not None:
@@ -345,12 +376,13 @@ async def approve_task(task_id: str, req: ApproveRequest):
 # ── 用户-代理对话 ─────────────────────────────────────────
 
 @router.post("/tasks/{task_id}/chat")
-async def send_chat_message(task_id: str, req: ChatMessageRequest):
+async def send_chat_message(task_id: str, req: ChatMessageRequest, request: Request):
     sm = _get_sm()
     bus = _get_bus()
     state = sm.get(task_id)
     if not state:
         raise HTTPException(404, f"任务 {task_id} 不存在")
+    _enforce_task_owner(state, request, "send_chat_message")
     msg = {
         "role": "user",
         "text": req.text.strip(),
@@ -373,11 +405,12 @@ async def send_chat_message(task_id: str, req: ChatMessageRequest):
 
 
 @router.get("/tasks/{task_id}/chat")
-async def get_chat_history(task_id: str):
+async def get_chat_history(task_id: str, request: Request):
     sm = _get_sm()
     state = sm.get(task_id)
     if not state:
         raise HTTPException(404, f"任务 {task_id} 不存在")
+    _enforce_task_owner(state, request, "get_chat_history")
     timeline = []
     for m in state.user_messages:
         timeline.append({**m, "role": "user"})

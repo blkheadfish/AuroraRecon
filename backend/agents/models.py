@@ -195,6 +195,19 @@ class ParsedTarget(BaseModel):
 	raw: str = ""      # 原始输入，原样保留
 
 
+class TaskFact(BaseModel):
+	"""任务级统一事实对象。"""
+	fact_key: str
+	fact_type: str = ""
+	value: Any = None
+	source: str = ""
+	source_node: str = ""
+	version: int = 1
+	first_seen_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+	last_seen_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+	confidence: float = 1.0
+
+
 def parse_target(raw: str) -> ParsedTarget:
 	"""
 	将用户输入的目标字符串统一解析为结构化信息。
@@ -266,6 +279,7 @@ class PentestState(BaseModel):
 	target_raw: str = ""           # 原始用户输入（= target，留作对照）
 
 	owner_id: str = ""
+	tenant_id: str = "default"
 
 	status: TaskStatus = TaskStatus.PENDING
 	current_phase: str = "init"
@@ -307,6 +321,10 @@ class PentestState(BaseModel):
 	#    "services": {"ssh_port": 22, "log_readable": [...]},
 	#    "creds": [{"user":..., "source":..., "value":...}]}
 	confirmed_facts: dict[str, Any] = Field(default_factory=dict)
+	# 统一事实仓（强一致主存储）；confirmed_facts 为兼容投影视图
+	task_facts: dict[str, TaskFact] = Field(default_factory=dict)
+	fact_version: int = 0
+	last_fact_normalized_at: str = ""
 	# 每个 finding.id 首轮产出的原始 Skill 探测变量（如 lfi_param/lfi_depth…）
 	exploit_probe_variables: dict[str, dict[str, Any]] = Field(default_factory=dict)
 	# 每个 finding.id 已知失败的命令集合，二次利用避开
@@ -371,6 +389,8 @@ class PentestState(BaseModel):
 
 	# 结构化决策事件队列（ReAct thinking / Skill reasoning），供 WS 增量推送
 	live_decision_events: list[dict] = Field(default_factory=list)
+	guard_stats: dict[str, int] = Field(default_factory=dict)
+	trace_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:16])
 
 	def log(self, msg: str) -> None:
 		import logging
