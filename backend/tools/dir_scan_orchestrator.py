@@ -175,7 +175,7 @@ class DirScanOrchestrator:
                         )
 
                 self._round += 1
-                self._track_recent_hints(new_count)
+                self._track_recent_hints(new_paths_only)
 
                 if self._should_consult_llm(new_count, tool_name, elapsed):
                     adaptation = await self._llm_mid_scan_eval(
@@ -246,22 +246,42 @@ class DirScanOrchestrator:
             mid_scan_adaptations=[],
         )
 
-    def _track_recent_hints(self, new_count: int) -> None:
-        """Track path hints from the most recent ingestion for LLM trigger logic."""
+    def _track_recent_hints(self, new_paths: list[str]) -> None:
+        """Track path hints from the most recent ingestion only.
+
+        Earlier version inadvertently scanned *all* aggregator entries — this
+        broke the "recent" semantics and made the LLM trigger fire on stale hits.
+        Now strictly collects hints from paths added in this round.
+        """
         self._recent_new_hints.clear()
-        if new_count > 0:
-            for entry in self.aggregator._entries.values():
-                for h in entry.hints:
-                    self._recent_new_hints.add(h)
+        for p in new_paths:
+            entry = self.aggregator._entries.get(p)
+            if entry is None:
+                continue
+            for h in entry.hints:
+                self._recent_new_hints.add(h)
 
     def _should_consult_llm(self, new_paths: int, tool_name: str, elapsed: float) -> bool:
-        if self._round < 3:
-            return False
-        if new_paths > 15:
-            return True
+        # 高价值命中或目录列表 → 立即 consult（不论轮次，是最强触发条件）
         if self._recent_new_hints & _HIGH_VALUE_HINTS:
             return True
         if "dirlist" in self._recent_new_hints:
+            return True
+        # 第 1 轮跑完（_round==1）后才允许其他条件触发，避免工具还没暖身就 consult
+        if self._round < 1:
+            return False
+        # 本轮大量新路径 → 让 LLM 评估要不要调整扩展名/深度（阈值 15 → 8）
+        if new_paths > 8:
+            return True
+        # 预算吃紧 + 本轮空手 → 让 LLM 决定早停 / 换工具
+        try:
+            budget_left = float(getattr(self.planner, "remaining_budget", 0) or 0)
+        except (TypeError, ValueError):
+            budget_left = 0.0
+        if budget_left < 180 and new_paths == 0 and self._round >= 2:
+            return True
+        # 累计路径达量 + 已跑过 2 轮 → 进入评估阶段决定是否进入深扫
+        if self.aggregator.count > 25 and self._round >= 2:
             return True
         return False
 
@@ -462,66 +482,150 @@ class DirScanOrchestrator:
         except Exception as e:
             logger.warning(f"[DirOrch] Backup variant probe failed: {e}")
 
+    # 扩展后的深扫关键词（35+），substring 匹配
+    _DEEP_KEYWORDS: frozenset[str] = frozenset({
+        "admin", "api", "backup", "config", "upload", "manager",
+        "console", "debug", "internal", "private", "portal", "panel",
+        "cgi-bin", "includes", "modules", "plugins", "data",
+        "user", "users", "account", "dashboard", "test", "staging", "dev",
+        "tmp", "temp", "assets", "static", "vendor", "files", "docs", "help",
+        "system", "settings", "secret", "secrets", "manage", "cms",
+        "wp-admin", "phpmyadmin", "install", "setup",
+    })
+
+    def _find_deep_scan_candidates(
+        self,
+        new_paths: list[str],
+        already_scanned: set[str],
+    ) -> list[str]:
+        """Identify directory-like paths worth queueing for the next deep-scan round.
+
+        Scoring-based selection (threshold >= 3):
+          is_dir_like                      +2
+          keyword hit                      +3
+          aggregator hint in HIGH_VALUE    +2
+          aggregator confidence >= 0.7     +1
+
+        This replaces the earlier AND gate which required BOTH dir-like AND
+        keyword hit, which caused the 3-round iteration to rarely advance.
+        """
+        scored: list[tuple[int, str]] = []
+        for p in new_paths:
+            if p in already_scanned:
+                continue
+            lower = p.lower().rstrip("/")
+            if not lower:
+                continue
+            basename = lower.rsplit("/", 1)[-1] if "/" in lower else lower
+            score = 0
+            is_dir_like = p.endswith("/") or "." not in basename
+            if is_dir_like and basename:
+                score += 2
+            if any(kw in lower for kw in self._DEEP_KEYWORDS):
+                score += 3
+            entry = self.aggregator._entries.get(p)
+            if entry is not None:
+                if entry.hints and (set(entry.hints) & _HIGH_VALUE_HINTS):
+                    score += 2
+                if entry.confidence >= 0.7:
+                    score += 1
+            if score >= 3:
+                scored.append((score, p))
+        scored.sort(key=lambda x: -x[0])
+        return [p for _, p in scored[:10]]
+
     async def _execute_deep_scans(self, base_url: str) -> None:
-        """Run queued recursive directory scans on high-value subdirectories."""
-        if not self._deep_scan_queue:
-            return
+        """Run queued recursive directory scans, iterating when new targets emerge."""
+        _MAX_DEEP_ROUNDS = 3
+        scanned_paths: set[str] = set()
 
-        unique_targets: dict[str, DeepScanTarget] = {}
-        for t in self._deep_scan_queue:
-            if t.path not in unique_targets:
-                unique_targets[t.path] = t
-        targets = list(unique_targets.values())[:5]
+        for round_idx in range(_MAX_DEEP_ROUNDS):
+            if not self._deep_scan_queue:
+                break
 
-        if self._log_cb:
-            await self._log_cb(
-                f"[DirOrch] 深扫队列: {len(targets)} 个子目录"
-            )
+            unique_targets: dict[str, DeepScanTarget] = {}
+            for t in self._deep_scan_queue:
+                if t.path not in unique_targets and t.path not in scanned_paths:
+                    unique_targets[t.path] = t
+            targets = list(unique_targets.values())[:5]
+            self._deep_scan_queue.clear()
 
-        for target in targets:
-            sub_url = f"{base_url.rstrip('/')}{target.path}"
-            wl = (
-                '/usr/share/wordlists/dirb/common.txt'
-                if target.wordlist == "small"
-                else '/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt'
-            )
-            script = (
-                f'WL="{wl}"; [ -f "$WL" ] || WL="/usr/share/wordlists/dirb/common.txt"; '
-                f'feroxbuster -u "{sub_url}" -w "$WL" -t 30 --depth 2 '
-                f'--no-state -q -C 404 2>/dev/null'
-            )
+            if not targets:
+                break
+
             if self._log_cb:
                 await self._log_cb(
-                    f"[DirOrch] 深扫: {target.path} ({target.reason})"
+                    f"[DirOrch] 深扫队列 第{round_idx + 1}/{_MAX_DEEP_ROUNDS}轮: "
+                    f"{len(targets)} 个子目录"
                 )
-            try:
-                result = await self.executor.run_script(
-                    script_content=script,
-                    timeout=300,
-                    task_id=self._task_id,
-                    log_callback=self._log_cb,
-                    record_callback=self._rec_cb,
-                    record_phase="recon",
-                    record_purpose=f"deep_scan_{target.path.strip('/')}",
+
+            for target in targets:
+                scanned_paths.add(target.path)
+                sub_url = f"{base_url.rstrip('/')}{target.path}"
+                wl = (
+                    '/usr/share/wordlists/dirb/common.txt'
+                    if target.wordlist == "small"
+                    else '/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt'
                 )
-                stdout = result.stdout or ""
-                paths_before_ds = set(self.aggregator._entries.keys())
-                new_count = self.aggregator.ingest("feroxbuster", stdout, base_url)
-                new_only_ds = [
-                    p for p in self.aggregator._entries if p not in paths_before_ds
-                ]
-                self._raw_outputs.append(f"=== deep_scan {target.path} ===\n{stdout}")
-                logger.info(
-                    "[DirOrch] 深扫 %s +%d 条 | %s",
-                    target.path, new_count, _preview_paths(new_only_ds, 25),
+                script = (
+                    f'WL="{wl}"; [ -f "$WL" ] || WL="/usr/share/wordlists/dirb/common.txt"; '
+                    f'feroxbuster -u "{sub_url}" -w "$WL" -t 30 --depth 2 '
+                    f'--no-state -q -C 404 2>/dev/null'
                 )
                 if self._log_cb:
                     await self._log_cb(
-                        f"[DirOrch] 深扫 {target.path}: +{new_count} 路径"
+                        f"[DirOrch] 深扫: {target.path} ({target.reason})"
                     )
-                    if new_only_ds:
+                try:
+                    result = await self.executor.run_script(
+                        script_content=script,
+                        timeout=300,
+                        task_id=self._task_id,
+                        log_callback=self._log_cb,
+                        record_callback=self._rec_cb,
+                        record_phase="recon",
+                        record_purpose=f"deep_scan_{target.path.strip('/')}",
+                    )
+                    stdout = result.stdout or ""
+                    paths_before_ds = set(self.aggregator._entries.keys())
+                    new_count = self.aggregator.ingest("feroxbuster", stdout, base_url)
+                    new_only_ds = [
+                        p for p in self.aggregator._entries if p not in paths_before_ds
+                    ]
+                    self._raw_outputs.append(f"=== deep_scan {target.path} ===\n{stdout}")
+                    logger.info(
+                        "[DirOrch] 深扫 %s +%d 条 | %s",
+                        target.path, new_count, _preview_paths(new_only_ds, 25),
+                    )
+                    if self._log_cb:
                         await self._log_cb(
-                            f"[DirOrch] 深扫 {target.path} 新增: {_preview_paths(new_only_ds, 20)}"
+                            f"[DirOrch] 深扫 {target.path}: +{new_count} 路径"
                         )
-            except Exception as e:
-                logger.warning(f"[DirOrch] Deep scan {target.path} failed: {e}")
+                        if new_only_ds:
+                            await self._log_cb(
+                                f"[DirOrch] 深扫 {target.path} 新增: "
+                                f"{_preview_paths(new_only_ds, 20)}"
+                            )
+
+                    followups = self._find_deep_scan_candidates(
+                        new_only_ds, scanned_paths,
+                    )
+                    for fp in followups:
+                        self._deep_scan_queue.append(DeepScanTarget(
+                            path=fp,
+                            reason=f"从 {target.path} 深扫中发现",
+                            wordlist="small",
+                        ))
+                    if followups and self._log_cb:
+                        await self._log_cb(
+                            f"[DirOrch] 深扫 {target.path} 追加下轮目标: "
+                            f"{_preview_paths(followups)}"
+                        )
+
+                except Exception as e:
+                    logger.warning(f"[DirOrch] Deep scan {target.path} failed: {e}")
+
+        if scanned_paths and self._log_cb:
+            await self._log_cb(
+                f"[DirOrch] 深扫全部完成: 共扫描 {len(scanned_paths)} 个子目录"
+            )

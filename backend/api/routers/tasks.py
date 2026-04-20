@@ -95,7 +95,8 @@ async def create_task(req: CreateTaskRequest, request: Request):
     task_id = str(uuid.uuid4())
 
     owner_id = getattr(request.state, "user_id", "") or ""
-
+    tenant_id = getattr(request.state, "tenant_id", "") or "default"
+    
     state = PentestState(
         task_id=task_id,
         target=req.target,

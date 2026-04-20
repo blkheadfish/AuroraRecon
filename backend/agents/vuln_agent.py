@@ -915,7 +915,7 @@ $PHUIP "{web_url}/index.php" 2>&1
                 "-c", sp["nuclei_concurrency"],
             ],
             input_data=url_list,
-            timeout=480,
+            timeout=600,
         )
 
         findings: list[VulnFinding] = []
