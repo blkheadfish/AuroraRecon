@@ -185,6 +185,15 @@ class ReconAgent:
 			raw_outputs_all: list[str] = []
 			coverage_reports: list[dict] = []
 
+			# Shared deep-scan queue across all web ports + Phase 3 deep-dive.
+			# Allows newly discovered directories from _deep_recursive_scan to
+			# feed back into the common queue and be drained at the end.
+			from backend.tools.deep_scan_coordinator import DeepScanCoordinator
+			deep_coord = DeepScanCoordinator(
+				max_total_scans=30,
+				budget_seconds=900.0,
+			)
+
 			for wp in web_ports[:4]:
 				scheme = "https" if wp.port in (443, 8443) else "http"
 				web_target = f"{scheme}://{target}:{wp.port}"
@@ -197,6 +206,7 @@ class ReconAgent:
 					has_waf=has_waf, tech_hints=tech_hints,
 					scan_strategy=scan_strategy,
 					record_callback=record_callback,
+					deep_coord=deep_coord,
 				)
 				raw_outputs_all.append(raw_out)
 				coverage_reports.append(coverage_rpt.to_log_dict())
@@ -211,6 +221,17 @@ class ReconAgent:
 				primary_target, tech_hints, aggregator,
 				task_id, log_callback, record_callback,
 				scan_strategy=scan_strategy,
+				deep_coord=deep_coord,
+			)
+
+			# ── Phase 3-drain: exhaust the shared deep-scan queue ──
+			await self._drain_deep_scan_queue(
+				base_url=primary_target,
+				aggregator=aggregator,
+				coord=deep_coord,
+				task_id=task_id,
+				log_callback=log_callback,
+				record_callback=record_callback,
 			)
 
 			path_contents = await self._probe_path_contents(
@@ -673,6 +694,7 @@ class ReconAgent:
 		tech_hints: list[str] | None = None,
 		scan_strategy: dict | None = None,
 		record_callback: RecordCallback = None,
+		deep_coord: "DeepScanCoordinator | None" = None,
 	) -> tuple[list[str], str, CoverageReport, PathAggregator]:
 		"""LLM-in-the-loop adaptive directory discovery via DirScanOrchestrator."""
 		from backend.tools.dir_scan_orchestrator import DirScanOrchestrator
@@ -695,6 +717,7 @@ class ReconAgent:
 			log_callback=log_callback,
 			record_callback=record_callback,
 			task_id=task_id,
+			coordinator=deep_coord,
 		)
 		result = await orchestrator.run(plan, web_target, scan_strategy)
 
@@ -776,6 +799,7 @@ class ReconAgent:
 		log_callback: LogCallback = None,
 		record_callback: RecordCallback = None,
 		scan_strategy: dict | None = None,
+		deep_coord: "DeepScanCoordinator | None" = None,
 	) -> None:
 		"""Ask LLM to plan post-scan deep dive actions and execute them."""
 		try:
@@ -817,6 +841,7 @@ class ReconAgent:
 			await self._execute_deep_dive_actions(
 				base_url, deep_plan, aggregator,
 				task_id, log_callback, record_callback,
+				deep_coord=deep_coord,
 			)
 		except Exception as exc:
 			logger.warning(f"[ReconAgent] LLM deep dive planning failed: {exc}")
@@ -831,8 +856,19 @@ class ReconAgent:
 		task_id: Optional[str],
 		log_callback: LogCallback = None,
 		record_callback: RecordCallback = None,
+		deep_coord: "DeepScanCoordinator | None" = None,
 	) -> None:
-		"""Execute deep dive actions from LLM plan concurrently."""
+		"""Execute deep dive actions from LLM plan concurrently.
+
+		Recursive scan requests are routed through the shared
+		`DeepScanCoordinator` (when provided) so that they share dedup /
+		budget with orchestrator-initiated queues. Robots/sitemap/git/API
+		probes remain fan-out tasks (cheap, no overlap risk).
+		"""
+		from backend.tools.deep_scan_coordinator import (
+			DeepScanTarget as _DeepScanTarget,
+		)
+
 		tasks: list[asyncio.Task] = []
 		task_labels: list[str] = []
 
@@ -841,14 +877,39 @@ class ReconAgent:
 			if log_callback:
 				await log_callback(f"[ReconAgent] {msg}")
 
-		# Recursive subdirectory scans
+		# Recursive subdirectory scans — enqueue into shared coordinator when
+		# available; fall back to direct fan-out for backwards compatibility
+		# (stand-alone recon, tests).
+		queued_recursive = 0
 		for scan in deep_plan.get("recursive_scans", [])[:3]:
 			sub_base = scan.get("base", "")
 			if not sub_base:
 				continue
 			reason = (scan.get("reason") or "").strip()
-			wl = scan.get("wordlist", "")
+			wl = scan.get("wordlist", "") or "small"
 			depth = scan.get("depth", 2)
+			if deep_coord is not None:
+				enqueued = deep_coord.enqueue(_DeepScanTarget(
+					path=sub_base,
+					reason=reason or "LLM 深挖规划",
+					wordlist=wl if wl in ("small", "medium", "large") else "small",
+					priority=60,  # LLM deep-dive outranks orchestrator-fallout followups
+					base_url=base_url,
+				))
+				if enqueued:
+					queued_recursive += 1
+					await _emit_deep_detail(
+						f"深挖子任务 [入队 coordinator] base={sub_base} "
+						f"depth={depth} priority=60"
+						f"{f' | 理由: {reason[:200]}' if reason else ''}"
+					)
+				else:
+					await _emit_deep_detail(
+						f"深挖子任务 [跳过入队] base={sub_base}（已扫或已在队列）"
+					)
+				continue
+
+			# Fallback: no coordinator → direct fan-out (legacy path)
 			label = (
 				f"深挖子任务 [递归目录爆破] base={sub_base} depth={depth}"
 				f"{f' wordlist={wl}' if wl else ''}"
@@ -862,6 +923,12 @@ class ReconAgent:
 					reason=reason,
 				)
 			))
+
+		if deep_coord is not None and queued_recursive:
+			await _emit_deep_detail(
+				f"深挖: 已向共享深扫队列入队 {queued_recursive} 个 LLM 推荐目标"
+				f" | {deep_coord.budget_report()}"
+			)
 
 		# Info source actions (robots, sitemap, git, api schema)
 		for action in deep_plan.get("info_source_actions", []):
@@ -953,7 +1020,29 @@ class ReconAgent:
 		record_callback: RecordCallback = None,
 		*,
 		reason: str = "",
+		deep_coord: "DeepScanCoordinator | None" = None,
 	) -> None:
+		"""Execute one feroxbuster deep scan and (optionally) feed newly
+		discovered directory-like paths back into the shared coordinator.
+
+		When `deep_coord` is supplied, this function:
+		  1. Guards against re-scanning paths already marked done
+		  2. Records elapsed + mark_scanned so the coordinator budget stays accurate
+		  3. Enqueues scored followups (same scoring as DirScanOrchestrator)
+		     so both Phase 2 and Phase 3 contribute to a single queue.
+		"""
+		from backend.tools.deep_scan_coordinator import (
+			pick_followups as _pick_followups,
+			DeepScanTarget as _DeepScanTarget,
+		)
+
+		if deep_coord is not None and deep_coord.has_been_scanned(sub_path):
+			msg = f"深扫跳过 {sub_path}（coordinator 已记录扫过）"
+			logger.info("[ReconAgent] %s", msg)
+			if log_callback:
+				await log_callback(f"[ReconAgent] {msg}")
+			return
+
 		sub_url = f"{base_url.rstrip('/')}{sub_path}"
 		d = min(depth, 3)
 		start_msg = (
@@ -968,8 +1057,10 @@ class ReconAgent:
 			f'feroxbuster -u "{sub_url}" -w "$WL" -t 30 --depth {d} '
 			f'--no-state -q -C 404 2>/dev/null'
 		)
+		scan_elapsed = 0.0
 		try:
 			paths_before = set(aggregator._entries.keys())
+			t0 = time.time()
 			result = await self.executor.run_script(
 				script_content=script, timeout=120, task_id=task_id,
 				log_callback=log_callback,
@@ -977,6 +1068,7 @@ class ReconAgent:
 				record_phase="recon",
 				record_purpose=f"deep_scan_{sub_path.strip('/')}",
 			)
+			scan_elapsed = time.time() - t0
 			raw_out = result.stdout or ""
 			new = aggregator.ingest("feroxbuster", raw_out, base_url)
 			new_paths = [p for p in aggregator._entries if p not in paths_before]
@@ -1005,12 +1097,108 @@ class ReconAgent:
 				await log_callback(
 					f"[ReconAgent] 深扫根 {root_norm} ferox 样本:\n{sample}"
 				)
+
+			# ── 回流：把新发现的 dir-like 子路径推回 coordinator ──────────
+			if deep_coord is not None:
+				scanned_snapshot = {root_norm}
+				# under_root 是绝对路径集合，更适合做回流候选
+				followup_pool = under_root or new_paths
+				followups = _pick_followups(
+					followup_pool, aggregator, scanned_snapshot,
+				)
+				enqueued = 0
+				for fp in followups:
+					if deep_coord.enqueue(_DeepScanTarget(
+						path=fp,
+						reason=f"从 {root_norm} 深扫中回流",
+						wordlist="small",
+						priority=30,
+						base_url=base_url,
+					)):
+						enqueued += 1
+				if enqueued and log_callback:
+					await log_callback(
+						f"[ReconAgent] 深扫根 {root_norm} 回流 {enqueued} 个子目标到共享队列"
+						f" | {deep_coord.budget_report()}"
+					)
+
 		except Exception as e:
 			logger.warning(f"[ReconAgent] Deep scan {sub_path} failed: {e}")
 			if log_callback:
 				await log_callback(
 					f"[ReconAgent] 深扫失败 {sub_path}: {e}"
 				)
+		finally:
+			if deep_coord is not None:
+				deep_coord.mark_scanned(sub_path, elapsed_s=scan_elapsed)
+
+	async def _drain_deep_scan_queue(
+		self,
+		*,
+		base_url: str,
+		aggregator: PathAggregator,
+		coord: "DeepScanCoordinator",
+		task_id: Optional[str],
+		log_callback: LogCallback = None,
+		record_callback: RecordCallback = None,
+		max_rounds: int = 3,
+		batch_size: int = 5,
+	) -> None:
+		"""Drain the shared deep-scan queue to convergence (or budget exhausted).
+
+		Invoked once at the end of Phase 3 after both the per-port orchestrators
+		and the LLM deep-dive have finished enqueueing their candidates. Each
+		round pops a priority-ordered batch and runs them sequentially so the
+		same target isn't hit by multiple concurrent ferox processes.
+		"""
+		if coord is None:
+			return
+		if not coord.has_pending():
+			if log_callback:
+				await log_callback(
+					f"[ReconAgent] 深扫收尾: 共享队列为空 | {coord.budget_report()}"
+				)
+			return
+
+		for round_idx in range(max_rounds):
+			if not coord.can_scan():
+				if log_callback:
+					await log_callback(
+						f"[ReconAgent] 深扫收尾: 预算耗尽，停止 | {coord.budget_report()}"
+					)
+				break
+			batch = coord.pop_batch(batch_size)
+			if not batch:
+				break
+
+			preview = ", ".join(
+				f"{t.path}(p={t.priority})" for t in batch
+			)
+			msg = (
+				f"深扫收尾 第{round_idx + 1}/{max_rounds}轮: "
+				f"{len(batch)} 目标 | {coord.budget_report()} | {preview}"
+			)
+			logger.info("[ReconAgent] %s", msg)
+			if log_callback:
+				await log_callback(f"[ReconAgent] {msg}")
+
+			for target in batch:
+				scan_base = target.base_url or base_url
+				await self._deep_recursive_scan(
+					scan_base, target.path, 2,
+					aggregator, task_id, log_callback, record_callback,
+					reason=target.reason or "shared queue drain",
+					deep_coord=coord,
+				)
+
+		stats = coord.stats()
+		final_msg = (
+			f"深扫收尾结束: scanned={stats.scanned}, "
+			f"queued_remaining={stats.queued}, elapsed={stats.elapsed_s:.1f}s"
+		)
+		logger.info("[ReconAgent] %s", final_msg)
+		if log_callback:
+			await log_callback(f"[ReconAgent] {final_msg}")
 
 	async def _parse_robots_txt(
 		self, base_url: str, aggregator: PathAggregator,

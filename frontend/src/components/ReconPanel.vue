@@ -66,26 +66,103 @@
 
       <!-- Web paths -->
       <div class="info-card mt-16" v-if="displayPaths.length">
-        <div class="card-title">
-          <el-icon><Link /></el-icon>
-          Web 路径发现
-          <span class="count-badge">{{ displayPaths.length }}</span>
+        <div class="card-title path-title">
+          <div class="path-title-left">
+            <el-icon><Link /></el-icon>
+            Web 路径发现
+            <span class="count-badge">{{ filteredLeafCount }}/{{ displayPaths.length }}</span>
+          </div>
+          <div class="path-title-right">
+            <el-input
+              v-model="search"
+              placeholder="搜索路径…"
+              clearable
+              size="small"
+              class="path-search"
+            >
+              <template #prefix><el-icon><Search /></el-icon></template>
+            </el-input>
+            <el-radio-group v-model="pathFilter" size="small" class="path-filter">
+              <el-radio-button value="all">全部</el-radio-button>
+              <el-radio-button value="high">高价值</el-radio-button>
+              <el-radio-button value="s200">200</el-radio-button>
+              <el-radio-button value="s403">403</el-radio-button>
+            </el-radio-group>
+            <el-button-group size="small" class="path-expand-ctrl">
+              <el-button :icon="ArrowDown" title="展开全部" @click="expandAll" />
+              <el-button :icon="ArrowUp" title="折叠全部" @click="collapseAll" />
+            </el-button-group>
+          </div>
         </div>
-        <div class="path-grid">
-          <span
-            v-for="(item, i) in displayPaths"
-            :key="i"
-            class="path-item"
-            :class="{
-              'path-high-value': item.highValue,
-              'path-forbidden': item.status === 403,
-            }"
-          >
-            <code>{{ item.path }}</code>
-            <span v-if="item.status === 403" class="path-status-tag forbidden">403</span>
-            <span v-if="item.badge" class="path-badge" :class="'badge-' + item.badge">{{ item.badge }}</span>
-          </span>
+
+        <div v-if="!pathTree.length" class="tree-empty">
+          <el-empty description="无匹配路径" :image-size="60" />
         </div>
+        <el-tree
+          v-else
+          :key="treeKey"
+          :data="pathTree"
+          node-key="key"
+          :default-expanded-keys="expandedKeys"
+          :expand-on-click-node="false"
+          :indent="14"
+          class="path-tree"
+        >
+          <template #default="{ data }">
+            <span
+              class="tree-node"
+              :class="{
+                'tree-node-leaf': data.isLeaf,
+                'tree-node-dir': !data.isLeaf,
+                'tree-node-hv': data.highValue,
+              }"
+            >
+              <span class="tree-label">
+                <span v-if="!data.isLeaf" class="tree-dir-label">
+                  {{ data.label }}<span class="tree-sep">/</span>
+                </span>
+                <el-tooltip
+                  v-else
+                  effect="dark"
+                  placement="top"
+                  :show-after="250"
+                  :disabled="!hasTooltip(data)"
+                >
+                  <template #content>
+                    <div class="tree-tooltip">
+                      <div class="tt-path"><code>{{ data.fullPath }}</code></div>
+                      <div v-if="data.confidence != null" class="tt-row">
+                        置信度: <b>{{ Math.round((data.confidence || 0) * 100) }}%</b>
+                      </div>
+                      <div v-if="data.hints && data.hints.length" class="tt-row">
+                        提示: {{ data.hints.join(', ') }}
+                      </div>
+                    </div>
+                  </template>
+                  <code class="tree-leaf-path">{{ data.label }}</code>
+                </el-tooltip>
+              </span>
+              <span class="tree-meta">
+                <span
+                  v-if="data.isLeaf"
+                  class="status-pill"
+                  :class="'status-' + statusKind(data.status)"
+                >{{ data.status || '?' }}</span>
+                <span
+                  v-if="data.badge"
+                  class="path-badge"
+                  :class="'badge-' + data.badge"
+                >{{ data.badge }}</span>
+                <el-icon
+                  v-if="data.isLeaf"
+                  class="copy-btn"
+                  :title="'复制 ' + data.fullPath"
+                  @click.stop="copyPath(data.fullPath)"
+                ><CopyDocument /></el-icon>
+              </span>
+            </span>
+          </template>
+        </el-tree>
       </div>
 
       <!-- Subdomains -->
@@ -104,7 +181,13 @@
 </template>
 
 <script setup>
-import { computed } from 'vue'
+import { computed, ref, watch } from 'vue'
+import { ElMessage } from 'element-plus'
+import {
+  Monitor, Connection, Link, Share,
+  Search, ArrowDown, ArrowUp, CopyDocument,
+} from '@element-plus/icons-vue'
+import { usePathTree } from '@/composables/usePathTree'
 
 const HIGH_VALUE_HINTS = new Set([
   'admin', 'login', 'config', 'backup', 'leak', 'upload', 'api', 'info_disclosure',
@@ -138,6 +221,7 @@ const displayPaths = computed(() => {
           path: item.path,
           status: item.status,
           confidence: item.confidence,
+          hints,
           highValue: hvHints.length > 0,
           badge,
         }
@@ -148,8 +232,74 @@ const displayPaths = computed(() => {
       })
   }
   const plain = props.task?.web_paths || []
-  return plain.map(p => ({ path: p, status: 200, confidence: 0.5, highValue: false, badge: '' }))
+  return plain.map(p => ({
+    path: p, status: 200, confidence: 0.5, hints: [], highValue: false, badge: '',
+  }))
 })
+
+const pathFilter = ref('all')
+const search = ref('')
+const {
+  tree: pathTree,
+  leafCount: filteredLeafCount,
+  highValueExpandKeys,
+  allKeys,
+} = usePathTree(displayPaths, pathFilter, search)
+
+const expandedKeys = ref([])
+const treeKey = ref(0)
+
+function syncExpanded() {
+  if (search.value.trim()) {
+    expandedKeys.value = [...allKeys.value]
+  } else if (pathFilter.value !== 'all') {
+    expandedKeys.value = [...allKeys.value]
+  } else {
+    expandedKeys.value = [...highValueExpandKeys.value]
+  }
+  treeKey.value++
+}
+
+watch(highValueExpandKeys, () => syncExpanded(), { immediate: true })
+watch(search, () => syncExpanded())
+watch(pathFilter, () => syncExpanded())
+
+function expandAll() {
+  expandedKeys.value = [...allKeys.value]
+  treeKey.value++
+}
+
+function collapseAll() {
+  expandedKeys.value = []
+  treeKey.value++
+}
+
+async function copyPath(path) {
+  try {
+    await navigator.clipboard.writeText(path)
+    ElMessage.success(`已复制 ${path}`)
+  } catch {
+    ElMessage.error('复制失败')
+  }
+}
+
+function statusKind(code) {
+  if (code === 200) return 'ok'
+  if (code === 403) return 'forbidden'
+  if (code === 0 || code == null) return 'unknown'
+  if (code >= 500) return 'error'
+  if (code >= 300 && code < 400) return 'redirect'
+  if (code === 401) return 'auth'
+  return 'other'
+}
+
+function hasTooltip(data) {
+  return !!(
+    data.fullPath ||
+    data.confidence != null ||
+    (data.hints && data.hints.length)
+  )
+}
 
 const isEmpty = computed(() =>
   !ports.value.length && !displayPaths.value.length && !subdomains.value.length
@@ -318,5 +468,205 @@ const isEmpty = computed(() =>
 .path-item.subdomain {
   color: var(--accent-purple);
   border-color: rgba(188,140,255,0.2);
+}
+
+/* ============ Path tree (B2/B3/B4) ============ */
+.path-title {
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.path-title-left {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.path-title-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.path-search {
+  width: 180px;
+}
+
+.path-filter :deep(.el-radio-button__inner) {
+  padding: 5px 10px;
+  font-size: 11px;
+}
+
+.path-expand-ctrl :deep(.el-button) {
+  padding: 5px 8px;
+}
+
+.tree-empty {
+  padding: 4px 0 2px;
+}
+
+.path-tree {
+  background: transparent;
+  font-size: 12px;
+  --el-tree-node-hover-bg-color: rgba(56,139,253,0.06);
+}
+
+.path-tree :deep(.el-tree-node__content) {
+  height: 28px;
+  padding-right: 4px;
+}
+
+.path-tree :deep(.el-tree-node__content:hover) {
+  background: rgba(56,139,253,0.06);
+}
+
+.path-tree :deep(.el-tree-node__content > *:last-child) {
+  flex: 1;
+  min-width: 0;
+}
+
+.tree-node {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
+  padding-right: 4px;
+}
+
+.tree-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.tree-dir-label {
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.tree-sep {
+  color: var(--text-muted);
+  margin-left: 1px;
+}
+
+.tree-leaf-path {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tree-node-hv.tree-node-dir .tree-dir-label {
+  color: #e8a040;
+}
+
+.tree-node-hv.tree-node-leaf .tree-leaf-path {
+  color: #f0b060;
+  font-weight: 500;
+}
+
+.tree-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.status-pill {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 9px;
+  line-height: 15px;
+  letter-spacing: 0.3px;
+  border: 1px solid transparent;
+}
+
+.status-pill.status-ok {
+  color: #48b97a;
+  background: rgba(72, 185, 122, 0.14);
+  border-color: rgba(72, 185, 122, 0.32);
+}
+
+.status-pill.status-forbidden {
+  color: #e28a40;
+  background: rgba(226, 138, 64, 0.14);
+  border-color: rgba(226, 138, 64, 0.32);
+}
+
+.status-pill.status-auth {
+  color: #c070e0;
+  background: rgba(192, 112, 224, 0.14);
+  border-color: rgba(192, 112, 224, 0.3);
+}
+
+.status-pill.status-redirect {
+  color: #60b0e0;
+  background: rgba(96, 176, 224, 0.14);
+  border-color: rgba(96, 176, 224, 0.3);
+}
+
+.status-pill.status-error {
+  color: #e06060;
+  background: rgba(224, 96, 96, 0.14);
+  border-color: rgba(224, 96, 96, 0.3);
+}
+
+.status-pill.status-unknown {
+  color: var(--text-muted);
+  background: rgba(160, 160, 160, 0.1);
+  border-color: rgba(160, 160, 160, 0.25);
+}
+
+.status-pill.status-other {
+  color: var(--text-muted);
+  background: rgba(160, 160, 160, 0.1);
+  border-color: rgba(160, 160, 160, 0.25);
+}
+
+.copy-btn {
+  font-size: 13px;
+  color: var(--text-muted);
+  cursor: pointer;
+  opacity: 0;
+  transition: color 0.15s, opacity 0.15s;
+}
+
+.path-tree :deep(.el-tree-node__content:hover) .copy-btn {
+  opacity: 1;
+}
+
+.copy-btn:hover {
+  color: var(--accent-blue);
+}
+
+.tree-tooltip {
+  max-width: 340px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.tree-tooltip .tt-path code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: #ffd080;
+  word-break: break-all;
+}
+
+.tree-tooltip .tt-row {
+  color: #ddd;
+  margin-top: 2px;
 }
 </style>

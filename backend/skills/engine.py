@@ -598,12 +598,24 @@ class SkillEngine:
                 ctx.exploit_cmd_template = step.command
 
                 shell_type = evidence_data.get("shell_type", "rce")
+                # Any shell_type starting with "rce" is capability=rce. Keep the
+                # explicit whitelist for non-rce cases (file_read / source_read)
+                # and rely on the prefix fallback for language-variants
+                # (rce_ssh_log_poison_{php,jsp,aspx} / rce_access_log_poison_*).
                 _exploit_level_map = {
                     "rce": "rce",
                     "rce_data_wrapper": "rce",
                     "rce_input_wrapper": "rce",
+                    # Legacy names retained so historical reports still resolve
                     "rce_ssh_log_poison": "rce",
                     "rce_apache_log_poison": "rce",
+                    # New per-language log-poison variants (C2/C5/C6):
+                    "rce_ssh_log_poison_php": "rce",
+                    "rce_ssh_log_poison_jsp": "rce",
+                    "rce_ssh_log_poison_aspx": "rce",
+                    "rce_access_log_poison_php": "rce",
+                    "rce_access_log_poison_jsp": "rce",
+                    "rce_access_log_poison_aspx": "rce",
                     "file_read": "file_read",
                     "source_read": "source_read",
                 }
