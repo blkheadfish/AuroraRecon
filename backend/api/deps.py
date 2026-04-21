@@ -80,3 +80,26 @@ async def get_current_user(request: Request) -> dict:
         "user_id": user_id,
         "username": getattr(request.state, "username", ""),
     }
+
+
+async def get_current_user_role(user_id: str) -> str:
+    """读取用户当前角色（user / admin），查不到默认为 user。"""
+    if not user_id:
+        return "user"
+    try:
+        from backend.db.database import get_user_by_id
+        user = await get_user_by_id(user_id)
+        if user and getattr(user, "role", None) in ("admin", "user"):
+            return user.role
+    except Exception as e:
+        logger.warning(f"[deps] get_current_user_role 失败: {e}")
+    return "user"
+
+
+async def require_admin(request: Request) -> dict:
+    """FastAPI 依赖：校验当前用户是 admin。"""
+    info = await get_current_user(request)
+    role = await get_current_user_role(info["user_id"])
+    if role != "admin":
+        raise HTTPException(status_code=403, detail="需要管理员权限")
+    return {**info, "role": role}

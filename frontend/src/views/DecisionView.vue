@@ -241,6 +241,8 @@ const decisionItems = computed(() => {
         id: `tool-start-${idx}`,
         time,
         tone: 'primary',
+        action: 'tool_start',
+        tool: entry.tool || 'unknown',
         title: `工具调用 · ${entry.tool || 'unknown'}`,
         desc: `阶段 ${entry.phase || '-'}\n${entry.message || ''}`.trim(),
       })
@@ -254,6 +256,8 @@ const decisionItems = computed(() => {
         id: `tool-res-${idx}`,
         time,
         tone: Number(exitText) === 0 ? 'success' : 'danger',
+        action: 'tool_result',
+        tool: entry.tool || 'unknown',
         title: `调用结果 · ${entry.tool || 'unknown'}`,
         desc: `exit=${exitText} ｜ elapsed=${elapsedText}\n${entry.message || ''}`.trim(),
       })
@@ -275,6 +279,8 @@ const decisionItems = computed(() => {
         id: `cmd-${idx}`,
         time,
         tone: (entry.exit_code ?? -1) === 0 ? 'success' : 'danger',
+        action: 'command_exec',
+        tool: entry.tool || 'shell',
         title: titleText,
         desc: `exit=${entry.exit_code ?? '-'} ｜ elapsed=${entry.elapsed_ms ?? '-'}ms${phaseTextInfo}${roundText}${purposeText}`,
         payloads: buildExecPayloads(command, stdout, stderr, {
@@ -291,6 +297,7 @@ const decisionItems = computed(() => {
         id: `approve-${idx}`,
         time,
         tone: 'warning',
+        action: 'approval',
         title: '审批节点',
         desc: entry.message || entry.raw || '',
       })
@@ -385,6 +392,8 @@ const decisionItems = computed(() => {
           id: `exploit-${ridx}-${cidx}`,
           time: new Date().toLocaleTimeString(),
           tone: record.exit_code === 0 ? 'success' : 'danger',
+          action: 'command_exec',
+          tool: result.vuln_id || 'shell',
           title: `命令执行 · ${result.vuln_id || 'unknown vuln'}`,
           desc: `purpose=${record.purpose || '-'} ｜ exit=${record.exit_code ?? '-'} ｜ elapsed=${record.elapsed ?? '-'}s`,
           payloads: buildExecPayloads(command, record.stdout || '', record.stderr || '', {
@@ -406,6 +415,8 @@ const decisionItems = computed(() => {
         id: `fallback-log-${idx}`,
         time: new Date().toLocaleTimeString(),
         tone: /failed|error|denied|401|403|❌/i.test(line) ? 'danger' : 'success',
+        action: 'command_exec',
+        tool: 'shell',
         title: '执行轨迹',
         desc: line,
         payloads: [{ title: '执行命令片段', language: inferPayloadLang(line), code: line }],

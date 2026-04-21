@@ -177,18 +177,74 @@ async def _save_user_profile(owner_id: str, profile: dict) -> None:
         _save_profile(profile)
 
 
+# ── 敏感字段处理 ─────────────────────────────────────────
+#
+# 设计：LLM / Embedding 的 API Key 改为"后端统一分配"（当前阶段仍从
+#   环境变量读取），前端不再直接编辑 api_key：
+#   - GET /settings：不返回真实 api_key，只返回 `has_key` 布尔值
+#   - POST /settings：忽略前端提交的 api_key（不会覆盖服务端已配置的 key）
+# 这样可以避免把 Key 暴露到前端/日志/备份里。
+
+_REDACTED_SECTIONS = ("llm", "embedding")
+
+
+def _redact_api_keys(data: dict) -> dict:
+    """返回前端的版本：去掉真实 api_key，用 has_key 代替。"""
+    if not isinstance(data, dict):
+        return data
+    out = dict(data)
+    for section in _REDACTED_SECTIONS:
+        block = out.get(section)
+        if isinstance(block, dict):
+            block = dict(block)
+            key = str(block.get("api_key") or "")
+            # 兼容历史：如果落盘时存过真实 key，这里也不回传
+            block["api_key"] = ""
+            block["has_key"] = bool(key)
+            out[section] = block
+    # 追加一份服务端当前生效的 key 状态（从环境变量读取），管理员可见
+    out["_llm_runtime"] = {
+        "has_key": bool(os.getenv("LLM_API_KEY", "")),
+        "provider": os.getenv("LLM_PROVIDER", ""),
+        "model": os.getenv("LLM_MODEL", ""),
+        "base_url": os.getenv("LLM_BASE_URL", ""),
+    }
+    out["_embedding_runtime"] = {
+        "has_key": bool(os.getenv("KB_EMBEDDING_API_KEY", "") or os.getenv("LLM_API_KEY", "")),
+        "base_url": os.getenv("KB_EMBEDDING_BASE_URL", ""),
+        "model": os.getenv("KB_EMBEDDING_MODEL", ""),
+    }
+    return out
+
+
+def _strip_client_api_keys(incoming: dict) -> dict:
+    """POST 入参清洗：剥掉前端传来的 api_key 字段，避免被持久化/写入环境变量。"""
+    if not isinstance(incoming, dict):
+        return incoming
+    cleaned = dict(incoming)
+    for section in _REDACTED_SECTIONS:
+        block = cleaned.get(section)
+        if isinstance(block, dict):
+            block = dict(block)
+            block.pop("api_key", None)
+            block.pop("has_key", None)
+            cleaned[section] = block
+    return cleaned
+
+
 # ── 设置端点 ──────────────────────────────────────────────
 
 @router.get("/settings")
 async def get_settings(request: Request):
     owner_id, _tenant_id = resolve_scope(request)
-    return await _load_user_settings(owner_id)
+    raw = await _load_user_settings(owner_id)
+    return _redact_api_keys(raw)
 
 
 @router.post("/settings")
 async def save_settings(data: dict, request: Request):
     owner_id, _tenant_id = resolve_scope(request)
-    incoming = dict(data or {})
+    incoming = _strip_client_api_keys(dict(data or {}))
     # allowlist: 禁止普通用户覆盖高风险运行时安全参数
     if isinstance(incoming.get("executor"), dict):
         blocked = {"docker_network", "toolbox_image", "persistent_container"}
@@ -196,9 +252,10 @@ async def save_settings(data: dict, request: Request):
             if k in blocked:
                 incoming["executor"].pop(k, None)
     merged = _deep_merge_dict(await _load_user_settings(owner_id), incoming)
-    await _save_user_settings(owner_id, merged)
+    # 持久化前再次剥掉 api_key（兼容历史数据），避免污染磁盘/DB
+    await _save_user_settings(owner_id, _strip_client_api_keys(merged))
     llm = merged.get("llm", {})
-    if llm.get("api_key"):    os.environ["LLM_API_KEY"]   = llm["api_key"]
+    # api_key 不再由 /settings 写入环境变量，只接受非敏感字段
     if llm.get("model"):      os.environ["LLM_MODEL"]      = llm["model"]
     if llm.get("base_url"):   os.environ["LLM_BASE_URL"]   = llm["base_url"]
     if llm.get("provider"):   os.environ["LLM_PROVIDER"]   = llm["provider"]
@@ -206,8 +263,6 @@ async def save_settings(data: dict, request: Request):
     embedding = merged.get("embedding", {})
     if embedding.get("enabled") is not None:
         os.environ["EMBEDDING_ENABLED"] = "true" if bool(embedding.get("enabled")) else "false"
-    if embedding.get("api_key") is not None:
-        os.environ["KB_EMBEDDING_API_KEY"] = str(embedding.get("api_key") or "")
     if embedding.get("base_url") is not None:
         os.environ["KB_EMBEDDING_BASE_URL"] = str(embedding.get("base_url") or "")
     if embedding.get("model") is not None:

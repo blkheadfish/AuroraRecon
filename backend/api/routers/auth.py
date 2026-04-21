@@ -43,20 +43,29 @@ def _user_to_dict(user) -> dict:
         "nickname": user.nickname or user.username,
         "avatar_url": user.avatar_url or "",
         "oss_url": user.oss_url or "",
+        "role": getattr(user, "role", None) or "user",
         "created_at": user.created_at.isoformat() if user.created_at else "",
     }
 
 
 @router.post("/register")
 async def auth_register(req: AuthRegisterRequest):
-    from backend.db.database import create_user, get_user_by_username
+    from backend.db.database import count_users, create_user, get_user_by_username
     existing = await get_user_by_username(req.username)
     if existing:
         raise HTTPException(409, "用户名已存在")
     hashed = await asyncio.to_thread(
         _bcrypt_lib.hashpw, req.password.encode(), _bcrypt_lib.gensalt()
     )
-    user = await create_user(req.username, hashed.decode(), req.nickname or req.username)
+    # 首位注册用户自动提升为 admin（便于部署后冷启动就有管理员）
+    try:
+        is_first = (await count_users()) == 0
+    except Exception:
+        is_first = False
+    role = "admin" if is_first else "user"
+    user = await create_user(req.username, hashed.decode(), req.nickname or req.username, role=role)
+    if is_first:
+        logger.info(f"[Auth] 首位用户 {user.username} 已自动提升为 admin")
     token = create_jwt(user.id, user.username)
     return {"token": token, "user": _user_to_dict(user)}
 

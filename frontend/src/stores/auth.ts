@@ -10,6 +10,7 @@ export interface AuthUser {
   nickname: string
   avatar_url: string
   oss_url: string
+  role: 'admin' | 'user' | string
   created_at: string
 }
 
@@ -34,6 +35,8 @@ export const useAuthStore = defineStore('auth', () => {
   const isLoggedIn = computed(() => !!token.value)
   const displayName = computed(() => user.value?.nickname || user.value?.username || '')
   const avatarUrl = computed(() => user.value?.avatar_url || '')
+  const role = computed(() => user.value?.role || 'user')
+  const isAdmin = computed(() => role.value === 'admin')
 
   function setAuth(newToken: string, newUser: AuthUser) {
     token.value = newToken
@@ -56,5 +59,9 @@ export const useAuthStore = defineStore('auth', () => {
     localStorage.removeItem(USER_KEY)
   }
 
-  return { token, user, isLoggedIn, displayName, avatarUrl, setAuth, updateUser, logout }
+  return {
+    token, user,
+    isLoggedIn, displayName, avatarUrl, role, isAdmin,
+    setAuth, updateUser, logout,
+  }
 })

@@ -49,13 +49,9 @@
           <el-icon><ChatDotRound /></el-icon>
           <template #title><span>Prompt管理</span></template>
         </el-menu-item>
-        <el-menu-item index="/profile">
-          <el-icon><User /></el-icon>
-          <template #title><span>个人空间</span></template>
-        </el-menu-item>
-        <el-menu-item index="/settings">
-          <el-icon><Setting /></el-icon>
-          <template #title><span>系统设置</span></template>
+        <el-menu-item v-if="isAdmin" index="/admin">
+          <el-icon><Lock /></el-icon>
+          <template #title><span>管理员面板</span></template>
         </el-menu-item>
       </el-menu>
 
@@ -86,11 +82,53 @@
     </el-aside>
 
     <el-main class="main-content">
-      <div v-if="isMobile" class="mobile-topbar">
-        <el-button link @click="uiPrefs.sidebarCollapsed = !uiPrefs.sidebarCollapsed" class="hamburger-btn">
+      <div class="global-topbar" :class="{ 'is-mobile': isMobile }">
+        <el-button
+          v-if="isMobile"
+          link
+          class="hamburger-btn"
+          @click="uiPrefs.sidebarCollapsed = !uiPrefs.sidebarCollapsed"
+        >
           <el-icon :size="20"><Expand /></el-icon>
         </el-button>
-        <span class="mobile-title">AuroraRecon</span>
+        <span v-if="isMobile" class="mobile-title">AuroraRecon</span>
+
+        <div class="topbar-spacer"></div>
+
+        <el-dropdown v-if="isLoggedIn" trigger="click" @command="handleUserCommand">
+          <div class="user-trigger" tabindex="0">
+            <el-avatar :size="30" class="user-avatar">{{ userInitial }}</el-avatar>
+            <span class="user-name">{{ currentNickname }}</span>
+            <el-tag
+              v-if="isAdmin"
+              type="danger"
+              size="small"
+              effect="plain"
+              class="role-tag"
+            >admin</el-tag>
+            <el-icon class="dropdown-caret"><ArrowDown /></el-icon>
+          </div>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item command="profile">
+                <el-icon><User /></el-icon>
+                <span>个人空间</span>
+              </el-dropdown-item>
+              <el-dropdown-item command="settings">
+                <el-icon><Setting /></el-icon>
+                <span>系统设置</span>
+              </el-dropdown-item>
+              <el-dropdown-item v-if="isAdmin" command="admin">
+                <el-icon><Lock /></el-icon>
+                <span>管理员面板</span>
+              </el-dropdown-item>
+              <el-dropdown-item command="logout" divided>
+                <el-icon><SwitchButton /></el-icon>
+                <span>退出登录</span>
+              </el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
       </div>
       <router-view />
     </el-main>
@@ -99,18 +137,47 @@
 
 <script setup>
 import { computed, ref, watch, onMounted, onUnmounted } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
 import { api } from '@/api'
 import { useTheme } from '@/composables/useTheme'
 import { useUiPrefsStore } from '@/stores/uiPrefs'
+import { useAuthStore } from '@/stores/auth'
 import { storeToRefs } from 'pinia'
 
 const MOBILE_BREAKPOINT = 768
 
 const route = useRoute()
+const router = useRouter()
 const uiPrefs = useUiPrefsStore()
+const auth = useAuthStore()
 const { sidebarCollapsed } = storeToRefs(uiPrefs)
 const isMobile = ref(window.innerWidth < MOBILE_BREAKPOINT)
+
+const isLoggedIn = computed(() => auth.isLoggedIn)
+const isAdmin = computed(() => auth.isAdmin)
+const currentNickname = computed(() => auth.displayName || '用户')
+const userInitial = computed(() => (currentNickname.value || 'U').slice(0, 1).toUpperCase())
+
+function handleUserCommand(command) {
+  if (command === 'profile') {
+    router.push('/profile')
+    return
+  }
+  if (command === 'settings') {
+    router.push('/settings')
+    return
+  }
+  if (command === 'admin') {
+    router.push('/admin')
+    return
+  }
+  if (command === 'logout') {
+    auth.logout()
+    ElMessage.success('已退出登录')
+    router.push('/login')
+  }
+}
 
 function onResize() {
   const nowMobile = window.innerWidth < MOBILE_BREAKPOINT
@@ -352,6 +419,79 @@ onUnmounted(() => {
   padding: 0;
   overflow-y: auto;
   transition: background 0.2s;
+  display: flex;
+  flex-direction: column;
+}
+
+.global-topbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 20px;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--bg-surface) 88%, transparent);
+  backdrop-filter: blur(6px);
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  min-height: 48px;
+}
+
+.topbar-spacer {
+  flex: 1;
+}
+
+.user-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 12px 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  cursor: pointer;
+  outline: none;
+  transition: border-color 0.15s, background 0.15s, transform 0.15s;
+  user-select: none;
+}
+
+.user-trigger:hover,
+.user-trigger:focus-visible {
+  border-color: var(--accent-blue);
+  background: var(--bg-hover);
+  transform: translateY(-1px);
+}
+
+.user-avatar {
+  background: rgba(56, 139, 253, 0.18) !important;
+  color: var(--accent-blue) !important;
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.user-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.role-tag {
+  font-family: var(--font-mono);
+  font-size: 10px !important;
+  letter-spacing: 0.04em;
+  padding: 0 6px !important;
+  height: 18px !important;
+  line-height: 18px !important;
+}
+
+.dropdown-caret {
+  font-size: 12px;
+  color: var(--text-muted);
 }
 
 .fade-text-enter-active,
@@ -384,13 +524,8 @@ onUnmounted(() => {
   overflow: hidden;
 }
 
-.mobile-topbar {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 16px;
-  border-bottom: 1px solid var(--border);
-  background: var(--bg-surface);
+.global-topbar.is-mobile {
+  padding: 8px 12px;
 }
 
 .hamburger-btn {

@@ -3,7 +3,7 @@
     <div class="page-header">
       <div>
         <h1 class="page-title">个人空间</h1>
-        <p class="page-sub">维护昵称、头像与账户安全设置</p>
+        <p class="page-sub">维护昵称与账户安全设置</p>
       </div>
     </div>
 
@@ -11,14 +11,14 @@
       <template #header><span class="card-title">基本资料</span></template>
       <div class="profile-grid" v-loading="profileLoading">
         <div class="avatar-col">
-          <el-avatar
-            :size="88"
-            :src="avatarError ? '' : profile.avatar_url"
-            class="profile-avatar"
-            @error="onAvatarError"
-          >
-            {{ nicknameInitial }}
-          </el-avatar>
+          <div class="profile-avatar initials-avatar">{{ nicknameInitial }}</div>
+          <el-tag
+            v-if="profileRoleTag"
+            :type="profileRoleTag.type"
+            size="small"
+            effect="plain"
+            class="role-badge"
+          >{{ profileRoleTag.label }}</el-tag>
         </div>
         <div class="form-col">
           <el-form label-width="100px">
@@ -27,13 +27,6 @@
             </el-form-item>
             <el-form-item label="昵称">
               <el-input v-model="profile.nickname" maxlength="64" show-word-limit />
-            </el-form-item>
-            <el-form-item label="头像链接">
-              <el-input v-model="profile.avatar_url" placeholder="https://example.com/avatar.png" />
-            </el-form-item>
-            <el-form-item label="OSS 地址">
-              <el-input v-model="profile.oss_url" placeholder="https://your-bucket.oss-cn-xxx.aliyuncs.com（预留）" />
-              <div class="hint">预留 OSS 基础地址，可自行填写后保存</div>
             </el-form-item>
             <el-form-item label="注册时间">
               <span class="muted">{{ formatTime(profile.created_at) }}</span>
@@ -70,28 +63,6 @@
       </el-form>
     </el-card>
 
-    <el-card class="panel">
-      <template #header>
-        <div class="card-header">
-          <span class="card-title">团队信息（预留）</span>
-          <el-button text :loading="teamLoading" @click="loadTeam">刷新</el-button>
-        </div>
-      </template>
-      <el-alert
-        v-if="teamReserved"
-        title="团队接口已预留，后端尚未启用"
-        type="info"
-        :closable="false"
-        show-icon
-      />
-      <el-table v-else-if="teamMembers.length" :data="teamMembers" size="small">
-        <el-table-column prop="user_id" label="用户ID" min-width="180" />
-        <el-table-column prop="email" label="邮箱" min-width="220" />
-        <el-table-column prop="role" label="角色" width="120" />
-      </el-table>
-      <el-empty v-else description="暂无团队成员数据" />
-      <div v-if="teamError" class="error-tip">{{ teamError }}</div>
-    </el-card>
   </div>
 </template>
 
@@ -105,12 +76,10 @@ const auth = useAuthStore()
 
 const profileLoading = ref(false)
 const profileSaving = ref(false)
-const avatarError = ref(false)
 const profile = ref({
   username: '',
   nickname: '',
-  avatar_url: '',
-  oss_url: '',
+  role: 'user',
   created_at: '',
 })
 
@@ -121,12 +90,12 @@ const passwordForm = ref({
   confirm_password: '',
 })
 
-const teamLoading = ref(false)
-const teamReserved = ref(false)
-const teamError = ref('')
-const teamMembers = ref([])
-
 const nicknameInitial = computed(() => (profile.value.nickname || 'U').slice(0, 1).toUpperCase())
+const profileRoleTag = computed(() => {
+  const r = String(profile.value.role || 'user')
+  if (r === 'admin') return { label: '管理员', type: 'danger' }
+  return null
+})
 
 const passwordStrength = computed(() => {
   const p = passwordForm.value.new_password || ''
@@ -157,11 +126,6 @@ function formatTime(raw) {
   return d.toLocaleString()
 }
 
-function onAvatarError() {
-  avatarError.value = true
-  return false
-}
-
 async function loadProfile() {
   profileLoading.value = true
   try {
@@ -169,8 +133,7 @@ async function loadProfile() {
     profile.value = {
       username: me.username || '',
       nickname: me.nickname || me.username || '',
-      avatar_url: me.avatar_url || '',
-      oss_url: me.oss_url || '',
+      role: me.role || 'user',
       created_at: me.created_at || '',
     }
   } catch {
@@ -178,8 +141,7 @@ async function loadProfile() {
       profile.value = {
         username: auth.user.username || '',
         nickname: auth.user.nickname || '',
-        avatar_url: auth.user.avatar_url || '',
-        oss_url: auth.user.oss_url || '',
+        role: auth.user.role || 'user',
         created_at: auth.user.created_at || '',
       }
     }
@@ -195,25 +157,18 @@ async function saveProfile() {
     return
   }
   profileSaving.value = true
-  avatarError.value = false
   try {
-    const res = await api.authUpdateMe({
-      nickname,
-      avatar_url: String(profile.value.avatar_url || '').trim(),
-      oss_url: String(profile.value.oss_url || '').trim(),
-    })
+    // 头像 / OSS 字段暂时下架，后端字段保留但前端不再编辑
+    const res = await api.authUpdateMe({ nickname })
     if (res?.user) {
       profile.value = {
         username: res.user.username || profile.value.username,
         nickname: res.user.nickname || nickname,
-        avatar_url: res.user.avatar_url || '',
-        oss_url: res.user.oss_url || '',
+        role: res.user.role || profile.value.role,
         created_at: res.user.created_at || profile.value.created_at,
       }
       auth.updateUser({
         nickname: res.user.nickname,
-        avatar_url: res.user.avatar_url,
-        oss_url: res.user.oss_url,
       })
     }
     ElMessage.success('个人资料已保存')
@@ -253,29 +208,8 @@ async function submitPassword() {
   }
 }
 
-async function loadTeam() {
-  teamLoading.value = true
-  teamError.value = ''
-  try {
-    const members = await api.listMembers()
-    teamMembers.value = Array.isArray(members) ? members : []
-    teamReserved.value = false
-  } catch (e) {
-    teamMembers.value = []
-    if (e?.response?.status === 501) {
-      teamReserved.value = true
-    } else {
-      teamReserved.value = false
-      teamError.value = e?.response?.data?.detail || e.message || '读取团队信息失败'
-    }
-  } finally {
-    teamLoading.value = false
-  }
-}
-
 onMounted(async () => {
   await loadProfile()
-  await loadTeam()
 })
 </script>
 
@@ -301,10 +235,26 @@ onMounted(async () => {
   gap: 10px;
 }
 .profile-avatar { border: 1px solid var(--border); }
+.initials-avatar {
+  width: 88px;
+  height: 88px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 34px;
+  font-weight: 700;
+  color: var(--accent-blue);
+  background: color-mix(in srgb, var(--accent-blue) 15%, var(--bg-surface));
+  user-select: none;
+}
+.role-badge {
+  font-family: var(--font-mono);
+  letter-spacing: 0.04em;
+}
 .muted { color: var(--text-muted); font-size: 12px; }
 .hint { font-size: 12px; color: var(--text-secondary); margin-top: 6px; }
 .hint .weak { color: var(--accent-red); }
 .hint .medium { color: var(--accent-yellow); }
 .hint .strong { color: var(--accent-green); }
-.error-tip { margin-top: 10px; color: var(--accent-red); font-size: 12px; }
 </style>

@@ -3,6 +3,7 @@
     <span class="dot" v-if="status === 'running'"></span>
     <el-icon v-else-if="status === 'completed'"><CircleCheckFilled /></el-icon>
     <el-icon v-else-if="status === 'failed'"><CircleCloseFilled /></el-icon>
+    <el-icon v-else-if="status === 'cancelled'"><RemoveFilled /></el-icon>
     <el-icon v-else><Clock /></el-icon>
     {{ labelMap[status] || status }}
   </span>
@@ -19,6 +20,7 @@ const labelMap = {
   running: '运行中',
   completed: '已完成',
   failed: '失败',
+  cancelled: '已取消',
 }
 </script>
 
@@ -41,23 +43,28 @@ const labelMap = {
 
 .status-pending {
   color: var(--status-pending);
-  background: rgba(139,148,158,0.1);
-  border-color: rgba(139,148,158,0.3);
+  background: color-mix(in srgb, var(--status-pending) 8%, transparent);
+  border-color: color-mix(in srgb, var(--status-pending) 22%, transparent);
 }
 .status-running {
   color: var(--status-running);
-  background: rgba(56,139,253,0.1);
-  border-color: rgba(56,139,253,0.3);
+  background: color-mix(in srgb, var(--status-running) 8%, transparent);
+  border-color: color-mix(in srgb, var(--status-running) 22%, transparent);
 }
 .status-completed {
   color: var(--status-completed);
-  background: rgba(63,185,80,0.1);
-  border-color: rgba(63,185,80,0.3);
+  background: color-mix(in srgb, var(--status-completed) 8%, transparent);
+  border-color: color-mix(in srgb, var(--status-completed) 22%, transparent);
 }
 .status-failed {
   color: var(--status-failed);
-  background: rgba(248,81,73,0.1);
-  border-color: rgba(248,81,73,0.3);
+  background: color-mix(in srgb, var(--status-failed) 8%, transparent);
+  border-color: color-mix(in srgb, var(--status-failed) 22%, transparent);
+}
+.status-cancelled {
+  color: var(--status-cancelled, #8b8fa3);
+  background: color-mix(in srgb, var(--status-cancelled, #8b8fa3) 8%, transparent);
+  border-color: color-mix(in srgb, var(--status-cancelled, #8b8fa3) 22%, transparent);
 }
 
 .dot {

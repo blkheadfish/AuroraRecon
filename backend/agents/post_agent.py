@@ -41,7 +41,7 @@ def _extract_rce_template(result: ExploitResult) -> Optional[str]:
         # curl-based web RCE: replace the OS command portion
         # Pattern: system('CMD') or system("CMD") in URL or POST data
         for pat, repl_fn in [
-            (r"system\(['\"]([^'\"]+)['\"]\)", lambda m: f"system('{{{\"CMD\"}}}')" ),
+            (r"system\(['\"]([^'\"]+)['\"]\)", lambda m: f'system(\'{{{{"CMD"}}}}\')' ),
             (r"\bcmd=([^\s&\"']+)", lambda m: "cmd={CMD}"),
             (r"'id'", lambda m: "'{CMD}'"),
             (r'"id"', lambda m: '"{CMD}"'),

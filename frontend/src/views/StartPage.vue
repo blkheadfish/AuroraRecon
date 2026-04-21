@@ -25,6 +25,7 @@
           <el-dropdown-menu>
             <el-dropdown-item command="profile">个人空间</el-dropdown-item>
             <el-dropdown-item command="settings">系统设置</el-dropdown-item>
+            <el-dropdown-item v-if="isAdmin" command="admin">管理员面板</el-dropdown-item>
             <el-dropdown-item command="logout" divided>退出登录</el-dropdown-item>
           </el-dropdown-menu>
         </template>
@@ -133,6 +134,7 @@ const boardModel = ref(createFallbackBoard())
 const { theme, init: initTheme, toggle: toggleTheme } = useTheme()
 
 const isLoggedIn = computed(() => auth.isLoggedIn)
+const isAdmin = computed(() => auth.isAdmin)
 const currentNickname = computed(() => auth.displayName || '安全研究员')
 const currentAvatar = computed(() => auth.avatarUrl || '')
 
@@ -238,6 +240,10 @@ function handleUserCommand(command) {
   }
   if (command === 'settings') {
     router.push('/settings')
+    return
+  }
+  if (command === 'admin') {
+    router.push('/admin')
     return
   }
   if (command === 'logout') {

@@ -16,12 +16,19 @@ import type {
   UserProfile,
 } from '@/types/settings'
 
-const BASE = '/api'
+// 默认走同源 `/api`（开发由 vite proxy 代理到后端，生产由 nginx 转发）。
+// 跨机部署且不方便反代时，构建时设置 VITE_API_BASE=http://<backend-host>:<port>
+// 即可让前端直连后端（需后端 CORS 放行，或者前端同机反代）。
+const BASE = (import.meta.env?.VITE_API_BASE as string | undefined)?.trim() || '/api'
 const TOKEN_KEY = 'auth.token'
+
+// 后端很多接口会触发 LLM 调用或 Docker 拉镜像，15s 在跨机内网部署下经常不够。
+// 统一默认 60s，少数已知重型接口（例如 /knowledge/build）在下方单独显式拔高。
+const DEFAULT_TIMEOUT_MS = Number(import.meta.env?.VITE_API_TIMEOUT_MS) || 60000
 
 const http: AxiosInstance = axios.create({
   baseURL: BASE,
-  timeout: 15000,
+  timeout: DEFAULT_TIMEOUT_MS,
 })
 
 http.interceptors.request.use((config) => {
@@ -49,6 +56,9 @@ http.interceptors.response.use(
 )
 
 function getWsBase(): string {
+  // 优先使用构建时指定的 VITE_WS_BASE（跨机部署场景），否则回落到同源。
+  const envWs = (import.meta.env?.VITE_WS_BASE as string | undefined)?.trim()
+  if (envWs) return envWs.replace(/\/$/, '')
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
   return `${proto}//${location.host}`
 }
@@ -110,24 +120,10 @@ export const api = {
   changePassword: (data: PasswordChangePayload): Promise<{ status: string }> =>
     http.post('/profile/change-password', data),
   getMetricsOverview: async (windowHours = 24): Promise<MetricsOverview> => {
+    // 只保留一次调用；之前的两段 axios.get 回退逻辑没有带 Authorization，
+    // 跨机部署时只会稳定吃到 401 / 超时，反而把这次请求拖满 15s 才报错。
     const params = { window_hours: windowHours }
-    try {
-      return await http.get('/metrics/overview', { params })
-    } catch (e) {
-      const status = e?.response?.status ?? null
-      if (status !== 404) throw e
-    }
-
-    try {
-      const res = await axios.get<MetricsOverview>('/metrics/overview', { params, timeout: 15000 })
-      return res.data
-    } catch (e) {
-      const status = e?.response?.status ?? null
-      if (status !== 404) throw e
-    }
-
-    const res = await axios.get<MetricsOverview>('/api/metrics/overview', { params, timeout: 15000 })
-    return res.data
+    return http.get('/metrics/overview', { params })
   },
   getSkills: (): Promise<{
     skills: Array<{
@@ -231,6 +227,41 @@ export const api = {
     http.get(`/tasks/${taskId}/comments`),
   addComment: (taskId: string, text: string): Promise<{ ok: boolean }> =>
     http.post(`/tasks/${taskId}/comments`, { text }),
+
+  // ── 管理员端点（role === 'admin' 才能调用） ────────────────
+  adminListUsers: (): Promise<{
+    users: Array<{
+      id: string
+      username: string
+      nickname: string
+      avatar_url: string
+      oss_url: string
+      role: string
+      created_at: string
+    }>
+    total: number
+  }> => http.get('/admin/users'),
+
+  adminUpdateUserRole: (
+    userId: string,
+    role: 'admin' | 'user',
+  ): Promise<{ status: string; user: { id: string; username: string; role: string } }> =>
+    http.patch(`/admin/users/${userId}/role`, { role }),
+
+  adminResetPassword: (
+    userId: string,
+    newPassword: string,
+  ): Promise<{ status: string }> =>
+    http.post(`/admin/users/${userId}/reset-password`, { new_password: newPassword }),
+
+  adminDeleteUser: (userId: string): Promise<{ status: string }> =>
+    http.delete(`/admin/users/${userId}`),
+
+  adminGetLlmRuntime: (): Promise<{
+    llm: { provider: string; model: string; base_url: string; has_key: boolean }
+    embedding: { enabled: boolean; model: string; base_url: string; has_key: boolean }
+    note: string
+  }> => http.get('/admin/llm-runtime'),
 }
 
 export interface WsConnection {

@@ -3,7 +3,7 @@
     <div class="page-header">
       <div>
         <h1 class="page-title">系统设置</h1>
-        <p class="page-sub">LLM 连接、工具配置、团队管理</p>
+        <p class="page-sub">LLM 连接、执行器、工作流默认值</p>
       </div>
       <el-button type="primary" @click="saveAll" :loading="saving">
         <el-icon><Check /></el-icon> 保存设置
@@ -17,6 +17,15 @@
         <template #label>
           <span class="tab-label"><el-icon><Cpu /></el-icon> 大模型</span>
         </template>
+
+        <el-alert
+          class="settings-alert"
+          type="info"
+          :closable="false"
+          show-icon
+          title="API Key 由系统统一分配"
+          description="LLM / Embedding 的 API Key 已改由后端统一配置，用户侧不再手动填写。如需替换或排查请联系管理员，管理员可在「管理员面板」查看当前运行时配置状态。"
+        />
 
         <el-card class="settings-card">
           <template #header><span class="card-title">LLM 连接配置</span></template>
@@ -32,14 +41,18 @@
             </el-form-item>
 
             <el-form-item label="API Key">
-              <el-input
-                  v-model="llm.api_key"
-                  type="password"
-                  show-password
-                  placeholder="sk-..."
-                  class="mono-input"
-              />
-              <div class="form-tip error" v-if="validationErrors.apiKey">{{ validationErrors.apiKey }}</div>
+              <div class="readonly-status">
+                <el-tag
+                  :type="runtime.llm.has_key ? 'success' : 'warning'"
+                  size="small"
+                  effect="plain"
+                >
+                  {{ runtime.llm.has_key ? '已分配' : '未配置' }}
+                </el-tag>
+                <span class="readonly-note">
+                  服务端通过环境变量 <code>LLM_API_KEY</code> 注入，不在前端展示
+                </span>
+              </div>
             </el-form-item>
 
             <el-form-item label="模型名称">
@@ -79,13 +92,18 @@
             </el-form-item>
 
             <el-form-item label="Embedding API Key">
-              <el-input
-                v-model="embedding.api_key"
-                type="password"
-                show-password
-                placeholder="jina_xxx / sk-xxx"
-                class="mono-input"
-              />
+              <div class="readonly-status">
+                <el-tag
+                  :type="runtime.embedding.has_key ? 'success' : 'warning'"
+                  size="small"
+                  effect="plain"
+                >
+                  {{ runtime.embedding.has_key ? '已分配' : '未配置' }}
+                </el-tag>
+                <span class="readonly-note">
+                  服务端通过环境变量 <code>KB_EMBEDDING_API_KEY</code> 注入，未设置时回退到 LLM Key
+                </span>
+              </div>
             </el-form-item>
 
             <el-form-item label="Embedding Base URL">
@@ -221,65 +239,6 @@
         </el-card>
       </el-tab-pane>
 
-      <!-- ④ 团队协作（预留 UI，接口已定义） -->
-      <el-tab-pane name="team">
-        <template #label>
-          <span class="tab-label"><el-icon><UserFilled /></el-icon> 团队</span>
-        </template>
-
-        <el-card class="settings-card">
-          <template #header>
-            <div class="card-header">
-              <span class="card-title">团队成员</span>
-              <el-tag type="info" size="small">阶段二功能</el-tag>
-            </div>
-          </template>
-
-          <el-alert
-              title="团队协作功能开发中"
-              description="接口已预留，阶段二将实现：多人任务分配、评论协作、角色权限、独立攻击机分配（remote 执行后端）。"
-              type="info"
-              :closable="false"
-              show-icon
-              style="margin-bottom: 16px"
-          />
-
-          <!-- 成员列表占位 -->
-          <div class="team-placeholder">
-            <div class="member-row" v-for="m in demoMembers" :key="m.email">
-              <div class="member-avatar">{{ m.name[0] }}</div>
-              <div class="member-info">
-                <div class="member-name">{{ m.name }}</div>
-                <div class="member-email">{{ m.email }}</div>
-              </div>
-              <el-tag :type="m.role === 'admin' ? 'danger' : 'info'" size="small">
-                {{ m.role }}
-              </el-tag>
-            </div>
-          </div>
-
-          <el-button disabled plain size="small" style="margin-top: 12px">
-            <el-icon><Plus /></el-icon> 邀请成员（即将开放）
-          </el-button>
-        </el-card>
-
-        <el-card class="settings-card">
-          <template #header><span class="card-title">执行后端扩展规划</span></template>
-          <div class="arch-preview">
-            <div class="arch-row">
-              <div class="arch-box active">local<div class="arch-sub">nmap · nuclei</div></div>
-              <div class="arch-arrow">→</div>
-              <div class="arch-box active">container<div class="arch-sub">MSF · JNDIExploit</div></div>
-              <div class="arch-arrow">→</div>
-              <div class="arch-box planned">remote SSH<div class="arch-sub">阶段二：多人独立攻击机</div></div>
-            </div>
-            <div class="arch-note">
-              接口不变，上层 Agent 代码零改动。多人场景：按 task_id 分配容器 + 动态端口，或 SSH 到独立攻击机。
-            </div>
-          </div>
-        </el-card>
-      </el-tab-pane>
-
     </el-tabs>
   </div>
 </template>
@@ -290,7 +249,7 @@ import { ElMessage } from 'element-plus'
 import { api } from '@/api'
 import {
   Check, Cpu, Connection, Monitor, Refresh, Loading,
-  Setting, UserFilled, Plus,
+  Setting,
 } from '@element-plus/icons-vue'
 import { trackEvent } from '@/metrics/tracker'
 
@@ -311,7 +270,6 @@ const PROVIDER_DEFAULTS = {
 
 const llm = ref({
   provider:   'deepseek',
-  api_key:    '',
   model:      'deepseek-chat',
   base_url:   'https://api.deepseek.com',
   max_tokens: 4096,
@@ -319,9 +277,14 @@ const llm = ref({
 
 const embedding = ref({
   enabled: true,
-  api_key: '',
   base_url: 'https://api.jina.ai/v1',
   model: '',
+})
+
+// 当前后端实际在用的 LLM / Embedding 运行时配置（是否已分配 key 等），只读
+const runtime = ref({
+  llm: { has_key: false, provider: '', model: '', base_url: '' },
+  embedding: { has_key: false, base_url: '', model: '' },
 })
 
 const executor = ref({
@@ -378,11 +341,6 @@ const modeMatrixRows = computed(() => {
   }))
 })
 
-// 团队演示数据
-const demoMembers = [
-  { name: '当前用户', email: 'you@example.com', role: 'admin' },
-]
-
 function onProviderChange(val) {
   const d = PROVIDER_DEFAULTS[val] || {}
   llm.value.model    = d.model    || ''
@@ -414,7 +372,6 @@ async function testLLM() {
 
 async function saveAll() {
   if (
-    validationErrors.value.apiKey ||
     validationErrors.value.baseUrl ||
     validationErrors.value.embeddingBaseUrl ||
     validationErrors.value.lhost
@@ -424,6 +381,7 @@ async function saveAll() {
   }
   saving.value = true
   try {
+    // 注意：api_key 不再由前端提交，后端 /settings 会忽略该字段
     await api.saveSettings({
       llm: llm.value,
       embedding: embedding.value,
@@ -441,15 +399,11 @@ async function saveAll() {
 
 const validationErrors = computed(() => {
   const errors = {
-    apiKey: '',
     baseUrl: '',
     embeddingBaseUrl: '',
     lhost: '',
   }
 
-  if (llm.value.api_key && !/^sk-[a-zA-Z0-9\-_]{8,}/.test(llm.value.api_key)) {
-    errors.apiKey = 'API Key 格式不合法，通常应以 sk- 开头。'
-  }
   if (llm.value.base_url && !/^https?:\/\/[\w.-]+(?:\/.*)?$/.test(llm.value.base_url)) {
     errors.baseUrl = 'Base URL 必须是合法的 http/https 地址。'
   }
@@ -469,6 +423,22 @@ async function loadSettings() {
     if (s.embedding) Object.assign(embedding.value, s.embedding)
     if (s.executor) Object.assign(executor.value, s.executor)
     if (s.workflow) Object.assign(workflow.value, s.workflow)
+    // 后端用 _llm_runtime / _embedding_runtime 带回"已分配/未配置"状态
+    if (s._llm_runtime) {
+      runtime.value.llm = {
+        has_key: !!s._llm_runtime.has_key,
+        provider: s._llm_runtime.provider || '',
+        model: s._llm_runtime.model || '',
+        base_url: s._llm_runtime.base_url || '',
+      }
+    }
+    if (s._embedding_runtime) {
+      runtime.value.embedding = {
+        has_key: !!s._embedding_runtime.has_key,
+        base_url: s._embedding_runtime.base_url || '',
+        model: s._embedding_runtime.model || '',
+      }
+    }
   } catch { /* 首次启动时后端可能还没有设置 */ }
 }
 
@@ -527,6 +497,25 @@ onMounted(async () => {
 .test-result.ok   { color: var(--accent-green); }
 .test-result.fail { color: var(--accent-red); }
 
+.settings-alert { margin-bottom: 16px; border-radius: var(--radius-lg) !important; }
+
+.readonly-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  min-height: 32px;
+}
+.readonly-status code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+.readonly-note { color: var(--text-secondary); font-size: 12px; }
+
 /* 状态表格 */
 .status-grid { display: flex; flex-direction: column; gap: 12px; }
 .status-row  { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid var(--border); }
@@ -545,43 +534,6 @@ onMounted(async () => {
 .status-value.warn { color: var(--accent-yellow); }
 .status-value.err  { color: var(--accent-red); }
 .mono { font-family: var(--font-mono); }
-
-/* 团队成员 */
-.team-placeholder { display: flex; flex-direction: column; gap: 10px; }
-.member-row {
-  display: flex; align-items: center; gap: 12px;
-  padding: 10px 12px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-}
-.member-avatar {
-  width: 36px; height: 36px; border-radius: 50%;
-  background: rgba(56,139,253,.15);
-  color: var(--accent-blue);
-  display: flex; align-items: center; justify-content: center;
-  font-weight: 700;
-}
-.member-name  { font-size: 13px; font-weight: 500; color: var(--text-primary); }
-.member-email { font-size: 11px; color: var(--text-muted); }
-.member-row .el-tag { margin-left: auto; }
-
-/* 架构预览 */
-.arch-preview { padding: 8px 0; }
-.arch-row { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
-.arch-box {
-  padding: 10px 16px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-secondary);
-  text-align: center;
-}
-.arch-box.active  { border-color: var(--accent-blue); color: var(--accent-blue); background: rgba(56,139,253,.06); }
-.arch-box.planned { border-color: var(--border); border-style: dashed; color: var(--text-muted); }
-.arch-sub { font-size: 11px; font-weight: 400; color: var(--text-muted); font-family: var(--font-mono); margin-top: 3px; }
-.arch-arrow { color: var(--text-muted); font-size: 18px; }
-.arch-note  { font-size: 12px; color: var(--text-muted); line-height: 1.6; }
 
 .loading-placeholder { display: flex; align-items: center; gap: 8px; color: var(--text-muted); padding: 12px 0; }
 .spin { animation: spin 1s linear infinite; }

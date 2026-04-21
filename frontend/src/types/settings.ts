@@ -1,6 +1,11 @@
+/**
+ * API Key 由后端统一分配（通过环境变量），前端不再编辑也不会拿到真实 key。
+ * 后端会返回 `has_key: true/false` 让前端展示"是否已配置"状态。
+ */
 export interface LlmSettings {
   provider: 'deepseek' | 'openai' | 'anthropic' | 'custom' | string
-  api_key: string
+  api_key?: string
+  has_key?: boolean
   model: string
   base_url: string
   max_tokens: number
@@ -15,7 +20,8 @@ export interface ExecutorSettings {
 
 export interface EmbeddingSettings {
   enabled: boolean
-  api_key: string
+  api_key?: string
+  has_key?: boolean
   base_url: string
   model: string
 }

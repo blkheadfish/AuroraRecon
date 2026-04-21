@@ -83,6 +83,7 @@ class UserRecord(Base):
     nickname: Mapped[str] = mapped_column(String(64), default="")
     avatar_url: Mapped[str] = mapped_column(String(1024), default="")
     oss_url: Mapped[str] = mapped_column(String(1024), default="")
+    role: Mapped[str] = mapped_column(String(16), default="user")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -160,6 +161,7 @@ async def init_db():
     migrations = [
         ("tasks", "owner_id", "ALTER TABLE tasks ADD COLUMN owner_id VARCHAR(36) DEFAULT '' NOT NULL"),
         ("tasks", "tenant_id", "ALTER TABLE tasks ADD COLUMN tenant_id VARCHAR(64) DEFAULT 'default' NOT NULL"),
+        ("users", "role", "ALTER TABLE users ADD COLUMN role VARCHAR(16) DEFAULT 'user' NOT NULL"),
     ]
     async with engine.begin() as conn:
         for table, column, ddl in migrations:
@@ -177,6 +179,26 @@ async def init_db():
                     logger.info(f"[DB] 迁移: {table}.{column} 已添加")
             except Exception as e:
                 logger.warning(f"[DB] 迁移 {table}.{column} 跳过: {e}")
+
+    # 保证至少一个 admin：如果用户表非空但无任何 admin，把最早注册的用户提升为 admin
+    try:
+        async with engine.begin() as conn:
+            row = (await conn.execute(text(
+                "SELECT COUNT(*) AS c FROM users WHERE role = 'admin'"
+            ))).fetchone()
+            admin_count = int(row.c) if row else 0
+            if admin_count == 0:
+                first = (await conn.execute(text(
+                    "SELECT id FROM users ORDER BY created_at ASC LIMIT 1"
+                ))).fetchone()
+                if first and first.id:
+                    await conn.execute(
+                        text("UPDATE users SET role = 'admin' WHERE id = :uid"),
+                        {"uid": first.id},
+                    )
+                    logger.info(f"[DB] 未检测到 admin，已将最早注册用户 {first.id} 提升为 admin")
+    except Exception as e:
+        logger.warning(f"[DB] admin 自动提升跳过: {e}")
 
     logger.info("[DB] 数据库表已就绪")
 
@@ -489,17 +511,71 @@ async def append_audit_log(
 
 # ── 用户操作 ──────────────────────────────────────────────
 
-async def create_user(username: str, password_hash: str, nickname: str = "") -> UserRecord:
+async def create_user(
+    username: str,
+    password_hash: str,
+    nickname: str = "",
+    role: str = "user",
+) -> UserRecord:
     async with async_session() as session:
         user = UserRecord(
             username=username,
             password_hash=password_hash,
             nickname=nickname or username,
+            role=role if role in ("admin", "user") else "user",
         )
         session.add(user)
         await session.commit()
         await session.refresh(user)
         return user
+
+
+async def count_users() -> int:
+    async with async_session() as session:
+        result = await session.execute(text("SELECT COUNT(*) AS c FROM users"))
+        row = result.fetchone()
+        return int(row.c) if row else 0
+
+
+async def list_all_users() -> list[dict]:
+    """管理员：列出所有用户（不含密码哈希）。"""
+    async with async_session() as session:
+        result = await session.execute(text(
+            "SELECT id, username, nickname, avatar_url, oss_url, role, created_at "
+            "FROM users ORDER BY created_at ASC"
+        ))
+        rows = result.fetchall()
+        return [
+            {
+                "id": r.id,
+                "username": r.username,
+                "nickname": r.nickname or r.username,
+                "avatar_url": r.avatar_url or "",
+                "oss_url": r.oss_url or "",
+                "role": r.role or "user",
+                "created_at": r.created_at.isoformat() if r.created_at else "",
+            }
+            for r in rows
+        ]
+
+
+async def count_admins() -> int:
+    async with async_session() as session:
+        result = await session.execute(text(
+            "SELECT COUNT(*) AS c FROM users WHERE role = 'admin'"
+        ))
+        row = result.fetchone()
+        return int(row.c) if row else 0
+
+
+async def delete_user(user_id: str) -> bool:
+    async with async_session() as session:
+        user = await session.get(UserRecord, user_id)
+        if not user:
+            return False
+        await session.delete(user)
+        await session.commit()
+        return True
 
 
 async def get_user_by_username(username: str) -> Optional[UserRecord]:

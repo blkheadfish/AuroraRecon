@@ -27,9 +27,10 @@
     --accent-purple: #a293c8;
 
     --status-pending:   #8b949e;
-    --status-running:   #388bfd;
-    --status-completed: #3fb950;
-    --status-failed:    #f85149;
+    --status-running:   #6ba3d6;
+    --status-completed: #6bb87a;
+    --status-failed:    #c9736e;
+    --status-cancelled: #8b8fa3;
 
     --phase-recon:    #388bfd;
     --phase-vuln:     #d29922;
@@ -119,9 +120,10 @@
     --accent-purple: #7773ad;
 
     --status-pending:   #656d76;
-    --status-running:   #0969da;
-    --status-completed: #1a7f37;
-    --status-failed:    #cf222e;
+    --status-running:   #4a82aa;
+    --status-completed: #3d8a52;
+    --status-failed:    #b5524c;
+    --status-cancelled: #7c7f8e;
 
     --phase-recon:    #0969da;
     --phase-vuln:     #9a6700;

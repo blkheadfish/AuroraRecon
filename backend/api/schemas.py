@@ -179,6 +179,23 @@ class PasswordChangeRequest(BaseModel):
     new_password: str
 
 
+# ── 管理员相关 ────────────────────────────────────────────
+
+class AdminUpdateRoleRequest(BaseModel):
+    role: Literal["admin", "user"]
+
+
+class AdminResetPasswordRequest(BaseModel):
+    new_password: str
+
+    @field_validator("new_password")
+    @classmethod
+    def validate_password(cls, v: str) -> str:
+        if len(v) < 6:
+            raise ValueError("密码至少 6 位")
+        return v
+
+
 # ── Skill 相关 ────────────────────────────────────────────
 
 class SkillRawUpdateRequest(BaseModel):
