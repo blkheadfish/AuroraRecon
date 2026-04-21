@@ -582,6 +582,9 @@ DIR_MID_SCAN_EVAL = """你是渗透测试专家，正在监控目录扫描进度
 已执行工具: {executed_tools}
 剩余时间预算: ~{remaining_budget}s
 
+已完成深扫的目录（{scanned_count} 条 — 禁止重复推荐）:
+{scanned_paths_summary}
+
 【决策要求 — 每项都要明确回答】
 
 1. 高价值目录识别: 哪些发现的目录值得立即做递归深扫？
@@ -608,8 +611,14 @@ DIR_MID_SCAN_EVAL = """你是渗透测试专家，正在监控目录扫描进度
   "new_wordlist_entries": ["从路径模式推导的新条目"],
   "extension_adjustment": "jsp,jspx,do,action（如需调整，否则为 null）",
   "strategy_change": null,
-  "interesting_findings": ["值得特别关注的发现及原因"]
+  "interesting_findings": ["值得特别关注的发现及原因"],
+  "dedupe_note": "一句话说明本轮 deep_scan_targets 与已扫目录的差异（确认没有重复推荐）"
 }}
+
+【重复推荐约束 — 硬性规则】
+- deep_scan_targets 中任何 path 都不得出现在"已完成深扫的目录"列表里
+- 若发现没有新的高价值目录可深扫，deep_scan_targets 返回空数组 [] 并在 dedupe_note 中注明
+- 重复推荐已扫目录会被视为决策偏差，必须在 dedupe_note 中自我纠正
 
 strategy_change 可选值: null（不变）/ "early_stop_quality_sufficient"（质量够了，提前结束）/ "switch_to_aggressive"（发现线索，加大力度）"""
 

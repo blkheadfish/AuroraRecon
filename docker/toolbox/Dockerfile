@@ -173,5 +173,12 @@ ENV JAVA8=/usr/lib/jvm/java-8/bin/java
 # 验证两个 JDK 共存
 RUN ${JAVA8} -version 2>&1 | head -1 && java -version 2>&1 | head -1
 
+# ---------- Legacy SSH 客户端（OpenSSH 7.4p1 + OpenSSL 1.0.2k）----------
+# 专供"日志投毒"场景（新版 OpenSSH 会过滤 invalid-character 用户名，
+# 导致 payload 到不了目标机的 auth.log）。构建耗时较长，默认不打入镜像。
+# 安装方式 —— 宿主机一键脚本（与 fix.sh / fix_v2.sh 同风格）：
+#   bash docker/toolbox/fix_ssh_legacy.sh
+# 脚本内部：docker run 临时容器 → 编译安装 → docker commit 回本镜像。
+
 WORKDIR /workspace
 CMD ["/bin/bash"]

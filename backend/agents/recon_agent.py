@@ -269,6 +269,43 @@ class ReconAgent:
 		task_id: Optional[str],
 		log_callback: LogCallback = None,
 	) -> tuple[list[PortInfo], dict, str]:
+		# 短路分支：用户已显式指定端口 → 只精细扫描该端口，
+		# 跳过常用/全端口扩散（避免分散精力，加快进入利用阶段）
+		if target_port:
+			logger.info(
+				f"[ReconAgent] 用户已指定端口 {target_port}，"
+				f"跳过端口枚举，直接 nmap -sV/-A 精细扫描"
+			)
+			port_str = str(target_port)
+			try:
+				_is_private = _ipaddress.ip_address(target).is_private
+			except ValueError:
+				_is_private = False
+			if _is_private:
+				nmap_detail_args = [
+					"-A", "--osscan-guess", "-Pn",
+					"-p", port_str, "-oX", "-", target,
+				]
+			else:
+				nmap_detail_args = [
+					"-sV", "--version-all", "-sC", "-Pn",
+					"-p", port_str, "-oX", "-", target,
+				]
+			detail_result: ExecuteResult = await self.executor.run(
+				tool="nmap",
+				args=nmap_detail_args,
+				timeout=300,
+				task_id=task_id,
+				log_callback=log_callback,
+			)
+			if not detail_result.success:
+				logger.warning(
+					f"[ReconAgent] 指定端口 {target_port} 精细扫描失败，返回空结果"
+				)
+				return [], {}, detail_result.stdout or ""
+			ports, os_info = self.nmap_parser.parse_xml_full(detail_result.stdout)
+			return ports, os_info, detail_result.stdout
+
 		# 常用端口列表
 		common_ports_list = [
 			21, 22, 23, 25, 53, 80, 81, 110, 135, 139, 143, 443, 445, 993, 995,

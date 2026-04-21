@@ -229,6 +229,17 @@ class DeepScanCoordinator:
     def has_been_scanned(self, path: str) -> bool:
         return _norm(path) in self._scanned
 
+    def scanned_summary(self, limit: int = 20) -> list[str]:
+        """Return a deterministic (sorted) snapshot of already-scanned paths.
+
+        Used by DIR_MID_SCAN_EVAL prompt (A5) to suppress duplicate LLM
+        recommendations. Paths are deduplicated + normalized via ``_norm``
+        already, we just sort them for stable ordering.
+        """
+        if limit <= 0:
+            return []
+        return sorted(self._scanned)[:limit]
+
     def stats(self) -> DeepScanStats:
         return DeepScanStats(
             enqueued=self._enqueued_total,

