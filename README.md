@@ -1,73 +1,16 @@
-# AuroraRecon (PentestAI v2)
+# AuroraRecon：基于大模型的自动化渗透测试系统
+项目核心是基于 LangGraph 的攻链编排，配合 Docker 工具沙箱、Skill 引擎、知识库检索，实现从侦察到报告的闭环。
+## 核心技术栈
+- 前端：Vue3+TypeScript+ElementUI
+- 后端：FastAPI
+- 核心编排引擎：LangGraph
+- 持久层服务：Redis,PostgreSQL,MinIO
 
-面向 **CTF/授权靶场/授权红蓝对抗** 的 AI 渗透测试工作台。  
-项目核心是基于 LangGraph 的攻链编排，配合 Docker 工具沙箱、Skill 引擎、知识库检索与人工审批，实现从侦察到报告的闭环。
 
 ## 1) 架构总览
 ![img.png](img.png)
-```text
-Vue 3 Frontend
-  ├─ 任务中心 / 决策视图 / 报告中心 / 工具管理 / Skill管理 / 知识库管理
-  └─ WebSocket 实时事件流（日志、命令执行、审批状态）
-             │
-             ▼
-FastAPI API Gateway
-  ├─ 任务与审批 API
-  ├─ Metrics API
-  ├─ Skill/Knowledge/Profile/Settings API
-  └─ Chat API（用户与任务代理对话）
-             │
-             ▼
-LangGraph Orchestrator
-  recon → vuln_scan → surface_enum → exploit_decision
-      → awaiting_approval → foothold_attempt → secondary_attack
-      → post_foothold_enum → privesc_attempt → objective_collect → report
-             │
-             ▼
-Tool Executor + Registry
-  ├─ container-exec（任务持久容器）
-  ├─ container-run（临时容器）
-  └─ remote（阶段二预留）
-             │
-             ▼
-Toolbox / MSF / LLM / Storage
-  ├─ pentest-toolbox (Kali tools)
-  ├─ Metasploit RPC
-  ├─ DeepSeek/OpenAI/Anthropic
-  └─ PostgreSQL + Redis + MinIO
-```
 
-## 2) 核心特性
 
-- **攻链优先编排**：流程不止“扫洞”，而是围绕立足点、提权与目标收集推进完整攻链。
-- **人工审批断点续跑**：在利用前强制进入 `awaiting_approval`，批准后无缝 `resume`。
-- **任务级容器隔离**：每个任务可复用独立 toolbox 容器，兼顾状态保留与并发隔离。
-- **结构化执行可观测**：命令、耗时、退出码、stdout/stderr 全链路入库并在前端可视化。
-- **Skill 引擎 + ReAct 兜底**：先走确定性利用路径，失败后进入 LLM 自由推理补偿。
-- **知识库混合检索**：关键词 + 语义向量（可降级），为利用决策提供上下文知识。
-- **报告中心在线编辑**：任务报告支持 Markdown 编辑与预览，便于二次修订输出。
-
-## 3) 功能模块
-
-### 后端能力
-
-- 任务生命周期：创建、执行、取消、删除、恢复、统计。
-- 实时推送：`/ws/{task_id}` 推送日志、决策事件、审批状态、完成态。
-- 指标总览：`/metrics/overview` 输出系统状态、工具分布、调用成功率等。
-- 配置管理：LLM、执行器、流程策略可通过 API 动态配置。
-- Skill/Knowledge 管理：支持在线读取、编辑、重载 YAML/JSON。
-- 持久化策略：优先 PostgreSQL/Redis/MinIO，不可用时自动降级到内存/本地。
-
-### 前端能力
-
-- `StartPage`：启动页 + 系统简报（调用 metrics 聚合看板）。
-- `Dashboard`：系统、工具、调用分布与成功率可视化。
-- `TaskList`：筛选/批量操作/任务创建（含策略提示）。
-- `TaskDetail`：Mermaid 进度、审批卡片、决策时间线、实时日志、原始数据。
-- `DecisionView`：专注决策流 + 用户消息干预代理行为。
-- `ReportCenter`：报告在线编辑与预览。
-- `ToolsManage` / `SkillsManage` / `KnowledgeManage`：运营与知识维护界面。
-- `Settings` / `Profile`：系统配置、LLM 测试、用户资料管理。
 
 ## 4) 支持工具（当前注册）
 
