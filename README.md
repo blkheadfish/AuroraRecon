@@ -1,5 +1,5 @@
 # AuroraRecon：基于大模型的自动化渗透测试系统
-项目核心是基于 LangGraph 的攻链编排，配合 Docker 工具沙箱、Skill 引擎、知识库检索，实现从侦察到报告的闭环。
+一个以攻链推进为核心的 LLM 辅助渗透测试系统。基于 LangGraph StateGraph 编排侦察、漏扫、利用、后渗透、报告全流程，工具在 Docker 沙箱中隔离执行，利用阶段优先走 YAML 定义的确定性 Skill 路径、失败后退化为 LLM 多轮推理，关键动作前强制人工审批。
 ## 核心技术栈
 - 前端：Vue3+TypeScript+ElementUI
 - 后端：FastAPI
