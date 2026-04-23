@@ -276,13 +276,54 @@ async def set_tool_timeout(
     return {"status": "ok", "tool": tool_name, "timeout": timeout}
 
 
+# Core containers that must not be stopped/restarted from the admin console.
+# They serve the admin console itself — killing them would lock the operator out.
+CORE_CONTAINERS = {
+    "pentest_api",
+    "pentest_frontend",
+    "pentest_redis",
+    "pentest_postgres",
+    "pentest_reverse_proxy",
+    "pentest_nginx",
+    "pentest_toolbox",
+}
+
+
+def _is_core_container(name: str) -> bool:
+    if not name:
+        return False
+    return name.lstrip("/").lower() in CORE_CONTAINERS
+
+
+def _docker_client():
+    """Create a short-timeout docker client so a stuck daemon can't hang the API."""
+    import docker as _docker
+    # 5s connect timeout is enough for the unix socket; avoids blocking the event loop.
+    return _docker.from_env(timeout=5)
+
+
 @router.get("/system-metrics")
 async def get_system_metrics(_admin=Depends(require_admin)):
-    host_info = {}
+    host_info: dict = {"source": "container", "error": ""}
     try:
+        import os
         import psutil
+
+        # If HOST_PROC / HOST_SYS are mounted (see docker-compose.yml) psutil will
+        # report the *host* values, not just what's visible to this container.
+        host_proc = os.environ.get("HOST_PROC")
+        host_sys = os.environ.get("HOST_SYS")
+        if host_proc:
+            psutil.PROCFS_PATH = host_proc
+            host_info["source"] = "host"
+        if host_sys:
+            try:
+                psutil.SYSFS_PATH = host_sys  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
         mem = psutil.virtual_memory()
-        host_info = {
+        host_info.update({
             "cpu_percent": psutil.cpu_percent(interval=0.5),
             "cpu_count": psutil.cpu_count(),
             "memory": {
@@ -292,12 +333,25 @@ async def get_system_metrics(_admin=Depends(require_admin)):
             },
             "disk": [],
             "uptime_seconds": int(time.time() - psutil.boot_time()),
-        }
-        for part in psutil.disk_partitions(all=False):
+        })
+
+        # Prefer /host/rootfs when available (mounted read-only by compose).
+        host_rootfs = os.environ.get("HOST_ROOTFS")
+        disk_mounts: list[str] = []
+        if host_rootfs and os.path.isdir(host_rootfs):
+            disk_mounts.append(host_rootfs)
+        try:
+            for part in psutil.disk_partitions(all=False):
+                if part.mountpoint not in disk_mounts:
+                    disk_mounts.append(part.mountpoint)
+        except Exception:
+            pass
+
+        for mount in disk_mounts:
             try:
-                usage = psutil.disk_usage(part.mountpoint)
+                usage = psutil.disk_usage(mount)
                 host_info["disk"].append({
-                    "mountpoint": part.mountpoint,
+                    "mountpoint": "/" if mount == host_rootfs else mount,
                     "total_gb": round(usage.total / (1024**3), 2),
                     "used_gb": round(usage.used / (1024**3), 2),
                     "percent": usage.percent,
@@ -305,17 +359,24 @@ async def get_system_metrics(_admin=Depends(require_admin)):
             except Exception:
                 pass
     except ImportError:
-        host_info = {"error": "psutil not installed"}
+        host_info["error"] = "psutil not installed"
+    except Exception as exc:  # pragma: no cover - defensive
+        host_info["error"] = f"psutil error: {exc}"
 
-    docker_info = {"containers": [], "total_running": 0, "total_stopped": 0}
+    docker_info: dict = {
+        "containers": [],
+        "total_running": 0,
+        "total_stopped": 0,
+        "error": "",
+    }
     try:
-        import docker as _docker
-        client = _docker.from_env()
+        client = _docker_client()
         for c in client.containers.list(all=True):
             info = {
                 "name": c.name,
                 "status": c.status,
                 "image": str(c.image.tags[0]) if c.image.tags else str(c.image.short_id),
+                "is_core": _is_core_container(c.name),
             }
             if c.status == "running":
                 docker_info["total_running"] += 1
@@ -339,8 +400,11 @@ async def get_system_metrics(_admin=Depends(require_admin)):
                 info["memory_mb"] = 0
                 info["memory_limit_mb"] = 0
             docker_info["containers"].append(info)
-    except Exception:
-        docker_info["error"] = "docker not available"
+    except ImportError:
+        docker_info["error"] = "docker SDK 未安装"
+    except Exception as exc:
+        # Typical causes: /var/run/docker.sock not mounted, or daemon down.
+        docker_info["error"] = f"{type(exc).__name__}: {exc}"
 
     return {"host": host_info, "docker": docker_info}
 
@@ -353,11 +417,17 @@ async def docker_container_action(
 ):
     if action not in ("restart", "stop", "start"):
         raise HTTPException(400, "action 必须是 restart / stop / start")
+    if _is_core_container(container_name) and action in ("stop", "restart"):
+        raise HTTPException(
+            status_code=403,
+            detail=f"{container_name} 是核心容器，禁止通过管理台执行 {action}（避免自锁）。",
+        )
     try:
-        import docker as _docker
-        client = _docker.from_env()
+        client = _docker_client()
         container = client.containers.get(container_name)
         getattr(container, action)()
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, f"操作失败: {e}")
     try:

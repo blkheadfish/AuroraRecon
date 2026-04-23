@@ -5,6 +5,9 @@ import LoginPage from '@/views/LoginPage.vue'
 
 const PUBLIC_ROUTES = new Set<string>(['start-page', 'login', 'register'])
 
+// Admin 允许访问的个人向路径（仍保留用户资料页）。其他用户工作台路由都会被反向守卫重定向到 /admin/dashboard。
+const ADMIN_ALLOWED_NON_ADMIN_PATHS = new Set<string>(['/profile'])
+
 const routes: RouteRecordRaw[] = [
   { path: '/', redirect: '/start' },
   { path: '/start', name: 'start-page', component: StartPage },
@@ -40,7 +43,11 @@ const routes: RouteRecordRaw[] = [
       { path: 'terminal', name: 'admin-terminal', component: () => import('@/views/admin/AdminTerminal.vue') },
     ],
   },
-  { path: '/:pathMatch(.*)*', name: 'not-found', redirect: '/dashboard' },
+  {
+    path: '/:pathMatch(.*)*',
+    name: 'not-found',
+    redirect: () => (currentRole() === 'admin' ? '/admin/dashboard' : '/dashboard'),
+  },
 ]
 
 const router = createRouter({
@@ -61,12 +68,24 @@ function currentRole(): string {
 
 router.beforeEach((to) => {
   const token = localStorage.getItem('auth.token')
-  if (!token && !PUBLIC_ROUTES.has(String(to.name ?? ''))) {
+  const name = String(to.name ?? '')
+  if (!token && !PUBLIC_ROUTES.has(name)) {
     return { name: 'login' }
   }
+  const role = currentRole()
   const needsAdmin = to.matched.some(r => r.meta?.requiresAdmin)
-  if (needsAdmin && currentRole() !== 'admin') {
+  if (needsAdmin && role !== 'admin') {
     return { name: 'dashboard' }
+  }
+  // 反向守卫：管理员只能看管理控制台（/admin/*），以及少量个人向路径。
+  if (role === 'admin' && token) {
+    const path = to.path
+    const isAdminArea = path.startsWith('/admin')
+    const isPublic = PUBLIC_ROUTES.has(name)
+    const isPersonal = ADMIN_ALLOWED_NON_ADMIN_PATHS.has(path)
+    if (!isAdminArea && !isPublic && !isPersonal) {
+      return { path: '/admin/dashboard' }
+    }
   }
 })
 

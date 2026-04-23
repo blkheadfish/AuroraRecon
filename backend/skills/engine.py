@@ -423,8 +423,7 @@ class SkillEngine:
                     logger.info("[SkillEngine] probe| %s", line[:400])
             logger.info("[SkillEngine] 探测完整输出结束 ==============")
 
-        # 记录
-        ctx.probe_records.append(self._build_exec_record(
+        await ctx.append_record_async("probe_records", self._build_exec_record(
             command=command,
             stdout=result.stdout,
             stderr=result.stderr,
@@ -448,7 +447,7 @@ class SkillEngine:
             if updates:
                 any_triggered = True
                 for k, v in updates.items():
-                    ctx.set_var(k, v)
+                    await ctx.set_var_async(k, v)
                     logger.info(f"[SkillEngine]   ✓ 设置变量: {k} = {v}")
 
         if not any_triggered and parse_rules:

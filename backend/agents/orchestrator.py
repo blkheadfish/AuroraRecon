@@ -68,6 +68,22 @@ def _record_chain_visit(state: PentestState, phase_name: str) -> None:
         state.chain_visited.append(phase_name)
 
 
+def _consume_risk_budget(state: PentestState, cost: int = 1) -> bool:
+    """Try to consume *cost* from the risk budget.
+
+    Returns True if the budget was sufficient (operation allowed),
+    False if the budget is exhausted (operation should be blocked).
+    """
+    if state.risk_budget_used + cost > state.risk_budget:
+        state.log(
+            f"⚠ 风险预算耗尽 (used={state.risk_budget_used}, "
+            f"limit={state.risk_budget})，跳过高风险操作"
+        )
+        return False
+    state.risk_budget_used += cost
+    return True
+
+
 # ───────────────────────────────────────────────────────
 # 目标解析 → 写入 state
 # ───────────────────────────────────────────────────────
@@ -1466,6 +1482,9 @@ async def node_foothold_attempt(state: PentestState) -> PentestState:
             existing_ports.add(p.port)
 
     exploitable = [f for f in state.findings if f.exploitable]
+    if not _consume_risk_budget(state, cost=1):
+        state.log("风险预算不足，跳过 foothold_attempt 阶段")
+        return state
     state.log(f"攻链: 立足点尝试 — 利用 {len(exploitable)} 个漏洞条目（含服务级 finding）")
     try:
         agent = ExploitAgent()
@@ -1659,11 +1678,43 @@ async def node_post_foothold_enum(state: PentestState) -> PentestState:
     return state
 
 
+async def node_post_foothold_approval(state: PentestState) -> PentestState:
+    """Approval gate before privesc/objective in strict (pentest_engineer) mode.
+
+    In auto_approve mode this is a no-op pass-through.  Otherwise LangGraph
+    will interrupt before this node just like human_approval, giving the
+    operator a chance to review post-foothold findings before escalation.
+    """
+    state.current_phase = "post_foothold_approval"
+    _record_chain_visit(state, "post_foothold_approval")
+
+    if state.auto_approve and not state.approved:
+        state.approved = True
+        state.log("✅ auto_approve 生效，跳过立足后审批")
+    elif not state.approved:
+        state.log("⏸ 已获取 shell，等待人工确认是否继续提权/收集")
+
+    if state.approved:
+        state.log("✅ 已获授权，继续提权阶段")
+    else:
+        state.log("⚠ 未获授权，跳过提权阶段，直接收集并出报告")
+    return state
+
+
+def edge_after_post_foothold_approval(state: PentestState) -> str:
+    if state.approved:
+        return "privesc_attempt"
+    return "objective_collect"
+
+
 async def node_privesc_attempt(state: PentestState) -> PentestState:
     from backend.agents.post_agent import PostExploitAgent
     state.current_phase = "privesc_attempt"
     _record_chain_visit(state, "privesc_attempt")
     state.privesc_attempt_count += 1
+    if not _consume_risk_budget(state, cost=1):
+        state.log("风险预算不足，跳过 privesc_attempt 阶段")
+        return state
     state.log(f"攻链: 提权尝试 第 {state.privesc_attempt_count}/{state.max_privesc_rounds} 轮")
     try:
         agent = PostExploitAgent()
@@ -1736,18 +1787,22 @@ async def node_report(state: PentestState) -> PentestState:
     state.current_phase = "report"
     _record_chain_visit(state, "report")
     state.log("开始生成报告...")
+    prior_status = state.status
     try:
         _flatten_post_findings_for_report(state)
         gen = ReportGenerator()
         report_md, report_path = await gen.generate(state)
         state.report_md = report_md
         state.report_path = report_path
-        state.status = TaskStatus.COMPLETED
         state.log(f"报告生成完成: {report_path}")
     except Exception as e:
-        state.error_msg = str(e)
-        state.status = TaskStatus.FAILED
-        state.log(f"报告生成异常: {e}")
+        state.report_error = str(e)
+        state.log(f"报告生成异常（不影响任务完成度）: {e}")
+    finally:
+        if prior_status != TaskStatus.FAILED:
+            state.status = TaskStatus.COMPLETED
+        else:
+            state.status = TaskStatus.FAILED
     finally:
         # 任务结束，清理专属工具容器（无论成功失败都执行）
         try:
@@ -1869,7 +1924,12 @@ def build_graph(checkpointer=None):
         "secondary_attack", edge_after_secondary,
         {"post_foothold_enum": "post_foothold_enum", "report": "report"},
     )
-    graph.add_edge("post_foothold_enum", "privesc_attempt")
+    graph.add_node("post_foothold_approval", node_post_foothold_approval)
+    graph.add_edge("post_foothold_enum", "post_foothold_approval")
+    graph.add_conditional_edges(
+        "post_foothold_approval", edge_after_post_foothold_approval,
+        {"privesc_attempt": "privesc_attempt", "objective_collect": "objective_collect"},
+    )
     graph.add_conditional_edges(
         "privesc_attempt", edge_after_privesc,
         {
@@ -1882,8 +1942,7 @@ def build_graph(checkpointer=None):
 
     return graph.compile(
         checkpointer=checkpointer,
-        # 在 human_approval 节点前中断，等待前端调用 /approve 后 resume
-        interrupt_before=["human_approval"],
+        interrupt_before=["human_approval", "post_foothold_approval"],
     )
 
 

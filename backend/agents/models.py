@@ -265,6 +265,7 @@ class PentestState(BaseModel):
 	auto_approve: bool = False                        # 自动通过审批(CTF 模式默认 True)
 	success_gate_level: str = "strict"                # strict | medium | lenient
 	risk_budget: int = 3                              # 允许的高风险操作次数
+	risk_budget_used: int = 0                         # 已消耗的高风险操作次数
 	max_react_rounds: int = 25                        # ReAct 单漏洞最大轮次
 	max_explore_rounds: int = 15                      # 探索阶段最大轮次
 	skill_min_score: int = 20                         # SkillRegistry 匹配下限
@@ -379,6 +380,7 @@ class PentestState(BaseModel):
 
 	report_path: str = ""
 	report_md: str = ""
+	report_error: str = ""
 
 	# 人工审批标志（由 resume() 注入，默认 False）
 	approved: bool = False

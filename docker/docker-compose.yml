@@ -90,10 +90,18 @@ services:
       - JWT_SECRET=${JWT_SECRET:-aurorarecon_default_secret_change_me}
       # 反弹 Shell
       - LHOST=${LHOST:-}
+      # 宿主机指标：设置这三个环境变量后 psutil 将读取宿主机真实 CPU/内存/磁盘
+      - HOST_PROC=/host/proc
+      - HOST_SYS=/host/sys
+      - HOST_ROOTFS=/host/rootfs
     volumes:
       - reports_data:/reports
       - /var/run/docker.sock:/var/run/docker.sock
       - /tmp/pentest_data:/data
+      # 只读挂载宿主机 /proc, /sys, / 以获取宿主机级监控指标
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host/rootfs:ro
     depends_on:
       postgres:
         condition: service_healthy

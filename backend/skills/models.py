@@ -9,6 +9,7 @@ Skill 数据模型
 """
 from __future__ import annotations
 
+import asyncio
 import re
 import shlex
 from dataclasses import dataclass, field
@@ -460,6 +461,18 @@ class SkillContext:
 
     # 当前成功的利用命令模板（用于验证阶段复用）
     exploit_cmd_template: str = ""
+
+    _var_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+
+    async def set_var_async(self, key: str, value: Any) -> None:
+        """Concurrency-safe variable write for use inside ``asyncio.gather``."""
+        async with self._var_lock:
+            self.variables[key] = value
+
+    async def append_record_async(self, target: str, record: dict) -> None:
+        """Concurrency-safe append to probe_records / step_records."""
+        async with self._var_lock:
+            getattr(self, target).append(record)
 
     def set_var(self, key: str, value: Any) -> None:
         self.variables[key] = value

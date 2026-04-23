@@ -163,7 +163,7 @@ ALLOWED_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in ALLOWED_ORIGINS],
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
 
@@ -179,7 +179,7 @@ async def auth_middleware(request: Request, call_next):
         return response
     if any(path.startswith(p) for p in _AUTH_WHITELIST_PREFIXES):
         return await call_next(request)
-    if path.startswith("/ws/"):
+    if path.startswith("/ws/") or path == "/admin/terminal":
         response = await call_next(request)
         response.headers["x-trace-id"] = request.state.trace_id
         return response

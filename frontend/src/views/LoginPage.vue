@@ -59,7 +59,8 @@ async function submit() {
   try {
     const res = await api.authLogin(u, p)
     auth.setAuth(res.token, res.user)
-    router.push('/dashboard')
+    const isAdmin = String(res.user?.role || '') === 'admin'
+    router.push(isAdmin ? '/admin/dashboard' : '/dashboard')
   } catch (e) {
     errorMsg.value = e?.response?.data?.detail || e.message || '登录失败'
   } finally {

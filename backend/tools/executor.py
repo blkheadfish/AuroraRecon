@@ -685,3 +685,51 @@ class ToolExecutor:
     async def stop_task_container(self, task_id: str) -> None:
         """task 结束时调用，清理容器。"""
         await TaskContainerManager.stop(task_id)
+
+
+class CallbackExecutorProxy:
+    """Thin proxy that injects per-task log/record callbacks into every executor call.
+
+    Instead of monkey-patching ``executor.run`` (which mutates a potentially
+    shared object), callers create a short-lived proxy per task invocation.
+    The proxy delegates to the real ``ToolExecutor`` while merging in the
+    callbacks, making concurrent usage safe.
+    """
+
+    def __init__(
+        self,
+        executor: ToolExecutor,
+        log_callback: LogCallback = None,
+        record_callback: RecordCallback = None,
+        record_phase: str = "",
+    ):
+        self._inner = executor
+        self._log_cb = log_callback
+        self._record_cb = record_callback
+        self._record_phase = record_phase
+
+    @property
+    def registry(self) -> ToolRegistry:
+        return self._inner.registry
+
+    async def run(self, *args, **kwargs):
+        if self._log_cb:
+            kwargs.setdefault("log_callback", self._log_cb)
+        if self._record_cb:
+            kwargs.setdefault("record_callback", self._record_cb)
+            kwargs.setdefault("record_phase", self._record_phase)
+        return await self._inner.run(*args, **kwargs)
+
+    async def run_script(self, *args, **kwargs):
+        if self._log_cb:
+            kwargs.setdefault("log_callback", self._log_cb)
+        if self._record_cb:
+            kwargs.setdefault("record_callback", self._record_cb)
+            kwargs.setdefault("record_phase", self._record_phase)
+        return await self._inner.run_script(*args, **kwargs)
+
+    async def start_task_container(self, task_id: str) -> str:
+        return await self._inner.start_task_container(task_id)
+
+    async def stop_task_container(self, task_id: str) -> None:
+        return await self._inner.stop_task_container(task_id)
