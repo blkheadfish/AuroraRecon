@@ -57,11 +57,18 @@ def _build_system_overview(tasks: list[PentestState], sm) -> dict:
     }
 
 
-def _build_tool_overview(sm) -> dict:
+async def _build_tool_overview(sm) -> dict:
     try:
         registry = sm.get_tool_registry()
         by_executor: dict[str, int] = defaultdict(int)
         tools = []
+        disabled_keys: set[str] = set()
+        try:
+            from backend.db.database import list_overrides
+            overrides = await list_overrides("tool")
+            disabled_keys = {o["resource_key"] for o in overrides if not o["enabled"]}
+        except Exception:
+            pass
         for td in registry.list_all():
             by_executor[td.executor] += 1
             tools.append({
@@ -69,6 +76,7 @@ def _build_tool_overview(sm) -> dict:
                 "category": td.category,
                 "executor": td.executor,
                 "timeout": td.timeout,
+                "enabled": td.name not in disabled_keys,
             })
         tools.sort(key=lambda item: (item["category"], item["name"]))
         return {
@@ -202,7 +210,7 @@ async def get_metrics_overview(window_hours: int = 24):
         "generated_at": now.isoformat(),
         "window_hours": bounded_window,
         "system_overview": _build_system_overview(all_tasks, sm),
-        "tool_overview": _build_tool_overview(sm),
+        "tool_overview": await _build_tool_overview(sm),
         "tool_invocation_overview": _build_tool_invocation_overview(scoped_tasks),
         "guard_overview": _build_guard_overview(scoped_tasks),
     }

@@ -22,7 +22,18 @@ async def list_skills():
     try:
         from backend.skills.registry import get_registry
         registry = get_registry()
-        return {"skills": registry.list_all(), "total": registry.size}
+        skills = registry.list_all()
+        try:
+            from backend.db.database import list_overrides
+            overrides = await list_overrides("skill")
+            disabled_keys = {o["resource_key"] for o in overrides if not o["enabled"]}
+            for s in skills:
+                sid = s.get("skill_id") or s.get("id", "")
+                s["enabled"] = sid not in disabled_keys
+        except Exception:
+            for s in skills:
+                s["enabled"] = True
+        return {"skills": skills, "total": registry.size}
     except Exception as e:
         return {"skills": [], "total": 0, "error": str(e)}
 

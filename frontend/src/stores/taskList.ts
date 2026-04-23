@@ -27,6 +27,7 @@ export const useTaskListStore = defineStore('taskList', () => {
     running: tasks.value.filter((task) => task.status === 'running' || task.status === 'pending').length,
     completed: tasks.value.filter((task) => task.status === 'completed').length,
     failed: tasks.value.filter((task) => task.status === 'failed').length,
+    cancelled: tasks.value.filter((task) => task.status === 'cancelled').length,
   }))
 
   async function fetchTasks() {
@@ -74,6 +75,12 @@ export const useTaskListStore = defineStore('taskList', () => {
     return tasks.value.find((task) => task.task_id === taskId) || null
   }
 
+  async function cancelTask(taskId: string) {
+    await api.cancelTask(taskId)
+    const idx = tasks.value.findIndex((t) => t.task_id === taskId)
+    if (idx >= 0) tasks.value[idx] = { ...tasks.value[idx], status: 'cancelled' }
+  }
+
   return {
     tasks,
     loading,
@@ -83,5 +90,6 @@ export const useTaskListStore = defineStore('taskList', () => {
     upsertTask,
     removeTask,
     getTaskById,
+    cancelTask,
   }
 })

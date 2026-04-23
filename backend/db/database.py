@@ -150,6 +150,16 @@ class AuditLogRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 
+class AdminOverrideRecord(Base):
+    __tablename__ = "admin_overrides"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    resource_type: Mapped[str] = mapped_column(String(16), index=True)
+    resource_key: Mapped[str] = mapped_column(String(128))
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    detail_json: Mapped[str] = mapped_column(Text, default="{}")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 # ── 数据库操作 ────────────────────────────────────────────
 
 async def init_db():
@@ -162,6 +172,7 @@ async def init_db():
         ("tasks", "owner_id", "ALTER TABLE tasks ADD COLUMN owner_id VARCHAR(36) DEFAULT '' NOT NULL"),
         ("tasks", "tenant_id", "ALTER TABLE tasks ADD COLUMN tenant_id VARCHAR(64) DEFAULT 'default' NOT NULL"),
         ("users", "role", "ALTER TABLE users ADD COLUMN role VARCHAR(16) DEFAULT 'user' NOT NULL"),
+        ("admin_overrides", "detail_json", "ALTER TABLE admin_overrides ADD COLUMN detail_json TEXT DEFAULT '{}'"),
     ]
     async with engine.begin() as conn:
         for table, column, ddl in migrations:
@@ -507,6 +518,115 @@ async def append_audit_log(
             )
         )
         await session.commit()
+
+
+async def list_audit_logs(
+    *,
+    page: int = 1,
+    page_size: int = 50,
+    action: str | None = None,
+    owner_id: str | None = None,
+) -> tuple[list[dict], int]:
+    bounded_page = max(1, page)
+    bounded_size = max(1, min(page_size, 200))
+    offset = (bounded_page - 1) * bounded_size
+
+    where_clauses: list[str] = []
+    params: dict = {}
+    if action:
+        where_clauses.append("action = :action")
+        params["action"] = action
+    if owner_id:
+        where_clauses.append("owner_id = :owner_id")
+        params["owner_id"] = owner_id
+
+    where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+    async with async_session() as session:
+        count_result = await session.execute(
+            text(f"SELECT COUNT(*) AS c FROM audit_logs{where_sql}"), params
+        )
+        total = int(count_result.scalar() or 0)
+
+        rows_result = await session.execute(
+            text(
+                f"SELECT id, owner_id, tenant_id, action, resource_type, resource_key, "
+                f"detail_json, created_at FROM audit_logs{where_sql} "
+                f"ORDER BY created_at DESC LIMIT :limit OFFSET :offset"
+            ),
+            {**params, "limit": bounded_size, "offset": offset},
+        )
+        items = []
+        for row in rows_result.fetchall():
+            detail = {}
+            try:
+                detail = json.loads(row.detail_json or "{}")
+            except Exception:
+                pass
+            items.append({
+                "id": row.id,
+                "owner_id": row.owner_id,
+                "tenant_id": row.tenant_id,
+                "action": row.action,
+                "resource_type": row.resource_type,
+                "resource_key": row.resource_key,
+                "detail": detail,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+            })
+        return items, total
+
+
+# ── Admin Override 操作 ───────────────────────────────────
+
+async def get_override(resource_type: str, resource_key: str) -> AdminOverrideRecord | None:
+    rid = f"{resource_type}:{resource_key}"[:64]
+    async with async_session() as session:
+        return await session.get(AdminOverrideRecord, rid)
+
+
+async def set_override(resource_type: str, resource_key: str, enabled: bool) -> AdminOverrideRecord:
+    rid = f"{resource_type}:{resource_key}"[:64]
+    async with async_session() as session:
+        record = await session.get(AdminOverrideRecord, rid)
+        if record:
+            record.enabled = enabled
+            record.updated_at = datetime.utcnow()
+        else:
+            record = AdminOverrideRecord(
+                id=rid,
+                resource_type=resource_type,
+                resource_key=resource_key,
+                enabled=enabled,
+            )
+            session.add(record)
+        await session.commit()
+        await session.refresh(record)
+        return record
+
+
+async def list_overrides(resource_type: str | None = None) -> list[dict]:
+    async with async_session() as session:
+        if resource_type:
+            result = await session.execute(
+                text("SELECT id, resource_type, resource_key, enabled, updated_at "
+                     "FROM admin_overrides WHERE resource_type = :rt ORDER BY resource_key"),
+                {"rt": resource_type},
+            )
+        else:
+            result = await session.execute(
+                text("SELECT id, resource_type, resource_key, enabled, updated_at "
+                     "FROM admin_overrides ORDER BY resource_type, resource_key")
+            )
+        return [
+            {
+                "id": row.id,
+                "resource_type": row.resource_type,
+                "resource_key": row.resource_key,
+                "enabled": row.enabled,
+                "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+            }
+            for row in result.fetchall()
+        ]
 
 
 # ── 用户操作 ──────────────────────────────────────────────

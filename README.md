@@ -1,41 +1,11 @@
-# AuroraRecon (PentestAI v2)
+# AuroraRecon
 
-面向 **CTF/授权靶场/授权红蓝对抗** 的 AI 渗透测试工作台。  
+基于大模型的自动化渗透测试系统
 项目核心是基于 LangGraph 的攻链编排，配合 Docker 工具沙箱、Skill 引擎、知识库检索与人工审批，实现从侦察到报告的闭环。
 
 ## 1) 架构总览
 ![img.png](img.png)
-```text
-Vue 3 Frontend
-  ├─ 任务中心 / 决策视图 / 报告中心 / 工具管理 / Skill管理 / 知识库管理
-  └─ WebSocket 实时事件流（日志、命令执行、审批状态）
-             │
-             ▼
-FastAPI API Gateway
-  ├─ 任务与审批 API
-  ├─ Metrics API
-  ├─ Skill/Knowledge/Profile/Settings API
-  └─ Chat API（用户与任务代理对话）
-             │
-             ▼
-LangGraph Orchestrator
-  recon → vuln_scan → surface_enum → exploit_decision
-      → awaiting_approval → foothold_attempt → secondary_attack
-      → post_foothold_enum → privesc_attempt → objective_collect → report
-             │
-             ▼
-Tool Executor + Registry
-  ├─ container-exec（任务持久容器）
-  ├─ container-run（临时容器）
-  └─ remote（阶段二预留）
-             │
-             ▼
-Toolbox / MSF / LLM / Storage
-  ├─ pentest-toolbox (Kali tools)
-  ├─ Metasploit RPC
-  ├─ DeepSeek/OpenAI/Anthropic
-  └─ PostgreSQL + Redis + MinIO
-```
+
 
 ## 2) 核心特性
 

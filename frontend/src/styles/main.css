@@ -500,3 +500,28 @@ html, body, #app {
 #app .el-popconfirm {
     background: var(--bg-surface);
 }
+
+/* ── Admin Console Shell Overrides ─────────────── */
+.admin-shell .el-menu-item.is-active {
+    color: var(--accent-red);
+}
+.admin-shell .el-tabs__active-bar {
+    background: var(--accent-red);
+}
+.admin-shell .el-tabs__item.is-active {
+    color: var(--accent-red);
+}
+.admin-shell .el-button--primary {
+    background: color-mix(in srgb, var(--accent-red) 88%, var(--bg-surface));
+    border-color: color-mix(in srgb, var(--accent-red) 94%, var(--bg-surface));
+}
+.admin-shell .el-button--primary:hover {
+    background: color-mix(in srgb, var(--accent-red) 97%, var(--bg-surface));
+    border-color: color-mix(in srgb, var(--accent-red) 100%, var(--bg-surface));
+}
+.admin-shell .el-switch {
+    --el-switch-on-color: var(--accent-green);
+}
+.admin-shell .el-pagination .is-active {
+    color: var(--accent-red) !important;
+}

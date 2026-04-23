@@ -202,6 +202,7 @@ async def auth_middleware(request: Request, call_next):
 # ── 挂载路由 ──────────────────────────────────────────────
 from backend.api.routers import (
     health, tasks, ws, auth, settings, skills, knowledge, team, prompts, admin,
+    admin_terminal,
 )
 
 app.include_router(health.router)
@@ -214,3 +215,4 @@ app.include_router(knowledge.router)
 app.include_router(prompts.router)
 app.include_router(team.router)
 app.include_router(admin.router)
+app.include_router(admin_terminal.router)

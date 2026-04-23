@@ -49,9 +49,9 @@
           <el-icon><ChatDotRound /></el-icon>
           <template #title><span>Prompt管理</span></template>
         </el-menu-item>
-        <el-menu-item v-if="isAdmin" index="/admin">
+        <el-menu-item v-if="isAdmin" index="/admin/dashboard">
           <el-icon><Lock /></el-icon>
-          <template #title><span>管理员面板</span></template>
+          <template #title><span>管理控制台</span></template>
         </el-menu-item>
       </el-menu>
 
@@ -169,7 +169,7 @@ function handleUserCommand(command) {
     return
   }
   if (command === 'admin') {
-    router.push('/admin')
+    router.push('/admin/dashboard')
     return
   }
   if (command === 'logout') {
@@ -192,11 +192,13 @@ watch(() => route.path, () => {
 })
 
 const hideSidebar = computed(() =>
-  ['/start', '/login', '/register'].includes(route.path)
+  ['/start', '/login', '/register'].includes(route.path) ||
+  route.matched.some(r => r.meta?.adminShell)
 )
 const activeMenu = computed(() => {
   if (route.path.startsWith('/tasks/')) return '/tasks'
   if (route.path.startsWith('/reports/')) return '/tasks'
+  if (route.path.startsWith('/admin')) return '/admin/dashboard'
   return route.path === '/' ? '/dashboard' : route.path
 })
 

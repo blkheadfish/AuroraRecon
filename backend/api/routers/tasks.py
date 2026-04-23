@@ -165,15 +165,24 @@ async def get_stats():
 
 
 @router.get("/tasks", response_model=list[TaskSummary])
-async def list_tasks(request: Request):
-    """仅返回当前登录用户自己创建的任务。"""
+async def list_tasks(request: Request, all: bool = False):
+    """返回任务列表。admin 传 ?all=true 可获取全部用户的任务。"""
     sm = _get_sm()
     owner_id = getattr(request.state, "user_id", "") or ""
+
+    is_admin_all = False
+    if all and owner_id:
+        from backend.api.deps import get_current_user_role
+        role = await get_current_user_role(owner_id)
+        if role == "admin":
+            is_admin_all = True
+
+    effective_owner = None if is_admin_all else (owner_id or None)
 
     if sm.db_available:
         try:
             from backend.db.database import list_tasks_from_db
-            db_list = await list_tasks_from_db(owner_id=owner_id or None)
+            db_list = await list_tasks_from_db(owner_id=effective_owner)
             result = []
             seen = set()
             for t in db_list:
@@ -181,25 +190,29 @@ async def list_tasks(request: Request):
                 seen.add(tid)
                 state = sm.get(tid)
                 if state:
-                    result.append(sm.to_summary(state))
+                    summary = sm.to_summary(state)
+                    summary["owner_id"] = state.owner_id or ""
+                    result.append(summary)
                 else:
-                    # DB 行缺少 workflow_mode/auto_approve,用 TaskSummary 默认值补齐
-                    result.append(TaskSummary(**t).model_dump())
-            # 兜底:内存中有但 DB 还没落盘的任务(限定 owner)
+                    summary = TaskSummary(**t).model_dump()
+                    summary["owner_id"] = t.get("owner_id", "")
+                    result.append(summary)
             for tid, state in sm.items():
                 if tid in seen:
                     continue
-                if owner_id and (state.owner_id or "") != owner_id:
+                if effective_owner and (state.owner_id or "") != effective_owner:
                     continue
-                result.append(sm.to_summary(state))
+                summary = sm.to_summary(state)
+                summary["owner_id"] = state.owner_id or ""
+                result.append(summary)
             return result
         except Exception as e:
             logger.warning(f"[DB] 查询失败: {e}")
 
-    # 无 DB 时按 owner 过滤内存任务
     return [
-        sm.to_summary(s) for s in sm.all_states()
-        if not owner_id or (s.owner_id or "") == owner_id
+        {**sm.to_summary(s), "owner_id": s.owner_id or ""}
+        for s in sm.all_states()
+        if not effective_owner or (s.owner_id or "") == effective_owner
     ]
 
 

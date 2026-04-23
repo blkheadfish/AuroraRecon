@@ -58,3 +58,8 @@ pytest-asyncio==0.24.0
 pytest-mock==3.14.0
 httpx                            # TestClient 依赖（已在上方列出）
 minio==7.2.8                     # MinIO 对象存储
+
+# ----- 系统资源监控 & 管理员终端 -----
+psutil==6.0.0                    # 宿主机 CPU/内存/磁盘采集（GET /admin/system-metrics）
+docker==7.1.0                    # Docker 容器资源 & 生命周期控制（Admin Dashboard + /admin/docker/*）
+asyncssh==2.17.0                 # 管理员 SSH WebSocket 代理（/admin/terminal）

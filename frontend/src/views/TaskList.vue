@@ -12,23 +12,27 @@
     </div>
 
     <div class="stats-bar">
-      <div class="stat-item">
+      <div class="stat-item" :class="{ active: !filterStatus }" @click="filterStatus = ''">
         <span class="stat-num">{{ listStore.stats.total }}</span>
         <span class="stat-label">全部任务</span>
       </div>
-      <div class="stat-item">
+      <div class="stat-item" :class="{ active: filterStatus === 'running' }" @click="filterStatus = filterStatus === 'running' ? '' : 'running'">
         <span class="stat-num running">{{ listStore.stats.running }}</span>
         <span class="stat-label">运行中</span>
       </div>
-      <div class="stat-item">
+      <div class="stat-item" :class="{ active: filterStatus === 'completed' }" @click="filterStatus = filterStatus === 'completed' ? '' : 'completed'">
         <span class="stat-num completed">{{ listStore.stats.completed }}</span>
         <span class="stat-label">已完成</span>
       </div>
-      <div class="stat-item">
+      <div class="stat-item" :class="{ active: filterStatus === 'failed' }" @click="filterStatus = filterStatus === 'failed' ? '' : 'failed'">
         <span class="stat-num failed">{{ listStore.stats.failed }}</span>
         <span class="stat-label">失败</span>
       </div>
-      <div class="stat-item">
+      <div class="stat-item" :class="{ active: filterStatus === 'cancelled' }" @click="filterStatus = filterStatus === 'cancelled' ? '' : 'cancelled'">
+        <span class="stat-num cancelled">{{ listStore.stats.cancelled }}</span>
+        <span class="stat-label">已取消</span>
+      </div>
+      <div class="stat-item" @click="filterPhase = filterPhase === 'awaiting_approval' ? '' : 'awaiting_approval'">
         <span class="stat-num warn">{{ awaitingApprovalCount }}</span>
         <span class="stat-label">待审批</span>
       </div>
@@ -47,6 +51,7 @@
           <el-option label="运行中" value="running" />
           <el-option label="已完成" value="completed" />
           <el-option label="失败" value="failed" />
+          <el-option label="已取消" value="cancelled" />
           <el-option label="待处理" value="pending" />
         </el-select>
         <el-select v-model="filterPhase" placeholder="阶段筛选" clearable style="width: 160px">
@@ -118,7 +123,7 @@
             <span v-else class="text-muted">-</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="220" align="center">
+        <el-table-column label="操作" width="280" align="center">
           <template #default="{ row }">
             <div class="actions" @click.stop>
               <el-button class="action-detail" size="small" type="primary" @click="goDetail(row.task_id)">详情</el-button>
@@ -130,6 +135,13 @@
                 type="success"
                 @click="goReport(row.task_id)"
               >报告</el-button>
+              <el-button
+                v-if="row.status === 'running' || row.status === 'pending'"
+                size="small"
+                type="warning"
+                plain
+                @click="handleCancel(row)"
+              >取消</el-button>
               <el-popconfirm title="确认删除该任务？" @confirm="handleDelete(row)">
                 <template #reference>
                   <el-button class="action-delete" size="small" type="danger">删除</el-button>
@@ -427,6 +439,23 @@ async function handleCreate() {
   }
 }
 
+async function handleCancel(row) {
+  try {
+    await ElMessageBox.confirm(
+      `确定取消任务 ${row.target}？运行中的进程将被终止。`,
+      '取消任务',
+      { type: 'warning', confirmButtonText: '确认取消' },
+    )
+  } catch { return }
+  try {
+    await listStore.cancelTask(row.task_id)
+    trackEvent('task.cancel', { taskId: row.task_id })
+    ElMessage.success('任务已取消')
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || e.message || '取消失败')
+  }
+}
+
 function handleDelete(row) {
   listStore.removeTask(row.task_id)
   trackEvent('task.delete', { taskId: row.task_id })
@@ -468,12 +497,15 @@ onMounted(() => {
 .page-title { font-size: 22px; color: var(--text-primary); font-weight: 700; }
 .page-sub { margin-top: 4px; color: var(--text-secondary); font-size: 13px; }
 
-.stats-bar { display: flex; gap: 22px; margin-bottom: 14px; padding: 14px 18px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--bg-surface); }
-.stat-item { display: flex; flex-direction: column; gap: 2px; }
+.stats-bar { display: flex; gap: 12px; margin-bottom: 14px; padding: 14px 18px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--bg-surface); }
+.stat-item { display: flex; flex-direction: column; gap: 2px; padding: 6px 14px; border-radius: var(--radius-md); cursor: pointer; transition: background 0.15s; min-width: 70px; }
+.stat-item:hover { background: var(--bg-hover); }
+.stat-item.active { background: color-mix(in srgb, var(--accent-blue) 10%, transparent); }
 .stat-num { font-family: var(--font-mono); font-size: 22px; color: var(--text-primary); font-weight: 700; }
 .stat-num.running { color: var(--accent-blue); }
 .stat-num.completed { color: var(--accent-green); }
 .stat-num.failed { color: var(--accent-red); }
+.stat-num.cancelled { color: var(--status-cancelled, #8b8fa3); }
 .stat-num.warn { color: var(--accent-yellow); }
 .stat-label { font-size: 12px; color: var(--text-muted); }
 

@@ -133,6 +133,7 @@ export const api = {
       paths_count: number
       probes_count: number
       source: string
+      enabled?: boolean
     }>
     total: number
   }> => http.get('/skills'),
@@ -262,6 +263,95 @@ export const api = {
     embedding: { enabled: boolean; model: string; base_url: string; has_key: boolean }
     note: string
   }> => http.get('/admin/llm-runtime'),
+
+  adminListAuditLogs: (params?: {
+    page?: number
+    page_size?: number
+    action?: string
+    owner_id?: string
+  }): Promise<{
+    items: Array<{
+      id: string
+      owner_id: string
+      tenant_id: string
+      action: string
+      resource_type: string
+      resource_key: string
+      detail: Record<string, unknown>
+      created_at: string
+    }>
+    total: number
+    page: number
+    page_size: number
+  }> => http.get('/admin/audit-logs', { params }),
+
+  adminSetSkillEnabled: (
+    skillId: string,
+    enabled: boolean,
+  ): Promise<{ status: string; resource_type: string; resource_key: string; enabled: boolean }> =>
+    http.patch(`/admin/skills/${skillId}/enabled`, { enabled }),
+
+  adminSetToolEnabled: (
+    toolName: string,
+    enabled: boolean,
+  ): Promise<{ status: string; resource_type: string; resource_key: string; enabled: boolean }> =>
+    http.patch(`/admin/tools/${toolName}/enabled`, { enabled }),
+
+  adminListOverrides: (resourceType?: string): Promise<{
+    items: Array<{ id: string; resource_type: string; resource_key: string; enabled: boolean; detail_json?: string; updated_at: string }>
+    total: number
+  }> => http.get('/admin/overrides', { params: resourceType ? { resource_type: resourceType } : {} }),
+
+  adminListTasks: (): Promise<Array<TaskSummary & { owner_id?: string }>> =>
+    http.get('/tasks', { params: { all: true } }),
+
+  adminGetSystemMetrics: (): Promise<{
+    host: {
+      cpu_percent: number
+      cpu_count: number
+      memory: { total_gb: number; used_gb: number; percent: number }
+      disk: Array<{ mountpoint: string; total_gb: number; used_gb: number; percent: number }>
+      uptime_seconds: number
+      error?: string
+    }
+    docker: {
+      containers: Array<{
+        name: string
+        status: string
+        image?: string
+        cpu_percent: number
+        memory_mb: number
+        memory_limit_mb: number
+      }>
+      total_running: number
+      total_stopped: number
+      error?: string
+    }
+  }> => http.get('/admin/system-metrics'),
+
+  adminSetToolTimeout: (
+    toolName: string,
+    timeout: number,
+  ): Promise<{ status: string; tool: string; timeout: number }> =>
+    http.patch(`/admin/tools/${toolName}/timeout`, { timeout }),
+
+  adminDockerAction: (
+    containerName: string,
+    action: 'restart' | 'stop' | 'start',
+  ): Promise<{ status: string; container: string; action: string }> =>
+    http.post(`/admin/docker/${containerName}/${action}`),
+
+  adminSaveKnowledgeRawGlobal: (
+    vulnId: string,
+    jsonContent: string,
+  ): Promise<{ status: string; vuln_id: string; source: string; scope: string }> =>
+    http.put(`/admin/knowledge/${vulnId}/raw`, { json_content: jsonContent }),
+
+  buildAdminTerminalWsUrl: (): string => {
+    const base = getWsBase()
+    const token = localStorage.getItem(TOKEN_KEY) ?? ''
+    return `${base}/admin/terminal${token ? `?token=${encodeURIComponent(token)}` : ''}`
+  },
 }
 
 export interface WsConnection {

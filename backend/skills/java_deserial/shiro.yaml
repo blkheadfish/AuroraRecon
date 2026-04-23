@@ -1,11 +1,3 @@
-# ═══════════════════════════════════════════════════════════
-# Apache Shiro RememberMe 反序列化 RCE (CVE-2016-4437) v5
-#
-# v5 改进:
-#   - Dockerfile 添加 pycryptodome（修复 AES 加密失败的根因）
-#   - SkillEngine 传递 task_id（命令在持久容器中执行）
-#   - 新增 NAT 路径: 无回调环境下通过写 webshell 验证 RCE
-# ═══════════════════════════════════════════════════════════
 skill_id: shiro_rce
 name: "Apache Shiro RememberMe 反序列化 RCE"
 category: java_deserialization
@@ -98,7 +90,7 @@ probes:
         set: { lhost_available: false }
 
 exploit_paths:
-  # ═══ 路径 A: 回调检测爆破（需要 LHOST）═══
+  # 路径 A: 回调检测爆破
   - path_id: shiro_callback
     name: "shiro_exploit.py 回调检测"
     priority: 1

@@ -23,9 +23,22 @@ const routes: RouteRecordRaw[] = [
   { path: '/settings', name: 'settings', component: () => import('@/views/Settings.vue') },
   {
     path: '/admin',
-    name: 'admin',
-    component: () => import('@/views/AdminPanel.vue'),
-    meta: { requiresAdmin: true },
+    component: () => import('@/layouts/AdminLayout.vue'),
+    meta: { requiresAdmin: true, adminShell: true },
+    redirect: '/admin/dashboard',
+    children: [
+      { path: 'dashboard', name: 'admin-dashboard', component: () => import('@/views/admin/AdminDashboard.vue') },
+      { path: 'tasks', name: 'admin-tasks', component: () => import('@/views/admin/AdminTasks.vue') },
+      { path: 'tasks/:id', name: 'admin-task-detail', component: () => import('@/views/TaskDetail.vue') },
+      { path: 'tools', name: 'admin-tools', component: () => import('@/views/admin/AdminTools.vue') },
+      { path: 'skills', name: 'admin-skills', component: () => import('@/views/admin/AdminSkills.vue') },
+      { path: 'knowledge', name: 'admin-knowledge', component: () => import('@/views/admin/AdminKnowledge.vue') },
+      { path: 'prompts', name: 'admin-prompts', component: () => import('@/views/PromptManage.vue') },
+      { path: 'users', name: 'admin-users', component: () => import('@/views/admin/AdminUsers.vue') },
+      { path: 'settings', name: 'admin-settings', component: () => import('@/views/admin/AdminSettings.vue') },
+      { path: 'audit', name: 'admin-audit', component: () => import('@/views/admin/AdminAudit.vue') },
+      { path: 'terminal', name: 'admin-terminal', component: () => import('@/views/admin/AdminTerminal.vue') },
+    ],
   },
   { path: '/:pathMatch(.*)*', name: 'not-found', redirect: '/dashboard' },
 ]
@@ -51,7 +64,8 @@ router.beforeEach((to) => {
   if (!token && !PUBLIC_ROUTES.has(String(to.name ?? ''))) {
     return { name: 'login' }
   }
-  if (to.meta?.requiresAdmin && currentRole() !== 'admin') {
+  const needsAdmin = to.matched.some(r => r.meta?.requiresAdmin)
+  if (needsAdmin && currentRole() !== 'admin') {
     return { name: 'dashboard' }
   }
 })
