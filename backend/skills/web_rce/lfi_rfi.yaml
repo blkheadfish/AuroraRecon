@@ -1,6 +1,7 @@
 skill_id: lfi_rfi_exploit
 name: "本地/远程文件包含 (LFI/RFI)"
 category: web_rce
+phase: foothold
 version: "4.0"
 
 principle: |
@@ -997,7 +998,7 @@ exploit_paths:
 
   - path_id: lfi_cred_reuse
     name: "LFI 偷取凭据复用 (SSH 密钥登录 / shadow 破解)"
-    priority: 3
+    priority: 4
     conditions:
       lfi_confirmed: true
     steps:

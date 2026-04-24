@@ -1,6 +1,7 @@
 skill_id: smb_enum_exploit
 name: "SMB Enumeration and Exploitation"
 category: server_misconfig
+phase: foothold
 version: "1.0"
 
 principle: |

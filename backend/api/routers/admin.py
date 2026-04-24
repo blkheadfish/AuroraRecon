@@ -308,15 +308,12 @@ def _docker_client():
     return _docker.from_env(timeout=5)
 
 
-@router.get("/system-metrics")
-async def get_system_metrics(_admin=Depends(require_admin)):
+def _collect_host_metrics() -> dict:
+    """Blocking: collect host CPU/memory/disk via psutil.  Runs in a thread."""
     host_info: dict = {"source": "container", "error": ""}
     try:
-        import os
         import psutil
 
-        # If HOST_PROC / HOST_SYS are mounted (see docker-compose.yml) psutil will
-        # report the *host* values, not just what's visible to this container.
         host_proc = os.environ.get("HOST_PROC")
         host_sys = os.environ.get("HOST_SYS")
         if host_proc:
@@ -330,7 +327,7 @@ async def get_system_metrics(_admin=Depends(require_admin)):
 
         mem = psutil.virtual_memory()
         host_info.update({
-            "cpu_percent": psutil.cpu_percent(interval=0.5),
+            "cpu_percent": psutil.cpu_percent(interval=0.3),
             "cpu_count": psutil.cpu_count(),
             "memory": {
                 "total_gb": round(mem.total / (1024**3), 2),
@@ -341,13 +338,14 @@ async def get_system_metrics(_admin=Depends(require_admin)):
             "uptime_seconds": int(time.time() - psutil.boot_time()),
         })
 
-        # Prefer /host/rootfs when available (mounted read-only by compose).
         host_rootfs = os.environ.get("HOST_ROOTFS")
         disk_mounts: list[str] = []
         if host_rootfs and os.path.isdir(host_rootfs):
             disk_mounts.append(host_rootfs)
         try:
             for part in psutil.disk_partitions(all=False):
+                if part.fstype in ("nfs", "nfs4", "cifs", "smbfs", "fuse.sshfs"):
+                    continue
                 if part.mountpoint not in disk_mounts:
                     disk_mounts.append(part.mountpoint)
         except Exception:
@@ -366,8 +364,14 @@ async def get_system_metrics(_admin=Depends(require_admin)):
                 pass
     except ImportError:
         host_info["error"] = "psutil not installed"
-    except Exception as exc:  # pragma: no cover - defensive
+    except Exception as exc:
         host_info["error"] = f"psutil error: {exc}"
+    return host_info
+
+
+def _collect_docker_metrics() -> dict:
+    """Blocking: list containers + parallel stats.  Runs in a thread."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     docker_info: dict = {
         "containers": [],
@@ -377,40 +381,119 @@ async def get_system_metrics(_admin=Depends(require_admin)):
     }
     try:
         client = _docker_client()
-        for c in client.containers.list(all=True):
+        containers = client.containers.list(all=True)
+
+        def _stat_one(c):
             info = {
                 "name": c.name,
                 "status": c.status,
                 "image": str(c.image.tags[0]) if c.image.tags else str(c.image.short_id),
                 "is_core": _is_core_container(c.name),
+                "cpu_percent": 0.0,
+                "memory_mb": 0,
+                "memory_limit_mb": 0,
             }
             if c.status == "running":
-                docker_info["total_running"] += 1
                 try:
                     stats = c.stats(stream=False)
-                    cpu_delta = stats["cpu_stats"]["cpu_usage"]["total_usage"] - stats["precpu_stats"]["cpu_usage"]["total_usage"]
-                    sys_delta = stats["cpu_stats"]["system_cpu_usage"] - stats["precpu_stats"]["system_cpu_usage"]
+                    cpu_delta = (
+                        stats["cpu_stats"]["cpu_usage"]["total_usage"]
+                        - stats["precpu_stats"]["cpu_usage"]["total_usage"]
+                    )
+                    sys_delta = (
+                        stats["cpu_stats"]["system_cpu_usage"]
+                        - stats["precpu_stats"]["system_cpu_usage"]
+                    )
                     cpu_count = stats["cpu_stats"].get("online_cpus", 1)
                     info["cpu_percent"] = round((cpu_delta / sys_delta) * cpu_count * 100.0, 2) if sys_delta > 0 else 0.0
-                    mem_usage = stats["memory_stats"].get("usage", 0)
-                    mem_limit = stats["memory_stats"].get("limit", 0)
-                    info["memory_mb"] = round(mem_usage / (1024**2), 1)
-                    info["memory_limit_mb"] = round(mem_limit / (1024**2), 1)
+                    info["memory_mb"] = round(stats["memory_stats"].get("usage", 0) / (1024**2), 1)
+                    info["memory_limit_mb"] = round(stats["memory_stats"].get("limit", 0) / (1024**2), 1)
                 except Exception:
-                    info["cpu_percent"] = 0.0
-                    info["memory_mb"] = 0
-                    info["memory_limit_mb"] = 0
-            else:
-                docker_info["total_stopped"] += 1
-                info["cpu_percent"] = 0.0
-                info["memory_mb"] = 0
-                info["memory_limit_mb"] = 0
-            docker_info["containers"].append(info)
+                    pass
+            return info
+
+        pool = ThreadPoolExecutor(max_workers=6)
+        try:
+            futures = {pool.submit(_stat_one, c): c for c in containers}
+            done_iter = as_completed(futures, timeout=8)
+            for fut in done_iter:
+                try:
+                    info = fut.result(timeout=0.1)
+                    docker_info["containers"].append(info)
+                    if info["status"] == "running":
+                        docker_info["total_running"] += 1
+                    else:
+                        docker_info["total_stopped"] += 1
+                except Exception:
+                    c = futures[fut]
+                    docker_info["containers"].append({
+                        "name": getattr(c, "name", "?"),
+                        "status": getattr(c, "status", "unknown"),
+                        "image": "?",
+                        "is_core": False,
+                        "cpu_percent": 0.0,
+                        "memory_mb": 0,
+                        "memory_limit_mb": 0,
+                    })
+        except Exception as inner_exc:
+            docker_info["warning"] = f"部分容器 stats 采集超时（{type(inner_exc).__name__}），已跳过"
+            for fut in futures:
+                if not fut.done():
+                    c = futures[fut]
+                    docker_info["containers"].append({
+                        "name": getattr(c, "name", "?"),
+                        "status": getattr(c, "status", "unknown"),
+                        "image": "?",
+                        "is_core": _is_core_container(getattr(c, "name", "")),
+                        "cpu_percent": 0.0,
+                        "memory_mb": 0,
+                        "memory_limit_mb": 0,
+                    })
+                    if getattr(c, "status", "") == "running":
+                        docker_info["total_running"] += 1
+                    else:
+                        docker_info["total_stopped"] += 1
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+
     except ImportError:
         docker_info["error"] = "docker SDK 未安装"
     except Exception as exc:
-        # Typical causes: /var/run/docker.sock not mounted, or daemon down.
         docker_info["error"] = f"{type(exc).__name__}: {exc}"
+    return docker_info
+
+
+@router.get("/system-metrics")
+async def get_system_metrics(_admin=Depends(require_admin)):
+    host_coro = asyncio.to_thread(_collect_host_metrics)
+    docker_coro = asyncio.to_thread(_collect_docker_metrics)
+
+    host_task = asyncio.ensure_future(host_coro)
+    docker_task = asyncio.ensure_future(docker_coro)
+
+    await asyncio.sleep(0)
+
+    done, pending = await asyncio.wait(
+        [host_task, docker_task], timeout=10, return_when=asyncio.ALL_COMPLETED,
+    )
+
+    if host_task in done:
+        try:
+            host_info = host_task.result()
+        except Exception as exc:
+            host_info = {"source": "container", "error": f"{type(exc).__name__}: {exc}", "cpu_percent": 0, "cpu_count": 0, "memory": {}, "disk": []}
+    else:
+        host_task.cancel()
+        host_info = {"source": "container", "error": "宿主机指标采集超时（>10s），可能存在无响应的网络挂载", "cpu_percent": 0, "cpu_count": 0, "memory": {}, "disk": []}
+
+    if docker_task in done:
+        try:
+            docker_info = docker_task.result()
+        except Exception as exc:
+            docker_info = {"containers": [], "total_running": 0, "total_stopped": 0, "error": f"{type(exc).__name__}: {exc}"}
+    else:
+        docker_task.cancel()
+        docker_info = {"containers": [], "total_running": 0, "total_stopped": 0, "error": "Docker 采集超时（>10s），daemon 响应缓慢或容器过多"}
 
     return {"host": host_info, "docker": docker_info}
 

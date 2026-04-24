@@ -8,6 +8,7 @@
 skill_id: thinkphp_rce
 name: "ThinkPHP 远程命令执行"
 category: web_rce
+phase: foothold
 version: "1.0"
 
 principle: |

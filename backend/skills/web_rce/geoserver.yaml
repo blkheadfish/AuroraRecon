@@ -8,6 +8,7 @@
 skill_id: geoserver_rce
 name: "GeoServer 属性名表达式 RCE (CVE-2024-36401)"
 category: web_rce
+phase: foothold
 version: "1.0"
 
 principle: |

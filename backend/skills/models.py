@@ -400,6 +400,7 @@ class Skill:
     skill_id: str
     name: str
     category: str = ""
+    phase: str = "foothold"   # foothold | post_foothold | privesc | recon
     version: str = "1.0"
     principle: str = ""   # 漏洞原理（给 LLM 兜底时参考）
 

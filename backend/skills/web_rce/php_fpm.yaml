@@ -11,6 +11,7 @@
 skill_id: php_fpm_rce
 name: "PHP-FPM Nginx 缓冲区溢出 RCE (CVE-2019-11043)"
 category: web_rce
+phase: foothold
 version: "3.0"
 
 principle: |

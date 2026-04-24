@@ -78,6 +78,7 @@ def apply_mode_defaults(
 class TaskStatus(str, Enum):
 	PENDING = "pending"
 	RUNNING = "running"
+	AWAITING_APPROVAL = "awaiting_approval"
 	COMPLETED = "completed"
 	FAILED = "failed"
 
@@ -384,6 +385,8 @@ class PentestState(BaseModel):
 
 	# 人工审批标志（由 resume() 注入，默认 False）
 	approved: bool = False
+	# 后渗透阶段独立审批标志，与 approved 互不干扰
+	post_approved: bool = False
 
 	# 用户-代理对话（决策视图交互式对话）
 	user_messages: list[dict] = Field(default_factory=list)

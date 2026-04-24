@@ -9,6 +9,7 @@
 skill_id: nginx_misconfig
 name: "Nginx 配置漏洞利用"
 category: server_misconfig
+phase: foothold
 version: "1.0"
 
 principle: |

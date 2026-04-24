@@ -8,6 +8,7 @@
 skill_id: struts2_ognl_rce
 name: "Struts2 OGNL 表达式注入 RCE"
 category: web_rce
+phase: foothold
 version: "1.0"
 
 principle: |

@@ -327,7 +327,7 @@ export const api = {
       total_stopped: number
       error?: string
     }
-  }> => http.get('/admin/system-metrics'),
+  }> => http.get('/admin/system-metrics', { timeout: 15000 }),
 
   adminSetToolTimeout: (
     toolName: string,

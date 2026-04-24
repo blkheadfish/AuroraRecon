@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 RUN pip install --no-deps PyJWT bcrypt
+RUN pip install docker==7.1.0 psutil==6.0.0 -i https://mirrors.aliyun.com/pypi/simple/
 
 # 复制项目代码
 COPY . .

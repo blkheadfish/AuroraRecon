@@ -1,6 +1,7 @@
 skill_id: tomcat_exploit
 name: "Apache Tomcat 综合利用"
 category: server_misconfig
+phase: foothold
 version: "3.0"
 
 principle: |

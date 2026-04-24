@@ -92,7 +92,7 @@ async def get_current_user_role(user_id: str) -> str:
         if user and getattr(user, "role", None) in ("admin", "user"):
             return user.role
     except Exception as e:
-        logger.warning(f"[deps] get_current_user_role 失败: {e}")
+        logger.warning("[deps] get_current_user_role 失败: %s: %s", type(e).__name__, e)
     return "user"
 
 

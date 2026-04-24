@@ -4,6 +4,7 @@
 skill_id: jboss_deserial_rce
 name: "JBoss JMXInvokerServlet 反序列化 RCE (CVE-2017-7504)"
 category: java_deserialization
+phase: foothold
 version: "1.0"
 
 principle: |

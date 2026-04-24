@@ -9,6 +9,7 @@
 skill_id: activemq_rce
 name: "ActiveMQ Jolokia JMX RCE (CVE-2022-41678)"
 category: web_rce
+phase: foothold
 version: "4.0"
 
 principle: |

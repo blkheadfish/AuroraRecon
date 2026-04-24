@@ -8,6 +8,7 @@
 skill_id: weblogic_jndi_rce
 name: "WebLogic 多 CVE RCE (14882/14883/21839)"
 category: web_rce
+phase: foothold
 version: "2.0"
 
 principle: |

@@ -203,9 +203,12 @@ html, body, #app {
     transition: background 0.2s, color 0.2s;
 }
 
-/* Form controls don't inherit font-family by default; force inherit so
-   scoped styles (e.g. .start-btn's Orbitron) can override naturally. */
-button, input, textarea, select, optgroup {
+/* Form controls and code elements don't inherit font-family by default
+   (browser UA gives them system / monospace).  Force inherit so
+   scoped styles (e.g. .start-btn's Orbitron) can override naturally,
+   while code/pre/kbd pick up JetBrains Mono from body. */
+button, input, textarea, select, optgroup,
+code, kbd, samp, pre {
     font-family: inherit;
 }
 

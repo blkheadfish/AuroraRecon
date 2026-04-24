@@ -1,6 +1,7 @@
 skill_id: xss_detection
 name: "XSS (Cross-Site Scripting) Detection"
 category: web_inject
+phase: foothold
 version: "1.0"
 
 principle: |

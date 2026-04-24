@@ -1,6 +1,7 @@
 skill_id: directory_discovery
 name: "Web 目录/路径发现与目录列表利用"
 category: server_misconfig
+phase: recon
 version: "2.0"
 
 principle: |

@@ -334,6 +334,7 @@ async def get_task_stats() -> dict:
                 COUNT(*) FILTER (WHERE status = 'completed') as completed,
                 COUNT(*) FILTER (WHERE status = 'failed') as failed,
                 COUNT(*) FILTER (WHERE status = 'pending') as pending,
+                COUNT(*) FILTER (WHERE status = 'awaiting_approval') as awaiting_approval,
                 COUNT(*) FILTER (WHERE got_shell = true) as shells_obtained,
                 COALESCE(SUM(findings_count), 0) as total_findings
             FROM tasks
@@ -345,6 +346,7 @@ async def get_task_stats() -> dict:
             "completed": row.completed,
             "failed": row.failed,
             "pending": row.pending,
+            "awaiting_approval": row.awaiting_approval,
             "shells_obtained": row.shells_obtained,
             "total_findings": row.total_findings,
         }

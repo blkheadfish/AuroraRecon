@@ -8,6 +8,7 @@
 skill_id: flask_ssti_rce
 name: "Flask/Jinja2 服务端模板注入 RCE"
 category: web_rce
+phase: foothold
 version: "1.0"
 
 principle: |

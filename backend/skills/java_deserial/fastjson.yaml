@@ -8,6 +8,7 @@
 skill_id: fastjson_rce
 name: "Fastjson autoType 反序列化 RCE"
 category: java_deserialization
+phase: foothold
 version: "1.0"
 
 principle: |

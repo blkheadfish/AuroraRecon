@@ -183,12 +183,18 @@ class SkillRegistry:
                 "skill_id": s.skill_id,
                 "name": s.name,
                 "category": s.category,
+                "phase": s.phase,
                 "paths_count": len(s.exploit_paths),
                 "probes_count": len(s.probes),
                 "source": s.source_file,
             }
             for s in self._skills
         ]
+
+    def list_by_phase(self, phase: str) -> list[Skill]:
+        """Return all skills tagged for the given attack phase."""
+        self.ensure_loaded()
+        return [s for s in self._skills if s.phase == phase]
 
     def reload(self) -> None:
         """Atomic reload: load into a new list first, then swap."""

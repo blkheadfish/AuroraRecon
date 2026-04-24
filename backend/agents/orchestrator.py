@@ -1,7 +1,7 @@
 """
 orchestrator.py  ── 改进版
 主要改进：
-  1. MemorySaver checkpointer   → 内置无需额外依赖，进程内断点续跑
+  1. PostgreSQL checkpointer    → 持久化断点续跑，MemorySaver 作回退
   2. @retry_node 装饰器         → 工具调用失败自动重试（最多3次）
   3. human_approval 节点        → 利用前强制人工确认（竞赛演示亮点）
   4. interrupt_before=["human_approval"] → LangGraph 原生中断机制
@@ -31,6 +31,13 @@ from typing import Any, Optional
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
+try:
+    from psycopg_pool import AsyncConnectionPool           # type: ignore
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver  # type: ignore
+    _HAS_PG_SAVER = True
+except ImportError:
+    _HAS_PG_SAVER = False
+
 from backend.agents.models import (
     CommandExecutionRecord,
     ExploitResult,
@@ -57,6 +64,7 @@ _CHAIN_PHASE_ORDER: list[str] = [
     "foothold_attempt",
     "secondary_attack",
     "post_foothold_enum",
+    "post_foothold_approval",
     "privesc_attempt",
     "objective_collect",
     "report",
@@ -1426,9 +1434,11 @@ async def node_human_approval(state: PentestState) -> PentestState:
         state.approved = True
         state.log(f"✅ auto_approve 生效,跳过人工审批({len(exploitable)} 个待利用漏洞)")
     elif not state.approved:
+        state.status = TaskStatus.AWAITING_APPROVAL
         state.log(f"⏸ 收到审批请求:{len(exploitable)} 个漏洞待利用")
 
     if state.approved:
+        state.status = TaskStatus.RUNNING
         state.log("✅ 已获授权,继续利用阶段")
     else:
         state.log("⚠ 未获授权,跳过利用阶段")
@@ -1681,20 +1691,21 @@ async def node_post_foothold_enum(state: PentestState) -> PentestState:
 async def node_post_foothold_approval(state: PentestState) -> PentestState:
     """Approval gate before privesc/objective in strict (pentest_engineer) mode.
 
-    In auto_approve mode this is a no-op pass-through.  Otherwise LangGraph
-    will interrupt before this node just like human_approval, giving the
-    operator a chance to review post-foothold findings before escalation.
+    Uses ``post_approved`` (independent of the first-gate ``approved``) so that
+    the two interrupt_before gates never interfere with each other.
     """
     state.current_phase = "post_foothold_approval"
     _record_chain_visit(state, "post_foothold_approval")
 
-    if state.auto_approve and not state.approved:
-        state.approved = True
+    if state.auto_approve and not state.post_approved:
+        state.post_approved = True
         state.log("✅ auto_approve 生效，跳过立足后审批")
-    elif not state.approved:
+    elif not state.post_approved:
+        state.status = TaskStatus.AWAITING_APPROVAL
         state.log("⏸ 已获取 shell，等待人工确认是否继续提权/收集")
 
-    if state.approved:
+    if state.post_approved:
+        state.status = TaskStatus.RUNNING
         state.log("✅ 已获授权，继续提权阶段")
     else:
         state.log("⚠ 未获授权，跳过提权阶段，直接收集并出报告")
@@ -1702,7 +1713,7 @@ async def node_post_foothold_approval(state: PentestState) -> PentestState:
 
 
 def edge_after_post_foothold_approval(state: PentestState) -> str:
-    if state.approved:
+    if state.post_approved:
         return "privesc_attempt"
     return "objective_collect"
 
@@ -1852,7 +1863,9 @@ def edge_after_foothold(state: PentestState) -> str:
     if state.foothold_status == "file_read":
         if not state.secondary_attack_done:
             return "secondary_attack"
-        return "report"
+        # Secondary attack done but still file_read only — still run
+        # post_foothold_enum to process extracted creds/keys/configs
+        return "post_foothold_enum"
     if not state.secondary_attack_done and any(f.exploitable for f in state.findings):
         return "secondary_attack"
     return "report"
@@ -1960,8 +1973,28 @@ class Orchestrator:
             return
         async with self._graph_lock:
             if self._graph is None:
-                checkpointer = MemorySaver()
+                checkpointer = await self._create_checkpointer()
                 self._graph = build_graph(checkpointer=checkpointer)
+
+    @staticmethod
+    async def _create_checkpointer():
+        """Build a persistent PostgreSQL checkpointer when available,
+        falling back to in-memory MemorySaver for local development."""
+        pg_url = os.getenv("DATABASE_URL", "")
+        if _HAS_PG_SAVER and pg_url:
+            conninfo = pg_url.replace(
+                "postgresql+asyncpg://", "postgresql://"
+            )
+            pool = AsyncConnectionPool(conninfo=conninfo, open=False)
+            await pool.open()
+            saver = AsyncPostgresSaver(pool)
+            await saver.setup()
+            logger.info("[Orchestrator] 使用 PostgreSQL 持久化 checkpointer")
+            return saver
+        logger.warning(
+            "[Orchestrator] PostgreSQL checkpointer 不可用，回退到 MemorySaver"
+        )
+        return MemorySaver()
 
     def _prepare_state(self, initial_state: PentestState) -> PentestState:
         """
@@ -2019,9 +2052,8 @@ class Orchestrator:
     async def resume(self, task_id: str, approved: bool = True) -> None:
         await self._ensure_graph()
         config = {"configurable": {"thread_id": task_id}}
-        # 正确做法：先把 approved 注入现有 checkpoint，再从断点继续
-        # ainvoke({"approved": ...}) 是错的——LangGraph 会把字典当新初始 state 从头跑
-        await self._graph.aupdate_state(config, {"approved": approved})
+        update = await self._build_approval_update(config, approved)
+        await self._graph.aupdate_state(config, update)
         await self._graph.ainvoke(None, config=config)
 
     async def resume_stream(self, task_id: str, approved: bool = True):
@@ -2033,11 +2065,22 @@ class Orchestrator:
         """
         await self._ensure_graph()
         config = {"configurable": {"thread_id": task_id}}
-        await self._graph.aupdate_state(config, {"approved": approved})
+        update = await self._build_approval_update(config, approved)
+        await self._graph.aupdate_state(config, update)
 
         async for event in self._graph.astream(None, config=config):
             for node_name, state in event.items():
                 yield node_name, state
+
+    async def _build_approval_update(self, config: dict, approved: bool) -> dict:
+        """Return the correct state patch depending on which gate is pending."""
+        snapshot = await self._graph.aget_state(config)
+        phase = ""
+        if snapshot and snapshot.values:
+            phase = snapshot.values.get("current_phase", "")
+        if phase == "post_foothold_approval":
+            return {"post_approved": approved}
+        return {"approved": approved}
 
     async def get_state(self, task_id: str) -> Optional[PentestState]:
         await self._ensure_graph()
@@ -2059,7 +2102,7 @@ def _stringify_dict_keys(obj: Any) -> Any:
     """
     递归将 dict 的所有 key 转为 str。
 
-    LangGraph 的 MemorySaver 使用 msgpack 序列化 checkpoint，
+    LangGraph checkpointer（MemorySaver/PostgresSaver）序列化 checkpoint，
     msgpack 默认 strict_map_key=True 不允许 int/float 作为 dict key。
     VulnAgent 的 fingerprints 用端口号(int)做 key，必须转换。
     """
