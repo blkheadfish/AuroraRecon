@@ -298,7 +298,13 @@ def _is_core_container(name: str) -> bool:
 def _docker_client():
     """Create a short-timeout docker client so a stuck daemon can't hang the API."""
     import docker as _docker
-    # 5s connect timeout is enough for the unix socket; avoids blocking the event loop.
+    if not hasattr(_docker, "from_env"):
+        src = getattr(_docker, "__file__", None) or getattr(_docker, "__path__", "unknown")
+        raise RuntimeError(
+            f"docker-py 未正确安装：当前 import 命中 {src}，"
+            "可能是镜像过旧或项目根 docker/ 目录未被 .dockerignore 排除。"
+            "请执行: docker compose build api --no-cache && docker compose up -d api"
+        )
     return _docker.from_env(timeout=5)
 
 

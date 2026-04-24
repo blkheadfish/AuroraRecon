@@ -7,7 +7,7 @@ import logging
 from collections import defaultdict
 from datetime import datetime, timedelta
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 
 from backend.agents.models import PentestState, TaskStatus
 from backend.api.state import get_state_manager, TOOL_START_RE, TOOL_DONE_RE
@@ -176,8 +176,11 @@ def _build_guard_overview(tasks: list[PentestState]) -> dict:
 
 
 @router.get("/health")
-async def health_check():
+async def health_check(request: Request):
     sm = get_state_manager()
+    admin_routes = sorted(
+        {r.path for r in request.app.routes if getattr(r, "path", "").startswith("/admin")}
+    )
     return {
         "status": "ok",
         "version": "2.0.0",
@@ -187,6 +190,8 @@ async def health_check():
         "redis": "connected" if sm.redis_available else "unavailable",
         "msf": "connected" if sm.msf_available else "unavailable",
         "active_tasks": sm.running_count,
+        "admin_routes_count": len(admin_routes),
+        "admin_routes": admin_routes,
         "timestamp": datetime.utcnow().isoformat(),
     }
 

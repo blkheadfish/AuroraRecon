@@ -163,7 +163,7 @@ ALLOWED_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in ALLOWED_ORIGINS],
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
 
@@ -216,3 +216,8 @@ app.include_router(prompts.router)
 app.include_router(team.router)
 app.include_router(admin.router)
 app.include_router(admin_terminal.router)
+
+_admin_paths = sorted(r.path for r in app.routes if getattr(r, "path", "").startswith("/admin"))
+logger.info("mounted admin routes: %d", len(_admin_paths))
+for _p in _admin_paths:
+    logger.info("  - %s", _p)

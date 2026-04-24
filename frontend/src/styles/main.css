@@ -203,52 +203,21 @@ html, body, #app {
     transition: background 0.2s, color 0.2s;
 }
 
-/* Force JetBrains Mono as the default body face for every widget unless
-   a component explicitly opts into Orbitron/Inter. Serif fallback was
-   leaking Times New Roman on some Element Plus pieces. */
-#app,
-#app input,
-#app textarea,
-#app button,
-#app select,
-#app .el-button,
-#app .el-input__inner,
-#app .el-textarea__inner,
-#app .el-select__wrapper,
-#app .el-select__input,
-#app .el-select-dropdown__item,
-#app .el-dropdown-menu__item,
-#app .el-menu-item,
-#app .el-message,
-#app .el-message-box,
-#app .el-form-item__label,
-#app .el-table,
-#app .el-tabs,
-#app .el-dialog,
-#app .el-alert,
-#app .el-empty__description,
-#app .el-pagination,
-#app .el-popover,
-#app .el-tooltip__popper {
-    font-family: var(--font-mono);
+/* Form controls don't inherit font-family by default; force inherit so
+   scoped styles (e.g. .start-btn's Orbitron) can override naturally. */
+button, input, textarea, select, optgroup {
+    font-family: inherit;
 }
 
-/* Keep Orbitron only where explicitly opted in.
-   Must use #app prefix to beat the mono overrides above. */
-#app .use-orbitron,
-#app .brand-title,
-#app .section-title-orbitron,
-#app .logo-monogram,
-#app .logo-text,
-#app .mobile-title,
-#app .title,
-#app .start-btn,
-#app .auth-title,
-#app .stat-hero,
-#app .nav-brand-text,
-#app .board-title,
-#app .kpi-value {
-    font-family: var(--font-orbitron) !important;
+/* Element Plus portals (message / message-box / popper / notification)
+   mount outside #app, so they won't inherit JetBrains Mono from body.
+   Give them an explicit mono declaration. */
+.el-message,
+.el-message-box,
+.el-popper,
+.el-notification,
+.el-overlay {
+    font-family: var(--font-mono);
 }
 
 /* Scrollbar */
