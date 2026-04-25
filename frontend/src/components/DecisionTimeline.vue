@@ -55,6 +55,15 @@
       </TransitionGroup>
     </el-timeline>
 
+    <!-- Live LLM thinking bubbles -->
+    <div v-for="(bubble, sid) in activeBubbles" :key="sid" class="llm-bubble">
+      <div class="bubble-header">
+        <span class="bubble-phase">{{ bubble.phase }}</span>
+        <span class="bubble-indicator">正在思考<span class="dots">...</span></span>
+      </div>
+      <pre class="bubble-text">{{ bubble.text }}</pre>
+    </div>
+
     <div ref="bottomAnchor" class="bottom-anchor" />
 
     <transition name="fade">
@@ -76,6 +85,23 @@ const props = defineProps({
     type: Array,
     default: () => [],
   },
+  llmStreams: {
+    type: Object,
+    default: () => ({}),
+  },
+})
+
+import { computed } from 'vue'
+
+const activeBubbles = computed(() => {
+  const now = Date.now()
+  const result = {}
+  for (const [sid, bubble] of Object.entries(props.llmStreams || {})) {
+    if (bubble && bubble.text && now - bubble.updatedAt < 60000) {
+      result[sid] = bubble
+    }
+  }
+  return result
 })
 
 const wrapRef = ref(null)
@@ -354,5 +380,52 @@ defineExpose({ scrollToItem })
 .highlight-flash {
   animation: highlight-pulse 0.7s ease 2;
   border-color: var(--accent-blue) !important;
+}
+
+.llm-bubble {
+  border: 1px solid var(--accent-purple, #a371f7);
+  border-left: 3px solid var(--accent-purple, #a371f7);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--bg-base) 92%, var(--accent-purple, #a371f7) 8%);
+  padding: 10px 12px;
+  margin: 8px 0;
+}
+
+.bubble-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+}
+
+.bubble-phase {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent-purple, #a371f7);
+}
+
+.bubble-indicator {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+@keyframes dot-blink {
+  0%, 20% { opacity: 0; }
+  50% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+.dots { animation: dot-blink 1.4s infinite; }
+
+.bubble-text {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 200px;
+  overflow-y: auto;
+  margin: 0;
+  line-height: 1.6;
 }
 </style>

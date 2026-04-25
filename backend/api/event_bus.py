@@ -58,3 +58,24 @@ _event_bus = TaskEventBus()
 
 def get_event_bus() -> TaskEventBus:
     return _event_bus
+
+
+# ── Task-level decision event sink ────────────────────────
+# Allows push_decision() inside PentestState to fire-and-forget
+# events into the EventBus without importing task_runner or bus.
+
+from typing import Callable, Awaitable
+
+_TASK_EVENT_SINK: dict[str, Callable[[dict], Awaitable[None]]] = {}
+
+
+def set_task_sink(task_id: str, sink: Callable[[dict], Awaitable[None]]) -> None:
+    _TASK_EVENT_SINK[task_id] = sink
+
+
+def clear_task_sink(task_id: str) -> None:
+    _TASK_EVENT_SINK.pop(task_id, None)
+
+
+def get_task_sink(task_id: str) -> Callable[[dict], Awaitable[None]] | None:
+    return _TASK_EVENT_SINK.get(task_id)

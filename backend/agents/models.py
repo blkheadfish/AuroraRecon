@@ -92,6 +92,13 @@ class PortInfo(BaseModel):
 	banner: str = ""
 
 
+CONFIDENCE_THRESHOLD_EXPLOIT = 60
+
+VerificationStatus = Literal[
+	"confirmed", "likely", "suspected", "unverified", "rejected"
+]
+
+
 class VulnFinding(BaseModel):
 	vuln_id: str = Field(default_factory=lambda: str(uuid.uuid4())[:8])
 	name: str
@@ -103,6 +110,10 @@ class VulnFinding(BaseModel):
 	evidence: str = ""
 	exploitable: bool = False
 	tool: str = ""
+	confidence: int = 50
+	verification_status: VerificationStatus = "unverified"
+	verification_reasons: list[str] = Field(default_factory=list)
+	evidence_snippets: list[dict[str, str]] = Field(default_factory=list)
 
 
 class CommandExecutionRecord(BaseModel):
@@ -405,12 +416,25 @@ class PentestState(BaseModel):
 		logging.getLogger(__name__).info(entry)
 
 	def push_decision(self, event: dict) -> None:
-		"""Append a structured decision event for real-time WS push."""
+		"""Append a structured decision event and fire-and-forget to EventBus."""
 		if "id" not in event:
 			event["id"] = f"de-{len(self.live_decision_events)}-{datetime.utcnow().strftime('%H%M%S%f')}"
 		if "timestamp" not in event:
 			event["timestamp"] = datetime.utcnow().strftime("%H:%M:%S")
 		self.live_decision_events.append(event)
+		# Prevent unbounded growth in LangGraph checkpoint payload
+		if len(self.live_decision_events) > 5000:
+			self.live_decision_events = self.live_decision_events[-2500:]
+		# Fire-and-forget to EventBus so WS clients see it immediately
+		try:
+			import asyncio
+			from backend.api.event_bus import get_task_sink
+			sink = get_task_sink(self.task_id)
+			if sink:
+				loop = asyncio.get_running_loop()
+				loop.create_task(sink(event))
+		except Exception:
+			pass
 
 	@field_validator("fingerprints", mode="before")
 	@classmethod

@@ -15,7 +15,7 @@ import time
 from backend.agents.models import PentestState, TaskStatus
 from backend.agents.orchestrator import Orchestrator
 from backend.api.state import get_state_manager
-from backend.api.event_bus import get_event_bus
+from backend.api.event_bus import get_event_bus, set_task_sink, clear_task_sink
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +95,13 @@ async def run_task(task_id: str, initial_state: PentestState):
     bus = get_event_bus()
     sm.mark_running(task_id)
     orchestrator = get_orchestrator()
+
+    # Register decision event sink so push_decision() inside agent nodes
+    # can fire events to WS clients in real-time (not waiting for node yield).
+    async def _decision_sink(ev: dict):
+        await bus.publish(task_id, {"type": "decision_event", "data": ev})
+
+    set_task_sink(task_id, _decision_sink)
 
     try:
         async for node_name, raw_state in orchestrator.run_stream(initial_state):
@@ -182,6 +189,7 @@ async def run_task(task_id: str, initial_state: PentestState):
 
     _last_db_save.pop(task_id, None)
     _redis_log_cursor.pop(task_id, None)
+    clear_task_sink(task_id)
     logger.info(f"[API] 任务 {task_id} 完成")
 
 
@@ -192,6 +200,11 @@ async def resume_task(task_id: str, approved: bool):
     bus = get_event_bus()
     sm.mark_running(task_id)
     orchestrator = get_orchestrator()
+
+    async def _decision_sink(ev: dict):
+        await bus.publish(task_id, {"type": "decision_event", "data": ev})
+
+    set_task_sink(task_id, _decision_sink)
 
     try:
         async for node_name, raw_state in orchestrator.resume_stream(
@@ -249,6 +262,7 @@ async def resume_task(task_id: str, approved: bool):
 
     _last_db_save.pop(task_id, None)
     _redis_log_cursor.pop(task_id, None)
+    clear_task_sink(task_id)
     logger.info(f"[API] 任务 {task_id} resume 完成")
 
 

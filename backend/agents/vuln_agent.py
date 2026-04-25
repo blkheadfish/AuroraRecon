@@ -62,13 +62,19 @@ class VulnAgent:
         record_callback: RecordCallback = None,
         decision_callback: DecisionCallback = None,
         nmap_vuln_hints: list[dict] | None = None,
+        workflow_mode: str = "pentest_engineer",
     ) -> dict[str, Any]:
         self._decision_callback = decision_callback
+        self._workflow_mode = workflow_mode
         logger.info(f"[VulnAgent] 开始漏洞扫描: {target}")
 
-        if log_callback or record_callback:
+        if log_callback or record_callback or decision_callback:
             origin_run = self.executor.run
             origin_run_script = self.executor.run_script
+
+            async def _tool_stream_cb(ev: dict):
+                if self._decision_callback:
+                    await self._decision_callback({"action": "tool_stream", **ev})
 
             async def _run_with_log(*args, **kwargs):
                 if log_callback:
@@ -76,6 +82,8 @@ class VulnAgent:
                 if record_callback:
                     kwargs.setdefault("record_callback", record_callback)
                     kwargs.setdefault("record_phase", "vuln_scan")
+                if self._decision_callback:
+                    kwargs.setdefault("stream_callback", _tool_stream_cb)
                 return await origin_run(*args, **kwargs)
 
             async def _run_script_with_log(*args, **kwargs):
@@ -84,6 +92,8 @@ class VulnAgent:
                 if record_callback:
                     kwargs.setdefault("record_callback", record_callback)
                     kwargs.setdefault("record_phase", "vuln_scan")
+                if self._decision_callback:
+                    kwargs.setdefault("stream_callback", _tool_stream_cb)
                 return await origin_run_script(*args, **kwargs)
 
             self.executor.run = _run_with_log
@@ -297,7 +307,20 @@ class VulnAgent:
         # 根据指纹信息修正误判的 finding（如 Struts2 应用被识别为 Tomcat 弱口令）
         all_findings = self._enrich_findings(all_findings, fingerprints)
 
-        logger.info(f"[VulnAgent] 扫描完成，共 {len(all_findings)} 个发现")
+        # ── Phase 6: 统一 FindingVerifier 复核 ───────────
+        from backend.agents.finding_verifier import FindingVerifier
+        verifier = FindingVerifier()
+        all_findings = [
+            verifier.verify(f, fingerprint=fingerprints.get(f.port, {}), raw_output=f.evidence)
+            for f in all_findings
+        ]
+
+        confirmed_count = sum(1 for f in all_findings if f.verification_status == "confirmed")
+        rejected_count = sum(1 for f in all_findings if f.verification_status == "rejected")
+        logger.info(
+            f"[VulnAgent] 扫描完成，共 {len(all_findings)} 个发现 "
+            f"(confirmed={confirmed_count}, rejected={rejected_count})"
+        )
 
         return {"findings": all_findings, "raw_nuclei": "", "raw_nikto": "", "fingerprints": fingerprints}
 
@@ -492,13 +515,15 @@ $PHUIP "{web_url}/index.php" 2>&1
             seen_services.add(svc)
             findings.append(VulnFinding(
                 name=meta["name"],
-                severity=meta["severity"],
+                severity="info",
                 cve="",
                 target=f"{target}:{p.port}",
                 port=p.port,
                 description=f"{meta['desc']} (版本: {p.version or 'unknown'})",
                 evidence=f"nmap: {p.port}/{p.service} {p.version} {p.banner}".strip(),
                 exploitable=False,
+                confidence=40,
+                verification_status="suspected",
                 tool="service-enum",
             ))
         if findings:
@@ -780,7 +805,24 @@ $PHUIP "{web_url}/index.php" 2>&1
         )
 
         try:
-            result, reasoning = await self.llm.chat(prompt, response_format="json", return_thinking=True)
+            import uuid as _uuid
+            stream_id = f"llm-strategy-{_uuid.uuid4().hex[:8]}"
+
+            async def _on_strategy_delta(delta: str):
+                if self._decision_callback:
+                    await self._decision_callback({
+                        "action": "llm_delta",
+                        "phase": "vuln_scan",
+                        "delta": delta,
+                        "stream_id": stream_id,
+                        "kind": "reasoning",
+                    })
+
+            result, reasoning = await self.llm.chat_with_stream_callback(
+                prompt,
+                on_reasoning_delta=_on_strategy_delta,
+                response_format="json",
+            )
             strategy = json.loads(result)
             if "error" in strategy or not strategy.get("nuclei_tags"):
                 raise ValueError(f"LLM 返回无效策略: {strategy.get('error', 'empty tags')}")
@@ -1332,8 +1374,13 @@ $PHUIP "{web_url}/index.php" 2>&1
                     if any(sign in combined for sign in probe_specific_signs[source]):
                         confirmed = True
 
-                # 都不匹配 → LLM 快速判断（只在有足够输出时）
-                if not confirmed and result.exit_code == 0 and len(stdout) > 50:
+                # 都不匹配 → LLM 快速判断（仅 ctf_expert 模式启用，pentest_engineer 不允许 LLM 自判）
+                if (
+                    not confirmed
+                    and result.exit_code == 0
+                    and len(stdout) > 50
+                    and getattr(self, "_workflow_mode", "pentest_engineer") == "ctf_expert"
+                ):
                     confirmed = await self._llm_quick_verify(
                         entry.description, cmd, stdout[:2000], stderr[:500]
                     )
@@ -1664,7 +1711,35 @@ $PHUIP "{web_url}/index.php" 2>&1
         )
 
         try:
-            result, reasoning = await self.llm.chat(prompt, response_format="json", return_thinking=True)
+            import uuid as _uuid
+            stream_id = f"llm-discovery-{_uuid.uuid4().hex[:8]}"
+
+            async def _on_content(delta: str):
+                if self._decision_callback:
+                    await self._decision_callback({
+                        "action": "llm_delta",
+                        "phase": "vuln_scan",
+                        "delta": delta,
+                        "stream_id": stream_id,
+                        "kind": "content",
+                    })
+
+            async def _on_reasoning(delta: str):
+                if self._decision_callback:
+                    await self._decision_callback({
+                        "action": "llm_delta",
+                        "phase": "vuln_scan",
+                        "delta": delta,
+                        "stream_id": stream_id,
+                        "kind": "reasoning",
+                    })
+
+            result, reasoning = await self.llm.chat_with_stream_callback(
+                prompt,
+                on_content_delta=_on_content,
+                on_reasoning_delta=_on_reasoning,
+                response_format="json",
+            )
             plan = json.loads(result)
         except Exception as e:
             logger.warning(f"[VulnAgent] LLM 主动发现失败: {e}")

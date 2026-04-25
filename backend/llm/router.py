@@ -12,7 +12,7 @@ import asyncio
 import json
 import logging
 import os
-from typing import Optional, Union, overload
+from typing import Callable, Optional, Union, overload
 
 from openai import AsyncOpenAI
 
@@ -249,6 +249,154 @@ class LLMRouter:
 
         fallback = json.dumps({"error": "unexpected", "action": "conclude_fail"}) if response_format == "json" else "LLM 调用失败: 未知错误"
         return (fallback, "") if return_thinking else fallback
+
+    async def chat_multi_turn_stream(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        on_content_delta: Optional[Callable] = None,
+        on_reasoning_delta: Optional[Callable] = None,
+        system_prompt: Optional[str] = None,
+        response_format: str = "text",
+        temperature: float = 0.2,
+        max_tokens: int = LLM_MAX_TOKENS,
+    ) -> tuple[str, str]:
+        """Streaming multi-turn chat with callbacks. Returns (content, reasoning)."""
+        full_messages = [
+            {"role": "system", "content": system_prompt or SECURITY_EXPERT_SYSTEM_PROMPT},
+            *messages,
+        ]
+        kwargs: dict = {
+            "model": self._model,
+            "messages": full_messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+        if response_format == "json":
+            kwargs["response_format"] = {"type": "json_object"}
+
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+
+        try:
+            stream = await self._client.chat.completions.create(**kwargs)
+            async for chunk in stream:
+                delta = chunk.choices[0].delta if chunk.choices else None
+                if not delta:
+                    continue
+                if delta.content:
+                    content_parts.append(delta.content)
+                    if on_content_delta:
+                        try:
+                            await on_content_delta(delta.content)
+                        except Exception:
+                            pass
+                rc = getattr(delta, "reasoning_content", None)
+                if not rc:
+                    extra = getattr(delta, "model_extra", None) or {}
+                    rc = extra.get("reasoning_content")
+                if rc:
+                    reasoning_parts.append(rc)
+                    if on_reasoning_delta:
+                        try:
+                            await on_reasoning_delta(rc)
+                        except Exception:
+                            pass
+        except Exception as e:
+            logger.error(f"[LLMRouter] multi-turn stream 失败: {e}")
+            fallback = json.dumps({"error": str(e), "action": "conclude_fail"}) if response_format == "json" else f"LLM stream error: {e}"
+            return fallback, ""
+
+        return "".join(content_parts), "".join(reasoning_parts)
+
+    async def chat_stream(
+        self,
+        user_message: str,
+        system_prompt: Optional[str] = None,
+        response_format: str = "text",
+        temperature: float = 0.2,
+        max_tokens: int = LLM_MAX_TOKENS,
+    ):
+        """
+        Streaming version of chat(). Yields (kind, delta) tuples where
+        kind is "content" or "reasoning".
+        """
+        messages = [
+            {"role": "system", "content": system_prompt or SECURITY_EXPERT_SYSTEM_PROMPT},
+            {"role": "user", "content": user_message},
+        ]
+        kwargs: dict = {
+            "model": self._model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+        if response_format == "json":
+            kwargs["response_format"] = {"type": "json_object"}
+
+        try:
+            stream = await self._client.chat.completions.create(**kwargs)
+            async for chunk in stream:
+                delta = chunk.choices[0].delta if chunk.choices else None
+                if not delta:
+                    continue
+                # Content delta
+                if delta.content:
+                    yield ("content", delta.content)
+                # Reasoning delta (DeepSeek exposes reasoning_content)
+                rc = getattr(delta, "reasoning_content", None)
+                if not rc:
+                    extra = getattr(delta, "model_extra", None) or {}
+                    rc = extra.get("reasoning_content")
+                if rc:
+                    yield ("reasoning", rc)
+        except Exception as e:
+            logger.error(f"[LLMRouter] stream 失败: {e}")
+            yield ("content", f"[LLM stream error: {e}]")
+
+    async def chat_with_stream_callback(
+        self,
+        user_message: str,
+        *,
+        on_content_delta: Optional[Callable] = None,
+        on_reasoning_delta: Optional[Callable] = None,
+        system_prompt: Optional[str] = None,
+        response_format: str = "text",
+        temperature: float = 0.2,
+        max_tokens: int = LLM_MAX_TOKENS,
+    ) -> tuple[str, str]:
+        """
+        Streaming chat that fires callbacks for each delta, then returns
+        the full (content, reasoning) strings.
+        """
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+
+        async for kind, delta in self.chat_stream(
+            user_message,
+            system_prompt=system_prompt,
+            response_format=response_format,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        ):
+            if kind == "content":
+                content_parts.append(delta)
+                if on_content_delta:
+                    try:
+                        await on_content_delta(delta)
+                    except Exception:
+                        pass
+            elif kind == "reasoning":
+                reasoning_parts.append(delta)
+                if on_reasoning_delta:
+                    try:
+                        await on_reasoning_delta(delta)
+                    except Exception:
+                        pass
+
+        return "".join(content_parts), "".join(reasoning_parts)
 
     async def analyze_scan_output(self, raw_output: str, tool_name: str) -> dict:
         """

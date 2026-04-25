@@ -48,6 +48,21 @@
         <span class="line-content" v-html="formatLine(line)"></span>
       </div>
 
+      <!-- Live tool streams -->
+      <template v-if="activeToolStreams.length">
+        <details v-for="stream in activeToolStreams" :key="stream.id" class="tool-stream-section" open>
+          <summary class="stream-header">
+            <span class="pulse-dot"></span> {{ stream.id }}
+          </summary>
+          <div class="stream-lines">
+            <div v-for="(line, li) in stream.lines.slice(-200)" :key="li" class="log-line line-stream">
+              <span class="line-num">{{ String(li + 1).padStart(4, ' ') }}</span>
+              <span class="line-content">{{ line }}</span>
+            </div>
+          </div>
+        </details>
+      </template>
+
       <div v-if="running" class="log-line running-indicator">
         <span class="line-num">    </span>
         <span class="cursor-blink">█</span>
@@ -71,6 +86,17 @@ import {ElMessage} from 'element-plus'
 const props = defineProps({
   logs: {type: Array, default: () => []},
   running: Boolean,
+  toolStreams: {type: Object, default: () => ({})},
+})
+
+const activeToolStreams = computed(() => {
+  const result = []
+  for (const [id, lines] of Object.entries(props.toolStreams || {})) {
+    if (Array.isArray(lines) && lines.length > 0) {
+      result.push({ id, lines })
+    }
+  }
+  return result
 })
 
 const terminalRef = ref()
@@ -404,5 +430,33 @@ function toggleHidden() {
   50% {
     opacity: 0;
   }
+}
+
+.tool-stream-section {
+  margin: 8px 16px;
+  border: 1px solid rgba(56, 139, 253, 0.2);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.stream-header {
+  cursor: pointer;
+  padding: 4px 10px;
+  font-size: 11px;
+  color: var(--accent-blue);
+  background: rgba(56, 139, 253, 0.06);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.stream-lines {
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.line-stream .line-content {
+  color: var(--accent-blue);
+  opacity: 0.85;
 }
 </style>

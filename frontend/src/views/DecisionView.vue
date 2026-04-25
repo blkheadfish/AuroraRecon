@@ -32,7 +32,7 @@
         :active-id="activeRailId"
         @jump="handleRailJump"
       />
-      <DecisionTimeline ref="timelineRef" :items="decisionItems">
+      <DecisionTimeline ref="timelineRef" :items="decisionItems" :llm-streams="llmStreams">
         <template #card="{ item }">
           <div v-if="item.action === 'approval_required' && !approvalDone" class="approval-card-slot">
             <ApprovalComposer
@@ -118,6 +118,7 @@ async function sendMessage() {
 }
 
 const state = computed(() => liveStore.getLiveState(taskId))
+const llmStreams = computed(() => state.value?.llmStreams || {})
 const task = computed(() => state.value.task || listStore.getTaskById(taskId))
 const logs = computed(() => state.value.logs || [])
 const findings = computed(() => task.value?.findings || [])

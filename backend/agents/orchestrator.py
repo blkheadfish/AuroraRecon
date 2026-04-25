@@ -543,6 +543,7 @@ async def node_vuln_scan(state: PentestState) -> PentestState:
         record_callback=_on_exec_record,
         decision_callback=_on_decision,
         nmap_vuln_hints=nmap_vuln_hints,
+        workflow_mode=state.workflow_mode,
     )
     state.findings = result.get("findings", [])
     # msgpack (LangGraph checkpoint) 不允许 int 作 dict key
@@ -1814,8 +1815,6 @@ async def node_report(state: PentestState) -> PentestState:
             state.status = TaskStatus.COMPLETED
         else:
             state.status = TaskStatus.FAILED
-    finally:
-        # 任务结束，清理专属工具容器（无论成功失败都执行）
         try:
             from backend.tools.executor import ToolExecutor
             _exec = ToolExecutor()

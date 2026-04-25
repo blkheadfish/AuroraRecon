@@ -45,7 +45,7 @@ class NucleiParser:
                     target=data.get("matched-at", target),
                     description=info.get("description", ""),
                     evidence=str(data.get("extracted-results", data.get("response", "")))[:10000],
-                    exploitable=severity in ("critical", "high"),
+                    exploitable=False,
                     tool="nuclei",
                 ))
             except (json.JSONDecodeError, KeyError) as e:

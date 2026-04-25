@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
 
 # 安装 Python 依赖
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+RUN pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
 RUN pip install --no-deps PyJWT bcrypt
 RUN pip install docker==7.1.0 psutil==6.0.0 -i https://mirrors.aliyun.com/pypi/simple/
 

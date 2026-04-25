@@ -107,7 +107,7 @@
               查看完整决策 →
             </el-button>
           </div>
-          <DecisionTimeline :items="decisionItems" />
+          <DecisionTimeline :items="decisionItems" :llm-streams="llmStreams" />
         </el-tab-pane>
 
         <el-tab-pane name="findings">
@@ -122,7 +122,7 @@
         </el-tab-pane>
 
         <el-tab-pane label="实时日志" name="logs">
-          <LogTerminal :logs="logs" :running="isRunning" />
+          <LogTerminal :logs="logs" :running="isRunning" :tool-streams="toolStreams" />
         </el-tab-pane>
 
         <el-tab-pane label="侦察数据" name="recon">
@@ -171,6 +171,8 @@ const cancelling = ref(false)
 const pollTimer = ref(null)
 
 const state = computed(() => liveStore.getLiveState(taskId))
+const llmStreams = computed(() => state.value?.llmStreams || {})
+const toolStreams = computed(() => state.value?.toolStreams || {})
 const task = computed(() => state.value.task || listStore.getTaskById(taskId))
 const logs = computed(() => state.value.logs || [])
 const findings = computed(() => task.value?.findings || [])

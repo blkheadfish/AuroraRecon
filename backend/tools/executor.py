@@ -258,6 +258,7 @@ class ToolExecutor:
         record_runtime_command: Optional[str] = None,
         task_id: Optional[str] = None,
         publish_ports: list[int] | None = None,
+        stream_callback=None,
     ) -> ExecuteResult:
         tool_def = self._registry.get_or_default(tool)
         effective_timeout = timeout or tool_def.timeout
@@ -330,6 +331,7 @@ class ToolExecutor:
             record_round=record_round,
             record_command=effective_record_command,
             record_runtime_command=record_runtime_command,
+            stream_callback=stream_callback,
         )
 
     # ── docker exec（持久容器）────────────────────────────
@@ -481,8 +483,10 @@ class ToolExecutor:
         record_round: Optional[int] = None,
         record_command: Optional[str] = None,
         record_runtime_command: Optional[str] = None,
+        stream_callback=None,
     ) -> ExecuteResult:
         cmd_display = " ".join(cmd)
+        stream_id = f"{tool}-{uuid.uuid4().hex[:8]}"
         log_msg = f"🔧 执行 {tool} [{backend_label}]: {cmd_display}"
         logger.info(f"[Executor] {log_msg}")
         if log_callback:
@@ -491,57 +495,131 @@ class ToolExecutor:
 
         start = time.monotonic()
         try:
+            use_streaming = stream_callback is not None and input_data is None
+
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdin=asyncio.subprocess.PIPE if input_data else None,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdin_bytes = input_data.encode() if input_data else None
 
-            try:
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    proc.communicate(input=stdin_bytes), timeout=timeout,
-                )
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
+            if use_streaming:
+                stdout_lines: list[str] = []
+                stderr_lines: list[str] = []
+
+                async def _pump(stream, kind: str, buffer: list[str]):
+                    while True:
+                        line = await stream.readline()
+                        if not line:
+                            break
+                        text = line.decode("utf-8", errors="replace").rstrip("\n")
+                        buffer.append(text)
+                        if log_callback:
+                            try: await log_callback(f"[{kind}] {text}")
+                            except Exception: pass
+                        if stream_callback:
+                            try:
+                                await stream_callback({
+                                    "tool": tool, "kind": kind, "line": text,
+                                    "stream_id": stream_id,
+                                })
+                            except Exception: pass
+
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(
+                            _pump(proc.stdout, "stdout", stdout_lines),
+                            _pump(proc.stderr, "stderr", stderr_lines),
+                            proc.wait(),
+                        ),
+                        timeout=timeout,
+                    )
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+                    elapsed = time.monotonic() - start
+                    msg = f"⏰ {tool} 超时 ({timeout}s)"
+                    logger.warning(f"[Executor] {msg}")
+                    if log_callback:
+                        try: await log_callback(msg)
+                        except Exception: pass
+                    await self._emit_record(
+                        record_callback=record_callback,
+                        record={
+                            "id": uuid.uuid4().hex[:16],
+                            "phase": record_phase or "",
+                            "tool": tool, "backend": backend_label,
+                            "round": record_round,
+                            "purpose": record_purpose or "",
+                            "timestamp": datetime.utcnow().isoformat(),
+                            "command": record_command or "",
+                            "runtime_command": record_runtime_command or cmd_display,
+                            "stdout": "\n".join(stdout_lines),
+                            "stderr": f"执行超时（{timeout}秒）\n" + "\n".join(stderr_lines),
+                            "exit_code": -1,
+                            "elapsed": round(elapsed, 3),
+                            "truncated": False,
+                            "total_len": sum(len(l) for l in stdout_lines + stderr_lines),
+                        },
+                    )
+                    return ExecuteResult(
+                        success=False,
+                        stdout="\n".join(stdout_lines),
+                        stderr=f"执行超时（{timeout}秒）",
+                        exit_code=-1, elapsed=elapsed,
+                        command=" ".join(cmd), tool_name=tool, backend=backend_label,
+                    )
+
+                stdout = "\n".join(stdout_lines)
+                stderr = "\n".join(stderr_lines)
                 elapsed = time.monotonic() - start
-                msg = f"⏰ {tool} 超时 ({timeout}s)"
-                logger.warning(f"[Executor] {msg}")
-                if log_callback:
-                    try: await log_callback(msg)
-                    except Exception: pass
-                await self._emit_record(
-                    record_callback=record_callback,
-                    record={
-                        "id": uuid.uuid4().hex[:16],
-                        "phase": record_phase or "",
-                        "tool": tool,
-                        "backend": backend_label,
-                        "round": record_round,
-                        "purpose": record_purpose or "",
-                        "timestamp": datetime.utcnow().isoformat(),
-                        "command": record_command or "",
-                        "runtime_command": record_runtime_command or cmd_display,
-                        "stdout": "",
-                        "stderr": f"执行超时（{timeout}秒）",
-                        "exit_code": -1,
-                        "elapsed": round(elapsed, 3),
-                        "truncated": False,
-                        "total_len": len(f"执行超时（{timeout}秒）"),
-                    },
-                )
-                return ExecuteResult(
-                    success=False, stdout="", stderr=f"执行超时（{timeout}秒）",
-                    exit_code=-1, elapsed=elapsed,
-                    command=" ".join(cmd), tool_name=tool, backend=backend_label,
-                )
+                exit_code = proc.returncode or 0
+            else:
+                stdin_bytes = input_data.encode() if input_data else None
+                try:
+                    stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                        proc.communicate(input=stdin_bytes), timeout=timeout,
+                    )
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+                    elapsed = time.monotonic() - start
+                    msg = f"⏰ {tool} 超时 ({timeout}s)"
+                    logger.warning(f"[Executor] {msg}")
+                    if log_callback:
+                        try: await log_callback(msg)
+                        except Exception: pass
+                    await self._emit_record(
+                        record_callback=record_callback,
+                        record={
+                            "id": uuid.uuid4().hex[:16],
+                            "phase": record_phase or "",
+                            "tool": tool, "backend": backend_label,
+                            "round": record_round,
+                            "purpose": record_purpose or "",
+                            "timestamp": datetime.utcnow().isoformat(),
+                            "command": record_command or "",
+                            "runtime_command": record_runtime_command or cmd_display,
+                            "stdout": "",
+                            "stderr": f"执行超时（{timeout}秒）",
+                            "exit_code": -1,
+                            "elapsed": round(elapsed, 3),
+                            "truncated": False,
+                            "total_len": len(f"执行超时（{timeout}秒）"),
+                        },
+                    )
+                    return ExecuteResult(
+                        success=False, stdout="", stderr=f"执行超时（{timeout}秒）",
+                        exit_code=-1, elapsed=elapsed,
+                        command=" ".join(cmd), tool_name=tool, backend=backend_label,
+                    )
 
-            elapsed = time.monotonic() - start
-            exit_code = proc.returncode or 0
-            stdout = stdout_bytes.decode("utf-8", errors="replace")
-            stderr = stderr_bytes.decode("utf-8", errors="replace")
+                elapsed = time.monotonic() - start
+                exit_code = proc.returncode or 0
+                stdout = stdout_bytes.decode("utf-8", errors="replace")
+                stderr = stderr_bytes.decode("utf-8", errors="replace")
+
             success = exit_code == 0 or len(stdout.strip()) > 0
 
             status = "✅" if success else "❌"
@@ -647,12 +725,14 @@ class ToolExecutor:
         record_runtime_command: Optional[str] = None,
         publish_ports: list[int] | None = None,
         task_id: Optional[str] = None,
+        stream_callback=None,
     ) -> ExecuteResult:
         """执行 shell 脚本片段
 
         Args:
             publish_ports: 需要映射到宿主机的端口列表（用于反连回调）
             task_id: 任务 ID，传入后命令在持久容器中执行（保留进程状态）
+            stream_callback: optional async callback for line-by-line output streaming
         """
         return await self.run(
             tool=shell, args=["-s"], timeout=timeout,
@@ -664,6 +744,7 @@ class ToolExecutor:
             record_command=script_content,
             record_runtime_command=record_runtime_command,
             publish_ports=publish_ports,
+            stream_callback=stream_callback,
             task_id=task_id,
         )
 

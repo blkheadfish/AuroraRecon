@@ -11,6 +11,8 @@ export interface PortInfo {
   banner?: string
 }
 
+export type VerificationStatus = 'confirmed' | 'likely' | 'suspected' | 'unverified' | 'rejected'
+
 export interface Finding {
   vuln_id: string
   name: string
@@ -22,6 +24,10 @@ export interface Finding {
   cve?: string
   evidence?: string
   exploitable?: boolean
+  confidence?: number
+  verification_status?: VerificationStatus
+  verification_reasons?: string[]
+  evidence_snippets?: { kind?: string; text?: string; source?: string }[]
 }
 
 export interface TaskSummary {

@@ -21,6 +21,12 @@
         <el-button v-if="filterSev" link size="small" @click="filterSev = null" class="clear-filter">
           清除筛选 ×
         </el-button>
+        <div class="confidence-filter">
+          <span class="filter-label">置信度 ≥</span>
+          <el-slider v-model="minConfidence" :min="0" :max="100" :step="10" :show-tooltip="true" style="width: 120px" size="small" />
+          <span class="filter-value">{{ minConfidence }}%</span>
+        </div>
+        <el-switch v-model="showRejected" active-text="显示已驳回" size="small" />
       </div>
 
       <!-- Findings table -->
@@ -29,6 +35,7 @@
         row-key="vuln_id"
         :expand-row-keys="expandedRows"
         @expand-change="handleExpand"
+        :row-class-name="rowClassName"
       >
         <el-table-column type="expand">
           <template #default="{ row }">
@@ -51,16 +58,26 @@
                   <div class="detail-label">最小复现片段</div>
                   <code class="mini-poc">{{ minimalRepro(row.evidence) }}</code>
                 </div>
+                <div class="detail-item" v-if="row.verification_reasons?.length">
+                  <div class="detail-label">复核原因</div>
+                  <ul class="verify-reasons">
+                    <li v-for="(reason, idx) in row.verification_reasons" :key="idx">{{ reason }}</li>
+                  </ul>
+                </div>
               </div>
             </div>
           </template>
         </el-table-column>
 
-        <el-table-column label="严重程度" width="110">
+        <el-table-column label="严重程度" width="140">
           <template #default="{ row }">
             <span class="sev-badge" :class="`severity-${row.severity}`">
               {{ sevLabel[row.severity] || row.severity }}
             </span>
+            <span class="confidence-badge" :class="confidenceClass(row)">
+              {{ row.confidence ?? 50 }}%
+            </span>
+            <el-tag v-if="row.verification_status === 'rejected'" size="small" type="info" class="rejected-tag">已驳回</el-tag>
           </template>
         </el-table-column>
 
@@ -119,6 +136,8 @@ const props = defineProps({
 
 const filterSev = ref(null)
 const expandedRows = ref([])
+const minConfidence = ref(0)
+const showRejected = ref(false)
 
 const severityOrder = ['critical', 'high', 'medium', 'low', 'info']
 const sevLabel = {
@@ -130,12 +149,31 @@ const sevLabel = {
 }
 
 const filteredFindings = computed(() => {
-  const sorted = [...props.findings].sort((a, b) => {
-    return severityOrder.indexOf(a.severity) - severityOrder.indexOf(b.severity)
-  })
-  if (!filterSev.value) return sorted
-  return sorted.filter(f => f.severity === filterSev.value)
+  let list = [...props.findings]
+  if (!showRejected.value) {
+    list = list.filter(f => f.verification_status !== 'rejected')
+  }
+  if (minConfidence.value > 0) {
+    list = list.filter(f => (f.confidence ?? 50) >= minConfidence.value)
+  }
+  list.sort((a, b) => severityOrder.indexOf(a.severity) - severityOrder.indexOf(b.severity))
+  if (filterSev.value) {
+    list = list.filter(f => f.severity === filterSev.value)
+  }
+  return list
 })
+
+function confidenceClass(row) {
+  const c = row.confidence ?? 50
+  if (c >= 70) return 'conf-high'
+  if (c >= 40) return 'conf-mid'
+  return 'conf-low'
+}
+
+function rowClassName({ row }) {
+  if (row.verification_status === 'rejected') return 'row-rejected'
+  return ''
+}
 
 function countBySeverity(sev) {
   return props.findings.filter(f => f.severity === sev).length
@@ -313,5 +351,42 @@ function exploitabilityScore(row) {
 .exploit-score.high {
   color: var(--accent-red);
   font-weight: 600;
+}
+
+.confidence-filter {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.filter-label { white-space: nowrap; }
+.filter-value { font-family: var(--font-mono); min-width: 32px; text-align: right; }
+
+.confidence-badge {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 8px;
+  margin-left: 4px;
+  border: 1px solid;
+}
+.conf-high { color: #3fb950; border-color: rgba(63,185,80,0.4); }
+.conf-mid  { color: #d29922; border-color: rgba(210,153,34,0.4); }
+.conf-low  { color: #8b949e; border-color: rgba(139,148,158,0.3); }
+
+.rejected-tag { margin-left: 4px; }
+
+:deep(.row-rejected) {
+  opacity: 0.45;
+}
+
+.verify-reasons {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.6;
 }
 </style>

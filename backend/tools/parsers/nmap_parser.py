@@ -128,6 +128,15 @@ class NmapParser:
 			logger.info(f"Nmap vuln scripts: 发现 {len(hints)} 个漏洞提示")
 		return hints
 
+	_VULN_FAIL_MARKERS = (
+		"script execution failed",
+		"no script results",
+		"error:",
+		"caused no output",
+		"connection refused",
+		"connection timed out",
+	)
+
 	@staticmethod
 	def _parse_vuln_script(script_elem, port: int) -> dict | None:
 		sid = script_elem.get("id", "")
@@ -137,14 +146,26 @@ class NmapParser:
 		out_lower = output.lower()
 		is_vuln_script = "vuln" in sid.lower()
 		has_vuln_signal = "vulnerable" in out_lower or "exploitable" in out_lower
+
 		if not is_vuln_script and not has_vuln_signal:
 			return None
 		if "not vulnerable" in out_lower and "vulnerable" not in out_lower.replace("not vulnerable", ""):
 			return None
+
+		# Discard scripts that failed to execute — these are NOT vulnerability evidence
+		has_failure = any(m in out_lower for m in NmapParser._VULN_FAIL_MARKERS)
+		if has_failure and not has_vuln_signal:
+			return None
+
 		cves = _CVE_RE.findall(output)
-		state = "VULNERABLE"
-		if "likely" in out_lower:
+
+		if has_vuln_signal and "vulnerable" in out_lower:
+			state = "VULNERABLE"
+		elif "likely" in out_lower:
 			state = "LIKELY VULNERABLE"
+		else:
+			state = "info"
+
 		return {
 			"port": port,
 			"script_id": sid,

@@ -8,6 +8,14 @@ import type { DecisionEvent, TaskDetail, WsTaskEvent } from '@/types/task'
 
 type ApprovalState = 'idle' | 'submitting' | 'submitted' | 'error'
 
+interface LlmStreamBubble {
+  streamId: string
+  phase: string
+  kind: string
+  text: string
+  updatedAt: number
+}
+
 interface TaskLiveState {
   task: TaskDetail | null
   logs: string[]
@@ -15,6 +23,8 @@ interface TaskLiveState {
   events: WsTaskEvent[]
   decisionEvents: DecisionEvent[]
   decisionEventIds: Set<string>
+  llmStreams: Record<string, LlmStreamBubble>
+  toolStreams: Record<string, string[]>
   approvalState: ApprovalState
   approvalNonce: string
   approvalSubmittedAt: number
@@ -37,6 +47,8 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
         events: [],
         decisionEvents: [],
         decisionEventIds: new Set<string>(),
+        llmStreams: {},
+        toolStreams: {},
         approvalState: 'idle',
         approvalNonce: '',
         approvalSubmittedAt: 0,
@@ -101,13 +113,34 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
         pushLog(state, line)
       }
       if ((event as { type?: string }).type === 'decision_event') {
-        const payload = (event as { data?: DecisionEvent }).data
+        const payload = (event as { data?: Record<string, unknown> }).data
         if (payload && typeof payload === 'object') {
-          mergeDecisionEvents(state, [payload])
-          if (state.task) {
-            state.task = {
-              ...state.task,
-              decision_events: state.decisionEvents.slice(),
+          const action = payload.action as string | undefined
+
+          if (action === 'llm_delta') {
+            const sid = (payload.stream_id as string) || 'default'
+            const delta = (payload.delta as string) || ''
+            const phase = (payload.phase as string) || ''
+            const kind = (payload.kind as string) || 'content'
+            if (!state.llmStreams[sid]) {
+              state.llmStreams[sid] = { streamId: sid, phase, kind, text: '', updatedAt: Date.now() }
+            }
+            state.llmStreams[sid].text += delta
+            state.llmStreams[sid].updatedAt = Date.now()
+          } else if (action === 'tool_stream') {
+            const sid = (payload.stream_id as string) || 'default'
+            const line = (payload.line as string) || ''
+            if (!state.toolStreams[sid]) {
+              state.toolStreams[sid] = []
+            }
+            state.toolStreams[sid].push(line)
+          } else {
+            mergeDecisionEvents(state, [payload as unknown as DecisionEvent])
+            if (state.task) {
+              state.task = {
+                ...state.task,
+                decision_events: state.decisionEvents.slice(),
+              }
             }
           }
         }
