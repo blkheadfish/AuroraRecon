@@ -608,13 +608,16 @@ class SkillEngine:
                     # Legacy names retained so historical reports still resolve
                     "rce_ssh_log_poison": "rce",
                     "rce_apache_log_poison": "rce",
-                    # New per-language log-poison variants (C2/C5/C6):
+                    # Legacy per-language log-poison variants:
                     "rce_ssh_log_poison_php": "rce",
                     "rce_ssh_log_poison_jsp": "rce",
                     "rce_ssh_log_poison_aspx": "rce",
                     "rce_access_log_poison_php": "rce",
                     "rce_access_log_poison_jsp": "rce",
                     "rce_access_log_poison_aspx": "rce",
+                    # New vector-based log-poison types (log_poisoning skill):
+                    "rce_access_log_poison": "rce",
+                    "rce_smtp_log_poison": "rce",
                     "file_read": "file_read",
                     "source_read": "source_read",
                 }
