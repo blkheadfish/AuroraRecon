@@ -26,6 +26,32 @@ THOUGHT_RE = re.compile(
 )
 
 
+_SHELL_NAMES = {"/bin/bash", "/bin/sh", "bash", "sh", "/bin/zsh", "zsh"}
+_SKIP_PREFIX_RE = re.compile(
+    r"^(set\s|export\s|cd\s|echo\s|#|if\s|then\b|else\b|fi\b|do\b|done\b|while\s|for\s|\[)"
+)
+_VAR_ASSIGN_RE = re.compile(r"^\w+=")
+
+
+def _infer_tool_from_command(cmd: str) -> str:
+    """Extract the primary tool name from a shell command/script string."""
+    if not cmd:
+        return "script"
+    for segment in re.split(r"[;\n|]|&&|\|\|", cmd):
+        segment = segment.strip()
+        if not segment:
+            continue
+        if _SKIP_PREFIX_RE.match(segment):
+            continue
+        if _VAR_ASSIGN_RE.match(segment):
+            continue
+        first_token = segment.split()[0]
+        name = first_token.rsplit("/", 1)[-1]
+        if name and name not in _SHELL_NAMES:
+            return name
+    return "script"
+
+
 def _command_preview(command: str, max_len: int = 280) -> str:
     """Compress command while retaining suspicious fragments for debugging."""
     normalized = " ".join((command or "").split())
@@ -343,6 +369,8 @@ class TaskStateManager:
             timestamp = str(payload.get("timestamp") or "")
             phase = str(payload.get("phase") or "")
             tool = str(payload.get("tool") or "shell")
+            if tool in _SHELL_NAMES:
+                tool = _infer_tool_from_command(cmd)
             backend = str(payload.get("backend") or "")
             exit_code = payload.get("exit_code")
             elapsed = payload.get("elapsed")
@@ -415,12 +443,15 @@ class TaskStateManager:
                 if dedupe_key in seen_exec_keys:
                     continue
                 seen_exec_keys.add(dedupe_key)
+                rec_tool = str(record.get("tool") or "shell")
+                if rec_tool in _SHELL_NAMES:
+                    rec_tool = _infer_tool_from_command(cmd)
                 events.append({
                     "id": f"cmd-{ridx}-{cidx}",
                     "timestamp": timestamp,
                     "phase": str(record.get("phase") or "exploit"),
                     "action": "command_exec",
-                    "tool": str(record.get("tool") or "shell"),
+                    "tool": rec_tool,
                     "backend": str(record.get("backend") or ""),
                     "poc_or_vuln": vuln_id,
                     "command": cmd,

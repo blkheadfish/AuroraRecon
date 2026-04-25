@@ -36,12 +36,6 @@ export default defineConfig({
 				changeOrigin: true,
 				timeout: 0,
 			},
-			'/admin/terminal': {
-				target: BACKEND.replace(/^http/, 'ws'),
-				ws: true,
-				changeOrigin: true,
-				timeout: 0,
-			},
 		},
 	},
 })

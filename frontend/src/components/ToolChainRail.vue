@@ -56,8 +56,26 @@ const nodes = computed(() => {
   return result
 })
 
+const SHELL_NAMES = new Set(['/bin/bash', '/bin/sh', 'bash', 'sh', '/bin/zsh', 'zsh'])
+const SKIP_RE = /^(set\s|export\s|cd\s|echo\s|#|if\s|then\b|else\b|fi\b|do\b|done\b|while\s|for\s|\[)/
+const VAR_RE = /^\w+=/
+
+function inferToolFromCommand(cmd) {
+  if (!cmd) return ''
+  for (const seg of cmd.split(/[;\n|]|&&|\|\|/)) {
+    const trimmed = seg.trim()
+    if (!trimmed) continue
+    if (SKIP_RE.test(trimmed)) continue
+    if (VAR_RE.test(trimmed)) continue
+    const token = trimmed.split(/\s/)[0]
+    const name = token.split('/').pop()
+    if (name && !SHELL_NAMES.has(name)) return name
+  }
+  return ''
+}
+
 function extractToolName(item) {
-  if (item.tool) return item.tool
+  if (item.tool && !SHELL_NAMES.has(item.tool)) return item.tool
   const title = item.title || ''
   const mCmd = title.match(/命令执行\s*·\s*(.+)/)
   if (mCmd) return mCmd[1]
@@ -65,6 +83,8 @@ function extractToolName(item) {
   if (mTool) return mTool[1]
   const mRes = title.match(/调用结果\s*·\s*(.+)/)
   if (mRes) return mRes[1]
+  const fromCmd = inferToolFromCommand(item.command || '')
+  if (fromCmd) return fromCmd
   return ''
 }
 

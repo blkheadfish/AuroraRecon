@@ -161,6 +161,24 @@ function inferOutputLang(text) {
   return 'auto'
 }
 
+const _SHELL_NAMES = new Set(['/bin/bash', '/bin/sh', 'bash', 'sh', '/bin/zsh', 'zsh'])
+const _SKIP_RE = /^(set\s|export\s|cd\s|echo\s|#|if\s|then\b|else\b|fi\b|do\b|done\b|while\s|for\s|\[)/
+const _VAR_RE = /^\w+=/
+
+function inferToolFromCommand(cmd) {
+  if (!cmd) return ''
+  for (const seg of cmd.split(/[;\n|]|&&|\|\|/)) {
+    const trimmed = seg.trim()
+    if (!trimmed) continue
+    if (_SKIP_RE.test(trimmed)) continue
+    if (_VAR_RE.test(trimmed)) continue
+    const token = trimmed.split(/\s/)[0]
+    const name = token.split('/').pop()
+    if (name && !_SHELL_NAMES.has(name)) return name
+  }
+  return ''
+}
+
 function buildExecPayloads(command, stdout, stderr, meta = {}) {
   const runtimeCommand = String(meta?.runtimeCommand || '').trim()
   const outputMeta = {
@@ -266,15 +284,18 @@ const decisionItems = computed(() => {
       const purposeText = entry.purpose ? ` ｜ purpose=${entry.purpose}` : ''
       const roundText = entry.round !== undefined && entry.round !== null ? ` ｜ round=${entry.round}` : ''
       const phaseTextInfo = entry.phase ? ` ｜ phase=${entry.phase}` : ''
+      const toolLabel = (entry.tool && !_SHELL_NAMES.has(entry.tool))
+        ? entry.tool
+        : inferToolFromCommand(entry.command) || 'shell'
       const titleText = entry.poc_or_vuln
         ? `命令执行 · ${entry.poc_or_vuln}`
-        : `命令执行 · ${entry.tool || 'shell'}`
+        : `命令执行 · ${toolLabel}`
       events.push({
         id: `cmd-${idx}`,
         time,
         tone: (entry.exit_code ?? -1) === 0 ? 'success' : 'danger',
         action: 'command_exec',
-        tool: entry.tool || 'shell',
+        tool: toolLabel,
         title: titleText,
         desc: `exit=${entry.exit_code ?? '-'} ｜ elapsed=${entry.elapsed_ms ?? '-'}ms${phaseTextInfo}${roundText}${purposeText}`,
         payloads: buildExecPayloads(command, stdout, stderr, {
