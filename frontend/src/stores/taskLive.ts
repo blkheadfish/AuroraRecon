@@ -108,11 +108,26 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
 
     state.unsub = subscribeTaskEvents(taskId, (event) => {
       state.events.push(event)
-      if ((event as { type?: string }).type === 'log') {
+      const eventType = (event as { type?: string }).type
+
+      if (eventType === 'history_logs') {
+        const lines = (event as { data?: string[] }).data || []
+        for (const line of lines) {
+          pushLog(state, line)
+        }
+      }
+      if (eventType === 'history_events') {
+        const events = (event as { data?: DecisionEvent[] }).data || []
+        mergeDecisionEvents(state, events)
+        if (state.task) {
+          state.task = { ...state.task, decision_events: state.decisionEvents.slice() }
+        }
+      }
+      if (eventType === 'log') {
         const line = String((event as { data?: string }).data || '')
         pushLog(state, line)
       }
-      if ((event as { type?: string }).type === 'decision_event') {
+      if (eventType === 'decision_event') {
         const payload = (event as { data?: Record<string, unknown> }).data
         if (payload && typeof payload === 'object') {
           const action = payload.action as string | undefined

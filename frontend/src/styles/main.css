@@ -60,11 +60,12 @@
     --hljs-selector:  #ff7b72;
     --hljs-literal:   #79c0ff;
 
-    --font-mono: 'JetBrains Mono', 'Fira Code', 'Consolas', 'Menlo', monospace;
-    /* Intentionally aliased to mono so any legacy --font-sans usage still
-       renders as JetBrains Mono and never falls back to Times New Roman. */
-    --font-sans: 'JetBrains Mono', 'Fira Code', 'Consolas', 'Menlo', monospace;
-    --font-orbitron: 'Orbitron', 'JetBrains Mono', 'Consolas', monospace;
+    --font-mono: 'JetBrains Mono', 'Fira Code', 'Consolas', 'Menlo',
+                 'PingFang SC', 'Microsoft YaHei', 'Noto Sans SC', monospace;
+    --font-sans: 'JetBrains Mono', 'Fira Code', 'Consolas', 'Menlo',
+                 'PingFang SC', 'Microsoft YaHei', 'Noto Sans SC', sans-serif;
+    --font-orbitron: 'Orbitron', 'JetBrains Mono', 'Consolas',
+                     'PingFang SC', 'Microsoft YaHei', 'Noto Sans SC', monospace;
     --start-grid-line: rgba(139, 148, 158, 0.2);
     --start-scanline: rgba(56, 139, 253, 0.14);
     --start-panel-bg: rgba(22, 27, 34, 0.72);

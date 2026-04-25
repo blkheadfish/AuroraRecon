@@ -35,8 +35,13 @@ try:
     from psycopg_pool import AsyncConnectionPool           # type: ignore
     from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver  # type: ignore
     _HAS_PG_SAVER = True
-except ImportError:
+except ImportError as _pg_import_err:
     _HAS_PG_SAVER = False
+    logging.getLogger(__name__).info(
+        "[Orchestrator] PostgreSQL checkpointer 依赖缺失 (%s)，"
+        "请安装 psycopg[binary] psycopg_pool langgraph-checkpoint-postgres",
+        _pg_import_err,
+    )
 
 from backend.agents.models import (
     CommandExecutionRecord,
@@ -405,12 +410,15 @@ async def node_recon(state: PentestState) -> PentestState:
         state.log(line)
     async def _on_exec_record(record: dict):
         _append_tool_record(state, record, default_phase="recon")
+    async def _on_decision(event: dict):
+        state.push_decision(event)
     result = await agent.run(
         target=state.target_host or state.target,
         target_port=state.target_port,
         task_id=state.task_id,
         log_callback=_on_tool_log,
         record_callback=_on_exec_record,
+        decision_callback=_on_decision,
     )
     state.open_ports = result.get("ports", [])
     state.os_info = _stringify_dict_keys(result.get("os_info", {}))
@@ -1980,18 +1988,39 @@ class Orchestrator:
         """Build a persistent PostgreSQL checkpointer when available,
         falling back to in-memory MemorySaver for local development."""
         pg_url = os.getenv("DATABASE_URL", "")
-        if _HAS_PG_SAVER and pg_url:
-            conninfo = pg_url.replace(
-                "postgresql+asyncpg://", "postgresql://"
+        if not pg_url:
+            logger.info(
+                "[Orchestrator] DATABASE_URL 未配置，使用 MemorySaver"
             )
-            pool = AsyncConnectionPool(conninfo=conninfo, open=False)
-            await pool.open()
-            saver = AsyncPostgresSaver(pool)
-            await saver.setup()
-            logger.info("[Orchestrator] 使用 PostgreSQL 持久化 checkpointer")
-            return saver
-        logger.warning(
-            "[Orchestrator] PostgreSQL checkpointer 不可用，回退到 MemorySaver"
+            return MemorySaver()
+        if not _HAS_PG_SAVER:
+            logger.warning(
+                "[Orchestrator] DATABASE_URL 已配置但 psycopg 依赖缺失，"
+                "回退到 MemorySaver。请安装: pip install 'psycopg[binary]' psycopg_pool"
+            )
+            return MemorySaver()
+        conninfo = pg_url.replace(
+            "postgresql+asyncpg://", "postgresql://"
+        )
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            try:
+                pool = AsyncConnectionPool(conninfo=conninfo, open=False)
+                await pool.open()
+                saver = AsyncPostgresSaver(pool)
+                await saver.setup()
+                logger.info("[Orchestrator] 使用 PostgreSQL 持久化 checkpointer")
+                return saver
+            except Exception as exc:
+                logger.warning(
+                    "[Orchestrator] PostgreSQL checkpointer 连接失败 "
+                    "(第 %d/%d 次): %s", attempt, max_retries, exc,
+                )
+                if attempt < max_retries:
+                    await asyncio.sleep(2.0 * attempt)
+        logger.error(
+            "[Orchestrator] PostgreSQL checkpointer %d 次重试均失败，回退到 MemorySaver",
+            max_retries,
         )
         return MemorySaver()
 

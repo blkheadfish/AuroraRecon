@@ -17,7 +17,7 @@ import os
 import re
 import shlex
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import urljoin, urlparse
 
 from backend.agents.models import PortInfo
@@ -93,6 +93,7 @@ class ReconAgent:
 		task_id: Optional[str] = None,
 		log_callback: LogCallback = None,
 		record_callback: RecordCallback = None,
+		decision_callback: Optional[Callable] = None,
 	) -> dict[str, Any]:
 		"""
 		执行侦察。
@@ -104,8 +105,22 @@ class ReconAgent:
 		                 确保该端口一定被覆盖。
 		    task_id:     任务 ID
 		    log_callback: 日志回调
+		    decision_callback: 实时决策事件回调（tool_start / tool_result / thought）
 		"""
-		if log_callback or record_callback:
+		self._decision_callback = decision_callback
+
+		async def _tool_stream_cb(line: str) -> None:
+			"""Forward tool stdout/stderr lines as tool_stream decision events."""
+			if decision_callback:
+				import uuid as _uuid
+				await decision_callback({
+					"action": "tool_stream",
+					"phase": "recon",
+					"stream_id": f"recon-{_uuid.uuid4().hex[:8]}",
+					"line": line,
+				})
+
+		if log_callback or record_callback or decision_callback:
 			origin_run = self.executor.run
 			origin_run_script = self.executor.run_script
 
@@ -115,6 +130,8 @@ class ReconAgent:
 				if record_callback:
 					kwargs.setdefault("record_callback", record_callback)
 					kwargs.setdefault("record_phase", "recon")
+				if decision_callback:
+					kwargs.setdefault("stream_callback", _tool_stream_cb)
 				return await origin_run(*args, **kwargs)
 
 			async def _run_script_with_hooks(*args, **kwargs):
@@ -123,6 +140,8 @@ class ReconAgent:
 				if record_callback:
 					kwargs.setdefault("record_callback", record_callback)
 					kwargs.setdefault("record_phase", "recon")
+				if decision_callback:
+					kwargs.setdefault("stream_callback", _tool_stream_cb)
 				return await origin_run_script(*args, **kwargs)
 
 			self.executor.run = _run_with_hooks
@@ -131,15 +150,48 @@ class ReconAgent:
 		logger.info(f"[ReconAgent] 开始侦察: {target}" +
 		            (f" (用户指定端口: {target_port})" if target_port else ""))
 
+		if decision_callback:
+			await decision_callback({
+				"action": "tool_start",
+				"phase": "recon",
+				"tool": "nmap",
+				"message": f"开始 Nmap 端口扫描: {target}",
+			})
+
 		ports, os_info, raw_nmap = await self._nmap_scan(
 			target, target_port, task_id, log_callback,
 		)
 
+		if decision_callback:
+			ports_summary = ", ".join(f"{p.port}/{p.service}" for p in ports[:15])
+			await decision_callback({
+				"action": "tool_result",
+				"phase": "recon",
+				"tool": "nmap",
+				"message": f"Nmap 扫描完成: 发现 {len(ports)} 个开放端口 ({ports_summary})",
+			})
+
 		# 4th pass: targeted per-service nmap vuln scripts
+		if decision_callback:
+			await decision_callback({
+				"action": "tool_start",
+				"phase": "recon",
+				"tool": "nmap-vuln-scripts",
+				"message": f"Nmap 漏洞脚本扫描: {len(ports)} 个端口",
+			})
+
 		nmap_vuln_hints = await self._nmap_vuln_scan(
 			target, [p.port for p in ports], task_id, log_callback,
 			ports_info=ports,
 		)
+
+		if decision_callback:
+			await decision_callback({
+				"action": "tool_result",
+				"phase": "recon",
+				"tool": "nmap-vuln-scripts",
+				"message": f"Nmap 漏洞脚本完成: {len(nmap_vuln_hints)} 条线索",
+			})
 
 		llm_recon_hints = await self._llm_analyze_nmap(
 			target, raw_nmap, ports, log_callback,
@@ -168,6 +220,14 @@ class ReconAgent:
 		if web_ports:
 			primary_scheme = "https" if web_ports[0].port in (443, 8443) else "http"
 			primary_target = f"{primary_scheme}://{target}:{web_ports[0].port}"
+
+			if decision_callback:
+				await decision_callback({
+					"action": "tool_start",
+					"phase": "recon",
+					"tool": "dir-discovery",
+					"message": f"开始目录发现: {len(web_ports)} 个 Web 端口",
+				})
 
 			has_waf = await self._detect_waf(
 				primary_target, task_id, log_callback,
@@ -243,6 +303,14 @@ class ReconAgent:
 			web_paths = aggregator.get_actionable_paths()
 			raw_gobuster = "\n".join(raw_outputs_all)
 			dir_coverage = coverage_reports[0] if coverage_reports else {}
+
+			if decision_callback:
+				await decision_callback({
+					"action": "tool_result",
+					"phase": "recon",
+					"tool": "dir-discovery",
+					"message": f"目录发现完成: {len(web_paths)} 条路径",
+				})
 
 		subdomains = await self._subdomain_enum(
 			target, task_id, log_callback,
