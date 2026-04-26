@@ -399,6 +399,17 @@ class PentestState(BaseModel):
 	# 后渗透阶段独立审批标志，与 approved 互不干扰
 	post_approved: bool = False
 
+	# ── 通用决策 checkpoint 协议 ─────────────────────────
+	# pending_checkpoint: 当前正在等待用户响应的 checkpoint(若有),
+	#   结构见 CheckpointPayload(下方),为 None 表示当前无人工干预需求。
+	# checkpoint_history:  已经完成的 checkpoint(含用户响应),用于审计和
+	#   断线重连后的回放;新条目追加在末尾,前端按 checkpoint_id 去重。
+	# pending_user_prompt: 上一轮 checkpoint 的 user_prompt,会拼接到
+	#   下一阶段的 LLM system prompt 末尾,做软引导。
+	pending_checkpoint: Optional[dict[str, Any]] = None
+	checkpoint_history: list[dict[str, Any]] = Field(default_factory=list)
+	pending_user_prompt: str = ""
+
 	# 用户-代理对话（决策视图交互式对话）
 	user_messages: list[dict] = Field(default_factory=list)
 	agent_replies: list[dict] = Field(default_factory=list)
@@ -435,6 +446,116 @@ class PentestState(BaseModel):
 				loop.create_task(sink(event))
 		except Exception:
 			pass
+
+	# ── 通用 checkpoint 协议(Plan 模式确认框)──────────────
+	def open_checkpoint(self, payload: dict[str, Any]) -> dict[str, Any]:
+		"""Register a pending checkpoint and broadcast it to the frontend.
+
+		Frontend receives the same payload via decision_event(action=
+		"checkpoint_request") so the live timeline / Plan 风格确认卡片可以
+		立刻渲染。Backend 节点随后应当主动结束本轮(return)并依靠 LangGraph
+		``interrupt_before`` 暂停在下一节点之前,等待 ``/checkpoint/respond``。
+		"""
+		cp_id = payload.get("checkpoint_id") or (
+			f"cp-{self.task_id[:8]}-{len(self.checkpoint_history)}-"
+			f"{datetime.utcnow().strftime('%H%M%S%f')}"
+		)
+		now = datetime.utcnow().isoformat()
+		ckpt = {
+			"checkpoint_id": cp_id,
+			"checkpoint_type": payload.get("checkpoint_type", "generic"),
+			"phase": payload.get("phase", self.current_phase),
+			"status": "pending",
+			"created_at": now,
+			"thinking": payload.get("thinking", ""),
+			"summary": payload.get("summary", ""),
+			"recommendation": payload.get("recommendation", ""),
+			"risk": payload.get("risk", ""),
+			"options": payload.get("options", []),
+			"requires_input": bool(payload.get("requires_input", True)),
+			"default_action": payload.get("default_action", "approve"),
+			"context": payload.get("context", {}),
+		}
+		self.pending_checkpoint = ckpt
+		# 决策事件流里也广播一份,方便前端时间线统一展示
+		self.push_decision({
+			"action": "checkpoint_request",
+			"phase": ckpt["phase"],
+			"checkpoint_id": cp_id,
+			"checkpoint_type": ckpt["checkpoint_type"],
+			"thinking": ckpt["thinking"],
+			"summary": ckpt["summary"],
+			"recommendation": ckpt["recommendation"],
+			"risk": ckpt["risk"],
+			"options": ckpt["options"],
+			"requires_input": ckpt["requires_input"],
+			"default_action": ckpt["default_action"],
+			"message": ckpt["summary"] or ckpt["recommendation"] or "等待人工确认",
+			"tone": "warning",
+		})
+		return ckpt
+
+	def resolve_checkpoint(self, response: dict[str, Any]) -> Optional[dict[str, Any]]:
+		"""Consume the pending checkpoint with the user's response.
+
+		``response`` 可包含: action(approve|reject|modify|skip)、
+		selected_option、user_prompt、note。返回已归档的 checkpoint 副本,
+		没有 pending 时返回 None。同时:
+		  - 把 user_prompt 追加到 ``pending_user_prompt`` 给后续节点参考
+		  - 把 user_prompt 作为 user_messages 入库,与 chat 时间线合并
+		"""
+		ckpt = self.pending_checkpoint
+		if not ckpt:
+			return None
+		now = datetime.utcnow().isoformat()
+		archived = dict(ckpt)
+		archived.update({
+			"status": "resolved",
+			"resolved_at": now,
+			"response": {
+				"action": response.get("action", "approve"),
+				"selected_option": response.get("selected_option", ""),
+				"user_prompt": response.get("user_prompt", ""),
+				"note": response.get("note", ""),
+			},
+		})
+		self.checkpoint_history.append(archived)
+		# 限长,避免 checkpoint payload 在 LangGraph snapshot 里无限增长
+		if len(self.checkpoint_history) > 200:
+			self.checkpoint_history = self.checkpoint_history[-100:]
+		self.pending_checkpoint = None
+
+		user_prompt = (response.get("user_prompt") or "").strip()
+		if user_prompt:
+			# 软引导:拼到 pending_user_prompt 末尾,下一节点的 prompt builder
+			# 可以读取这个字段把它注入 system prompt。
+			joined = (self.pending_user_prompt or "").strip()
+			self.pending_user_prompt = (
+				f"{joined}\n{user_prompt}" if joined else user_prompt
+			)
+			self.user_messages.append({
+				"role": "user",
+				"text": user_prompt,
+				"timestamp": now,
+				"checkpoint_id": archived["checkpoint_id"],
+			})
+
+		self.push_decision({
+			"action": "checkpoint_resolved",
+			"phase": archived["phase"],
+			"checkpoint_id": archived["checkpoint_id"],
+			"checkpoint_type": archived["checkpoint_type"],
+			"response": archived["response"],
+			"message": (
+				f"用户响应: {archived['response']['action']}"
+				+ (f" — {user_prompt[:80]}" if user_prompt else "")
+			),
+			"tone": (
+				"success" if archived["response"]["action"] == "approve"
+				else ("danger" if archived["response"]["action"] == "reject" else "info")
+			),
+		})
+		return archived
 
 	@field_validator("fingerprints", mode="before")
 	@classmethod

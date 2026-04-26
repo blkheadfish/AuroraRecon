@@ -13,7 +13,8 @@ from fastapi import APIRouter, HTTPException, BackgroundTasks, Request
 
 from backend.agents.models import PentestState, TaskStatus, apply_mode_defaults
 from backend.api.schemas import (
-    CreateTaskRequest, TaskSummary, TaskStats, ApproveRequest, ChatMessageRequest,
+    CreateTaskRequest, TaskSummary, TaskStats, ApproveRequest,
+    CheckpointDecisionRequest, ChatMessageRequest,
 )
 from backend.api.state import get_state_manager, TaskStateManager
 from backend.api.event_bus import get_event_bus, TaskEventBus
@@ -217,13 +218,24 @@ async def list_tasks(request: Request, all: bool = False):
 
 
 @router.get("/tasks/{task_id}")
-async def get_task(task_id: str, request: Request):
+async def get_task(task_id: str, request: Request, full: bool = False):
+    """返回任务详情。
+
+    默认走轻量快照(``to_detail_snapshot``),只附带最近 N 条 phase_log
+    与 decision_events,完整日志/报告/工具记录走专用接口,避免运行很久
+    的任务首屏接口返回上 MB 数据导致前端卡顿。
+
+    ``?full=true`` 仍可拿到旧版完整 ``to_detail`` 结果,用于「原始数据」
+    Tab 等需要整棵 state 的场景。
+    """
     state = await _resolve_state(task_id)
     if not state:
         raise HTTPException(status_code=404, detail="任务不存在")
     _enforce_task_owner(state, request, "get_task")
     sm = _get_sm()
-    return sm.to_detail(state)
+    if full:
+        return sm.to_detail(state)
+    return sm.to_detail_snapshot(state)
 
 
 @router.get("/tasks/{task_id}/report")
@@ -238,21 +250,106 @@ async def get_report(task_id: str, request: Request):
 
 
 @router.get("/tasks/{task_id}/logs")
-async def get_logs(task_id: str, request: Request):
+async def get_logs(
+    task_id: str,
+    request: Request,
+    offset: int = 0,
+    limit: int = 500,
+    tail: int | None = None,
+    after_seq: int | None = None,
+):
+    """分页/增量读取任务日志。
+
+    协议:
+      * 不传参数 → 兼容旧前端,返回最近 ``limit`` (默认 500) 条
+        作为 ``tail`` 行为,避免一次性下发数万行 phase_log。
+      * ``tail=N``        → 返回最后 N 行(N 上限 5000)。
+      * ``after_seq=K``   → 返回 index > K 的所有行(增量,WS 重连用)。
+      * ``offset=O&limit=L`` → 经典分页(向前回滚历史日志用)。
+
+    响应:
+      ``logs``        : list[str]
+      ``offset``      : 本次返回起始 index (含)
+      ``limit``       : 服务端真实使用的 limit
+      ``total``       : 服务端 phase_log 总条数
+      ``next_seq``    : 下一次增量读起点(等于 offset+len(logs))
+      ``has_more``    : 是否还有更早的历史可向前翻
+    """
     sm = _get_sm()
     state = await _resolve_state(task_id)
     if not state:
         raise HTTPException(status_code=404, detail="任务不存在")
     _enforce_task_owner(state, request, "get_logs")
+
+    # 合并 Redis(若可用) 与内存 phase_log,Redis 优先(更完整);
+    # Redis 不可用或为空时回退到内存数组。
+    source: list[str] = []
     if sm.redis_available:
         try:
             from backend.db.redis_cache import get_task_logs
-            logs = await get_task_logs(task_id)
-            if logs:
-                return {"logs": logs}
+            redis_logs = await get_task_logs(task_id)
+            if redis_logs:
+                source = list(redis_logs)
         except Exception:
-            pass
-    return {"logs": state.phase_log}
+            source = []
+    if not source:
+        source = list(state.phase_log or [])
+
+    total = len(source)
+    LIMIT_MAX = 5000
+
+    if after_seq is not None:
+        start = max(0, int(after_seq))
+        end = total
+        sliced = source[start:end]
+        return {
+            "logs": sliced,
+            "offset": start,
+            "limit": len(sliced),
+            "total": total,
+            "next_seq": start + len(sliced),
+            "has_more": False,
+        }
+
+    if tail is not None:
+        n = max(0, min(int(tail), LIMIT_MAX))
+        start = max(0, total - n)
+        sliced = source[start:]
+        return {
+            "logs": sliced,
+            "offset": start,
+            "limit": len(sliced),
+            "total": total,
+            "next_seq": total,
+            "has_more": start > 0,
+        }
+
+    if offset == 0 and limit == 500:
+        # 默认行为(不带参数):返回最近 500 条,避免大日志全量下发。
+        n = min(500, LIMIT_MAX)
+        start = max(0, total - n)
+        sliced = source[start:]
+        return {
+            "logs": sliced,
+            "offset": start,
+            "limit": len(sliced),
+            "total": total,
+            "next_seq": total,
+            "has_more": start > 0,
+        }
+
+    start = max(0, int(offset))
+    n = max(0, min(int(limit), LIMIT_MAX))
+    end = min(total, start + n)
+    sliced = source[start:end]
+    return {
+        "logs": sliced,
+        "offset": start,
+        "limit": len(sliced),
+        "total": total,
+        "next_seq": end,
+        "has_more": end < total,
+    }
 
 
 @router.post("/tasks/{task_id}/cancel")
@@ -385,6 +482,79 @@ async def approve_task(task_id: str, req: ApproveRequest, request: Request):
         "status": "running",
     })
     return {"status": "ok", "approved": req.approved}
+
+
+# ── 通用 checkpoint 响应 ──────────────────────────────────
+
+@router.post("/tasks/{task_id}/checkpoint/respond")
+async def respond_checkpoint(
+    task_id: str, req: CheckpointDecisionRequest, request: Request,
+):
+    """统一处理 Plan 模式确认框的响应。
+
+    它是 ``/approve`` 的超集:
+      * 没有 pending checkpoint 但任务确实在 awaiting_approval,会回退到
+        旧逻辑(仅设置 approved/post_approved)。
+      * 存在 pending checkpoint 时,根据 ``action`` 解析:
+          - approve / modify / skip → 视为同意继续(approved=True)
+          - reject                 → 视为拒绝(approved=False)
+      * ``user_prompt`` 会被写进 state.pending_user_prompt,后续节点可消费。
+    """
+    sm = _get_sm()
+    bus = _get_bus()
+    state = sm.get(task_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    _enforce_task_owner(state, request, "respond_checkpoint")
+
+    if state.current_phase not in ("awaiting_approval", "post_foothold_approval"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"任务当前阶段 '{state.current_phase}' 不需要确认",
+        )
+
+    inflight_ts = sm.get_approval_inflight(task_id)
+    if inflight_ts is not None:
+        elapsed = _time.time() - inflight_ts
+        if elapsed < sm.APPROVAL_INFLIGHT_TIMEOUT:
+            return {"status": "ok", "note": "审批已在执行中"}
+        sm.clear_approval_inflight(task_id)
+
+    archived = state.resolve_checkpoint({
+        "action": req.action,
+        "selected_option": req.selected_option,
+        "user_prompt": req.user_prompt,
+        "note": req.note,
+    })
+
+    approved = req.action != "reject"
+    sm.set_approval_inflight(task_id, _time.time())
+    if state.current_phase == "post_foothold_approval":
+        state.post_approved = approved
+    else:
+        state.approved = approved
+
+    state.log(
+        f"[Checkpoint] action={req.action}"
+        + (f" prompt='{req.user_prompt[:40]}'" if req.user_prompt else "")
+    )
+    sm.set(task_id, state)
+
+    from backend.api.services.task_runner import resume_task
+    task_handle = asyncio.create_task(resume_task(task_id, approved))
+    sm.register_bg_task(task_id, task_handle)
+
+    await bus.publish(task_id, {
+        "type": "phase_update",
+        **sm.ws_phase_payload(state, log_tail=3),
+        "status": "running",
+    })
+    return {
+        "status": "ok",
+        "approved": approved,
+        "action": req.action,
+        "checkpoint": archived,
+    }
 
 
 # ── 用户-代理对话 ─────────────────────────────────────────

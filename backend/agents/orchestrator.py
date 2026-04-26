@@ -1434,6 +1434,10 @@ async def node_human_approval(state: PentestState) -> PentestState:
       推进状态。
     - 否则保持原行为:LangGraph 在本节点前中断,前端 /approve 设置 approved
       后再恢复执行。
+
+    新版本同时使用 ``state.open_checkpoint`` 推送 Plan 风格确认卡片,把
+    AI thinking、可选动作、风险提示一起暴露给前端;旧的 ``/approve`` 端点
+    继续兼容(只更新 approved 字段)。
     """
     state.current_phase = "awaiting_approval"
     _record_chain_visit(state, "awaiting_approval")
@@ -1445,10 +1449,75 @@ async def node_human_approval(state: PentestState) -> PentestState:
     elif not state.approved:
         state.status = TaskStatus.AWAITING_APPROVAL
         state.log(f"⏸ 收到审批请求:{len(exploitable)} 个漏洞待利用")
+        # 推送通用 checkpoint(若已有 pending 则跳过,避免重复)
+        if not state.pending_checkpoint:
+            top_targets = [
+                {
+                    "label": f.name,
+                    "severity": f.severity,
+                    "vuln_id": f.vuln_id,
+                    "exploitable": True,
+                    "reason": (f.description or "")[:120],
+                }
+                for f in exploitable[:5]
+            ]
+            risk_note = (
+                "高风险" if any(f.severity in ("critical", "high") for f in exploitable)
+                else "中等风险"
+            )
+            thinking_lines = []
+            for f in exploitable[:6]:
+                line = f"- {f.severity.upper()} | {f.name}"
+                if f.cve:
+                    line += f" ({f.cve})"
+                thinking_lines.append(line)
+            state.open_checkpoint({
+                "checkpoint_type": "exploit_gate",
+                "phase": "awaiting_approval",
+                "summary": (
+                    f"系统已识别 {len(exploitable)} 个可利用漏洞,等待你的授权再开始利用。"
+                ),
+                "thinking": "\n".join(thinking_lines) or "暂无可展开的推理",
+                "recommendation": "批准后将进入立足点尝试阶段;拒绝则跳过利用并直接出报告。",
+                "risk": risk_note,
+                "default_action": "approve",
+                "options": [
+                    {
+                        "id": "approve",
+                        "label": "批准并继续利用",
+                        "tone": "primary",
+                        "action": "approve",
+                    },
+                    {
+                        "id": "modify",
+                        "label": "提交建议(继续利用前补充意图/约束)",
+                        "tone": "info",
+                        "action": "modify",
+                        "wants_prompt": True,
+                    },
+                    {
+                        "id": "reject",
+                        "label": "拒绝利用,直接出报告",
+                        "tone": "danger",
+                        "action": "reject",
+                    },
+                ],
+                "context": {
+                    "exploitable_count": len(exploitable),
+                    "top_targets": top_targets,
+                    "workflow_mode": state.workflow_mode,
+                    "auto_approve": state.auto_approve,
+                },
+            })
 
     if state.approved:
         state.status = TaskStatus.RUNNING
         state.log("✅ 已获授权,继续利用阶段")
+        # checkpoint 在 /checkpoint/respond 里已经被 resolve 过了,这里兜底清一次
+        if state.pending_checkpoint and (
+            state.pending_checkpoint.get("checkpoint_type") == "exploit_gate"
+        ):
+            state.pending_checkpoint = None
     else:
         state.log("⚠ 未获授权,跳过利用阶段")
         for f in state.findings:
@@ -1712,10 +1781,59 @@ async def node_post_foothold_approval(state: PentestState) -> PentestState:
     elif not state.post_approved:
         state.status = TaskStatus.AWAITING_APPROVAL
         state.log("⏸ 已获取 shell，等待人工确认是否继续提权/收集")
+        if not state.pending_checkpoint:
+            state.open_checkpoint({
+                "checkpoint_type": "post_foothold_gate",
+                "phase": "post_foothold_approval",
+                "summary": (
+                    f"目标已建立立足点(privilege={state.privilege_level or 'unknown'})。"
+                    f" 是否继续提权与目标收集?"
+                ),
+                "thinking": (
+                    f"foothold_status={state.foothold_status},"
+                    f" privesc_attempt={state.privesc_attempt_count}/{state.max_privesc_rounds},"
+                    f" exploit_results={len(state.exploit_results)}"
+                ),
+                "recommendation": "建议继续:执行提权 + 目标收集再出报告。",
+                "risk": "中等风险",
+                "default_action": "approve",
+                "options": [
+                    {
+                        "id": "approve",
+                        "label": "继续提权 / 收集",
+                        "tone": "primary",
+                        "action": "approve",
+                    },
+                    {
+                        "id": "modify",
+                        "label": "提交意见后继续(给提权更多约束)",
+                        "tone": "info",
+                        "action": "modify",
+                        "wants_prompt": True,
+                    },
+                    {
+                        "id": "reject",
+                        "label": "停止提权,直接出报告",
+                        "tone": "danger",
+                        "action": "reject",
+                    },
+                ],
+                "context": {
+                    "foothold_status": state.foothold_status,
+                    "privilege_level": state.privilege_level,
+                    "privesc_round": state.privesc_attempt_count,
+                    "max_privesc_rounds": state.max_privesc_rounds,
+                    "workflow_mode": state.workflow_mode,
+                },
+            })
 
     if state.post_approved:
         state.status = TaskStatus.RUNNING
         state.log("✅ 已获授权，继续提权阶段")
+        if state.pending_checkpoint and (
+            state.pending_checkpoint.get("checkpoint_type") == "post_foothold_gate"
+        ):
+            state.pending_checkpoint = None
     else:
         state.log("⚠ 未获授权，跳过提权阶段，直接收集并出报告")
     return state
@@ -2004,8 +2122,13 @@ class Orchestrator:
         )
         max_retries = 3
         for attempt in range(1, max_retries + 1):
+            pool = None
             try:
-                pool = AsyncConnectionPool(conninfo=conninfo, open=False)
+                pool = AsyncConnectionPool(
+                    conninfo=conninfo,
+                    open=False,
+                    kwargs={"autocommit": True},
+                )
                 await pool.open()
                 saver = AsyncPostgresSaver(pool)
                 await saver.setup()
@@ -2016,6 +2139,11 @@ class Orchestrator:
                     "[Orchestrator] PostgreSQL checkpointer 连接失败 "
                     "(第 %d/%d 次): %s", attempt, max_retries, exc,
                 )
+                if pool is not None:
+                    try:
+                        await pool.close()
+                    except Exception:
+                        pass
                 if attempt < max_retries:
                     await asyncio.sleep(2.0 * attempt)
         logger.error(

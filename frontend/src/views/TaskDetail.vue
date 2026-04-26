@@ -121,19 +121,29 @@
           <FindingsPanel :findings="findings" />
         </el-tab-pane>
 
-        <el-tab-pane label="实时日志" name="logs">
+        <!-- lazy: 这些 Tab 都是重组件,首屏不挂载,减少首次渲染时间和内存。 -->
+        <el-tab-pane label="实时日志" name="logs" lazy>
           <LogTerminal :logs="logs" :running="isRunning" :tool-streams="toolStreams" />
         </el-tab-pane>
 
-        <el-tab-pane label="侦察数据" name="recon">
+        <el-tab-pane label="侦察数据" name="recon" lazy>
           <ReconPanel :task="task" />
         </el-tab-pane>
 
-        <el-tab-pane label="原始数据" name="raw">
-          <JsonViewer :data="task" title="任务完整状态" />
+        <el-tab-pane label="原始数据" name="raw" lazy>
+          <div v-if="rawLoading" class="raw-loading">正在加载完整任务状态...</div>
+          <JsonViewer
+            v-else-if="rawTask"
+            :data="rawTask"
+            title="任务完整状态"
+          />
+          <div v-else class="raw-loading">
+            <el-button size="small" @click="loadRawTask">加载完整任务状态</el-button>
+            <span class="raw-hint">默认页面只展示最近的轻量快照,完整 state 按需拉取</span>
+          </div>
         </el-tab-pane>
 
-        <el-tab-pane label="报告" name="report" v-if="task?.report_path">
+        <el-tab-pane label="报告" name="report" v-if="task?.report_path || task?.report_available" lazy>
           <ReportPanel :task-id="taskId" />
         </el-tab-pane>
       </el-tabs>
@@ -142,7 +152,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, defineAsyncComponent, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { api } from '@/api'
@@ -151,13 +161,15 @@ import { useTaskLiveStore } from '@/stores/taskLive'
 import { trackEvent } from '@/metrics/tracker'
 import StatusBadge from '@/components/StatusBadge.vue'
 import TaskProgressMermaid from '@/components/TaskProgressMermaid.vue'
-import LogTerminal from '@/components/LogTerminal.vue'
 import FindingsPanel from '@/components/FindingsPanel.vue'
-import ReconPanel from '@/components/ReconPanel.vue'
-import JsonViewer from '@/components/JsonViewer.vue'
-import ReportPanel from '@/components/ReportPanel.vue'
 import DecisionTimeline from '@/components/DecisionTimeline.vue'
 import ApprovalComposer from '@/components/ApprovalComposer.vue'
+
+// 重组件改为按需加载, 首屏不付出解析+实例化 cost。
+const LogTerminal = defineAsyncComponent(() => import('@/components/LogTerminal.vue'))
+const ReconPanel = defineAsyncComponent(() => import('@/components/ReconPanel.vue'))
+const JsonViewer = defineAsyncComponent(() => import('@/components/JsonViewer.vue'))
+const ReportPanel = defineAsyncComponent(() => import('@/components/ReportPanel.vue'))
 
 const route = useRoute()
 const router = useRouter()
@@ -169,6 +181,8 @@ const loading = ref(true)
 const activeTab = ref('decision')
 const cancelling = ref(false)
 const pollTimer = ref(null)
+const rawTask = ref(null)
+const rawLoading = ref(false)
 
 const state = computed(() => liveStore.getLiveState(taskId))
 const llmStreams = computed(() => state.value?.llmStreams || {})
@@ -464,6 +478,8 @@ async function doCancel() {
 
 async function pollTask() {
   if (!isRunning.value) return
+  // WS 在最近 10s 内已带来过更新就跳过这次兜底刷新, 避免 WS+轮询双轨重复处理。
+  if (Date.now() - (state.value.lastWsUpdate || 0) < 10000) return
   try {
     await liveStore.refreshTask(taskId)
   } catch {
@@ -473,7 +489,9 @@ async function pollTask() {
 
 function startPolling() {
   stopPolling()
-  pollTimer.value = window.setInterval(pollTask, 15000)
+  // 兜底轮询拉长到 30s。WS 是数据主通道, 轮询只是断网/丢消息的保底,
+  // 没有必要每 15s 全量拉一次轻量快照。
+  pollTimer.value = window.setInterval(pollTask, 30000)
 }
 
 function stopPolling() {
@@ -483,10 +501,31 @@ function stopPolling() {
   }
 }
 
+async function loadRawTask() {
+  if (rawLoading.value) return
+  rawLoading.value = true
+  try {
+    rawTask.value = await api.getTaskFull(taskId)
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || '加载完整状态失败')
+  } finally {
+    rawLoading.value = false
+  }
+}
+
+// 用户首次切到「原始数据」Tab 时再请求完整 state, 避免首屏白白付费。
+watch(activeTab, (val) => {
+  if (val === 'raw' && !rawTask.value && !rawLoading.value) {
+    loadRawTask()
+  }
+})
+
 onMounted(async () => {
   loading.value = true
   try {
-    await Promise.all([listStore.fetchTasks(), liveStore.refreshTask(taskId)])
+    // 不再阻塞在全量任务列表上 —— 进入单个详情页和列表无强相关,
+    // refreshTask 内部会通过 upsertTask 同步当前条目。
+    await liveStore.refreshTask(taskId)
     await liveStore.attach(taskId)
     startPolling()
     trackEvent('task.detail.open', { taskId })
@@ -555,6 +594,20 @@ onUnmounted(() => {
   font-size: 12px;
 }
 .summary-hint {
+  color: var(--text-muted);
+}
+
+.raw-loading {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 24px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.raw-hint {
+  font-size: 12px;
   color: var(--text-muted);
 }
 </style>

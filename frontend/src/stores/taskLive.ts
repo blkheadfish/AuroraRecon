@@ -4,9 +4,17 @@ import { ElMessage } from 'element-plus'
 import { api } from '@/api'
 import { subscribeTaskEvents } from '@/services/wsManager'
 import { useTaskListStore } from '@/stores/taskList'
-import type { DecisionEvent, TaskDetail, WsTaskEvent } from '@/types/task'
+import type { DecisionEvent, TaskDetail } from '@/types/task'
 
 type ApprovalState = 'idle' | 'submitting' | 'submitted' | 'error'
+
+// ── 有界缓存阈值 ───────────────────────────────────────
+// 长任务运行起来日志/工具流/决策事件都会无限堆积,直接 push 进响应式
+// 数组会让前端内存与 DOM 越跑越慢直到卡死。统一在 store 层做 LRU 裁剪,
+// 由前端组件按需再缩成「可见 tail」交给 DOM。
+const MAX_LOG_BUFFER = 3000
+const MAX_DECISION_EVENTS = 1000
+const MAX_TOOL_STREAM_LINES = 500
 
 interface LlmStreamBubble {
   streamId: string
@@ -20,7 +28,10 @@ interface TaskLiveState {
   task: TaskDetail | null
   logs: string[]
   logSet: Set<string>
-  events: WsTaskEvent[]
+  /** 已知 server 端 phase_log 总条数,用于增量拉取/分页加载更早历史。 */
+  logTotal: number
+  /** 已加载历史的最早 index(0 表示已经从头加载)。 */
+  logEarliestSeq: number
   decisionEvents: DecisionEvent[]
   decisionEventIds: Set<string>
   llmStreams: Record<string, LlmStreamBubble>
@@ -44,7 +55,8 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
         task: null,
         logs: [],
         logSet: new Set<string>(),
-        events: [],
+        logTotal: 0,
+        logEarliestSeq: 0,
         decisionEvents: [],
         decisionEventIds: new Set<string>(),
         llmStreams: {},
@@ -62,6 +74,11 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
     if (!line || state.logSet.has(line)) return
     state.logSet.add(line)
     state.logs.push(line)
+    if (state.logs.length > MAX_LOG_BUFFER) {
+      const drop = state.logs.length - MAX_LOG_BUFFER
+      const evicted = state.logs.splice(0, drop)
+      for (const line of evicted) state.logSet.delete(line)
+    }
   }
 
   function mergeDecisionEvents(state: TaskLiveState, incoming: DecisionEvent[] = []) {
@@ -73,12 +90,28 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
       state.decisionEvents.push(event)
     }
     state.decisionEvents.sort((a, b) => String(a?.timestamp || '').localeCompare(String(b?.timestamp || '')))
+    if (state.decisionEvents.length > MAX_DECISION_EVENTS) {
+      const drop = state.decisionEvents.length - MAX_DECISION_EVENTS
+      const evicted = state.decisionEvents.splice(0, drop)
+      for (const ev of evicted) state.decisionEventIds.delete(String(ev?.id || ''))
+    }
+  }
+
+  function pushToolStreamLine(state: TaskLiveState, sid: string, line: string) {
+    if (!state.toolStreams[sid]) state.toolStreams[sid] = []
+    const arr = state.toolStreams[sid]
+    arr.push(line)
+    if (arr.length > MAX_TOOL_STREAM_LINES) {
+      arr.splice(0, arr.length - MAX_TOOL_STREAM_LINES)
+    }
   }
 
   async function refreshTask(taskId: string) {
+    // 后端默认返回轻量快照: phase_log 留空, phase_log_tail/phase_log_total
+    // 描述完整大小, decision_events 等价于 decision_events_tail。
     const full = await api.getTask(taskId)
     const state = ensureState(taskId)
-    mergeDecisionEvents(state, full.decision_events || [])
+    mergeDecisionEvents(state, full.decision_events_tail || full.decision_events || [])
 
     const apiTime = full.updated_at ?? ''
     const localTime = state.task?.updated_at ?? ''
@@ -91,15 +124,60 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
         ...state.task,
         findings: full.findings ?? state.task.findings,
         report_path: full.report_path ?? state.task.report_path,
+        report_available: full.report_available ?? state.task.report_available,
+        phase_log_total: full.phase_log_total ?? state.task.phase_log_total,
+        decision_events_total: full.decision_events_total ?? state.task.decision_events_total,
         decision_events: state.decisionEvents.slice(),
       }
     }
 
-    for (const line of (full.phase_log || [])) {
+    // 兼容: 老接口返回 phase_log,新接口返回 phase_log_tail
+    const tail = (full.phase_log_tail && full.phase_log_tail.length)
+      ? full.phase_log_tail
+      : (full.phase_log || [])
+    for (const line of tail) {
       pushLog(state, line)
+    }
+    if (typeof full.phase_log_total === 'number') {
+      state.logTotal = full.phase_log_total
+      const tailLen = tail.length
+      // tail 来自最近 tail_len 条,因此最早可见 index 至少是 total - tailLen
+      const minEarliest = Math.max(0, full.phase_log_total - tailLen)
+      state.logEarliestSeq = state.logEarliestSeq
+        ? Math.min(state.logEarliestSeq, minEarliest)
+        : minEarliest
     }
     taskListStore.upsertTask(full)
     return full
+  }
+
+  async function loadEarlierLogs(taskId: string, count = 500): Promise<number> {
+    const state = ensureState(taskId)
+    if (state.logEarliestSeq <= 0) return 0
+    const end = state.logEarliestSeq
+    const start = Math.max(0, end - count)
+    if (end <= start) return 0
+    try {
+      const page = await api.getLogs(taskId, { offset: start, limit: end - start })
+      const logs = Array.isArray(page.logs) ? page.logs : []
+      // 旧日志 prepend: 用 unshift 保持时间顺序,同时维持 dedup set
+      for (let i = logs.length - 1; i >= 0; i--) {
+        const line = logs[i]
+        if (!line || state.logSet.has(line)) continue
+        state.logSet.add(line)
+        state.logs.unshift(line)
+      }
+      if (state.logs.length > MAX_LOG_BUFFER) {
+        const drop = state.logs.length - MAX_LOG_BUFFER
+        const evicted = state.logs.splice(state.logs.length - drop, drop)
+        for (const line of evicted) state.logSet.delete(line)
+      }
+      state.logEarliestSeq = page.offset
+      if (typeof page.total === 'number') state.logTotal = page.total
+      return logs.length
+    } catch {
+      return 0
+    }
   }
 
   async function attach(taskId: string) {
@@ -107,14 +185,24 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
     if (state.unsub) return
 
     state.unsub = subscribeTaskEvents(taskId, (event) => {
-      state.events.push(event)
       const eventType = (event as { type?: string }).type
 
+      if (eventType === 'history_meta') {
+        const total = Number((event as { phase_log_total?: number }).phase_log_total || 0)
+        if (total > 0) state.logTotal = total
+        return
+      }
       if (eventType === 'history_logs') {
         const lines = (event as { data?: string[] }).data || []
-        for (const line of lines) {
-          pushLog(state, line)
+        for (const line of lines) pushLog(state, line)
+        const meta = event as { start_seq?: number; total?: number }
+        if (typeof meta.start_seq === 'number') {
+          state.logEarliestSeq = state.logEarliestSeq
+            ? Math.min(state.logEarliestSeq, meta.start_seq)
+            : meta.start_seq
         }
+        if (typeof meta.total === 'number') state.logTotal = meta.total
+        return
       }
       if (eventType === 'history_events') {
         const events = (event as { data?: DecisionEvent[] }).data || []
@@ -122,10 +210,13 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
         if (state.task) {
           state.task = { ...state.task, decision_events: state.decisionEvents.slice() }
         }
+        return
       }
       if (eventType === 'log') {
         const line = String((event as { data?: string }).data || '')
         pushLog(state, line)
+        state.logTotal = Math.max(state.logTotal, state.logTotal + 1)
+        return
       }
       if (eventType === 'decision_event') {
         const payload = (event as { data?: Record<string, unknown> }).data
@@ -145,10 +236,7 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
           } else if (action === 'tool_stream') {
             const sid = (payload.stream_id as string) || 'default'
             const line = (payload.line as string) || ''
-            if (!state.toolStreams[sid]) {
-              state.toolStreams[sid] = []
-            }
-            state.toolStreams[sid].push(line)
+            pushToolStreamLine(state, sid, line)
           } else {
             mergeDecisionEvents(state, [payload as unknown as DecisionEvent])
             if (state.task) {
@@ -159,8 +247,9 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
             }
           }
         }
+        return
       }
-      if ((event as { type?: string }).type === 'phase_update') {
+      if (eventType === 'phase_update') {
         state.lastWsUpdate = Date.now()
         const patch = event as {
           phase?: string
@@ -201,12 +290,11 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
           }
         }
         if (patch.logs?.length) {
-          for (const line of patch.logs) {
-            pushLog(state, line)
-          }
+          for (const line of patch.logs) pushLog(state, line)
         }
+        return
       }
-      if ((event as { type?: string }).type === 'approval_required') {
+      if (eventType === 'approval_required') {
         state.lastWsUpdate = Date.now()
         const incomingNonce = (event as { nonce?: string }).nonce || `ar-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
         taskListStore.upsertTask({ task_id: taskId, current_phase: 'awaiting_approval', status: 'running' })
@@ -234,9 +322,11 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
         if (state.task) {
           state.task = { ...state.task, decision_events: state.decisionEvents.slice() }
         }
+        return
       }
-      if ((event as { type?: string }).type === 'done') {
+      if (eventType === 'done') {
         refreshTask(taskId).catch(() => {})
+        return
       }
     })
   }
@@ -285,6 +375,7 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
     taskStateMap,
     ensureState,
     refreshTask,
+    loadEarlierLogs,
     attach,
     detach,
     clear,

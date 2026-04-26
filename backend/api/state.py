@@ -237,6 +237,10 @@ class TaskStateManager:
             "max_explore_rounds": state.max_explore_rounds,
             "skill_min_score": state.skill_min_score,
             "skill_weak_boost": state.skill_weak_boost,
+            # 通用 Plan 模式 checkpoint(刷新页面后用于回填确认卡片)
+            "pending_checkpoint": state.pending_checkpoint,
+            "checkpoint_history": list(state.checkpoint_history or []),
+            "pending_user_prompt": state.pending_user_prompt,
         })
         # stdout/stderr 截断（避免 MB 级响应）+ 标注 truncated_reason
         for rec in base.get("tool_records", []):
@@ -250,6 +254,142 @@ class TaskStateManager:
                         "truncated_reason",
                         f"API 层截断: {field} {original_len}→2000 字符",
                     )
+        return base
+
+    # 任务详情接口默认返回的轻量快照大小阈值。运行时间长的任务 phase_log /
+    # decision_events 会增长到 5k+,直接整体下发会让前端首屏卡顿,所以默认
+    # 只回最近 N 条,完整数据通过 /tasks/{id}/logs 与 ?full=true 走分页/按需。
+    DEFAULT_SNAPSHOT_LOG_TAIL = 60
+    DEFAULT_SNAPSHOT_DECISION_TAIL = 120
+    SNAPSHOT_PATH_SNIPPET_MAX = 400
+    SNAPSHOT_EXPLOIT_OUTPUT_MAX = 1000
+
+    def to_detail_snapshot(
+        self,
+        state: PentestState,
+        log_tail: int = DEFAULT_SNAPSHOT_LOG_TAIL,
+        decision_tail: int = DEFAULT_SNAPSHOT_DECISION_TAIL,
+    ) -> dict:
+        """Lightweight detail used by the running-task page首屏。
+
+        与 ``to_detail`` 的差异:
+          * ``phase_log`` 被替换为 ``phase_log_tail`` (最近 N 条) +
+            ``phase_log_total`` (总数),完整日志走 ``/tasks/{id}/logs``
+            的分页接口。
+          * ``decision_events`` 同样仅返回 ``decision_events_tail`` +
+            ``decision_events_total``。
+          * ``tool_records`` 直接丢弃(前端 view 实际未消费),仅保留
+            ``tool_records_count`` 用于摘要展示。
+          * ``report_md`` 不再随首屏返回,前端打开「报告」Tab 时再走
+            ``/tasks/{id}/report``。
+          * ``exploit_results`` 内每条 stdout/stderr 截断到 1KB,
+            ``path_contents`` 的 ``content_snippet`` 截断到 400 字符。
+
+        ``decision_events`` 字段名保持向后兼容(等同于 tail),老前端
+        即便没有更新仍能拿到最近的事件渲染。
+        """
+        base = self.to_summary(state)
+
+        log_tail = max(0, min(log_tail, 500))
+        decision_tail = max(0, min(decision_tail, 500))
+
+        log_total = len(state.phase_log or [])
+        phase_log_tail = (
+            list(state.phase_log[-log_tail:]) if (log_tail and log_total) else []
+        )
+
+        all_events = self.build_decision_events(state) + list(state.live_decision_events)
+        decision_total = len(all_events)
+        decision_tail_slice = (
+            all_events[-decision_tail:] if decision_tail and decision_total else []
+        )
+
+        path_contents_snapshot: list[dict] = []
+        for c in (state.path_contents or []):
+            if not isinstance(c, dict):
+                continue
+            entry = dict(c)
+            snippet = entry.get("content_snippet") or ""
+            if isinstance(snippet, str) and len(snippet) > self.SNAPSHOT_PATH_SNIPPET_MAX:
+                entry["content_snippet"] = (
+                    snippet[: self.SNAPSHOT_PATH_SNIPPET_MAX] + "...(truncated)"
+                )
+                entry["content_truncated"] = True
+            path_contents_snapshot.append(entry)
+
+        exploit_results_snapshot: list[dict] = []
+        for r in state.exploit_results:
+            payload = r.model_dump() if hasattr(r, "model_dump") else dict(r or {})
+            for field_name in ("command_results", "command_records"):
+                records = payload.get(field_name) or []
+                trimmed = []
+                for rec in records:
+                    if not isinstance(rec, dict):
+                        trimmed.append(rec)
+                        continue
+                    rec_copy = dict(rec)
+                    for io in ("stdout", "stderr"):
+                        val = rec_copy.get(io, "")
+                        if isinstance(val, str) and len(val) > self.SNAPSHOT_EXPLOIT_OUTPUT_MAX:
+                            rec_copy[io] = (
+                                val[: self.SNAPSHOT_EXPLOIT_OUTPUT_MAX] + "\n...(truncated)"
+                            )
+                            rec_copy["truncated"] = True
+                    trimmed.append(rec_copy)
+                payload[field_name] = trimmed
+            exploit_results_snapshot.append(payload)
+
+        base.update({
+            "target_os": state.target_os,
+            "scope_note": state.scope_note,
+            "extra_hint": state.extra_hint,
+            "user_prompt": state.user_prompt,
+            "error_msg": state.error_msg,
+            "open_ports": [p.model_dump() for p in state.open_ports],
+            "os_info": state.os_info,
+            "web_paths": state.web_paths,
+            "path_contents": path_contents_snapshot,
+            "subdomains": state.subdomains,
+            "findings": [f.model_dump() for f in state.findings],
+            "exploit_results": exploit_results_snapshot,
+            # 显式置空,避免老前端再去渲染整张大表;计数/快照足够支撑 UI。
+            "tool_records": [],
+            "tool_records_count": len(state.tool_records or []),
+            # 兼容字段:旧前端 read decision_events,等价于 tail
+            "decision_events": decision_tail_slice,
+            "decision_events_tail": decision_tail_slice,
+            "decision_events_total": decision_total,
+            "post_findings": state.post_findings,
+            # report_md 单独走 /tasks/{id}/report,首屏不再随车
+            "report_md": "",
+            "report_available": bool(state.report_md or state.report_path),
+            # phase_log 改为 tail + total,前端分页走 /tasks/{id}/logs
+            "phase_log": [],
+            "phase_log_tail": phase_log_tail,
+            "phase_log_total": log_total,
+            "fingerprints": state.fingerprints,
+            "foothold_status": state.foothold_status,
+            "credential_store": state.credential_store,
+            "loot_store": state.loot_store,
+            "privesc_hypotheses": state.privesc_hypotheses,
+            "objective_status": state.objective_status,
+            "attack_next_steps": state.attack_next_steps,
+            "privesc_attempt_count": state.privesc_attempt_count,
+            "max_privesc_rounds": state.max_privesc_rounds,
+            "chain_summary": state.chain_summary,
+            "chain_visited": state.chain_visited,
+            "secondary_elided": state.secondary_elided,
+            "success_gate_level": state.success_gate_level,
+            "risk_budget": state.risk_budget,
+            "max_react_rounds": state.max_react_rounds,
+            "max_explore_rounds": state.max_explore_rounds,
+            "skill_min_score": state.skill_min_score,
+            "skill_weak_boost": state.skill_weak_boost,
+            # Plan 风格 checkpoint 数据,刷新后用于回填确认卡片
+            "pending_checkpoint": state.pending_checkpoint,
+            "checkpoint_history": list(state.checkpoint_history or [])[-10:],
+            "pending_user_prompt": state.pending_user_prompt,
+        })
         return base
 
     def ws_phase_payload(self, state: PentestState, log_tail: int = 5) -> dict:

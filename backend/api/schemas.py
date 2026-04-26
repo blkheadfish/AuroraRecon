@@ -167,6 +167,24 @@ class ApproveRequest(BaseModel):
     approved: bool = True
 
 
+class CheckpointDecisionRequest(BaseModel):
+    """Plan 模式确认框的用户响应。
+
+    action:
+      - ``approve`` 直接按 Agent 推荐继续
+      - ``reject``  跳过该决策,后续节点应当尊重
+      - ``modify``  保留当前阶段但带上用户 prompt 重做(由 Agent 节点决定如何使用)
+      - ``skip``    不做选择,等价于让任务继续按默认值跑
+    selected_option / user_prompt 仅作为软引导写入 state,Agent 节点自己决定
+    如何消费,便于前端逐步演进。
+    """
+
+    action: Literal["approve", "reject", "modify", "skip"] = "approve"
+    selected_option: str = ""
+    user_prompt: str = ""
+    note: str = ""
+
+
 # ── 设置相关 ──────────────────────────────────────────────
 
 class ProfileUpdateRequest(BaseModel):

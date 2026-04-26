@@ -5,6 +5,7 @@ import type {
   MetricsOverview,
   ReportData,
   TaskDetail,
+  TaskLogsPage,
   TaskStats,
   TaskSummary,
   WsTaskEvent,
@@ -101,10 +102,18 @@ export const api = {
       skill_min_score:     payload.skillMinScore ?? null,
       skill_weak_boost:    payload.skillWeakBoost ?? null,
     }),
+  // 默认走轻量快照(phase_log_tail/decision_events_tail),完整 state 用 getTaskFull
   getTask: (id: string): Promise<TaskDetail> => http.get(`/tasks/${id}`),
+  // 「原始数据」Tab 显式拉完整 to_detail(),按需触发,首屏不再付出该代价
+  getTaskFull: (id: string): Promise<TaskDetail> =>
+    http.get(`/tasks/${id}`, { params: { full: true } }),
   listTasks: (): Promise<TaskSummary[]> => http.get('/tasks'),
   getStats: (): Promise<TaskStats> => http.get('/tasks/stats'),
-  getLogs: (id: string): Promise<{ logs: string[] }> => http.get(`/tasks/${id}/logs`),
+  getLogs: (
+    id: string,
+    params?: { offset?: number; limit?: number; tail?: number; after_seq?: number },
+  ): Promise<TaskLogsPage> =>
+    http.get(`/tasks/${id}/logs`, { params: params || {} }),
   getReport: (id: string): Promise<ReportData> => http.get(`/tasks/${id}/report`),
   cancelTask: (id: string): Promise<{ ok: boolean }> => http.post(`/tasks/${id}/cancel`),
   deleteTask: (id: string): Promise<{ ok: boolean }> => http.delete(`/tasks/${id}`),
@@ -359,14 +368,30 @@ export interface WsConnection {
   readonly readyState: number
 }
 
+export interface WsConnectOptions {
+  /** Replay only entries with phase_log index > afterLogSeq (incremental reconnect). */
+  afterLogSeq?: number
+  /** First-connect history replay tail size (server caps to 5000). */
+  logTail?: number
+}
+
 export function createWsConnection(
   taskId: string,
   onMessage?: (data: WsTaskEvent) => void,
   onClose?: () => void,
+  options?: WsConnectOptions,
 ): WsConnection {
   const wsBase = getWsBase()
   const token = localStorage.getItem(TOKEN_KEY) ?? ''
-  const url = `${wsBase}/ws/${taskId}${token ? `?token=${encodeURIComponent(token)}` : ''}`
+  const queryParts: string[] = []
+  if (token) queryParts.push(`token=${encodeURIComponent(token)}`)
+  if (typeof options?.afterLogSeq === 'number' && options.afterLogSeq >= 0) {
+    queryParts.push(`after_log_seq=${options.afterLogSeq}`)
+  }
+  if (typeof options?.logTail === 'number' && options.logTail >= 0) {
+    queryParts.push(`log_tail=${options.logTail}`)
+  }
+  const url = `${wsBase}/ws/${taskId}${queryParts.length ? `?${queryParts.join('&')}` : ''}`
 
   const PING_INTERVAL = 15000
   const PONG_TIMEOUT = 5000

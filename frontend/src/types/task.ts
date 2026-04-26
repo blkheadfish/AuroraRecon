@@ -46,10 +46,18 @@ export interface TaskSummary {
 
 export interface TaskDetail extends TaskSummary {
   findings?: Finding[]
+  // 后端默认返回轻量快照: phase_log 留空, phase_log_tail 仅含最近 N 条,
+  // phase_log_total 表示真实总条数。完整日志走分页 /tasks/{id}/logs。
   phase_log?: string[]
+  phase_log_tail?: string[]
+  phase_log_total?: number
   decision_events?: DecisionEvent[]
+  decision_events_tail?: DecisionEvent[]
+  decision_events_total?: number
   exploit_results?: ExploitResult[]
   tool_records?: CommandExecutionRecord[]
+  tool_records_count?: number
+  report_available?: boolean
   open_ports?: PortInfo[]
   os_info?: Record<string, string>
   web_paths?: string[]
@@ -70,6 +78,7 @@ export interface TaskDetail extends TaskSummary {
     server?: string
     powered_by?: string
     content_snippet?: string
+    content_truncated?: boolean
   }[]
   subdomains?: string[]
   scope_note?: string
@@ -90,6 +99,18 @@ export interface TaskDetail extends TaskSummary {
   privesc_attempt_count?: number
   max_privesc_rounds?: number
   chain_summary?: string
+  pending_checkpoint?: CheckpointPayload | null
+  checkpoint_history?: CheckpointPayload[]
+  pending_user_prompt?: string
+}
+
+export interface TaskLogsPage {
+  logs: string[]
+  offset: number
+  limit: number
+  total: number
+  next_seq: number
+  has_more: boolean
 }
 
 export interface CommandExecutionRecord {
@@ -121,6 +142,38 @@ export interface ExploitResult {
   session_info?: Record<string, unknown>
 }
 
+export interface CheckpointOption {
+  id: string
+  label: string
+  tone?: 'primary' | 'success' | 'warning' | 'danger' | 'info' | string
+  action?: 'approve' | 'reject' | 'modify' | 'skip' | string
+  wants_prompt?: boolean
+  hint?: string
+}
+
+export interface CheckpointPayload {
+  checkpoint_id: string
+  checkpoint_type: string
+  phase?: string
+  status?: 'pending' | 'resolved' | string
+  created_at?: string
+  resolved_at?: string
+  thinking?: string
+  summary?: string
+  recommendation?: string
+  risk?: string
+  requires_input?: boolean
+  default_action?: 'approve' | 'reject' | 'modify' | 'skip' | string
+  options?: CheckpointOption[]
+  context?: Record<string, unknown>
+  response?: {
+    action: string
+    selected_option?: string
+    user_prompt?: string
+    note?: string
+  }
+}
+
 export interface DecisionEvent {
   id: string
   timestamp?: string
@@ -142,6 +195,19 @@ export interface DecisionEvent {
   message?: string
   tone?: 'primary' | 'success' | 'warning' | 'danger' | 'info' | string
   raw?: string
+  // Plan 风格 checkpoint 事件(action === 'checkpoint_request' / 'checkpoint_resolved')
+  checkpoint_id?: string
+  checkpoint_type?: string
+  thinking?: string
+  summary?: string
+  recommendation?: string
+  risk?: string
+  options?: CheckpointOption[]
+  requires_input?: boolean
+  default_action?: string
+  context?: Record<string, unknown>
+  response?: CheckpointPayload['response']
+  replay?: boolean
 }
 
 export interface TaskStats {
@@ -249,6 +315,21 @@ export interface WsDecisionEvent {
   data: DecisionEvent
 }
 
+export interface WsHistoryMetaEvent {
+  type: 'history_meta'
+  phase_log_total: number
+  phase_log_start: number
+  phase_log_replayed: number
+}
+
+export interface WsHistoryLogsEvent {
+  type: 'history_logs'
+  data: string[]
+  start_seq?: number
+  next_seq?: number
+  total?: number
+}
+
 export type WsTaskEvent =
   | WsPhaseUpdateEvent
   | WsLogEvent
@@ -256,4 +337,6 @@ export type WsTaskEvent =
   | WsApprovalRequiredEvent
   | WsHeartbeatEvent
   | WsDecisionEvent
+  | WsHistoryMetaEvent
+  | WsHistoryLogsEvent
   | Record<string, unknown>

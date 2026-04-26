@@ -11,6 +11,24 @@
         <el-tooltip content="自动滚动">
           <el-switch v-model="autoScroll" size="small"/>
         </el-tooltip>
+        <el-button
+          v-if="hiddenCount > 0 && !showAllRows"
+          link
+          size="small"
+          class="action-btn"
+          @click="showAllRows = true"
+        >
+          <span class="action-label">展开全部 {{ totalRows }} 行</span>
+        </el-button>
+        <el-button
+          v-else-if="showAllRows"
+          link
+          size="small"
+          class="action-btn"
+          @click="showAllRows = false"
+        >
+          <span class="action-label">仅显示最近 {{ MAX_VISIBLE_ROWS }} 行</span>
+        </el-button>
         <el-button link size="small" @click="copyLogs" class="action-btn">
           <el-icon>
             <CopyDocument/>
@@ -38,13 +56,16 @@
         <span class="wait-text">等待任务输出...</span>
       </div>
 
+      <div v-if="hiddenCount > 0 && !showAllRows" class="log-truncate-hint">
+        已折叠 {{ hiddenCount }} 行历史日志，仅渲染最近 {{ MAX_VISIBLE_ROWS }} 行避免页面卡顿
+      </div>
+
       <div
-          v-for="(line, i) in displayLogs"
-          :key="i"
+          v-for="line in displayLogs"
+          :key="line"
           class="log-line"
           :class="getLineClass(line)"
       >
-        <span class="line-num">{{ String(i + 1).padStart(4, ' ') }}</span>
         <span class="line-content" v-html="formatLine(line)"></span>
       </div>
 
@@ -55,7 +76,7 @@
             <span class="pulse-dot"></span> {{ stream.id }}
           </summary>
           <div class="stream-lines">
-            <div v-for="(line, li) in stream.lines.slice(-200)" :key="li" class="log-line line-stream">
+            <div v-for="(line, li) in stream.lines" :key="li" class="log-line line-stream">
               <span class="line-num">{{ String(li + 1).padStart(4, ' ') }}</span>
               <span class="line-content">{{ line }}</span>
             </div>
@@ -70,7 +91,9 @@
     </div>
 
     <div class="terminal-footer">
-      <span class="log-count">{{ displayLogs.length }} 行</span>
+      <span class="log-count">
+        {{ displayLogs.length }} / {{ totalRows }} 行
+      </span>
       <span v-if="running" class="running-badge">
         <span class="pulse-dot"></span> 实时接收中
       </span>
@@ -80,7 +103,7 @@
 </template>
 
 <script setup>
-import {ref, computed, watch, nextTick} from 'vue'
+import {ref, computed, watch, nextTick, shallowRef} from 'vue'
 import {ElMessage} from 'element-plus'
 
 const props = defineProps({
@@ -89,11 +112,20 @@ const props = defineProps({
   toolStreams: {type: Object, default: () => ({})},
 })
 
+// 单帧 DOM 渲染上千行 v-html + 多次正则会把主线程锁死。
+// 默认只渲染最近 MAX_VISIBLE_ROWS 行,通过 toolbar 上的「展开全部」按钮
+// 让用户在需要时主动放开,完整历史日志走分页接口而不是塞 DOM。
+const MAX_VISIBLE_ROWS = 800
+const KEY_EVENT_SCAN_TAIL = 600
+const TOOL_STREAM_TAIL = 200
+
+const showAllRows = ref(false)
+
 const activeToolStreams = computed(() => {
   const result = []
   for (const [id, lines] of Object.entries(props.toolStreams || {})) {
     if (Array.isArray(lines) && lines.length > 0) {
-      result.push({ id, lines })
+      result.push({ id, lines: lines.slice(-TOOL_STREAM_TAIL) })
     }
   }
   return result
@@ -103,22 +135,48 @@ const terminalRef = ref()
 const autoScroll = ref(true)
 const hidden = ref(false)
 
-const displayLogs = computed(() => hidden.value ? [] : props.logs)
-const keyEvents = computed(() =>
-  props.logs
+const totalRows = computed(() => props.logs.length)
+
+const displayLogs = computed(() => {
+  if (hidden.value) return []
+  if (showAllRows.value || props.logs.length <= MAX_VISIBLE_ROWS) {
+    return props.logs
+  }
+  return props.logs.slice(-MAX_VISIBLE_ROWS)
+})
+
+const hiddenCount = computed(() =>
+  Math.max(0, props.logs.length - displayLogs.value.length),
+)
+
+const keyEvents = computed(() => {
+  const tail = props.logs.length > KEY_EVENT_SCAN_TAIL
+    ? props.logs.slice(-KEY_EVENT_SCAN_TAIL)
+    : props.logs
+  return tail
     .filter(line =>
       /approval|required|authorized|利用成功|利用失败|report|报告生成|done|error|failed/i.test(line),
     )
-    .slice(-5),
-)
+    .slice(-5)
+})
 
-watch(() => props.logs.length, async () => {
-  if (autoScroll.value) {
-    await nextTick()
+// 滚动批处理:连续日志到达时只在下一帧更新一次,避免每行触发一次同步
+// scrollTop 计算(scrollHeight 在大列表下读取很贵,会触发 reflow)。
+let scrollFrame = 0
+function scheduleScrollToBottom() {
+  if (!autoScroll.value) return
+  if (scrollFrame) return
+  scrollFrame = window.requestAnimationFrame(() => {
+    scrollFrame = 0
     if (terminalRef.value) {
       terminalRef.value.scrollTop = terminalRef.value.scrollHeight
     }
-  }
+  })
+}
+
+watch(() => props.logs.length, async () => {
+  await nextTick()
+  scheduleScrollToBottom()
 })
 
 function getLineClass(line) {
@@ -141,24 +199,32 @@ function escapeHtml(text) {
     .replace(/"/g, '&quot;')
 }
 
+// 高亮结果按行内容缓存。同一条日志行在重渲染时不再重复跑 4 次正则替换,
+// 切换/滚动 / 重新挂载时尤其有效。Map 大小上限同步 MAX_VISIBLE_ROWS。
+const formatCache = shallowRef(new Map())
+const FORMAT_CACHE_CAP = MAX_VISIBLE_ROWS * 2
+
 function formatLine(line) {
+  const cache = formatCache.value
+  const cached = cache.get(line)
+  if (cached !== undefined) return cached
   let out = escapeHtml(line)
+  out = out.replace(/\[(\d{2}:\d{2}:\d{2})\]/g, '<span class="ts">[$1]</span>')
+  out = out.replace(/\[([a-z_]+)\]/g, '<span class="phase-tag">[$1]</span>')
   out = out.replace(
-      /\[(\d{2}:\d{2}:\d{2})\]/g,
-      '<span class="ts">[$1]</span>'
+    /(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d+)?)/g,
+    '<span class="hl-ip">$1</span>',
   )
   out = out.replace(
-      /\[([a-z_]+)\]/g,
-      '<span class="phase-tag">[$1]</span>'
+    /\b(\d+)\s*(个|端口|漏洞|条|ms|s)\b/g,
+    '<span class="hl-num">$1</span>$2',
   )
-  out = out.replace(
-      /(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d+)?)/g,
-      '<span class="hl-ip">$1</span>'
-  )
-  out = out.replace(
-      /\b(\d+)\s*(个|端口|漏洞|条|ms|s)\b/g,
-      '<span class="hl-num">$1</span>$2'
-  )
+  if (cache.size >= FORMAT_CACHE_CAP) {
+    // FIFO 驱逐: Map 维持插入顺序,删第一个就够。
+    const firstKey = cache.keys().next().value
+    if (firstKey !== undefined) cache.delete(firstKey)
+  }
+  cache.set(line, out)
   return out
 }
 
@@ -282,6 +348,16 @@ function toggleHidden() {
   padding: 24px 16px;
   color: var(--text-muted);
   font-size: 13px;
+}
+
+.log-truncate-hint {
+  margin: 6px 16px 8px;
+  padding: 6px 10px;
+  font-size: 11px;
+  color: var(--text-muted);
+  background: rgba(56, 139, 253, 0.06);
+  border: 1px dashed rgba(56, 139, 253, 0.25);
+  border-radius: 4px;
 }
 
 .wait-text {

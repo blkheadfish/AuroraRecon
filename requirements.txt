@@ -14,8 +14,8 @@ langgraph==0.2.28
 langchain==0.3.1
 langchain-core==0.3.6
 langchain-openai==0.2.1          # DeepSeek/GPT 共用（兼容 OpenAI SDK）
-langgraph-checkpoint-sqlite
-langgraph-checkpoint-postgres
+langgraph-checkpoint-sqlite<2.0.0
+langgraph-checkpoint-postgres<2.0.0
 psycopg[binary]>=3.1.0
 psycopg_pool>=3.1.0
 
