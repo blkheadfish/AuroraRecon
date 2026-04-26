@@ -119,6 +119,21 @@ export const api = {
   deleteTask: (id: string): Promise<{ ok: boolean }> => http.delete(`/tasks/${id}`),
   approveTask: (id: string, approved = true): Promise<{ ok: boolean }> =>
     http.post(`/tasks/${id}/approve`, { approved }),
+  respondCheckpoint: (
+    id: string,
+    payload: {
+      action: 'approve' | 'reject' | 'modify' | 'skip'
+      selected_option?: string
+      user_prompt?: string
+      note?: string
+    },
+  ): Promise<{ status: string; approved: boolean; action: string }> =>
+    http.post(`/tasks/${id}/checkpoint/respond`, {
+      action: payload.action,
+      selected_option: payload.selected_option ?? '',
+      user_prompt: payload.user_prompt ?? '',
+      note: payload.note ?? '',
+    }),
 
   getSettings: (): Promise<SettingsPayload> => http.get('/settings'),
   saveSettings: (data: SettingsPayload): Promise<{ ok: boolean }> => http.post('/settings', data),

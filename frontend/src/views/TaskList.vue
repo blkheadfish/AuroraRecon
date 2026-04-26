@@ -5,7 +5,7 @@
         <h1 class="page-title">渗透任务中心</h1>
         <p class="page-sub">创建任务、管理队列、跟踪审批与利用状态</p>
       </div>
-      <el-button type="primary" size="large" @click="showCreate = true">
+      <el-button type="primary" size="large" @click="goCreate">
         <el-icon><Plus /></el-icon>
         新建任务
       </el-button>
@@ -78,7 +78,7 @@
       </div>
 
       <el-empty v-if="!listStore.loading && !filteredTasks.length" description="暂无匹配任务">
-        <el-button type="primary" @click="showCreate = true">
+        <el-button type="primary" @click="goCreate">
           <el-icon><Plus /></el-icon> 创建第一个任务
         </el-button>
       </el-empty>
@@ -393,6 +393,10 @@ function goDetail(taskId) {
 
 function goReport(taskId) {
   router.push(`/reports/${taskId}`)
+}
+
+function goCreate() {
+  router.push('/tasks/new')
 }
 
 async function handleCreate() {

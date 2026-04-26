@@ -15,6 +15,7 @@ const routes: RouteRecordRaw[] = [
   { path: '/register', name: 'register', component: () => import('@/views/RegisterPage.vue') },
   { path: '/dashboard', name: 'dashboard', component: () => import('@/views/Dashboard.vue') },
   { path: '/tasks', name: 'tasks', component: () => import('@/views/TaskList.vue') },
+  { path: '/tasks/new', name: 'task-create', component: () => import('@/views/TaskCreateChat.vue') },
   { path: '/tasks/:id', name: 'task-detail', component: () => import('@/views/TaskDetail.vue') },
   { path: '/tasks/:id/decision', name: 'decision-view', component: () => import('@/views/DecisionView.vue') },
   { path: '/reports/:id', name: 'report-center', component: () => import('@/views/ReportCenter.vue') },
