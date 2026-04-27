@@ -50,13 +50,25 @@ services:
     container_name: pentest_api
     restart: unless-stopped
     command: >
-      uvicorn backend.api.main:app
-      --host 0.0.0.0
-      --port 8000
-      --workers 1
-      --ws-ping-interval 20
-      --ws-ping-timeout 60
-      --timeout-keep-alive 120
+      sh -c '
+      if [ "$${API_RELOAD:-true}" = "true" ]; then
+        exec uvicorn backend.api.main:app
+          --host 0.0.0.0
+          --port 8000
+          --reload
+          --reload-dir backend
+          --ws-ping-interval 20
+          --ws-ping-timeout 60
+          --timeout-keep-alive 120;
+      else
+        exec uvicorn backend.api.main:app
+          --host 0.0.0.0
+          --port 8000
+          --workers 1
+          --ws-ping-interval 20
+          --ws-ping-timeout 60
+          --timeout-keep-alive 120;
+      fi'
     ports:
       - "8000:8000"
     environment:
@@ -90,11 +102,19 @@ services:
       - JWT_SECRET=${JWT_SECRET:-aurorarecon_default_secret_change_me}
       # 反弹 Shell
       - LHOST=${LHOST:-}
+      # API 开发热更新：默认 true。生产/压测可设 API_RELOAD=false 回到单 worker 模式
+      - API_RELOAD=${API_RELOAD:-true}
+      # bind mount/Windows/远程文件系统下强制轮询，避免 --reload 收不到文件变更
+      - WATCHFILES_FORCE_POLLING=${WATCHFILES_FORCE_POLLING:-true}
       # 宿主机指标：设置这三个环境变量后 psutil 将读取宿主机真实 CPU/内存/磁盘
       - HOST_PROC=/host/proc
       - HOST_SYS=/host/sys
       - HOST_ROOTFS=/host/rootfs
     volumes:
+      # 开发热更新：Python 源码从宿主机挂载进容器，改代码无需重建镜像
+      - ../backend:/app/backend
+      - ../docs:/app/docs
+      - ../requirements.txt:/app/requirements.txt:ro
       - reports_data:/reports
       - /var/run/docker.sock:/var/run/docker.sock
       - /tmp/pentest_data:/data

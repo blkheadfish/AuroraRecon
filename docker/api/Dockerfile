@@ -6,6 +6,11 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# Windows/远程挂载场景下 watchfiles 可能收不到 inotify，强制轮询更稳。
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    WATCHFILES_FORCE_POLLING=true
+
 # 安装 Docker CLI（静态二进制，不依赖 apt 源）
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
     && DOCKER_VERSION="27.3.1" \
@@ -42,5 +47,4 @@ HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
 
 EXPOSE 8000
 
-#CMD ["uvicorn", "backend.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
-CMD ["uvicorn", "backend.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+CMD ["uvicorn", "backend.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "backend"]

@@ -317,6 +317,11 @@ def make_fact_sink(state: PentestState):
                             # 新凭据 → 顺手写入 attack_graph + pending_seeds
                             try:
                                 cred_dict = c if isinstance(c, dict) else {"value": str(c)}
+                                # credential_store 是 replan snapshot 的主观察点；
+                                # 只写 task_facts/confirmed_facts 会导致 emit_replan_signals
+                                # 看不到 +credential，从而无法回流 vuln_scan。
+                                if cred_dict not in (state.credential_store or []):
+                                    state.credential_store.append(cred_dict)
                                 attach_credential_to_graph(
                                     state, cred_dict, discovered_by="fact_sink",
                                 )

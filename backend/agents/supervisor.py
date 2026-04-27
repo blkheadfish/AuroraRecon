@@ -104,7 +104,22 @@ def _rule_decide(state: PentestState) -> Optional[dict[str, Any]]:
     if sig.get("re_intel_harvest_for_paths") and _under_cap(state, "intel_harvest"):
         return {"next": "intel_harvest", "reason": "new intel paths to harvest", "rule": "replan.re_intel_harvest_for_paths"}
 
-    # ── 2. 阶段递推（按"未访问且前置条件满足"的顺序） ─────────────
+    # ── 2. 已拿 shell 时优先进入立足后链路 ─────────────────────
+    # supervisor 可能从 checkpoint / 测试构造状态恢复，此时 got_shell=True
+    # 本身就是强事实，不应因为 phase_visit_count 缺少 recon 而倒回侦察。
+    if state.got_shell:
+        if not _has_visited(state, "post_foothold_enum"):
+            return {"next": "post_foothold_enum", "reason": "拿到 shell，开始立足后枚举", "rule": "phase.post_enum"}
+        if not state.post_approved_once and not state.auto_approve and not state.post_approved:
+            return {"next": "post_foothold_approval", "reason": "立足后审批", "rule": "phase.post_approval"}
+        if (state.post_approved or state.auto_approve or state.post_approved_once):
+            pl = (state.privilege_level or "").lower()
+            if pl != "root" and state.privesc_attempt_count < state.max_privesc_rounds:
+                return {"next": "privesc_attempt", "reason": "尝试提权", "rule": "phase.privesc"}
+            if not _has_visited(state, "objective_collect"):
+                return {"next": "objective_collect", "reason": "进入目标收集", "rule": "phase.objective"}
+
+    # ── 3. 阶段递推（按"未访问且前置条件满足"的顺序） ─────────────
     if not _has_visited(state, "recon"):
         return {"next": "recon", "reason": "first run", "rule": "phase.recon_first"}
 
@@ -122,7 +137,7 @@ def _rule_decide(state: PentestState) -> Optional[dict[str, Any]]:
     if _has_exploitable(state) and not _has_visited(state, "exploit_decision"):
         return {"next": "exploit_decision", "reason": "exploitable findings → decide", "rule": "phase.exploit_decision"}
 
-    # ── 3. 利用阶段 ────────────────────────────────────────────
+    # ── 4. 利用阶段 ────────────────────────────────────────────
     if _has_exploitable(state) and not state.approved_once and not state.auto_approve and not state.approved:
         return {"next": "human_approval", "reason": "需要人工授权", "rule": "phase.human_approval"}
 
@@ -131,19 +146,6 @@ def _rule_decide(state: PentestState) -> Optional[dict[str, Any]]:
             return {"next": "foothold_attempt", "reason": "授权完成，尝试立足点", "rule": "phase.foothold"}
         if not state.got_shell and state.foothold_status == "file_read" and state.secondary_attack_count < state.max_secondary_attacks:
             return {"next": "secondary_attack", "reason": "file_read 已确认，继续尝试 RCE", "rule": "phase.secondary"}
-
-    # ── 4. 立足后 ──────────────────────────────────────────────
-    if state.got_shell:
-        if not _has_visited(state, "post_foothold_enum"):
-            return {"next": "post_foothold_enum", "reason": "拿到 shell，开始立足后枚举", "rule": "phase.post_enum"}
-        if not state.post_approved_once and not state.auto_approve and not state.post_approved:
-            return {"next": "post_foothold_approval", "reason": "立足后审批", "rule": "phase.post_approval"}
-        if (state.post_approved or state.auto_approve or state.post_approved_once):
-            pl = (state.privilege_level or "").lower()
-            if pl != "root" and state.privesc_attempt_count < state.max_privesc_rounds:
-                return {"next": "privesc_attempt", "reason": "尝试提权", "rule": "phase.privesc"}
-            if not _has_visited(state, "objective_collect"):
-                return {"next": "objective_collect", "reason": "进入目标收集", "rule": "phase.objective"}
 
     # ── 5. 兜底：连续多轮无新事实 → 直接出报告 ─────────────────
     if _no_new_facts(state, k=3):
