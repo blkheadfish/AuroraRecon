@@ -76,14 +76,25 @@ const roleLabel = computed(() => {
 }
 
 .bubble {
+  /* 短消息也吃满 max-width,保证一栏 agent/system 卡片宽度一致更整齐;
+     user 卡片保留 fit-content 行为(见下方覆盖),贴右贴合聊天习惯。*/
   max-width: min(78%, 720px);
   padding: 10px 12px;
   border-radius: var(--radius-md);
   background: var(--bg-surface);
   border: 1px solid var(--border);
   color: var(--text-primary);
+  box-sizing: border-box;
+}
+.role-agent .bubble,
+.role-system .bubble {
+  flex: 1 1 auto;
+  min-width: 0;
+  width: 100%;
 }
 .role-user .bubble {
+  /* 用户气泡贴右,按内容自适应宽度,但不要过窄(避免一两个字时塌成方块)*/
+  min-width: 80px;
   background: color-mix(in srgb, var(--accent-blue) 12%, var(--bg-elevated));
   border-color: color-mix(in srgb, var(--accent-blue) 35%, var(--border));
 }

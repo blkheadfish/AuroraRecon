@@ -209,6 +209,20 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
     }
   }
 
+  // 比较器: 主 key = timestamp 字典序; tie-breaker = id 中的递增 idx
+  // (id 形如 "de-{idx}-{HHMMSSffffff}", idx 是后端 push 时的真实顺序)
+  function _decisionEventIdx(id: string): number {
+    const m = String(id || '').match(/^de-(\d+)-/)
+    return m ? Number(m[1]) : 0
+  }
+  function _compareDecisionEvents(a: DecisionEvent, b: DecisionEvent): number {
+    const ta = String(a?.timestamp || '')
+    const tb = String(b?.timestamp || '')
+    const cmp = ta.localeCompare(tb)
+    if (cmp !== 0) return cmp
+    return _decisionEventIdx(String(a?.id || '')) - _decisionEventIdx(String(b?.id || ''))
+  }
+
   function mergeDecisionEvents(state: TaskLiveState, incoming: DecisionEvent[] = []) {
     if (!Array.isArray(incoming) || !incoming.length) return
     for (const event of incoming) {
@@ -217,7 +231,10 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
       state.decisionEventIds.add(id)
       state.decisionEvents.push(event)
     }
-    state.decisionEvents.sort((a, b) => String(a?.timestamp || '').localeCompare(String(b?.timestamp || '')))
+    // 用副本 sort + splice 重建,避免 Vue3 reactive 对原地 sort 触发依赖更新
+    // 不可靠的问题(实测在 Pinia + computed 链路下偶发 rail 渲染顺序不刷新)。
+    const sorted = state.decisionEvents.slice().sort(_compareDecisionEvents)
+    state.decisionEvents.splice(0, state.decisionEvents.length, ...sorted)
     if (state.decisionEvents.length > MAX_DECISION_EVENTS) {
       const drop = state.decisionEvents.length - MAX_DECISION_EVENTS
       const evicted = state.decisionEvents.splice(0, drop)
