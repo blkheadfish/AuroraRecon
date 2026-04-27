@@ -321,6 +321,9 @@ class MatchRule:
     json_probe_result: str = ""
     service_is: str = ""       # nmap service 字段
     port_is: list[int] = field(default_factory=list)
+    # finding.tool 精确匹配，用于让 fact_sink 合成的 service-level finding
+    # （例如 tool="cred-replay" / tool="service-sweep"）能高精度命中专用 Skill。
+    tool_is: str = ""
 
     def matches(
         self,
@@ -330,6 +333,7 @@ class MatchRule:
         json_probe: str = "",
         service: str = "",
         port: Optional[int] = None,
+        tool: str = "",
     ) -> bool:
         """检查是否匹配。所有非空字段必须全部满足。"""
         fp_lower = fingerprint.lower()
@@ -365,6 +369,11 @@ class MatchRule:
         if self.port_is:
             checks.append(
                 port in self.port_is if port else False
+            )
+
+        if self.tool_is:
+            checks.append(
+                self.tool_is.lower() == (tool or "").lower()
             )
 
         # 无条件 = 不匹配

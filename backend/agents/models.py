@@ -263,6 +263,130 @@ def parse_target(raw: str) -> ParsedTarget:
 	return ParsedTarget(raw=raw, host=raw)
 
 
+# ───────────────────────────────────────────────────────
+# AttackGraph — 结构化的攻击图模型
+# ───────────────────────────────────────────────────────
+
+AttackNodeType = Literal[
+	"host", "service", "finding", "credential", "foothold", "loot",
+	"objective", "path",
+]
+
+AttackEdgeRelation = Literal[
+	"enables", "leads_to", "exposes", "consumes", "discovers",
+]
+
+
+class AttackGraphNode(BaseModel):
+	"""一个攻击图节点（host/service/finding/credential 等）。"""
+	id: str
+	type: AttackNodeType
+	label: str = ""
+	facts: dict[str, Any] = Field(default_factory=dict)
+	discovered_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+	discovered_by: str = ""
+
+
+class AttackGraphEdge(BaseModel):
+	"""攻击图边。"""
+	src: str
+	dst: str
+	relation: AttackEdgeRelation = "leads_to"
+	note: str = ""
+	created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+class AttackGraph(BaseModel):
+	"""轻量级攻击图，记录可视化所需的节点 / 边。
+
+	设计要点：
+	  - upsert_node：若同 id 节点已存在则合并 facts，不会覆盖发现时间；
+	  - add_edge：自动去重；
+	  - 大小有上限，防止反馈循环导致 checkpoint payload 失控。
+	"""
+	nodes: list[AttackGraphNode] = Field(default_factory=list)
+	edges: list[AttackGraphEdge] = Field(default_factory=list)
+	max_nodes: int = 500
+	max_edges: int = 2000
+
+	def _index(self) -> dict[str, int]:
+		return {n.id: i for i, n in enumerate(self.nodes)}
+
+	def upsert_node(
+		self,
+		node_id: str,
+		*,
+		type: AttackNodeType,
+		label: str = "",
+		facts: Optional[dict[str, Any]] = None,
+		discovered_by: str = "",
+	) -> AttackGraphNode:
+		idx = self._index().get(node_id)
+		if idx is not None:
+			existing = self.nodes[idx]
+			if facts:
+				merged = dict(existing.facts or {})
+				merged.update(facts)
+				existing.facts = merged
+			if label and not existing.label:
+				existing.label = label
+			if discovered_by and not existing.discovered_by:
+				existing.discovered_by = discovered_by
+			return existing
+		if len(self.nodes) >= self.max_nodes:
+			# 简单保护：到达上限后丢弃最旧的非 host/objective 节点
+			drop_at: Optional[int] = None
+			for i, n in enumerate(self.nodes):
+				if n.type not in ("host", "objective"):
+					drop_at = i
+					break
+			if drop_at is not None:
+				dropped = self.nodes.pop(drop_at)
+				self.edges = [
+					e for e in self.edges
+					if e.src != dropped.id and e.dst != dropped.id
+				]
+		node = AttackGraphNode(
+			id=node_id, type=type, label=label or node_id,
+			facts=dict(facts or {}), discovered_by=discovered_by,
+		)
+		self.nodes.append(node)
+		return node
+
+	def add_edge(
+		self,
+		src: str,
+		dst: str,
+		*,
+		relation: AttackEdgeRelation = "leads_to",
+		note: str = "",
+	) -> Optional[AttackGraphEdge]:
+		if not src or not dst or src == dst:
+			return None
+		# 去重
+		for e in self.edges:
+			if e.src == src and e.dst == dst and e.relation == relation:
+				return e
+		if len(self.edges) >= self.max_edges:
+			# 简单保护：丢弃最旧的非 enables 类型边
+			drop_at: Optional[int] = None
+			for i, ee in enumerate(self.edges):
+				if ee.relation != "enables":
+					drop_at = i
+					break
+			if drop_at is not None:
+				self.edges.pop(drop_at)
+		edge = AttackGraphEdge(src=src, dst=dst, relation=relation, note=note)
+		self.edges.append(edge)
+		return edge
+
+	def to_payload(self) -> dict[str, Any]:
+		return {
+			"nodes": [n.model_dump() for n in self.nodes],
+			"edges": [e.model_dump() for e in self.edges],
+		}
+
+
 class PentestState(BaseModel):
 	task_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
 	target: str = ""
@@ -365,9 +489,13 @@ class PentestState(BaseModel):
 	got_shell: bool = False
 	privilege_level: str = ""
 	# 利用阶段首轮全部失败后，是否已执行过二次攻击重试
+	# 注：feedback / supervisor 模式下改为按计数判断（见 secondary_attack_count）
 	secondary_attack_done: bool = False
 	# 首轮即拿到立足点，未进入二次利用节点（供 UI 标记跳过）
 	secondary_elided: bool = False
+	# 二次攻击执行次数（feedback 模式可重入，linear 模式仍兼容 secondary_attack_done）
+	secondary_attack_count: int = 0
+	max_secondary_attacks: int = 2
 
 	# ── 主机攻链状态（VulnHub / 靶机向）：与 findings 并存，策略以攻链为主 ──
 	# foothold: none | web_rce | shell | ssh | meterpreter
@@ -419,11 +547,63 @@ class PentestState(BaseModel):
 	guard_stats: dict[str, int] = Field(default_factory=dict)
 	trace_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:16])
 
+	# ── 攻击链反馈循环（feedback / supervisor 模式共用）────────────
+	# 待消费的"种子"事实：在反馈/监督模式下，下游节点（如 post_foothold_enum）
+	# 发现新事实后，写入对应 bucket，上游节点（recon/surface_enum/vuln_scan）
+	# 重新进入时把它们并入本次输入再执行。
+	pending_seeds: dict[str, list[Any]] = Field(default_factory=lambda: {
+		"hosts": [],
+		"ports": [],
+		"web_paths": [],
+		"credentials": [],
+	})
+	# 每个阶段的进入次数与上次输入签名（避免相同输入重复执行）
+	phase_visit_count: dict[str, int] = Field(default_factory=dict)
+	phase_signature: dict[str, str] = Field(default_factory=dict)
+	# 各阶段的访问次数上限（防止反馈循环里某阶段被无限拉起）
+	max_phase_visits: dict[str, int] = Field(default_factory=lambda: {
+		"recon": 3,
+		"surface_enum": 4,
+		"intel_harvest": 3,
+		"vuln_scan": 4,
+		"foothold_attempt": 3,
+		"secondary_attack": 2,
+		"post_foothold_enum": 4,
+		"privesc_attempt": 3,
+	})
+	# 信号驱动的"重新规划"信号桶：见 fact_hooks.emit_replan_signals
+	replan_signals: dict[str, int] = Field(default_factory=dict)
+	# 已执行的反馈跳数（保护：超过 max_replan 后强制走默认分支）
+	replan_count: int = 0
+	max_replan: int = 3
+
+	# ── Supervisor 模式状态字段 ──────────────────────────────
+	# supervisor 路由出的"下一阶段"
+	next_phase: str = ""
+	# supervisor 已进入的轮次（防 LLM 路由失控）
+	supervisor_round: int = 0
+	supervisor_round_limit: int = 30
+	# supervisor 决策历史尾部（用于"连续 3 轮选同 phase 且无新 fact → 强制 report"）
+	supervisor_history: list[dict[str, Any]] = Field(default_factory=list)
+	# 给 foothold/privesc 接力使用：审批是否已通过一次（避免 supervisor
+	# 模式下星形拓扑反复在 interrupt_before 暂停）
+	approved_once: bool = False
+	post_approved_once: bool = False
+
+	# ── AttackGraph（结构化的攻击图，可视化用）────────────────
+	# 单点写入入口：fact_sink / apply_service_info_extraction 中产生新事实时
+	# 顺手 upsert 进来。非 supervisor 模式也会被填充，前端可以独立展示。
+	attack_graph: AttackGraph = Field(default_factory=AttackGraph)
+
 	def log(self, msg: str) -> None:
 		import logging
 		ts = datetime.utcnow().strftime("%H:%M:%S")
 		entry = f"[{ts}] [{self.current_phase}] {msg}"
 		self.phase_log.append(entry)
+		# 滚动淘汰: 反馈/监督模式下 phase_log 会随循环爆炸增长,
+		# 同 live_decision_events 一致, 超过 5000 行截留最近 2500 行.
+		if len(self.phase_log) > 5000:
+			self.phase_log = self.phase_log[-2500:]
 		logging.getLogger(__name__).info(entry)
 
 	def push_decision(self, event: dict) -> None:

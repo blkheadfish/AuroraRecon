@@ -64,6 +64,7 @@ def load_skill(path: Path) -> Skill:
         skill_id=skill_id,
         name=raw.get("name", skill_id),
         category=raw.get("category", ""),
+        phase=raw.get("phase", "foothold"),
         version=raw.get("version", "1.0"),
         principle=raw.get("principle", ""),
         match=_parse_match(raw.get("match", {})),
@@ -95,6 +96,7 @@ def _parse_match_rule(raw: dict) -> MatchRule:
         json_probe_result=raw.get("json_probe_result", ""),
         service_is=raw.get("service_is", ""),
         port_is=_ensure_list(raw.get("port_is", [])),
+        tool_is=raw.get("tool_is", ""),
     )
 
 

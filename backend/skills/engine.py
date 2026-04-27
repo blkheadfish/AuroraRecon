@@ -204,6 +204,47 @@ class SkillEngine:
         if services.get("ssh_port"):
             ctx.variables.setdefault("ssh_port", str(services.get("ssh_port")))
 
+        # ── 已知凭据预加载（来自 confirmed_facts.creds + state.credential_store）──
+        # 任意 Skill 都能通过 has_known_creds == true 走"凭据复用"分支；
+        # 凭据本体以 base64 注入避免多行换行/特殊字符破坏 bash 语法：
+        #   {known_users_b64} / {known_passwords_b64} / {known_cred_pairs_b64}
+        # yaml 端 ``echo '{known_users_b64}' | base64 -d`` 即可拿回多行原文。
+        import base64 as _base64
+
+        creds = (confirmed_facts or {}).get("creds") or []
+        known_users: list[str] = []
+        known_passwords: list[str] = []
+        cred_pairs: list[str] = []
+        for c in creds:
+            if not isinstance(c, dict):
+                continue
+            u = (c.get("user") or c.get("username") or "").strip()
+            p = (c.get("value") or c.get("password") or "").strip()
+            if u and u not in known_users:
+                known_users.append(u)
+            if p and p not in known_passwords:
+                known_passwords.append(p)
+            if u and p:
+                pair = f"{u}:{p}"
+                if pair not in cred_pairs:
+                    cred_pairs.append(pair)
+
+        def _b64(items: list[str]) -> str:
+            joined = "\n".join(items[:30])
+            return _base64.b64encode(joined.encode("utf-8", errors="ignore")).decode("ascii")
+
+        if known_users:
+            ctx.variables.setdefault("known_users_b64", _b64(known_users))
+            # 给 prompt/log 用的可读形式（不进 bash）
+            ctx.variables.setdefault("known_users_preview", ", ".join(known_users[:5]))
+        if known_passwords:
+            ctx.variables.setdefault("known_passwords_b64", _b64(known_passwords))
+            ctx.variables.setdefault("known_passwords_count", str(len(known_passwords)))
+        if cred_pairs:
+            ctx.variables.setdefault("known_cred_pairs_b64", _b64(cred_pairs))
+        if known_passwords or known_users:
+            ctx.variables.setdefault("has_known_creds", True)
+
         logger.info(
             f"[SkillEngine] 开始执行 Skill: {skill.skill_id} "
             f"→ {target_url} (can_reverse={env_can_reverse})"

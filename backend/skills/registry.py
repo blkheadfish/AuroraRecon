@@ -238,6 +238,7 @@ class SkillRegistry:
                 json_probe=json_probe,
                 service="",
                 port=finding.port,
+                tool=finding.tool or "",
             ):
                 return 0
 
@@ -245,6 +246,14 @@ class SkillRegistry:
 
         for rule in match_cfg.rules:
             rule_score = 0
+
+            # tool_is 精确匹配（最强信号）：用于 fact_sink / VulnAgent 合成的
+            # service-level finding（cred-replay / service-sweep）精确路由到
+            # 专用 Skill。给 +120 分确保它能压过 ssh_exploit 等 service+port 规则
+            # （后者最高 60 + 30 + 25 = 115）。
+            if rule.tool_is and finding.tool:
+                if rule.tool_is.lower() == finding.tool.lower():
+                    rule_score += 120
 
             # CVE 精确匹配（最强信号）
             if rule.cve_matches and cve_lower:

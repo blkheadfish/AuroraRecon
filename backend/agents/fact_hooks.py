@@ -314,6 +314,15 @@ def make_fact_sink(state: PentestState):
                                 first_seen_at=now,
                                 last_seen_at=now,
                             )
+                            # 新凭据 → 顺手写入 attack_graph + pending_seeds
+                            try:
+                                cred_dict = c if isinstance(c, dict) else {"value": str(c)}
+                                attach_credential_to_graph(
+                                    state, cred_dict, discovered_by="fact_sink",
+                                )
+                                push_pending_seed(state, "credentials", cred_dict)
+                            except Exception:
+                                pass
                 elif isinstance(payload, dict):
                     for k, v in payload.items():
                         if isinstance(v, list) and section == "lfi" and k == "readable_files":
@@ -640,6 +649,24 @@ def apply_service_info_extraction(
     if "php" in runtime_facts:
         state.php_runtime = runtime_facts["php"]
 
+    # 同步写入 attack_graph：服务节点 + finding 节点
+    try:
+        host = ""
+        if "://" in (base_url or ""):
+            host = base_url.split("://", 1)[1].split("/", 1)[0].split(":")[0]
+        if host:
+            attach_service_to_graph(
+                state, host, port, service="http", discovered_by="intel_harvest",
+            )
+        # 把刚 emit 的高价值 findings 也挂上
+        for f in state.findings[-10:]:
+            if f.tool in ("intel_harvest", "phpinfo_parser", "apache_status_parser",
+                          "nginx_stub_parser", "tomcat_status_parser",
+                          "spring_actuator_parser", "env_file_parser"):
+                attach_finding_to_graph(state, f, discovered_by=f.tool or "intel_harvest")
+    except Exception as exc:
+        logger.debug(f"[fact_hooks] attack_graph upsert from intel skipped: {exc}")
+
 
 def apply_phpinfo_extraction(
     state: PentestState,
@@ -649,3 +676,288 @@ def apply_phpinfo_extraction(
 ) -> None:
     """Backward-compat alias — delegates to the generalised dispatcher."""
     apply_service_info_extraction(state, harvested, base_url, port)
+
+
+# ── Phase 幂等 / 反馈循环辅助工具 ─────────────────────────
+# 核心思想：让上游阶段（recon/surface_enum/vuln_scan/...）可以被反复进入，
+# 但相同输入跳过、新增输入只跑增量。配合 emit_replan_signals 形成完整循环。
+
+import json as _json
+
+
+def consume_pending_seeds(state: PentestState, bucket: str) -> list[Any]:
+    """Pop and return the pending seeds in *bucket* (idempotency-friendly).
+
+    上游节点在入口处调用本函数，把"待处理种子"取出后并入本次输入，
+    然后清空对应桶，避免下次重入时再次合并相同种子。
+    """
+    seeds = list((state.pending_seeds or {}).get(bucket) or [])
+    if not state.pending_seeds:
+        state.pending_seeds = {
+            "hosts": [], "ports": [], "web_paths": [], "credentials": [],
+        }
+    state.pending_seeds[bucket] = []
+    return seeds
+
+
+def push_pending_seed(state: PentestState, bucket: str, value: Any) -> None:
+    """Append *value* into *bucket* if not already present."""
+    if not state.pending_seeds:
+        state.pending_seeds = {
+            "hosts": [], "ports": [], "web_paths": [], "credentials": [],
+        }
+    seeds = state.pending_seeds.setdefault(bucket, [])
+    # 简单去重（dict / list 用 json 序列化比较）
+    try:
+        marker = _json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        marker = repr(value)
+    existing_markers = set()
+    for s in seeds:
+        try:
+            existing_markers.add(_json.dumps(s, ensure_ascii=False, sort_keys=True, default=str))
+        except Exception:
+            existing_markers.add(repr(s))
+    if marker not in existing_markers:
+        seeds.append(value)
+
+
+def compute_phase_signature(payload: Any) -> str:
+    """Stable sha1 over the canonical JSON dump of *payload*."""
+    try:
+        text = _json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        text = repr(payload)
+    return hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def should_skip_phase(
+    state: PentestState,
+    phase: str,
+    signature: str,
+) -> tuple[bool, str]:
+    """Decide whether to short-circuit *phase* on this re-entry.
+
+    Returns (skip, reason). The caller should still call ``mark_phase_visited``
+    even when skipping so that ``replan_count`` accounting stays consistent.
+    """
+    visits = int((state.phase_visit_count or {}).get(phase, 0))
+    cap = int((state.max_phase_visits or {}).get(phase, 99))
+    if visits >= cap:
+        return True, f"phase_visit_cap_reached: {visits}/{cap}"
+    prior_sig = (state.phase_signature or {}).get(phase, "")
+    if visits > 0 and prior_sig and prior_sig == signature:
+        return True, "duplicate_input_signature"
+    return False, ""
+
+
+def mark_phase_visited(
+    state: PentestState,
+    phase: str,
+    signature: str,
+) -> None:
+    """Bookkeep visit count + last input signature."""
+    pvc = dict(state.phase_visit_count or {})
+    pvc[phase] = int(pvc.get(phase, 0)) + 1
+    state.phase_visit_count = pvc
+    psig = dict(state.phase_signature or {})
+    psig[phase] = signature
+    state.phase_signature = psig
+
+
+def snapshot_facts(state: PentestState) -> dict[str, Any]:
+    """Take a small snapshot of"interesting"sets for replan-signal diffing."""
+    creds: list[Any] = list(state.credential_store or [])
+    web_paths: list[str] = list(state.web_paths or [])
+    intel_paths: list[str] = list(state.intel_discovered_paths or [])
+    hosts: set[str] = set()
+    if state.target_host:
+        hosts.add(state.target_host)
+    for h in (state.subdomains or []):
+        if h:
+            hosts.add(h)
+    open_ports = [getattr(p, "port", None) or (p.get("port") if isinstance(p, dict) else None) for p in (state.open_ports or [])]
+    open_ports = [p for p in open_ports if p]
+    return {
+        "credentials": [_json.dumps(c, sort_keys=True, default=str) if isinstance(c, (dict, list)) else str(c) for c in creds],
+        "web_paths": list(web_paths),
+        "intel_paths": list(intel_paths),
+        "hosts": sorted(hosts),
+        "ports": sorted({int(p) for p in open_ports if isinstance(p, (int, str)) and str(p).isdigit()}),
+    }
+
+
+def emit_replan_signals(
+    state: PentestState,
+    *,
+    before: dict[str, Any],
+    after: dict[str, Any],
+    source_node: str,
+) -> dict[str, int]:
+    """Compare ``before`` / ``after`` snapshots and increment replan signals.
+
+    Signal vocabulary (consumed by ``edge_after_*_v2`` in feedback mode and by
+    ``_rule_decide`` in supervisor mode):
+
+      - ``re_recon_for_hosts``        — 新发现 host
+      - ``re_surface_enum_for_paths`` — 新发现 web_path
+      - ``re_vuln_scan_for_creds``    — 新发现凭据
+      - ``re_vuln_scan_for_ports``    — 新发现 open_port
+      - ``re_intel_harvest_for_paths``— intel_discovered_paths 增长
+    """
+    signals = dict(state.replan_signals or {})
+    log_lines: list[str] = []
+
+    def _diff(key: str) -> int:
+        b = set(map(str, before.get(key) or []))
+        a = set(map(str, after.get(key) or []))
+        return len(a - b)
+
+    new_creds = _diff("credentials")
+    new_paths = _diff("web_paths")
+    new_intel_paths = _diff("intel_paths")
+    new_hosts = _diff("hosts")
+    new_ports = _diff("ports")
+
+    if new_creds:
+        signals["re_vuln_scan_for_creds"] = int(signals.get("re_vuln_scan_for_creds", 0)) + new_creds
+        log_lines.append(f"+{new_creds} 凭据")
+    if new_paths:
+        signals["re_surface_enum_for_paths"] = int(signals.get("re_surface_enum_for_paths", 0)) + new_paths
+        log_lines.append(f"+{new_paths} 路径")
+    if new_intel_paths:
+        signals["re_intel_harvest_for_paths"] = int(signals.get("re_intel_harvest_for_paths", 0)) + new_intel_paths
+    if new_hosts:
+        signals["re_recon_for_hosts"] = int(signals.get("re_recon_for_hosts", 0)) + new_hosts
+        log_lines.append(f"+{new_hosts} 主机")
+    if new_ports:
+        signals["re_vuln_scan_for_ports"] = int(signals.get("re_vuln_scan_for_ports", 0)) + new_ports
+        log_lines.append(f"+{new_ports} 端口")
+
+    state.replan_signals = signals
+
+    if log_lines:
+        state.log(f"[replan] {source_node}: {', '.join(log_lines)} → 信号 {signals}")
+        try:
+            state.push_decision({
+                "action": "replan_signal",
+                "phase": source_node,
+                "thinking": f"{source_node} 检测到新事实，发出 replan 信号",
+                "message": f"replan: {', '.join(log_lines)}",
+                "raw": _json.dumps(signals, ensure_ascii=False),
+                "tone": "info",
+            })
+        except Exception:
+            pass
+
+    return signals
+
+
+def consume_replan_signal(state: PentestState, key: str) -> None:
+    """Drop a single replan signal after it has been honoured by an edge."""
+    signals = dict(state.replan_signals or {})
+    if key in signals:
+        signals.pop(key, None)
+        state.replan_signals = signals
+
+
+# ── AttackGraph 写入辅助 ──────────────────────────────────
+
+def _ag_host_id(host: str) -> str:
+    return f"host:{host}"
+
+
+def _ag_service_id(host: str, port: int | str) -> str:
+    return f"svc:{host}:{port}"
+
+
+def _ag_finding_id(finding_id: str) -> str:
+    return f"finding:{finding_id}"
+
+
+def _ag_credential_id(cred: dict[str, Any]) -> str:
+    user = cred.get("user") or cred.get("username") or ""
+    src = cred.get("source") or ""
+    val = cred.get("value") or cred.get("password") or ""
+    digest = canonical_command_hash(f"{user}|{src}|{val}")
+    return f"cred:{digest}"
+
+
+def attach_host_to_graph(state: PentestState, host: str, *, discovered_by: str = "") -> str:
+    if not host:
+        return ""
+    nid = _ag_host_id(host)
+    state.attack_graph.upsert_node(
+        nid, type="host", label=host, discovered_by=discovered_by,
+    )
+    return nid
+
+
+def attach_service_to_graph(
+    state: PentestState,
+    host: str,
+    port: int | str,
+    *,
+    service: str = "",
+    version: str = "",
+    discovered_by: str = "recon",
+) -> str:
+    if not host or not port:
+        return ""
+    host_id = attach_host_to_graph(state, host, discovered_by=discovered_by)
+    sid = _ag_service_id(host, port)
+    state.attack_graph.upsert_node(
+        sid,
+        type="service",
+        label=f"{service or 'service'}:{port}".strip(":"),
+        facts={"port": port, "service": service, "version": version},
+        discovered_by=discovered_by,
+    )
+    state.attack_graph.add_edge(host_id, sid, relation="exposes")
+    return sid
+
+
+def attach_finding_to_graph(
+    state: PentestState,
+    finding: VulnFinding,
+    *,
+    discovered_by: str = "vuln_scan",
+) -> str:
+    fid = _ag_finding_id(finding.vuln_id)
+    state.attack_graph.upsert_node(
+        fid,
+        type="finding",
+        label=finding.name or finding.vuln_id,
+        facts={
+            "severity": finding.severity,
+            "cve": finding.cve or "",
+            "exploitable": finding.exploitable,
+            "tool": finding.tool,
+        },
+        discovered_by=discovered_by,
+    )
+    if finding.port:
+        host = (finding.target or "").split("/")[2].split(":")[0] if "://" in (finding.target or "") else ""
+        if not host:
+            host = (finding.target or "").split(":")[0]
+        if host:
+            sid = _ag_service_id(host, finding.port)
+            state.attack_graph.add_edge(sid, fid, relation="enables")
+    return fid
+
+
+def attach_credential_to_graph(
+    state: PentestState,
+    cred: dict[str, Any],
+    *,
+    discovered_by: str = "exploit_agent",
+) -> str:
+    cid = _ag_credential_id(cred)
+    state.attack_graph.upsert_node(
+        cid,
+        type="credential",
+        label=f"{cred.get('user') or '?'}@{cred.get('source') or '?'}",
+        facts=dict(cred),
+        discovered_by=discovered_by,
+    )
+    return cid

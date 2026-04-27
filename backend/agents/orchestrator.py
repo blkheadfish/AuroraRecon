@@ -631,6 +631,32 @@ async def node_vuln_scan(state: PentestState) -> PentestState:
     async def _on_decision(event: dict):
         state.push_decision(event)
     nmap_vuln_hints = state.raw_recon.get("nmap_vuln_hints", [])
+
+    # 反馈循环：seed_creds 已经从 pending_seeds["credentials"] 消费出来，
+    # 需要再合并 state.credential_store 里 fact_sink 抓到的所有真实凭据，
+    # 一并传给 VulnAgent.run(seeds=...)，触发：
+    #   1) hydra 字典动态扩充（真实密码优先于固定 wordlist）
+    #   2) credential-replay finding 合成（确定性触发 credential_replay Skill）
+    merged_seed_creds: list[dict] = []
+    seen_cred_keys: set[str] = set()
+    for src in (seed_creds, list(state.credential_store or [])):
+        for c in src:
+            if not isinstance(c, dict):
+                continue
+            key = json.dumps(c, sort_keys=True, default=str, ensure_ascii=False)
+            if key in seen_cred_keys:
+                continue
+            seen_cred_keys.add(key)
+            merged_seed_creds.append(c)
+
+    seeds_payload: dict[str, list] = {}
+    if merged_seed_creds:
+        seeds_payload["credentials"] = merged_seed_creds
+    if seed_paths:
+        seeds_payload["web_paths"] = list(seed_paths)
+    if seed_ports:
+        seeds_payload["ports"] = list(seed_ports)
+
     result = await agent.run(
         target=state.target_host or state.target,
         ports=state.open_ports,
@@ -645,6 +671,7 @@ async def node_vuln_scan(state: PentestState) -> PentestState:
         decision_callback=_on_decision,
         nmap_vuln_hints=nmap_vuln_hints,
         workflow_mode=state.workflow_mode,
+        seeds=seeds_payload or None,
     )
     state.findings = result.get("findings", [])
     # msgpack (LangGraph checkpoint) 不允许 int 作 dict key
