@@ -4,9 +4,14 @@ import { ElMessage } from 'element-plus'
 import { api } from '@/api'
 import { subscribeTaskEvents } from '@/services/wsManager'
 import { useTaskListStore } from '@/stores/taskList'
-import type { DecisionEvent, TaskDetail } from '@/types/task'
+import type {
+  CheckpointPayload,
+  DecisionEvent,
+  TaskDetail,
+} from '@/types/task'
 
 type ApprovalState = 'idle' | 'submitting' | 'submitted' | 'error'
+type CheckpointState = 'idle' | 'submitting' | 'submitted' | 'error'
 
 // ── 有界缓存阈值 ───────────────────────────────────────
 // 长任务运行起来日志/工具流/决策事件都会无限堆积,直接 push 进响应式
@@ -40,6 +45,12 @@ interface TaskLiveState {
   approvalNonce: string
   approvalSubmittedAt: number
   lastWsUpdate: number
+  /** 当前 pending 的 Plan 风格 checkpoint(若有),来自后端 decision_event。 */
+  pendingCheckpoint: CheckpointPayload | null
+  /** 已 resolve 的 checkpoint 历史(最新的在末尾),用于审计与时间线展示。 */
+  checkpointHistory: CheckpointPayload[]
+  /** 当前 checkpoint 的提交状态,避免重复点击。 */
+  checkpointState: CheckpointState
   unsub?: () => void
 }
 
@@ -65,9 +76,126 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
         approvalNonce: '',
         approvalSubmittedAt: 0,
         lastWsUpdate: 0,
+        pendingCheckpoint: null,
+        checkpointHistory: [],
+        checkpointState: 'idle',
       }
     }
     return taskStateMap.value[taskId]
+  }
+
+  // ── checkpoint helpers ─────────────────────────────────
+  function decisionEventToCheckpoint(event: DecisionEvent): CheckpointPayload | null {
+    const cpId = String((event as { checkpoint_id?: string }).checkpoint_id || '')
+    if (!cpId) return null
+    return {
+      checkpoint_id: cpId,
+      checkpoint_type: String((event as { checkpoint_type?: string }).checkpoint_type || 'generic'),
+      phase: event.phase || '',
+      status: 'pending',
+      created_at: event.timestamp || new Date().toISOString(),
+      thinking: (event as { thinking?: string }).thinking || '',
+      summary: (event as { summary?: string }).summary || event.message || '',
+      recommendation: (event as { recommendation?: string }).recommendation || '',
+      risk: (event as { risk?: string }).risk || '',
+      requires_input: Boolean((event as { requires_input?: boolean }).requires_input),
+      default_action:
+        ((event as { default_action?: string }).default_action as CheckpointPayload['default_action']) ||
+        'approve',
+      options: ((event as { options?: CheckpointPayload['options'] }).options) || [],
+      context: ((event as { context?: Record<string, unknown> }).context) || {},
+    }
+  }
+
+  function archiveCheckpoint(state: TaskLiveState, archived: CheckpointPayload) {
+    if (!archived?.checkpoint_id) return
+    const idx = state.checkpointHistory.findIndex(
+      (h) => h.checkpoint_id === archived.checkpoint_id,
+    )
+    if (idx >= 0) {
+      state.checkpointHistory.splice(idx, 1, archived)
+    } else {
+      state.checkpointHistory.push(archived)
+    }
+    if (state.checkpointHistory.length > 50) {
+      state.checkpointHistory.splice(0, state.checkpointHistory.length - 50)
+    }
+  }
+
+  function applyCheckpointRequest(state: TaskLiveState, event: DecisionEvent) {
+    const ckpt = decisionEventToCheckpoint(event)
+    if (!ckpt) return
+    // 已 resolve 过的 checkpoint 不应再次激活(replay 场景)
+    const archived = state.checkpointHistory.find(
+      (h) => h.checkpoint_id === ckpt.checkpoint_id && h.status === 'resolved',
+    )
+    if (archived) return
+    state.pendingCheckpoint = ckpt
+    if (state.checkpointState === 'submitting' || state.checkpointState === 'submitted') {
+      // 新 checkpoint 进入,重置交互态
+      state.checkpointState = 'idle'
+    }
+  }
+
+  function applyCheckpointResolved(state: TaskLiveState, event: DecisionEvent) {
+    const cpId = String((event as { checkpoint_id?: string }).checkpoint_id || '')
+    if (!cpId) return
+    const base =
+      state.pendingCheckpoint && state.pendingCheckpoint.checkpoint_id === cpId
+        ? state.pendingCheckpoint
+        : state.checkpointHistory.find((h) => h.checkpoint_id === cpId)
+    const archived: CheckpointPayload = {
+      checkpoint_id: cpId,
+      checkpoint_type:
+        String((event as { checkpoint_type?: string }).checkpoint_type || base?.checkpoint_type || 'generic'),
+      phase: event.phase || base?.phase || '',
+      status: 'resolved',
+      created_at: base?.created_at || '',
+      resolved_at: event.timestamp || new Date().toISOString(),
+      thinking: base?.thinking || '',
+      summary: base?.summary || '',
+      recommendation: base?.recommendation || '',
+      risk: base?.risk || '',
+      requires_input: base?.requires_input,
+      default_action: base?.default_action,
+      options: base?.options || [],
+      context: base?.context || {},
+      response: ((event as { response?: CheckpointPayload['response'] }).response) || base?.response,
+    }
+    archiveCheckpoint(state, archived)
+    if (state.pendingCheckpoint?.checkpoint_id === cpId) {
+      state.pendingCheckpoint = null
+    }
+    if (state.checkpointState === 'submitting') {
+      state.checkpointState = 'submitted'
+    }
+  }
+
+  function syncCheckpointFromSnapshot(
+    state: TaskLiveState,
+    pending: CheckpointPayload | null | undefined,
+    history: CheckpointPayload[] | undefined,
+  ) {
+    if (Array.isArray(history)) {
+      for (const item of history) {
+        if (!item?.checkpoint_id) continue
+        archiveCheckpoint(state, item)
+      }
+    }
+    if (pending && pending.checkpoint_id) {
+      // 后端权威:有 pending 就强制采用快照里的 pending(可能是首次刷新加载)
+      const archived = state.checkpointHistory.find(
+        (h) => h.checkpoint_id === pending.checkpoint_id && h.status === 'resolved',
+      )
+      if (!archived) {
+        state.pendingCheckpoint = { ...pending, status: 'pending' }
+      } else {
+        state.pendingCheckpoint = null
+      }
+    } else if (state.pendingCheckpoint) {
+      // 后端没有 pending, 但本地仍有 → 说明已被消费, 清掉
+      state.pendingCheckpoint = null
+    }
   }
 
   function pushLog(state: TaskLiveState, line: string) {
@@ -112,6 +240,12 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
     const full = await api.getTask(taskId)
     const state = ensureState(taskId)
     mergeDecisionEvents(state, full.decision_events_tail || full.decision_events || [])
+    // 同步 Plan 风格 checkpoint(刷新/重连后用于回填确认卡片)
+    syncCheckpointFromSnapshot(
+      state,
+      (full.pending_checkpoint as CheckpointPayload | null | undefined) ?? null,
+      (full.checkpoint_history as CheckpointPayload[] | undefined) ?? [],
+    )
 
     const apiTime = full.updated_at ?? ''
     const localTime = state.task?.updated_at ?? ''
@@ -128,6 +262,9 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
         phase_log_total: full.phase_log_total ?? state.task.phase_log_total,
         decision_events_total: full.decision_events_total ?? state.task.decision_events_total,
         decision_events: state.decisionEvents.slice(),
+        pending_checkpoint: full.pending_checkpoint ?? state.task.pending_checkpoint,
+        checkpoint_history: full.checkpoint_history ?? state.task.checkpoint_history,
+        pending_user_prompt: full.pending_user_prompt ?? state.task.pending_user_prompt,
       }
     }
 
@@ -207,8 +344,21 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
       if (eventType === 'history_events') {
         const events = (event as { data?: DecisionEvent[] }).data || []
         mergeDecisionEvents(state, events)
+        // 重连/首连时回放历史 checkpoint 事件,保证刷新后卡片仍能恢复。
+        // 顺序处理:先 request 把 pendingCheckpoint 填上,再用 resolved 覆盖。
+        for (const e of events) {
+          if (e?.action === 'checkpoint_request') applyCheckpointRequest(state, e)
+        }
+        for (const e of events) {
+          if (e?.action === 'checkpoint_resolved') applyCheckpointResolved(state, e)
+        }
         if (state.task) {
-          state.task = { ...state.task, decision_events: state.decisionEvents.slice() }
+          state.task = {
+            ...state.task,
+            decision_events: state.decisionEvents.slice(),
+            pending_checkpoint: state.pendingCheckpoint,
+            checkpoint_history: state.checkpointHistory.slice(),
+          }
         }
         return
       }
@@ -238,11 +388,21 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
             const line = (payload.line as string) || ''
             pushToolStreamLine(state, sid, line)
           } else {
-            mergeDecisionEvents(state, [payload as unknown as DecisionEvent])
+            const decisionEvent = payload as unknown as DecisionEvent
+            mergeDecisionEvents(state, [decisionEvent])
+            // Plan 风格 checkpoint 协议:实时把 pending_checkpoint 同步进 store,
+            // 任务详情页的 DecisionCheckpointCard 直接订阅 state.pendingCheckpoint。
+            if (action === 'checkpoint_request') {
+              applyCheckpointRequest(state, decisionEvent)
+            } else if (action === 'checkpoint_resolved') {
+              applyCheckpointResolved(state, decisionEvent)
+            }
             if (state.task) {
               state.task = {
                 ...state.task,
                 decision_events: state.decisionEvents.slice(),
+                pending_checkpoint: state.pendingCheckpoint,
+                checkpoint_history: state.checkpointHistory.slice(),
               }
             }
           }
@@ -371,6 +531,46 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
     }
   }
 
+  async function submitCheckpoint(
+    taskId: string,
+    payload: {
+      action: 'approve' | 'reject' | 'modify' | 'skip'
+      selected_option?: string
+      user_prompt?: string
+      note?: string
+    },
+  ) {
+    const s = ensureState(taskId)
+    if (s.checkpointState === 'submitting') return
+    s.checkpointState = 'submitting'
+    try {
+      await api.respondCheckpoint(taskId, payload)
+      // 后续真正的 resolved 状态由 ws 推送的 checkpoint_resolved 事件统一收尾,
+      // 这里只标记本地按钮 loading 收回,避免界面残留。
+      s.checkpointState = 'submitted'
+      s.approvalSubmittedAt = Date.now()
+      const tip = (
+        payload.action === 'approve' ? '已批准并继续' :
+        payload.action === 'reject'  ? '已拒绝当前节点' :
+        payload.action === 'modify'  ? '已提交意见,Agent 将参考用户提示继续' :
+                                       '已提交,Agent 将按默认策略继续'
+      )
+      ElMessage.success(tip)
+    } catch (e: unknown) {
+      const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+      const msg = detail || (e as Error)?.message || '提交确认失败'
+      if (detail && /已在执行/.test(detail)) {
+        s.checkpointState = 'submitted'
+        s.approvalSubmittedAt = Date.now()
+        ElMessage.info('确认已在执行中')
+      } else {
+        s.checkpointState = 'error'
+        ElMessage.error(msg)
+        setTimeout(() => { s.checkpointState = 'idle' }, 3000)
+      }
+    }
+  }
+
   return {
     taskStateMap,
     ensureState,
@@ -381,5 +581,6 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
     clear,
     getLiveState,
     submitApproval,
+    submitCheckpoint,
   }
 })

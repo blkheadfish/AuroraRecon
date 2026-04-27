@@ -29,8 +29,16 @@
       </div>
     </div>
 
+    <DecisionCheckpointCard
+      v-if="pendingCheckpoint"
+      :checkpoint="pendingCheckpoint"
+      :loading="checkpointSubmitting"
+      class="checkpoint-card-block"
+      @submit="onCheckpointSubmit"
+    />
+
     <el-alert
-      v-if="showApprovalActions"
+      v-else-if="showApprovalActions"
       type="warning"
       :closable="false"
       show-icon
@@ -85,6 +93,7 @@
     />
 
     <ApprovalComposer
+      v-if="!pendingCheckpoint"
       :needs-approval="showApprovalActions"
       :loading="approving"
       @approve="doApprove(true)"
@@ -119,6 +128,17 @@
             </span>
           </template>
           <FindingsPanel :findings="findings" />
+        </el-tab-pane>
+
+        <el-tab-pane name="attack_graph" lazy>
+          <template #label>
+            <span class="tab-label">
+              <el-icon><Share /></el-icon>
+              攻击图
+              <el-badge v-if="attackGraphNodeCount" :value="attackGraphNodeCount" class="tab-badge" />
+            </span>
+          </template>
+          <AttackGraphView :graph="attackGraph" />
         </el-tab-pane>
 
         <!-- lazy: 这些 Tab 都是重组件,首屏不挂载,减少首次渲染时间和内存。 -->
@@ -164,12 +184,14 @@ import TaskProgressMermaid from '@/components/TaskProgressMermaid.vue'
 import FindingsPanel from '@/components/FindingsPanel.vue'
 import DecisionTimeline from '@/components/DecisionTimeline.vue'
 import ApprovalComposer from '@/components/ApprovalComposer.vue'
+import DecisionCheckpointCard from '@/components/DecisionCheckpointCard.vue'
 
 // 重组件改为按需加载, 首屏不付出解析+实例化 cost。
 const LogTerminal = defineAsyncComponent(() => import('@/components/LogTerminal.vue'))
 const ReconPanel = defineAsyncComponent(() => import('@/components/ReconPanel.vue'))
 const JsonViewer = defineAsyncComponent(() => import('@/components/JsonViewer.vue'))
 const ReportPanel = defineAsyncComponent(() => import('@/components/ReportPanel.vue'))
+const AttackGraphView = defineAsyncComponent(() => import('@/components/AttackGraphView.vue'))
 
 const route = useRoute()
 const router = useRouter()
@@ -196,6 +218,13 @@ const approvalState = computed(() => state.value.approvalState)
 const approving = computed(() => approvalState.value === 'submitting')
 const showApprovalActions = computed(() => needsApproval.value && approvalState.value === 'idle')
 const exploitableCount = computed(() => findings.value.filter((item) => item.exploitable).length)
+
+// 攻击图（来自 backend state.attack_graph，反馈/监督模式下会填充节点和边）
+const attackGraph = computed(() => task.value?.attack_graph || { nodes: [], edges: [] })
+const attackGraphNodeCount = computed(() => attackGraph.value?.nodes?.length || 0)
+
+const pendingCheckpoint = computed(() => state.value?.pendingCheckpoint || null)
+const checkpointSubmitting = computed(() => state.value?.checkpointState === 'submitting')
 
 const nextAction = computed(() => {
   if (!task.value) return '-'
@@ -333,6 +362,32 @@ const decisionItems = computed(() => {
       })
       return
     }
+    if (entry.action === 'checkpoint_request') {
+      events.push({
+        id: entry.id || `cp-req-${idx}`,
+        time,
+        tone: 'warning',
+        title: 'Plan 决策点 · 等待确认',
+        desc: entry.summary || entry.message || entry.recommendation || '',
+        thinking: entry.thinking || '',
+        expandable: (entry.thinking || '').length > 80,
+        action: 'checkpoint_request',
+      })
+      return
+    }
+    if (entry.action === 'checkpoint_resolved') {
+      const resp = entry.response || {}
+      const acted = resp.action || 'approve'
+      events.push({
+        id: entry.id || `cp-res-${idx}`,
+        time,
+        tone: acted === 'reject' ? 'danger' : (acted === 'approve' ? 'success' : 'info'),
+        title: `Plan 决策点 · 已${acted === 'approve' ? '批准' : (acted === 'reject' ? '拒绝' : '处理')}`,
+        desc: resp.user_prompt || entry.message || '',
+        action: 'checkpoint_resolved',
+      })
+      return
+    }
     if (entry.action === 'log') {
       const msg = entry.message || entry.raw || ''
       if (!msg) return
@@ -462,6 +517,16 @@ function doApprove(approved) {
   liveStore.submitApproval(taskId, approved)
 }
 
+function onCheckpointSubmit(payload) {
+  trackEvent('task.checkpoint.respond', {
+    taskId,
+    action: payload.action,
+    has_prompt: Boolean(payload.user_prompt),
+    selected_option: payload.selected_option || '',
+  })
+  liveStore.submitCheckpoint(taskId, payload)
+}
+
 async function doCancel() {
   if (cancelling.value) return
   cancelling.value = true
@@ -555,6 +620,10 @@ onUnmounted(() => {
 .summary-value { margin-top: 6px; font-size: 14px; color: var(--text-primary); font-weight: 600; }
 .summary-value.risk { color: var(--accent-yellow); }
 .summary-value.evidence { font-family: var(--font-mono); font-size: 12px; }
+
+.checkpoint-card-block {
+  margin-bottom: 12px;
+}
 
 .approval-banner {
   margin-bottom: 12px;

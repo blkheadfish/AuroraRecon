@@ -7,7 +7,7 @@ import {
   Warning, CopyDocument, Delete, Check, Cpu, Connection, Refresh,
   Loading, UserFilled, CircleCheckFilled, CircleCloseFilled,
   Remove, RemoveFilled, ArrowDown, Lock, Clock,
-  SwitchButton, Edit, Key, InfoFilled,
+  SwitchButton, Edit, Key, InfoFilled, Share,
 } from '@element-plus/icons-vue'
 import 'element-plus/dist/index.css'
 import App from './App.vue'
@@ -24,7 +24,7 @@ const icons = {
   Warning, CopyDocument, Delete, Check, Cpu, Connection, Refresh,
   Loading, UserFilled, CircleCheckFilled, CircleCloseFilled,
   Remove, RemoveFilled, ArrowDown, Lock, Clock,
-  SwitchButton, Edit, Key, InfoFilled,
+  SwitchButton, Edit, Key, InfoFilled, Share,
 }
 for (const [key, component] of Object.entries(icons)) {
   app.component(key, component)

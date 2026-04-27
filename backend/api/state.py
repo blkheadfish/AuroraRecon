@@ -230,6 +230,8 @@ class TaskStateManager:
             "chain_summary": state.chain_summary,
             "chain_visited": state.chain_visited,
             "secondary_elided": state.secondary_elided,
+            "secondary_attack_count": state.secondary_attack_count,
+            "max_secondary_attacks": state.max_secondary_attacks,
             # per-task 运行时参数(workflow_mode/auto_approve 已在 summary 里)
             "success_gate_level": state.success_gate_level,
             "risk_budget": state.risk_budget,
@@ -241,6 +243,14 @@ class TaskStateManager:
             "pending_checkpoint": state.pending_checkpoint,
             "checkpoint_history": list(state.checkpoint_history or []),
             "pending_user_prompt": state.pending_user_prompt,
+            # 攻击链反馈循环 / Supervisor 模式可视化字段
+            "attack_graph": state.attack_graph.to_payload() if state.attack_graph else {"nodes": [], "edges": []},
+            "phase_visit_count": dict(state.phase_visit_count or {}),
+            "replan_signals": dict(state.replan_signals or {}),
+            "replan_count": state.replan_count,
+            "max_replan": state.max_replan,
+            "supervisor_round": state.supervisor_round,
+            "supervisor_history": list(state.supervisor_history or []),
         })
         # stdout/stderr 截断（避免 MB 级响应）+ 标注 truncated_reason
         for rec in base.get("tool_records", []):
@@ -389,6 +399,16 @@ class TaskStateManager:
             "pending_checkpoint": state.pending_checkpoint,
             "checkpoint_history": list(state.checkpoint_history or [])[-10:],
             "pending_user_prompt": state.pending_user_prompt,
+            # 攻击链反馈循环 / Supervisor 模式可视化字段（首屏精简版）
+            "attack_graph": state.attack_graph.to_payload() if state.attack_graph else {"nodes": [], "edges": []},
+            "phase_visit_count": dict(state.phase_visit_count or {}),
+            "replan_signals": dict(state.replan_signals or {}),
+            "replan_count": state.replan_count,
+            "max_replan": state.max_replan,
+            "supervisor_round": state.supervisor_round,
+            "supervisor_history": list(state.supervisor_history or [])[-20:],
+            "secondary_attack_count": state.secondary_attack_count,
+            "max_secondary_attacks": state.max_secondary_attacks,
         })
         return base
 

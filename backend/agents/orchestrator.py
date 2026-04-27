@@ -58,6 +58,24 @@ logger = logging.getLogger(__name__)
 
 TASK_TIMEOUT = int(os.getenv("TASK_TIMEOUT_SECONDS", "7200"))
 
+# Attack chain mode 分发开关
+#   linear      — 默认；当前的单向流水线
+#   feedback    — 在 secondary_attack / post_foothold_enum / privesc_attempt 出口
+#                 加条件回流边，根据 replan_signals 决定是否回上游重跑
+#   supervisor  — 星形拓扑，所有阶段都回 supervisor 节点决定下一步
+ATTACK_CHAIN_MODE_ENV = "ATTACK_CHAIN_MODE"
+_VALID_CHAIN_MODES = {"linear", "feedback", "supervisor"}
+
+
+def _current_chain_mode() -> str:
+    mode = (os.getenv(ATTACK_CHAIN_MODE_ENV, "linear") or "linear").strip().lower()
+    if mode not in _VALID_CHAIN_MODES:
+        logger.warning(
+            "[Orchestrator] 非法 ATTACK_CHAIN_MODE=%r，回退 linear", mode,
+        )
+        return "linear"
+    return mode
+
 # 与前端 TaskProgressMermaid 节点顺序一致（单调推进）
 _CHAIN_PHASE_ORDER: list[str] = [
     "recon",
@@ -146,6 +164,10 @@ def _append_tool_record(
     if rec.id and any(item.id == rec.id for item in state.tool_records):
         return
     state.tool_records.append(rec)
+    # 滚动淘汰：反馈/监督模式下命令记录会持续增长，超过 2000 条
+    # 截留最近 1000 条，避免 LangGraph checkpoint payload 失控。
+    if len(state.tool_records) > 2000:
+        state.tool_records = state.tool_records[-1000:]
 
 
 def _operator_chat_block(state: PentestState) -> str:
@@ -395,15 +417,36 @@ async def node_recon(state: PentestState) -> PentestState:
     _record_chain_visit(state, "recon")
     state.status = TaskStatus.RUNNING
 
-    # 为本次任务启动专属工具容器（多人并发时每个 task 独立隔离）
+    # ── 增量入口：把 pending_seeds["hosts"] 并入；签名命中则跳过 ──
+    seed_hosts = _consume_pending_seeds(state, "hosts")
+    targets: list[str] = []
+    if state.target_host:
+        targets.append(state.target_host)
+    elif state.target:
+        targets.append(state.target)
+    for h in seed_hosts:
+        if isinstance(h, str) and h and h not in targets:
+            targets.append(h)
+    sig = _compute_phase_signature({"targets": targets})
+    skip, skip_reason = _should_skip_phase(state, "recon", sig)
+    if skip:
+        state.log(f"recon 跳过：{skip_reason}（visit={state.phase_visit_count.get('recon', 0)}）")
+        _consume_replan_signal(state, "re_recon_for_hosts")
+        _mark_phase_visited(state, "recon", sig)
+        return state
+
+    # 为本次任务启动专属工具容器（多人并发时每个 task 独立隔离；幂等）
     try:
         _exec = ToolExecutor()
         await _exec.start_task_container(state.task_id)
-        state.log(f"工具容器已就绪: pentest_task_{state.task_id[:12]}")
+        if state.phase_visit_count.get("recon", 0) == 0:
+            state.log(f"工具容器已就绪: pentest_task_{state.task_id[:12]}")
     except Exception as _ce:
-        # 容器启动失败不阻断流程，降级为 docker run --rm 模式
         state.log(f"⚠ 工具容器启动失败，降级为临时容器模式: {_ce}")
 
+    revisit = state.phase_visit_count.get("recon", 0) > 0
+    if revisit and seed_hosts:
+        state.log(f"recon 重入：消费 {len(seed_hosts)} 个种子主机 → {seed_hosts}")
     state.log(f"开始侦察目标: {state.target_host or state.target}")
     agent = ReconAgent()
     async def _on_tool_log(line: str):
@@ -508,6 +551,20 @@ async def node_recon(state: PentestState) -> PentestState:
         ],
         "message": f"侦察完成: {len(state.open_ports)} 端口, {web_count} 路径, OS={state.target_os}",
     })
+    # 同步到 attack_graph：host + service
+    try:
+        host = state.target_host or state.target
+        _attach_host_to_graph(state, host, discovered_by="recon")
+        for p in state.open_ports:
+            _attach_service_to_graph(
+                state, host, p.port,
+                service=p.service or "", version=p.version or "",
+                discovered_by="recon",
+            )
+    except Exception as _ag_exc:
+        logger.debug(f"[node_recon] attack_graph upsert skipped: {_ag_exc}")
+    _consume_replan_signal(state, "re_recon_for_hosts")
+    _mark_phase_visited(state, "recon", sig)
     return state
 
 
@@ -529,6 +586,42 @@ async def node_vuln_scan(state: PentestState) -> PentestState:
         if new_count:
             state.log(f"情报回注: intel_harvest 新增 {new_count} 条路径到攻击面")
 
+    # ── 增量入口：消费 pending_seeds 中的 web_paths/credentials/ports ──
+    seed_paths = _consume_pending_seeds(state, "web_paths")
+    seed_creds = _consume_pending_seeds(state, "credentials")
+    seed_ports = _consume_pending_seeds(state, "ports")
+    if seed_paths:
+        existing = set(state.web_paths or [])
+        added = 0
+        for p in seed_paths:
+            if isinstance(p, str) and p and p not in existing:
+                state.web_paths.append(p)
+                existing.add(p)
+                added += 1
+        if added:
+            state.log(f"vuln_scan 重入: 注入 {added} 条种子路径")
+
+    sig_payload = {
+        "ports": [p.port for p in state.open_ports],
+        "web_paths_count": len(state.web_paths or []),
+        "intel_count": len(state.intel_discovered_paths or []),
+        "seed_creds_count": len(seed_creds),
+    }
+    sig = _compute_phase_signature(sig_payload)
+    skip, skip_reason = _should_skip_phase(state, "vuln_scan", sig)
+    if skip:
+        state.log(f"vuln_scan 跳过：{skip_reason}")
+        _consume_replan_signal(state, "re_vuln_scan_for_creds")
+        _consume_replan_signal(state, "re_vuln_scan_for_ports")
+        _mark_phase_visited(state, "vuln_scan", sig)
+        return state
+
+    revisit = state.phase_visit_count.get("vuln_scan", 0) > 0
+    if revisit:
+        state.log(
+            f"vuln_scan 重入：seed_creds={len(seed_creds)}, seed_ports={len(seed_ports)}, "
+            f"signals={state.replan_signals}"
+        )
     state.log("开始漏洞扫描...")
     agent = VulnAgent()
     async def _on_tool_log(line: str):
@@ -560,6 +653,14 @@ async def node_vuln_scan(state: PentestState) -> PentestState:
     state.fingerprints = _stringify_dict_keys(result.get("fingerprints", {}))
     exploitable = [f for f in state.findings if f.exploitable]
     state.log(f"漏洞扫描完成: {len(state.findings)} 发现, {len(exploitable)} 可利用")
+    try:
+        for f in state.findings[-30:]:
+            _attach_finding_to_graph(state, f, discovered_by="vuln_scan")
+    except Exception as _ag_exc:
+        logger.debug(f"[node_vuln_scan] attack_graph upsert skipped: {_ag_exc}")
+    _consume_replan_signal(state, "re_vuln_scan_for_creds")
+    _consume_replan_signal(state, "re_vuln_scan_for_ports")
+    _mark_phase_visited(state, "vuln_scan", sig)
     return state
 
 
@@ -655,8 +756,33 @@ async def node_surface_enum(state: PentestState) -> PentestState:
     from backend.tools.tool_coverage_planner import ToolCoveragePlanner
     state.current_phase = "surface_enum"
     _record_chain_visit(state, "surface_enum")
-    state.log("攻链: 表面枚举 — 多工具 Web 探测与敏感文件发现")
 
+    # ── 增量入口：消费 pending_seeds["ports"]/["web_paths"] ──
+    seed_ports = _consume_pending_seeds(state, "ports")
+    seed_paths = _consume_pending_seeds(state, "web_paths")
+    if seed_paths:
+        existing = set(state.web_paths or [])
+        added = 0
+        for p in seed_paths:
+            if isinstance(p, str) and p and p not in existing:
+                state.web_paths.append(p)
+                existing.add(p)
+                added += 1
+        if added:
+            state.log(f"surface_enum 重入: 注入 {added} 条种子路径")
+    sig = _compute_phase_signature({
+        "ports": [p.port for p in state.open_ports],
+        "web_paths_count": len(state.web_paths or []),
+        "seed_ports": list(seed_ports),
+    })
+    skip, skip_reason = _should_skip_phase(state, "surface_enum", sig)
+    if skip:
+        state.log(f"surface_enum 跳过：{skip_reason}")
+        _consume_replan_signal(state, "re_surface_enum_for_paths")
+        _mark_phase_visited(state, "surface_enum", sig)
+        return state
+
+    state.log("攻链: 表面枚举 — 多工具 Web 探测与敏感文件发现")
     aggregator = PathAggregator()
     aggregator.add_paths(state.web_paths or [], source="recon_phase")
 
@@ -877,6 +1003,8 @@ async def node_surface_enum(state: PentestState) -> PentestState:
         ],
         "message": f"表面枚举完成: {inv['total_paths']} 路径, {inv['high_value']} 高价值",
     })
+    _consume_replan_signal(state, "re_surface_enum_for_paths")
+    _mark_phase_visited(state, "surface_enum", sig)
     return state
 
 
@@ -1089,8 +1217,19 @@ def _update_inventory_hints_from_intel(
 
 from backend.agents.fact_hooks import (
     apply_service_info_extraction as _apply_service_info_extraction,
+    attach_finding_to_graph as _attach_finding_to_graph,
+    attach_host_to_graph as _attach_host_to_graph,
+    attach_service_to_graph as _attach_service_to_graph,
+    compute_phase_signature as _compute_phase_signature,
+    consume_pending_seeds as _consume_pending_seeds,
+    consume_replan_signal as _consume_replan_signal,
+    emit_replan_signals as _emit_replan_signals,
     make_fact_sink as _make_fact_sink,
+    mark_phase_visited as _mark_phase_visited,
     normalize_and_dedupe_state_facts as _normalize_and_dedupe_state_facts,
+    push_pending_seed as _push_pending_seed,
+    should_skip_phase as _should_skip_phase,
+    snapshot_facts as _snapshot_facts,
 )
 
 
@@ -1103,11 +1242,23 @@ async def node_intel_harvest(state: PentestState) -> PentestState:
 
     state.current_phase = "intel_harvest"
     _record_chain_visit(state, "intel_harvest")
-    state.log("情报采集: 文件情报提取 + 页面源码审计")
 
     file_targets, page_targets = _classify_harvest_targets(state)
+    # 增量幂等：基于本轮目标集合签名
+    sig = _compute_phase_signature({
+        "files": sorted(file_targets), "pages": sorted(page_targets),
+    })
+    skip, skip_reason = _should_skip_phase(state, "intel_harvest", sig)
+    if skip:
+        state.log(f"intel_harvest 跳过：{skip_reason}")
+        _consume_replan_signal(state, "re_intel_harvest_for_paths")
+        _mark_phase_visited(state, "intel_harvest", sig)
+        return state
+
+    state.log("情报采集: 文件情报提取 + 页面源码审计")
     if not file_targets and not page_targets:
         state.log("情报采集: 无高价值目标，跳过")
+        _mark_phase_visited(state, "intel_harvest", sig)
         return state
 
     state.log(f"情报采集: 文件目标 {len(file_targets)} 个, 页面目标 {len(page_targets)} 个")
@@ -1360,6 +1511,8 @@ async def node_intel_harvest(state: PentestState) -> PentestState:
             f"{len(state.page_params)} 参数 ({verified_count} 已验证)"
         ),
     })
+    _consume_replan_signal(state, "re_intel_harvest_for_paths")
+    _mark_phase_visited(state, "intel_harvest", sig)
     return state
 
 
@@ -1443,6 +1596,12 @@ async def node_human_approval(state: PentestState) -> PentestState:
     _record_chain_visit(state, "awaiting_approval")
     exploitable = [f for f in state.findings if f.exploitable]
 
+    # 反馈/监督模式下，第二次及以后到达本节点时不再重新拉起人工审批：
+    # 第一次审批通过后我们认为整个利用阶段都得到了授权。
+    if state.approved_once and not state.approved:
+        state.approved = True
+        state.log("✅ 反馈循环：审批已在前序轮次通过，跳过人工审批")
+
     if state.auto_approve and not state.approved:
         state.approved = True
         state.log(f"✅ auto_approve 生效,跳过人工审批({len(exploitable)} 个待利用漏洞)")
@@ -1512,6 +1671,7 @@ async def node_human_approval(state: PentestState) -> PentestState:
 
     if state.approved:
         state.status = TaskStatus.RUNNING
+        state.approved_once = True
         state.log("✅ 已获授权,继续利用阶段")
         # checkpoint 在 /checkpoint/respond 里已经被 resolve 过了,这里兜底清一次
         if state.pending_checkpoint and (
@@ -1530,6 +1690,7 @@ async def node_foothold_attempt(state: PentestState) -> PentestState:
     state.current_phase = "foothold_attempt"
     _record_chain_visit(state, "foothold_attempt")
     exploitable = [f for f in state.findings if f.exploitable]
+    before_snapshot = _snapshot_facts(state)
     _normalize_and_dedupe_state_facts(state, source_node="foothold_attempt_pre")
 
     php_fpm = [
@@ -1621,6 +1782,16 @@ async def node_foothold_attempt(state: PentestState) -> PentestState:
                 state.log("所有利用尝试均未成功")
         _sync_foothold_state(state)
         _normalize_and_dedupe_state_facts(state, source_node="foothold_attempt_post")
+        try:
+            after_snapshot = _snapshot_facts(state)
+            _emit_replan_signals(
+                state,
+                before=before_snapshot,
+                after=after_snapshot,
+                source_node="foothold_attempt",
+            )
+        except Exception as _exc:
+            logger.debug(f"[foothold_attempt] emit_replan_signals skipped: {_exc}")
     except Exception as e:
         state.error_msg = str(e)
         state.log(f"利用阶段异常: {e}")
@@ -1632,7 +1803,11 @@ async def node_secondary_attack(state: PentestState) -> PentestState:
     from backend.agents.exploit_agent import ExploitAgent
     state.current_phase = "secondary_attack"
     _record_chain_visit(state, "secondary_attack")
+    # linear 模式保持兼容：done 标志仍然写为 True；feedback / supervisor 模式
+    # 通过 secondary_attack_count + max_secondary_attacks 控制重入次数。
     state.secondary_attack_done = True
+    state.secondary_attack_count = int(state.secondary_attack_count or 0) + 1
+    before_snapshot = _snapshot_facts(state)
     _normalize_and_dedupe_state_facts(state, source_node="secondary_attack_pre")
 
     if state.got_shell:
@@ -1719,6 +1894,17 @@ async def node_secondary_attack(state: PentestState) -> PentestState:
                 state.log("二次攻击仍未成功")
         _sync_foothold_state(state)
         _normalize_and_dedupe_state_facts(state, source_node="secondary_attack_post")
+        # 反馈循环：secondary_attack 是最常见的"新事实产生地"
+        try:
+            after_snapshot = _snapshot_facts(state)
+            _emit_replan_signals(
+                state,
+                before=before_snapshot,
+                after=after_snapshot,
+                source_node="secondary_attack",
+            )
+        except Exception as _exc:
+            logger.debug(f"[secondary_attack] emit_replan_signals skipped: {_exc}")
     except Exception as e:
         state.error_msg = str(e)
         state.log(f"二次攻击异常: {e}")
@@ -1729,6 +1915,7 @@ async def node_post_foothold_enum(state: PentestState) -> PentestState:
     from backend.agents.post_agent import PostExploitAgent
     state.current_phase = "post_foothold_enum"
     _record_chain_visit(state, "post_foothold_enum")
+    before_snapshot = _snapshot_facts(state)
     state.log("攻链: 立足后枚举")
     try:
         agent = PostExploitAgent()
@@ -1760,9 +1947,23 @@ async def node_post_foothold_enum(state: PentestState) -> PentestState:
         if fp and fp != "unknown":
             state.privilege_level = fp
         state.log("立足后枚举完成")
+        try:
+            after_snapshot = _snapshot_facts(state)
+            _emit_replan_signals(
+                state,
+                before=before_snapshot,
+                after=after_snapshot,
+                source_node="post_foothold_enum",
+            )
+        except Exception as _exc:
+            logger.debug(f"[post_foothold_enum] emit_replan_signals skipped: {_exc}")
     except Exception as e:
         state.error_msg = str(e)
         state.log(f"立足后枚举异常: {e}")
+    _mark_phase_visited(
+        state, "post_foothold_enum",
+        _compute_phase_signature({"round": state.phase_visit_count.get('post_foothold_enum', 0)}),
+    )
     return state
 
 
@@ -1774,6 +1975,11 @@ async def node_post_foothold_approval(state: PentestState) -> PentestState:
     """
     state.current_phase = "post_foothold_approval"
     _record_chain_visit(state, "post_foothold_approval")
+
+    # 反馈/监督模式下，第二次及以后到达本节点时不再重新拉起人工审批
+    if state.post_approved_once and not state.post_approved:
+        state.post_approved = True
+        state.log("✅ 反馈循环：立足后审批已在前序轮次通过，跳过人工审批")
 
     if state.auto_approve and not state.post_approved:
         state.post_approved = True
@@ -1829,6 +2035,7 @@ async def node_post_foothold_approval(state: PentestState) -> PentestState:
 
     if state.post_approved:
         state.status = TaskStatus.RUNNING
+        state.post_approved_once = True
         state.log("✅ 已获授权，继续提权阶段")
         if state.pending_checkpoint and (
             state.pending_checkpoint.get("checkpoint_type") == "post_foothold_gate"
@@ -1850,6 +2057,7 @@ async def node_privesc_attempt(state: PentestState) -> PentestState:
     state.current_phase = "privesc_attempt"
     _record_chain_visit(state, "privesc_attempt")
     state.privesc_attempt_count += 1
+    before_snapshot = _snapshot_facts(state)
     if not _consume_risk_budget(state, cost=1):
         state.log("风险预算不足，跳过 privesc_attempt 阶段")
         return state
@@ -1876,6 +2084,16 @@ async def node_privesc_attempt(state: PentestState) -> PentestState:
         pl = (state.privilege_level or "").lower()
         if pl == "root":
             state.objective_status["root_reached"] = True
+        try:
+            after_snapshot = _snapshot_facts(state)
+            _emit_replan_signals(
+                state,
+                before=before_snapshot,
+                after=after_snapshot,
+                source_node="privesc_attempt",
+            )
+        except Exception as _exc:
+            logger.debug(f"[privesc_attempt] emit_replan_signals skipped: {_exc}")
     except Exception as e:
         state.error_msg = str(e)
         state.log(f"提权阶段异常: {e}")
@@ -2014,10 +2232,125 @@ def edge_after_privesc(state: PentestState) -> str:
 
 
 # ───────────────────────────────────────────────────────
-# 构建图
+# Feedback 模式专用条件边（v2）
+#   读取 state.replan_signals + state.replan_count + state.phase_visit_count
+#   决定是否回上游重跑。每跳一次 replan_count++，触达 max_replan 后回退。
+# ───────────────────────────────────────────────────────
+
+def _can_replan(state: PentestState, target_phase: str) -> bool:
+    if state.replan_count >= state.max_replan:
+        return False
+    visits = state.phase_visit_count.get(target_phase, 0)
+    cap = state.max_phase_visits.get(target_phase, 99)
+    return visits < cap
+
+
+def _do_replan(state: PentestState, target_phase: str, signal_key: str) -> str:
+    state.replan_count += 1
+    _consume_replan_signal(state, signal_key)
+    state.log(
+        f"[replan] {target_phase} ← 触发反馈 (#{state.replan_count}/{state.max_replan}, "
+        f"signal={signal_key})"
+    )
+    state.push_decision({
+        "action": "replan_route",
+        "phase": state.current_phase,
+        "thinking": f"signal {signal_key} 命中，回流到 {target_phase}",
+        "message": f"replan → {target_phase}",
+        "tone": "info",
+    })
+    return target_phase
+
+
+def edge_after_foothold_v2(state: PentestState) -> str:
+    """Foothold 出口：先看 replan signals，再走老逻辑。"""
+    if state.status == TaskStatus.FAILED:
+        return "report"
+    sig = state.replan_signals or {}
+    if state.got_shell:
+        return "post_foothold_enum"
+    # foothold 失败：若产生了新凭据/路径，回 vuln_scan 重跑
+    if sig.get("re_vuln_scan_for_creds") and _can_replan(state, "vuln_scan"):
+        return _do_replan(state, "vuln_scan", "re_vuln_scan_for_creds")
+    if sig.get("re_surface_enum_for_paths") and _can_replan(state, "surface_enum"):
+        return _do_replan(state, "surface_enum", "re_surface_enum_for_paths")
+    # File-read foothold: escalate via secondary attack
+    if state.foothold_status == "file_read":
+        if state.secondary_attack_count < state.max_secondary_attacks:
+            return "secondary_attack"
+        return "post_foothold_enum"
+    if state.secondary_attack_count < state.max_secondary_attacks and any(
+        f.exploitable for f in state.findings
+    ):
+        return "secondary_attack"
+    return "report"
+
+
+def edge_after_secondary_v2(state: PentestState) -> str:
+    """Secondary 出口：成功 → post；产生凭据 → vuln_scan；产生路径 → surface_enum。"""
+    if state.status == TaskStatus.FAILED:
+        return "report"
+    if state.got_shell:
+        return "post_foothold_enum"
+    sig = state.replan_signals or {}
+    if sig.get("re_vuln_scan_for_creds") and _can_replan(state, "vuln_scan"):
+        return _do_replan(state, "vuln_scan", "re_vuln_scan_for_creds")
+    if sig.get("re_surface_enum_for_paths") and _can_replan(state, "surface_enum"):
+        return _do_replan(state, "surface_enum", "re_surface_enum_for_paths")
+    return "report"
+
+
+def edge_after_post_foothold_enum_v2(state: PentestState) -> str:
+    """立足后枚举出口：新主机 → recon；新凭据 → vuln_scan；否则继续 approval。"""
+    if state.status == TaskStatus.FAILED:
+        return "post_foothold_approval"
+    sig = state.replan_signals or {}
+    if sig.get("re_recon_for_hosts") and _can_replan(state, "recon"):
+        return _do_replan(state, "recon", "re_recon_for_hosts")
+    if sig.get("re_vuln_scan_for_creds") and _can_replan(state, "vuln_scan"):
+        return _do_replan(state, "vuln_scan", "re_vuln_scan_for_creds")
+    if sig.get("re_surface_enum_for_paths") and _can_replan(state, "surface_enum"):
+        return _do_replan(state, "surface_enum", "re_surface_enum_for_paths")
+    return "post_foothold_approval"
+
+
+def edge_after_privesc_v2(state: PentestState) -> str:
+    """提权出口：到 root → objective；产生新凭据 → vuln_scan；否则按老规则。"""
+    if state.status == TaskStatus.FAILED:
+        return "objective_collect"
+    pl = (state.privilege_level or "").lower()
+    if pl == "root":
+        return "objective_collect"
+    sig = state.replan_signals or {}
+    if sig.get("re_vuln_scan_for_creds") and _can_replan(state, "vuln_scan"):
+        return _do_replan(state, "vuln_scan", "re_vuln_scan_for_creds")
+    if state.privesc_attempt_count >= state.max_privesc_rounds:
+        return "objective_collect"
+    return "privesc_again"
+
+
+# ───────────────────────────────────────────────────────
+# 构建图（按 ATTACK_CHAIN_MODE 分发）
 # ───────────────────────────────────────────────────────
 
 def build_graph(checkpointer=None):
+    """根据 ATTACK_CHAIN_MODE 分发到对应的图构造器。
+
+    - ``linear``    — 默认；与历史行为完全一致；
+    - ``feedback``  — 在 secondary_attack / post_foothold_enum / privesc_attempt
+                      出口加条件回流边；
+    - ``supervisor``— 星形拓扑，全部节点回 supervisor 决定下一步。
+    """
+    mode = _current_chain_mode()
+    logger.info("[Orchestrator] ATTACK_CHAIN_MODE=%s", mode)
+    if mode == "supervisor":
+        return _build_graph_supervisor(checkpointer)
+    if mode == "feedback":
+        return _build_graph_feedback(checkpointer)
+    return _build_graph_linear(checkpointer)
+
+
+def _build_graph_linear(checkpointer=None):
     graph = StateGraph(PentestState)
 
     graph.add_node("recon",               node_recon)
@@ -2077,6 +2410,150 @@ def build_graph(checkpointer=None):
     )
     graph.add_edge("objective_collect", "report")
     graph.add_edge("report", END)
+
+    return graph.compile(
+        checkpointer=checkpointer,
+        interrupt_before=["human_approval", "post_foothold_approval"],
+    )
+
+
+def _build_graph_feedback(checkpointer=None):
+    """Feedback DAG：在 secondary_attack / post_foothold_enum / privesc_attempt
+    出口允许根据 replan_signals 回流到 recon / surface_enum / vuln_scan。
+
+    与 linear 的差别仅在 4 条 conditional_edges 的目标集合。审批节点保持不变，
+    但反馈循环回流到 vuln_scan/surface_enum/recon 时不再经过 human_approval（因为
+    审批针对的是 exploit 决策，不针对前置阶段的重跑）。
+    """
+    graph = StateGraph(PentestState)
+
+    graph.add_node("recon",               node_recon)
+    graph.add_node("vuln_scan",           node_vuln_scan)
+    graph.add_node("surface_enum",        node_surface_enum)
+    graph.add_node("intel_harvest",       node_intel_harvest)
+    graph.add_node("exploit_decision",    node_exploit_decision)
+    graph.add_node("human_approval",      node_human_approval)
+    graph.add_node("foothold_attempt",    node_foothold_attempt)
+    graph.add_node("secondary_attack",    node_secondary_attack)
+    graph.add_node("post_foothold_enum",  node_post_foothold_enum)
+    graph.add_node("post_foothold_approval", node_post_foothold_approval)
+    graph.add_node("privesc_attempt",     node_privesc_attempt)
+    graph.add_node("objective_collect",   node_objective_collect)
+    graph.add_node("report",              node_report)
+
+    graph.add_edge(START, "recon")
+    graph.add_edge("recon", "surface_enum")
+    graph.add_edge("surface_enum", "intel_harvest")
+    graph.add_edge("intel_harvest", "vuln_scan")
+    graph.add_edge("vuln_scan", "exploit_decision")
+
+    graph.add_conditional_edges(
+        "exploit_decision", edge_should_exploit,
+        {
+            "human_approval": "human_approval",
+            "foothold_attempt": "foothold_attempt",
+            "report": "report",
+        },
+    )
+    graph.add_conditional_edges(
+        "human_approval", edge_after_approval,
+        {"foothold_attempt": "foothold_attempt", "report": "report"},
+    )
+
+    # foothold 出口：除老分支外，反馈到 vuln_scan / surface_enum
+    graph.add_conditional_edges(
+        "foothold_attempt", edge_after_foothold_v2,
+        {
+            "post_foothold_enum": "post_foothold_enum",
+            "secondary_attack": "secondary_attack",
+            "vuln_scan": "vuln_scan",
+            "surface_enum": "surface_enum",
+            "report": "report",
+        },
+    )
+    graph.add_conditional_edges(
+        "secondary_attack", edge_after_secondary_v2,
+        {
+            "post_foothold_enum": "post_foothold_enum",
+            "vuln_scan": "vuln_scan",
+            "surface_enum": "surface_enum",
+            "report": "report",
+        },
+    )
+    graph.add_conditional_edges(
+        "post_foothold_enum", edge_after_post_foothold_enum_v2,
+        {
+            "post_foothold_approval": "post_foothold_approval",
+            "recon": "recon",
+            "vuln_scan": "vuln_scan",
+            "surface_enum": "surface_enum",
+        },
+    )
+    graph.add_conditional_edges(
+        "post_foothold_approval", edge_after_post_foothold_approval,
+        {"privesc_attempt": "privesc_attempt", "objective_collect": "objective_collect"},
+    )
+    graph.add_conditional_edges(
+        "privesc_attempt", edge_after_privesc_v2,
+        {
+            "objective_collect": "objective_collect",
+            "privesc_again": "privesc_attempt",
+            "vuln_scan": "vuln_scan",
+        },
+    )
+    graph.add_edge("objective_collect", "report")
+    graph.add_edge("report", END)
+
+    return graph.compile(
+        checkpointer=checkpointer,
+        interrupt_before=["human_approval", "post_foothold_approval"],
+    )
+
+
+def _build_graph_supervisor(checkpointer=None):
+    """Supervisor 模式：星形拓扑。
+
+    所有阶段执行完毕后都返回 supervisor，由 supervisor 路由到下一阶段。
+    interrupt_before 仍保留 human_approval / post_foothold_approval，但靠
+    state.approved_once / post_approved_once 防止反复在审批门暂停。
+    """
+    from backend.agents.supervisor import (
+        node_supervisor,
+        supervisor_route,
+    )
+
+    graph = StateGraph(PentestState)
+
+    graph.add_node("supervisor",          node_supervisor)
+    graph.add_node("recon",               node_recon)
+    graph.add_node("vuln_scan",           node_vuln_scan)
+    graph.add_node("surface_enum",        node_surface_enum)
+    graph.add_node("intel_harvest",       node_intel_harvest)
+    graph.add_node("exploit_decision",    node_exploit_decision)
+    graph.add_node("human_approval",      node_human_approval)
+    graph.add_node("foothold_attempt",    node_foothold_attempt)
+    graph.add_node("secondary_attack",    node_secondary_attack)
+    graph.add_node("post_foothold_enum",  node_post_foothold_enum)
+    graph.add_node("post_foothold_approval", node_post_foothold_approval)
+    graph.add_node("privesc_attempt",     node_privesc_attempt)
+    graph.add_node("objective_collect",   node_objective_collect)
+    graph.add_node("report",              node_report)
+
+    graph.add_edge(START, "supervisor")
+
+    PHASE_NODES = [
+        "recon", "surface_enum", "intel_harvest", "vuln_scan",
+        "exploit_decision", "human_approval", "foothold_attempt",
+        "secondary_attack", "post_foothold_enum", "post_foothold_approval",
+        "privesc_attempt", "objective_collect",
+    ]
+    for p in PHASE_NODES:
+        graph.add_edge(p, "supervisor")
+    # report 是终态，不回 supervisor
+    graph.add_edge("report", END)
+
+    routing = {p: p for p in PHASE_NODES + ["report"]}
+    graph.add_conditional_edges("supervisor", supervisor_route, routing)
 
     return graph.compile(
         checkpointer=checkpointer,
@@ -2176,7 +2653,7 @@ class Orchestrator:
     async def run(self, initial_state: PentestState) -> PentestState:
         await self._ensure_graph()
         initial_state = self._prepare_state(initial_state)
-        config = {"configurable": {"thread_id": initial_state.task_id}}
+        config = self._make_run_config(initial_state.task_id)
         initial_state.log(f"任务启动,目标: {initial_state.target}")
         try:
             final_state: PentestState = await asyncio.wait_for(
@@ -2199,7 +2676,7 @@ class Orchestrator:
     async def run_stream(self, initial_state: PentestState):
         await self._ensure_graph()
         initial_state = self._prepare_state(initial_state)
-        config = {"configurable": {"thread_id": initial_state.task_id}}
+        config = self._make_run_config(initial_state.task_id)
 
         async for event in self._graph.astream(initial_state, config=config):
             for node_name, state in event.items():
@@ -2207,7 +2684,7 @@ class Orchestrator:
 
     async def resume(self, task_id: str, approved: bool = True) -> None:
         await self._ensure_graph()
-        config = {"configurable": {"thread_id": task_id}}
+        config = self._make_run_config(task_id)
         update = await self._build_approval_update(config, approved)
         await self._graph.aupdate_state(config, update)
         await self._graph.ainvoke(None, config=config)
@@ -2220,13 +2697,33 @@ class Orchestrator:
         每个节点完成后 yield 状态更新，供 API 层实时推送。
         """
         await self._ensure_graph()
-        config = {"configurable": {"thread_id": task_id}}
+        config = self._make_run_config(task_id)
         update = await self._build_approval_update(config, approved)
         await self._graph.aupdate_state(config, update)
 
         async for event in self._graph.astream(None, config=config):
             for node_name, state in event.items():
                 yield node_name, state
+
+    @staticmethod
+    def _make_run_config(task_id: str) -> dict:
+        """Build LangGraph run config with mode-aware recursion_limit.
+
+        - linear   : 25 (LangGraph 默认即可)
+        - feedback : 100  (容纳 max_replan * 阶段数)
+        - supervisor: 200 (星形拓扑步数翻倍)
+        """
+        mode = _current_chain_mode()
+        if mode == "supervisor":
+            limit = 200
+        elif mode == "feedback":
+            limit = 100
+        else:
+            limit = 50
+        return {
+            "configurable": {"thread_id": task_id},
+            "recursion_limit": limit,
+        }
 
     async def _build_approval_update(self, config: dict, approved: bool) -> dict:
         """Return the correct state patch depending on which gate is pending."""
