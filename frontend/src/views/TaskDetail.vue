@@ -29,33 +29,23 @@
       </div>
     </div>
 
-    <DecisionCheckpointCard
-      v-if="pendingCheckpoint"
-      :checkpoint="pendingCheckpoint"
-      :loading="checkpointSubmitting"
-      class="checkpoint-card-block"
-      @submit="onCheckpointSubmit"
-    />
-
-    <el-alert
-      v-else-if="showApprovalActions"
-      type="warning"
-      :closable="false"
-      show-icon
-      class="approval-banner"
+    <div
+      v-if="pendingCheckpoint || showApprovalActions"
+      class="pause-banner"
+      role="status"
     >
-      <template #title>
-        <span class="approval-banner-text">当前任务需要人工审批确认</span>
-        <div class="approval-banner-actions">
-          <el-button type="success" size="small" :loading="approving" @click="doApprove(true)">
-            <el-icon><Check /></el-icon> 批准执行
-          </el-button>
-          <el-button type="danger" size="small" plain :loading="approving" @click="doApprove(false)">
-            拒绝
-          </el-button>
-        </div>
-      </template>
-    </el-alert>
+      <el-icon class="pause-icon"><Warning /></el-icon>
+      <div class="pause-text">
+        <strong>Plan 模式 · 已暂停</strong>
+        <span>Agent 给出了下一步建议,请在下方决策摘要中确认是否继续。</span>
+      </div>
+      <el-button
+        type="primary"
+        size="small"
+        plain
+        @click="activeTab = 'decision'"
+      >查看建议</el-button>
+    </div>
 
     <div class="summary-grid" v-if="task">
       <el-card class="summary-card">
@@ -92,15 +82,6 @@
       class="progress-mermaid"
     />
 
-    <ApprovalComposer
-      v-if="!pendingCheckpoint"
-      :needs-approval="showApprovalActions"
-      :loading="approving"
-      @approve="doApprove(true)"
-      @reject="doApprove(false)"
-      class="approval-composer"
-    />
-
     <el-card class="main-card">
       <el-tabs v-model="activeTab" class="detail-tabs">
         <el-tab-pane name="decision">
@@ -116,7 +97,47 @@
               查看完整决策 →
             </el-button>
           </div>
-          <DecisionTimeline :items="decisionItems" :llm-streams="llmStreams" />
+          <DecisionTimeline :items="decisionItems" :llm-streams="llmStreams">
+            <template #card="{ item }">
+              <DecisionCheckpointCard
+                v-if="item.action === 'checkpoint_request' && pendingCheckpoint && pendingCheckpoint.checkpoint_id === item.id"
+                :checkpoint="pendingCheckpoint"
+                :loading="checkpointSubmitting"
+                inline
+                class="inline-checkpoint"
+                @submit="onCheckpointSubmit"
+              />
+              <div
+                v-else-if="item.action === 'checkpoint_request'"
+                class="inline-checkpoint-done"
+              >
+                <el-icon><Check /></el-icon>
+                决策点已处理
+              </div>
+              <div
+                v-else-if="item.action === 'approval_required' && showApprovalActions"
+                class="inline-approval"
+              >
+                <span class="inline-approval-text">是否继续执行?</span>
+                <div class="inline-approval-actions">
+                  <el-button type="primary" size="small" :loading="approving" @click="doApprove(true)">
+                    <el-icon><Check /></el-icon>
+                    批准并继续
+                  </el-button>
+                  <el-button size="small" plain :loading="approving" @click="doApprove(false)">
+                    拒绝
+                  </el-button>
+                </div>
+              </div>
+              <div
+                v-else-if="item.action === 'approval_required'"
+                class="inline-checkpoint-done"
+              >
+                <el-icon><Check /></el-icon>
+                审批已处理
+              </div>
+            </template>
+          </DecisionTimeline>
         </el-tab-pane>
 
         <el-tab-pane name="findings">
@@ -183,7 +204,6 @@ import StatusBadge from '@/components/StatusBadge.vue'
 import TaskProgressMermaid from '@/components/TaskProgressMermaid.vue'
 import FindingsPanel from '@/components/FindingsPanel.vue'
 import DecisionTimeline from '@/components/DecisionTimeline.vue'
-import ApprovalComposer from '@/components/ApprovalComposer.vue'
 import DecisionCheckpointCard from '@/components/DecisionCheckpointCard.vue'
 
 // 重组件改为按需加载, 首屏不付出解析+实例化 cost。
@@ -621,32 +641,65 @@ onUnmounted(() => {
 .summary-value.risk { color: var(--accent-yellow); }
 .summary-value.evidence { font-family: var(--font-mono); font-size: 12px; }
 
-.checkpoint-card-block {
-  margin-bottom: 12px;
-}
-
-.approval-banner {
+.pause-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
   margin-bottom: 12px;
   border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--accent-yellow) 10%, var(--bg-elevated));
+  border: 1px solid color-mix(in srgb, var(--accent-yellow) 32%, var(--border));
 }
-.approval-banner :deep(.el-alert__title) {
+.pause-icon {
+  color: color-mix(in srgb, var(--accent-yellow) 80%, var(--text-primary));
+  font-size: 18px;
+  flex: 0 0 auto;
+}
+.pause-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.pause-text strong {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.inline-checkpoint {
+  margin-top: 8px;
+}
+.inline-checkpoint-done {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.inline-approval {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  width: 100%;
+  gap: 12px;
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  border-left: 3px solid color-mix(in srgb, var(--accent-yellow) 80%, var(--text-primary));
+  background: color-mix(in srgb, var(--accent-yellow) 6%, var(--bg-elevated));
 }
-.approval-banner-text {
-  font-weight: 600;
+.inline-approval-text {
   font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
 }
-.approval-banner-actions {
-  display: flex;
-  gap: 8px;
-  margin-left: 16px;
-}
+.inline-approval-actions { display: flex; gap: 8px; }
 
 .progress-mermaid { margin-bottom: 12px; }
-.approval-composer { margin-bottom: 12px; }
 .main-card { border-radius: var(--radius-lg) !important; }
 .tab-label { display: inline-flex; align-items: center; gap: 5px; }
 .tab-badge { margin-left: 4px; }

@@ -1,5 +1,5 @@
 <template>
-  <el-card class="checkpoint-card" :class="`tone-${headerTone}`" shadow="never">
+  <el-card class="checkpoint-card" :class="[`tone-${headerTone}`, { 'is-inline': inline }]" shadow="never">
     <div class="header">
       <div class="header-left">
         <el-icon class="header-icon"><WarningFilled /></el-icon>
@@ -146,10 +146,15 @@ import {
 } from '@element-plus/icons-vue'
 import type { CheckpointOption, CheckpointPayload } from '@/types/task'
 
-const props = defineProps<{
-  checkpoint: CheckpointPayload
-  loading?: boolean
-}>()
+const props = withDefaults(
+  defineProps<{
+    checkpoint: CheckpointPayload
+    loading?: boolean
+    /** 嵌入到 timeline 等其它容器中时,去掉外层卡片的边框/背景,让上层容器控制视觉。 */
+    inline?: boolean
+  }>(),
+  { loading: false, inline: false },
+)
 
 const emit = defineEmits<{
   (e: 'submit', payload: {
@@ -314,6 +319,24 @@ function onSubmit(action: 'approve' | 'reject' | 'modify' | 'skip') {
 .checkpoint-card :deep(.el-card__body) {
   padding: 16px 18px !important;
 }
+
+/* inline 模式: 卡片融入 timeline / 对话流, 由父容器控制外框 */
+.checkpoint-card.is-inline {
+  background: transparent;
+  border: none;
+  border-left: 3px solid color-mix(in srgb, var(--accent-yellow) 80%, var(--text-primary));
+  border-radius: 0;
+}
+.checkpoint-card.is-inline.tone-danger {
+  border-left-color: color-mix(in srgb, var(--accent-red) 80%, var(--text-primary));
+}
+.checkpoint-card.is-inline.tone-primary {
+  border-left-color: color-mix(in srgb, var(--accent-blue) 80%, var(--text-primary));
+}
+.checkpoint-card.is-inline :deep(.el-card__body) {
+  padding: 4px 0 4px 12px !important;
+}
+.checkpoint-card.is-inline .header { margin-bottom: 10px; }
 
 .header {
   display: flex;

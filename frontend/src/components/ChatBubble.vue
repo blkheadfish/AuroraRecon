@@ -1,7 +1,7 @@
 <template>
   <div class="bubble-row" :class="`role-${role}`">
     <div class="avatar" :class="`avatar-${role}`">
-      <span v-if="role === 'agent'">AI</span>
+      <img v-if="role === 'agent'" :src="robotIcon" class="avatar-img" alt="Agent" />
       <span v-else-if="role === 'user'">你</span>
       <span v-else>·</span>
     </div>
@@ -19,6 +19,7 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
+import robotIcon from '@/assets/robot.png'
 
 const props = withDefaults(
   defineProps<{
@@ -58,10 +59,21 @@ const roleLabel = computed(() => {
   background: var(--bg-elevated);
   color: var(--text-primary);
   border: 1px solid var(--border);
+  overflow: hidden;
 }
-.avatar-agent { color: color-mix(in srgb, var(--accent-blue) 90%, white); }
+.avatar-agent {
+  color: color-mix(in srgb, var(--accent-blue) 90%, white);
+  background: color-mix(in srgb, var(--accent-blue) 12%, var(--bg-elevated));
+  border-color: color-mix(in srgb, var(--accent-blue) 35%, var(--border));
+}
 .avatar-user { color: color-mix(in srgb, var(--accent-green) 90%, white); }
 .avatar-system { color: var(--text-muted); }
+.avatar-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
 
 .bubble {
   max-width: min(78%, 720px);

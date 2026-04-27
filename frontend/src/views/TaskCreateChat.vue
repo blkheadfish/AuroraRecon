@@ -8,7 +8,7 @@
         </el-button>
         <div class="title-block">
           <h2>创建渗透测试任务</h2>
-          <p class="title-sub">用对话告诉 Agent 你想做什么,Agent mode 在输入框上方切换。</p>
+          <p class="title-sub">用一句话告诉 Agent 你想测什么,目标会自动从描述中识别。</p>
         </div>
       </div>
     </header>
@@ -50,28 +50,28 @@
 
       <section class="composer">
         <div class="composer-toolbar">
-          <div class="toolbar-group">
-            <span class="toolbar-label">Agent 模式</span>
-            <el-radio-group v-model="form.workflowMode" size="small" @change="onWorkflowModeChange">
-              <el-radio-button label="pentest_engineer">渗透工程师</el-radio-button>
-              <el-radio-button label="ctf_expert">CTF 选手</el-radio-button>
-            </el-radio-group>
-          </div>
-
-          <div class="toolbar-group">
-            <span class="toolbar-label">审批策略</span>
-            <el-radio-group v-model="form.autoApprove" size="small">
-              <el-radio-button :label="false">手动确认</el-radio-button>
-              <el-radio-button :label="true">全自动</el-radio-button>
-            </el-radio-group>
+          <div class="mode-pills" role="tablist" aria-label="Agent 模式">
+            <button
+              v-for="m in MODES"
+              :key="m.value"
+              type="button"
+              class="pill"
+              :class="{ active: form.workflowMode === m.value }"
+              role="tab"
+              :aria-selected="form.workflowMode === m.value"
+              @click="setMode(m.value)"
+            >
+              <el-icon class="pill-icon"><component :is="m.icon" /></el-icon>
+              <span>{{ m.label }}</span>
+            </button>
           </div>
 
           <el-popover placement="top" trigger="click" :width="380">
             <template #reference>
-              <el-button size="small">
-                <el-icon><Setting /></el-icon>
-                高级
-              </el-button>
+              <button type="button" class="pill pill-ghost">
+                <el-icon class="pill-icon"><Setting /></el-icon>
+                <span>高级</span>
+              </button>
             </template>
             <div class="adv-panel">
               <div class="adv-row">
@@ -127,31 +127,30 @@
           </el-popover>
         </div>
 
-        <div class="target-line">
-          <span class="target-label">目标</span>
-          <el-input
-            v-model="form.target"
-            size="default"
-            class="target-input"
-            placeholder="IP / 域名 / IP:端口 / URL — 仅在合法授权范围内使用"
-            clearable
-            @input="targetWasFocused = true"
-          />
-          <span v-if="targetWasFocused && targetError" class="target-err">{{ targetError }}</span>
-        </div>
-
         <div class="input-bar">
           <el-input
             v-model="form.userPrompt"
             type="textarea"
-            :rows="3"
+            :rows="4"
             resize="none"
-            placeholder="例如：先验证 SQL 注入再尝试 RCE,优先低噪声命令,拿 flag 优先..."
+            class="prompt-input"
+            placeholder='例如:请对 192.168.1.10 进行渗透测试,优先验证 SQL 注入,拿 flag 优先;或 https://target.example.com 走 web 攻击面'
             @keydown.ctrl.enter.prevent="submit"
             @keydown.meta.enter.prevent="submit"
           />
           <div class="send-row">
-            <span class="hint">Ctrl/Cmd + Enter 发送 · 当前 mode: {{ workflowModeLabel }}</span>
+            <span class="hint">
+              <span class="hint-shortcut">Ctrl/Cmd + Enter 发送</span>
+              <span class="hint-divider">·</span>
+              <span class="hint-target" v-if="detectedTarget">
+                <el-icon><Aim /></el-icon>
+                已识别目标: <code>{{ detectedTarget }}</code>
+              </span>
+              <span class="hint-target hint-target-missing" v-else>
+                <el-icon><Warning /></el-icon>
+                请在描述中包含目标 IP / 域名 / URL
+              </span>
+            </span>
             <el-button
               type="primary"
               :loading="creating"
@@ -169,10 +168,10 @@
 </template>
 
 <script setup lang="ts">
-import { computed, defineAsyncComponent, nextTick, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, nextTick, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { ArrowLeft, Setting, Promotion } from '@element-plus/icons-vue'
+import { ArrowLeft, Setting, Promotion, Aim, Warning, Cpu, Tools } from '@element-plus/icons-vue'
 import { useTaskListStore } from '@/stores/taskList'
 import { trackEvent } from '@/metrics/tracker'
 import type { WorkflowMode } from '@/types/task'
@@ -182,16 +181,10 @@ const ChatBubble = defineAsyncComponent(() => import('@/components/ChatBubble.vu
 const router = useRouter()
 const listStore = useTaskListStore()
 
-const MODE_DEFAULTS: Record<WorkflowMode, { autoApprove: boolean; description: string }> = {
-  pentest_engineer: {
-    autoApprove: false,
-    description: '渗透工程师模式: 严格证据门槛, 利用前需要人工授权。',
-  },
-  ctf_expert: {
-    autoApprove: true,
-    description: 'CTF 选手模式: 全自动 + 宽松证据, 优先拿 flag。',
-  },
-}
+const MODES: Array<{ value: WorkflowMode; label: string; icon: unknown }> = [
+  { value: 'pentest_engineer', label: '渗透工程师', icon: Tools },
+  { value: 'ctf_expert', label: 'CTF 选手', icon: Cpu },
+]
 
 interface ChatMessage {
   id: string
@@ -203,12 +196,10 @@ interface ChatMessage {
 }
 
 const form = ref({
-  target: '',
   scopeNote: 'CTF/授权靶场测试',
   extraHint: '',
   userPrompt: '',
   workflowMode: 'pentest_engineer' as WorkflowMode,
-  autoApprove: MODE_DEFAULTS.pentest_engineer.autoApprove,
   successGateLevel: '' as '' | 'strict' | 'medium' | 'lenient',
   riskBudget: null as number | null,
   maxReactRounds: null as number | null,
@@ -216,7 +207,6 @@ const form = ref({
 })
 
 const creating = ref(false)
-const targetWasFocused = ref(false)
 const streamRef = ref<HTMLElement | null>(null)
 
 const messages = ref<ChatMessage[]>([
@@ -224,29 +214,22 @@ const messages = ref<ChatMessage[]>([
     id: 'agent-greeting',
     role: 'agent',
     text:
-      '你好,我是渗透测试 Agent。\n请告诉我:\n  1) 想攻击的目标(顶部输入框)\n  2) 你的偏好与策略(下方输入框,例如优先验证 PoC、避免长时间暴力等)\n\n在输入框上方可以切换 Agent 模式与审批策略。',
+      '你好,我是渗透测试 Agent。\n直接告诉我你想测试什么,例如:"请对 10.0.0.1 进行渗透测试,优先验证 SQL 注入"。\n关键节点我会暂停并请你确认是否继续,类似 Plan 模式。',
     timestamp: nowTime(),
     tone: 'info',
     suggestions: [
-      '先做轻量侦察,确认 web 攻击面后再尝试利用',
-      '优先低噪声命令,避免触发 IDS/IPS',
-      '尽快验证可利用性并尝试拿 flag',
+      '请对 192.168.1.10 进行渗透测试,优先低噪声命令',
+      '对 https://ctf.example.com 做 web 攻击面侦察并尝试拿 flag',
+      '对 10.0.0.5:8080 验证 RCE,避免触发 IDS/IPS',
     ],
   },
 ])
 
-const workflowModeLabel = computed(() =>
-  form.value.workflowMode === 'ctf_expert' ? 'CTF 选手' : '渗透工程师',
+const detectedTarget = computed(() => extractTarget(form.value.userPrompt))
+
+const canSubmit = computed(
+  () => !creating.value && form.value.userPrompt.trim().length > 0 && !!detectedTarget.value,
 )
-
-const targetError = computed(() => {
-  const v = form.value.target.trim()
-  if (!v) return '请输入目标'
-  if (!isValidTarget(v)) return '格式应为 IP / 域名 / IP:端口 / URL'
-  return ''
-})
-
-const canSubmit = computed(() => !targetError.value && !creating.value)
 
 const advancedSummary = computed(() => {
   const out: string[] = []
@@ -262,25 +245,6 @@ const advancedSummary = computed(() => {
 })
 
 const advancedDirty = computed(() => advancedSummary.value.length > 0)
-
-watch(
-  () => form.value.workflowMode,
-  (mode) => {
-    pushAgent(MODE_DEFAULTS[mode].description, 'info')
-  },
-)
-
-watch(
-  () => form.value.autoApprove,
-  (val) => {
-    pushAgent(
-      val
-        ? '已切换到全自动: 后续 Agent 决策不会再弹出审批确认。'
-        : '已切换到手动确认: 关键节点会暂停并请求你的判断。',
-      'info',
-    )
-  },
-)
 
 function nowTime() {
   return new Date().toLocaleTimeString()
@@ -309,8 +273,8 @@ function applySuggestion(text: string) {
   form.value.userPrompt = cur ? `${cur}\n${text}` : text
 }
 
-function onWorkflowModeChange(mode: WorkflowMode) {
-  form.value.autoApprove = MODE_DEFAULTS[mode].autoApprove
+function setMode(mode: WorkflowMode) {
+  form.value.workflowMode = mode
 }
 
 function isValidIPv4(host: string): boolean {
@@ -332,29 +296,43 @@ function isValidHost(host: string): boolean {
   return hostnamePattern.test(host)
 }
 
-function isValidTarget(value: string): boolean {
-  const raw = String(value || '').trim()
-  if (!raw) return false
-  try {
-    const u = new URL(raw)
-    if (!['http:', 'https:'].includes(u.protocol)) return false
-    if (!isValidHost(u.hostname)) return false
-    if (u.port) {
-      const p = Number(u.port)
-      if (!Number.isFinite(p) || p < 1 || p > 65535) return false
+// 从自然语言 prompt 中识别第一个目标 (URL / IP[:port] / 域名[:port])。
+function extractTarget(prompt: string): string | null {
+  const text = String(prompt || '')
+  if (!text.trim()) return null
+  const patterns: RegExp[] = [
+    /https?:\/\/[^\s,;'"，。、）)]+/i,
+    /\b\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?\b/,
+    /(?<![./@\w])(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,}(?::\d{1,5})?(?![\w./])/,
+  ]
+  for (const p of patterns) {
+    const m = text.match(p)
+    if (!m) continue
+    const candidate = m[0].replace(/[.,;'"，。、)）]+$/, '')
+    if (!candidate) continue
+    if (/^https?:/i.test(candidate)) {
+      try {
+        const u = new URL(candidate)
+        if (!isValidHost(u.hostname)) continue
+        if (u.port) {
+          const p2 = Number(u.port)
+          if (!Number.isFinite(p2) || p2 < 1 || p2 > 65535) continue
+        }
+        return candidate
+      } catch {
+        continue
+      }
     }
-    return true
-  } catch {
-    // fallthrough
+    const portMatch = candidate.match(/:(\d{1,5})$/)
+    let host = candidate
+    if (portMatch) {
+      host = candidate.slice(0, -portMatch[0].length)
+      const p2 = Number(portMatch[1])
+      if (!Number.isFinite(p2) || p2 < 1 || p2 > 65535) continue
+    }
+    if (isValidHost(host) && !host.includes(':')) return candidate
   }
-  const portMatch = raw.match(/:(\d{1,5})$/)
-  let host = raw
-  if (portMatch) {
-    host = raw.slice(0, -portMatch[0].length)
-    const p = Number(portMatch[1])
-    if (!Number.isFinite(p) || p < 1 || p > 65535) return false
-  }
-  return isValidHost(host) && !host.includes(':')
+  return null
 }
 
 function goBack() {
@@ -363,42 +341,46 @@ function goBack() {
 
 async function submit() {
   if (!canSubmit.value) {
-    targetWasFocused.value = true
+    if (!form.value.userPrompt.trim()) {
+      ElMessage.warning('请先输入任务描述')
+    } else if (!detectedTarget.value) {
+      pushAgent('我没有从描述里识别到目标(IP / 域名 / URL),请在句子里写清楚要测试的对象。', 'warning')
+    }
     return
   }
+  const target = detectedTarget.value as string
   creating.value = true
   const userText = form.value.userPrompt.trim()
   messages.value.push({
     id: `user-${Date.now()}`,
     role: 'user',
-    text: userText
-      ? `目标: ${form.value.target}\n${userText}`
-      : `目标: ${form.value.target}`,
+    text: userText,
     timestamp: nowTime(),
   })
   scrollToBottom()
 
   try {
     const task = await listStore.createTask({
-      target: form.value.target.trim(),
+      target,
       scopeNote: form.value.scopeNote,
       extraHint: form.value.extraHint,
       userPrompt: userText,
       workflowMode: form.value.workflowMode,
-      autoApprove: form.value.autoApprove,
+      // 始终走手动确认,关键节点会通过 checkpoint 暂停并征求用户意见
+      autoApprove: false,
       successGateLevel: form.value.successGateLevel || null,
       riskBudget: form.value.riskBudget,
       maxReactRounds: form.value.maxReactRounds,
       maxExploreRounds: form.value.maxExploreRounds,
     })
     trackEvent('task.create', {
-      target: form.value.target,
+      target,
       workflowMode: form.value.workflowMode,
-      autoApprove: form.value.autoApprove,
+      autoApprove: false,
       taskId: task.task_id,
     })
     pushAgent(
-      `任务已创建: ${task.task_id}。即将跳转到任务详情页,你可以在那里查看实时 thinking 与确认卡片。`,
+      `任务已创建: ${task.task_id}。即将跳转到任务详情页,关键节点我会在对话流中暂停等待你确认。`,
       'primary',
     )
     ElMessage.success(`任务已创建: ${task.target}`)
@@ -493,29 +475,53 @@ async function submit() {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 14px;
-  padding-bottom: 4px;
+  gap: 8px;
+  padding-bottom: 6px;
   border-bottom: 1px dashed var(--border);
 }
-.toolbar-group { display: flex; align-items: center; gap: 8px; }
-.toolbar-label { font-size: 12px; color: var(--text-muted); }
 
-.target-line {
-  display: flex;
+/* Cursor 风格的胶囊模式切换 */
+.mode-pills {
+  display: inline-flex;
   align-items: center;
-  gap: 10px;
+  gap: 2px;
+  padding: 2px;
+  background: color-mix(in srgb, var(--text-primary) 6%, transparent);
+  border-radius: 999px;
 }
-.target-label {
-  flex: 0 0 auto;
-  width: 44px;
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
   font-size: 12px;
+  line-height: 1;
   color: var(--text-muted);
+  background: transparent;
+  border: none;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
 }
-.target-input { flex: 1; }
-.target-err {
-  font-size: 12px;
-  color: var(--accent-red);
-  white-space: nowrap;
+.pill:hover {
+  color: var(--text-secondary);
+  background: color-mix(in srgb, var(--text-primary) 6%, transparent);
+}
+.pill.active {
+  color: var(--text-primary);
+  background: var(--bg-elevated);
+  box-shadow: 0 1px 2px color-mix(in srgb, #000 30%, transparent);
+}
+.pill-ghost {
+  margin-left: auto;
+  background: transparent;
+  border: 1px solid transparent;
+}
+.pill-ghost:hover {
+  background: color-mix(in srgb, var(--text-primary) 6%, transparent);
+}
+.pill-icon {
+  font-size: 13px;
 }
 
 .input-bar {
@@ -523,12 +529,43 @@ async function submit() {
   flex-direction: column;
   gap: 6px;
 }
+.prompt-input :deep(.el-textarea__inner) {
+  font-size: 13px;
+  line-height: 1.55;
+}
 .send-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 10px;
 }
-.hint { font-size: 12px; color: var(--text-muted); }
+.hint {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.hint-divider { opacity: 0.5; }
+.hint-target {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-secondary);
+}
+.hint-target code {
+  font-family: var(--font-mono);
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  font-size: 11px;
+}
+.hint-target-missing {
+  color: var(--accent-yellow);
+}
 
 .adv-panel { display: flex; flex-direction: column; gap: 10px; }
 .adv-row { display: flex; flex-direction: column; gap: 4px; }

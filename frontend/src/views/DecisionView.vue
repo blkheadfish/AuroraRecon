@@ -34,7 +34,19 @@
       />
       <DecisionTimeline ref="timelineRef" :items="decisionItems" :llm-streams="llmStreams">
         <template #card="{ item }">
-          <div v-if="item.action === 'approval_required' && !approvalDone" class="approval-card-slot">
+          <DecisionCheckpointCard
+            v-if="item.action === 'checkpoint_request' && pendingCheckpoint && pendingCheckpoint.checkpoint_id === item.id"
+            :checkpoint="pendingCheckpoint"
+            :loading="checkpointSubmitting"
+            inline
+            class="inline-checkpoint"
+            @submit="onCheckpointSubmit"
+          />
+          <div
+            v-else-if="item.action === 'checkpoint_request'"
+            class="inline-checkpoint-done"
+          >决策点已处理</div>
+          <div v-else-if="item.action === 'approval_required' && !approvalDone" class="approval-card-slot">
             <ApprovalComposer
               :needs-approval="needsApproval"
               :loading="approving"
@@ -76,6 +88,7 @@ import { useTaskLiveStore } from '@/stores/taskLive'
 import DecisionTimeline from '@/components/DecisionTimeline.vue'
 import ToolChainRail from '@/components/ToolChainRail.vue'
 import ApprovalComposer from '@/components/ApprovalComposer.vue'
+import DecisionCheckpointCard from '@/components/DecisionCheckpointCard.vue'
 import StatusBadge from '@/components/StatusBadge.vue'
 
 const route = useRoute()
@@ -98,9 +111,17 @@ function handleRailJump(id) {
 const approvalState = computed(() => liveStore.getLiveState(taskId).approvalState)
 const approvalDone = computed(() => approvalState.value === 'submitted')
 const approving = computed(() => approvalState.value === 'submitting')
+const pendingCheckpoint = computed(() => liveStore.getLiveState(taskId)?.pendingCheckpoint || null)
+const checkpointSubmitting = computed(
+  () => liveStore.getLiveState(taskId)?.checkpointState === 'submitting',
+)
 
 function doApprove(approved) {
   liveStore.submitApproval(taskId, approved)
+}
+
+function onCheckpointSubmit(payload) {
+  liveStore.submitCheckpoint(taskId, payload)
 }
 
 async function sendMessage() {
@@ -329,6 +350,34 @@ const decisionItems = computed(() => {
         action: 'approval_required',
         exploitable_count: entry.exploitable_count,
         findings_count: entry.findings_count,
+      })
+      return
+    }
+
+    if (entry.action === 'checkpoint_request') {
+      events.push({
+        id: entry.id || `cp-req-${idx}`,
+        time,
+        tone: 'warning',
+        title: 'Plan 决策点 · 等待确认',
+        desc: entry.summary || entry.message || entry.recommendation || '',
+        thinking: entry.thinking || '',
+        expandable: (entry.thinking || '').length > 80,
+        action: 'checkpoint_request',
+      })
+      return
+    }
+
+    if (entry.action === 'checkpoint_resolved') {
+      const resp = entry.response || {}
+      const acted = resp.action || 'approve'
+      events.push({
+        id: entry.id || `cp-res-${idx}`,
+        time,
+        tone: acted === 'reject' ? 'danger' : (acted === 'approve' ? 'success' : 'info'),
+        title: `Plan 决策点 · 已${acted === 'approve' ? '批准' : (acted === 'reject' ? '拒绝' : '处理')}`,
+        desc: resp.user_prompt || entry.message || '',
+        action: 'checkpoint_resolved',
       })
       return
     }
@@ -593,5 +642,14 @@ onUnmounted(() => {
   font-size: 13px;
   color: var(--text-primary);
   line-height: 1.5;
+}
+
+.inline-checkpoint {
+  margin-top: 8px;
+}
+.inline-checkpoint-done {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
 }
 </style>
