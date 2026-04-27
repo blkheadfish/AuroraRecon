@@ -15,8 +15,11 @@
         <div class="node-connector" v-if="i > 0" />
         <div class="node-dot" :class="'dot-' + node.tone" />
         <div class="node-body">
-          <span class="node-label">{{ node.label }}</span>
-          <span class="node-time">{{ node.time }}</span>
+          <div class="node-line">
+            <span class="node-label">{{ node.label }}</span>
+            <span class="node-time">{{ node.time }}</span>
+          </div>
+          <span v-if="node.hint" class="node-hint" :title="node.hint">{{ node.hint }}</span>
         </div>
       </div>
       <div v-if="!nodes.length" class="rail-empty">暂无事件</div>
@@ -39,6 +42,7 @@ const listRef = ref(null)
 const TOOL_ACTIONS = new Set([
   'command_exec', 'tool_start', 'tool_result', 'tool_executed',
   'approval_required', 'approval',
+  'thought', 'checkpoint_request', 'checkpoint_resolved',
 ])
 
 const nodes = computed(() => {
@@ -50,6 +54,7 @@ const nodes = computed(() => {
       id: item.id,
       tone: item.tone || 'info',
       label: extractLabel(item),
+      hint: extractHint(item),
       time: item.time || '',
     })
   }
@@ -105,7 +110,29 @@ function extractLabel(item) {
   if (action === 'approval_required' || action === 'approval') {
     return '审批'
   }
+  if (action === 'thought') {
+    const round = item.round ? `R${item.round}` : ''
+    return (round ? `💭 ${round}` : '💭 思考').slice(0, 22)
+  }
+  if (action === 'checkpoint_request') {
+    return '⚑ 决策点'
+  }
+  if (action === 'checkpoint_resolved') {
+    return '✓ 已决策'
+  }
   return (item.title || '事件').slice(0, 22)
+}
+
+function extractHint(item) {
+  const action = item.action || ''
+  if (action === 'thought') {
+    const txt = item.purpose || item.thinking || item.desc || ''
+    return String(txt).replace(/\s+/g, ' ').slice(0, 60)
+  }
+  if (action === 'checkpoint_request') {
+    return String(item.summary || item.recommendation || item.desc || '').slice(0, 60)
+  }
+  return ''
 }
 </script>
 
@@ -204,6 +231,15 @@ function extractLabel(item) {
   flex-direction: column;
   min-width: 0;
   flex: 1;
+  gap: 1px;
+}
+
+.node-line {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px;
+  min-width: 0;
 }
 
 .node-label {
@@ -220,6 +256,22 @@ function extractLabel(item) {
   font-size: 9px;
   color: var(--text-muted);
   font-family: var(--font-mono);
+  flex-shrink: 0;
+}
+
+.node-hint {
+  font-size: 10px;
+  color: var(--text-muted);
+  line-height: 1.35;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+}
+
+.rail-node.active .node-hint {
+  color: var(--text-secondary);
 }
 
 .rail-empty {

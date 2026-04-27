@@ -269,3 +269,42 @@ class KnowledgeRawRequest(BaseModel):
 
 class ChatMessageRequest(BaseModel):
     text: str
+
+
+# ── 意图解析（LLM 驱动） ─────────────────────────────────
+
+class ParseIntentRequest(BaseModel):
+    """前端在用户输入自然语言任务描述时调用,
+    由 LLM 解析出结构化的 target / 工作流偏好 / 关注漏洞等信息。
+    """
+
+    user_prompt: str
+    workflow_mode: WorkflowMode = "pentest_engineer"
+
+    @field_validator("user_prompt")
+    @classmethod
+    def validate_user_prompt(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("user_prompt 不能为空")
+        # 防止把整篇文章塞进来打爆 LLM 上下文
+        return v[:2000]
+
+
+class ParseIntentResponse(BaseModel):
+    """LLM 解析的结构化结果。
+
+    fallback=True 表示 LLM 调用失败,字段是基于本地正则兜底解析得到。
+    target 为空字符串表示没有从 prompt 中识别到合法目标。
+    """
+
+    target: str = ""
+    suggested_workflow_mode: str = ""
+    priority_vulns: list[str] = []
+    scope_note: str = ""
+    extra_hint: str = ""
+    summary: str = ""
+    intents: list[str] = []
+    confidence: float = 0.0
+    fallback: bool = False
+    error: str = ""

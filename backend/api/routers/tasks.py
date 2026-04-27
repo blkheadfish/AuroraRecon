@@ -4,17 +4,20 @@ routers/tasks.py —— 任务 CRUD + 审批 + 对话
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
 import time as _time
 import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, BackgroundTasks, Request
 
-from backend.agents.models import PentestState, TaskStatus, apply_mode_defaults
+from backend.agents.models import PentestState, TaskStatus, apply_mode_defaults, parse_target
 from backend.api.schemas import (
     CreateTaskRequest, TaskSummary, TaskStats, ApproveRequest,
     CheckpointDecisionRequest, ChatMessageRequest,
+    ParseIntentRequest, ParseIntentResponse,
 )
 from backend.api.state import get_state_manager, TaskStateManager
 from backend.api.event_bus import get_event_bus, TaskEventBus
@@ -74,6 +77,184 @@ async def _resolve_state(task_id: str) -> PentestState | None:
         except Exception:
             pass
     return None
+
+
+# ── 意图解析 (LLM 驱动) ───────────────────────────────────
+
+# 与前端 TaskCreateChat.vue 的 extractTarget 对齐的兜底正则集合
+_FALLBACK_TARGET_PATTERNS = [
+    re.compile(r"https?://[^\s,;'\"，。、）)]+", re.IGNORECASE),
+    re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?\b"),
+    re.compile(
+        r"(?<![./@\w])(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
+        r"[A-Za-z]{2,}(?::\d{1,5})?(?![\w./])"
+    ),
+]
+
+
+def _fallback_extract_target(prompt: str) -> str:
+    """LLM 不可用时的目标提取兜底,逻辑与前端 extractTarget 一致。"""
+    if not prompt:
+        return ""
+    for pattern in _FALLBACK_TARGET_PATTERNS:
+        match = pattern.search(prompt)
+        if not match:
+            continue
+        candidate = match.group(0).rstrip(".,;'\"，。、)）")
+        if not candidate:
+            continue
+        try:
+            parsed = parse_target(candidate)
+        except Exception:
+            continue
+        if parsed.host:
+            return candidate
+    return ""
+
+
+def _validate_target_candidate(raw: str) -> str:
+    """对 LLM 返回的 target 做安全 + 合法性校验,失败返回空串。"""
+    if not raw:
+        return ""
+    candidate = raw.strip().rstrip(".,;'\"，。、)）")
+    if not candidate or len(candidate) > 256:
+        return ""
+    if re.search(r"[;\|`$&<>(){}\[\]!\s]", candidate):
+        return ""
+    try:
+        parsed = parse_target(candidate)
+    except Exception:
+        return ""
+    return candidate if parsed.host else ""
+
+
+_INTENT_SYSTEM_PROMPT = """你是一名渗透测试任务意图解析器。
+你的输入是用户用自然语言描述的一段渗透测试需求,你需要从中抽取结构化信息。
+
+只输出纯 JSON,不要 markdown 代码块、不要任何解释,严格遵守以下 schema:
+
+{
+  "target": "<从描述中提取的第一个目标地址 (IP / 域名 / URL),没有就留空串>",
+  "suggested_workflow_mode": "<pentest_engineer 或 ctf_expert,根据语境推断>",
+  "priority_vulns": ["<漏洞类型简标签,如 sqli / rce / lfi / xss / ssrf / auth_bypass / file_upload / deserialization 等>"],
+  "scope_note": "<对授权范围/场景的一句话归纳,例如 'CTF/授权靶场测试' 或 '内网授权红队评估'>",
+  "extra_hint": "<对 Agent 的额外行动建议,简短一句话,例如 '优先低噪声,避开 IDS' 或 '先打 web 攻击面,拿 flag 优先'>",
+  "summary": "<一句话用中文复述用户意图,不超过 30 字>",
+  "intents": ["<语义标签,如 stealth / get_flag / low_noise / prefer_msf / chain_attack / web_only 等>"],
+  "confidence": <0~1 的小数,你对自己解析结果的把握度>
+}
+
+提取规则:
+1. target 必须是单一字符串,不要包含中文标点和空格;只要找到一个有效的就停止
+2. 如果用户提到 "CTF / flag / 靶场",倾向 ctf_expert;明确说 "渗透 / 红队 / 内网" 倾向 pentest_engineer
+3. priority_vulns 用全小写英文短标签,数量最多 6 个
+4. scope_note / extra_hint 不要原样照搬用户原话,做语义提炼
+5. 没有把握的字段宁可留空 / 空数组,也不要编造"""
+
+
+def _build_intent_user_prompt(user_prompt: str, current_mode: str) -> str:
+    return (
+        f"当前默认 workflow_mode = {current_mode}\n"
+        f"用户描述:\n```\n{user_prompt.strip()}\n```\n"
+        "请按 schema 输出 JSON。"
+    )
+
+
+def _coerce_intent_payload(data: dict) -> dict:
+    """规整 LLM 输出的字段,过滤异常类型。"""
+    target = _validate_target_candidate(str(data.get("target") or ""))
+    mode_raw = str(data.get("suggested_workflow_mode") or "").strip().lower()
+    if mode_raw not in ("pentest_engineer", "ctf_expert"):
+        mode_raw = ""
+
+    def _clean_list(values, max_items: int = 6, max_len: int = 32) -> list[str]:
+        if not isinstance(values, list):
+            return []
+        out: list[str] = []
+        for item in values:
+            if not isinstance(item, str):
+                continue
+            tag = item.strip().lower()
+            if not tag or len(tag) > max_len:
+                continue
+            if tag not in out:
+                out.append(tag)
+            if len(out) >= max_items:
+                break
+        return out
+
+    confidence_raw = data.get("confidence", 0.0)
+    try:
+        confidence = float(confidence_raw)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    confidence = max(0.0, min(1.0, confidence))
+
+    return {
+        "target": target,
+        "suggested_workflow_mode": mode_raw,
+        "priority_vulns": _clean_list(data.get("priority_vulns")),
+        "scope_note": str(data.get("scope_note") or "").strip()[:120],
+        "extra_hint": str(data.get("extra_hint") or "").strip()[:200],
+        "summary": str(data.get("summary") or "").strip()[:120],
+        "intents": _clean_list(data.get("intents"), max_items=8, max_len=24),
+        "confidence": confidence,
+    }
+
+
+@router.post("/tasks/parse-intent", response_model=ParseIntentResponse)
+async def parse_task_intent(req: ParseIntentRequest, request: Request):
+    """
+    用 LLM 解析用户的自然语言任务描述,返回结构化的目标/工作流/漏洞偏好。
+
+    - 调用 ``LLMRouter.chat(response_format='json')``,8s 超时
+    - LLM 不可用 / 返回不合法 JSON / target 校验失败时,自动回退到正则
+      提取(等价于前端老逻辑),并把 ``fallback=True``
+    - 该接口 **只读**,不会创建任务,也不依赖任务状态
+    """
+    user_id = getattr(request.state, "user_id", "") or ""
+    if not user_id:
+        raise HTTPException(status_code=401, detail="未登录")
+
+    user_prompt = req.user_prompt
+    current_mode = req.workflow_mode
+
+    fallback_target = _fallback_extract_target(user_prompt)
+
+    try:
+        from backend.llm.router import LLMRouter
+        llm = LLMRouter()
+        raw = await asyncio.wait_for(
+            llm.chat(
+                _build_intent_user_prompt(user_prompt, current_mode),
+                system_prompt=_INTENT_SYSTEM_PROMPT,
+                response_format="json",
+                temperature=0.1,
+                max_tokens=512,
+            ),
+            timeout=8.0,
+        )
+    except asyncio.TimeoutError:
+        logger.info("[parse_intent] LLM 超时,回退正则")
+        return ParseIntentResponse(target=fallback_target, fallback=True, error="LLM 超时")
+    except Exception as e:
+        logger.warning(f"[parse_intent] LLM 调用异常: {e}")
+        return ParseIntentResponse(target=fallback_target, fallback=True, error=str(e)[:120])
+
+    try:
+        data = json.loads(raw if isinstance(raw, str) else str(raw))
+        if not isinstance(data, dict):
+            raise ValueError("LLM 返回不是对象")
+    except Exception as e:
+        logger.info(f"[parse_intent] LLM JSON 解析失败,回退正则: {e}")
+        return ParseIntentResponse(target=fallback_target, fallback=True, error=f"JSON 解析失败: {e}")
+
+    payload = _coerce_intent_payload(data)
+    # 即便 LLM 没解析出 target,也尽量回填正则结果,前端体验更平滑
+    if not payload["target"] and fallback_target:
+        payload["target"] = fallback_target
+
+    return ParseIntentResponse(**payload, fallback=False)
 
 
 # ── CRUD ──────────────────────────────────────────────────

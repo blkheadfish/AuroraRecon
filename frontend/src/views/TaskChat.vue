@@ -36,9 +36,18 @@
       </div>
     </header>
 
-    <main class="chat-main" ref="streamRef" @scroll="onUserScroll">
-      <div class="bubble-stream">
-        <template v-for="msg in messages" :key="msg.id">
+    <main class="chat-main">
+      <ToolChainRail
+        :items="railItems"
+        :active-id="activeRailId"
+        class="chat-rail"
+        @jump="handleRailJump"
+      />
+
+      <div class="chat-stream-wrap" ref="streamRef" @scroll="onUserScroll">
+        <div class="bubble-stream">
+          <template v-for="msg in messages" :key="msg.id">
+            <div :data-bubble-id="msg.id" class="bubble-anchor">
           <ChatBubble
             :role="msg.role"
             :text="msg.text"
@@ -107,48 +116,80 @@
               />
             </div>
           </ChatBubble>
-        </template>
+            </div>
+          </template>
 
-        <div v-for="(bubble, sid) in activeStreamBubbles" :key="sid" class="llm-stream-bubble">
-          <div class="bubble-header">
-            <span class="bubble-phase">{{ bubble.phase || '推理' }}</span>
-            <span class="bubble-indicator">正在思考<span class="dots">...</span></span>
+          <div v-for="(bubble, sid) in activeStreamBubbles" :key="sid" class="llm-stream-bubble">
+            <div class="bubble-header">
+              <span class="bubble-phase">{{ bubble.phase || '推理' }}</span>
+              <span class="bubble-indicator">正在思考<span class="dots">...</span></span>
+            </div>
+            <pre class="bubble-text">{{ bubble.text }}</pre>
           </div>
-          <pre class="bubble-text">{{ bubble.text }}</pre>
         </div>
-      </div>
 
-      <transition name="fade">
-        <button v-if="showJumpBtn" class="jump-latest" @click="jumpToBottom">
-          <el-icon><ArrowDown /></el-icon>
-          跳转最新
-        </button>
-      </transition>
+        <transition name="fade">
+          <button v-if="showJumpBtn" class="jump-latest" @click="jumpToBottom">
+            <el-icon><ArrowDown /></el-icon>
+            跳转最新
+          </button>
+        </transition>
+      </div>
     </main>
 
     <footer class="chat-footer">
-      <el-input
-        v-model="chatInput"
-        type="textarea"
-        :rows="2"
-        :autosize="{ minRows: 1, maxRows: 5 }"
-        resize="none"
-        placeholder="输入指令或问题，影响 Agent 决策...  Ctrl/Cmd + Enter 发送"
-        :disabled="sending"
-        class="chat-input"
-        @keydown.ctrl.enter.prevent="sendMessage"
-        @keydown.meta.enter.prevent="sendMessage"
-      />
-      <el-button
-        type="primary"
-        :loading="sending"
-        :disabled="!chatInput.trim()"
-        class="send-btn"
-        @click="sendMessage"
-      >
-        <el-icon><Promotion /></el-icon>
-        发送
-      </el-button>
+      <section class="composer">
+        <div class="composer-toolbar">
+          <span class="composer-tip">
+            <el-icon><ChatLineRound /></el-icon>
+            你可以追加指令影响后续决策, 或在决策点提出修改意见
+          </span>
+          <span class="composer-shortcut">Ctrl/Cmd + Enter 发送</span>
+        </div>
+        <div class="input-bar">
+          <el-input
+            v-model="chatInput"
+            type="textarea"
+            :rows="3"
+            :autosize="{ minRows: 2, maxRows: 6 }"
+            resize="none"
+            class="prompt-input"
+            placeholder="输入指令或问题，影响 Agent 决策..."
+            :disabled="sending"
+            @keydown.ctrl.enter.prevent="sendMessage"
+            @keydown.meta.enter.prevent="sendMessage"
+          />
+          <div class="send-row">
+            <span class="hint">
+              <span v-if="needsApproval" class="hint-warn">
+                <el-icon><Warning /></el-icon>
+                Agent 已暂停, 等待审批
+              </span>
+              <span v-else-if="pendingCheckpoint" class="hint-warn">
+                <el-icon><Warning /></el-icon>
+                有 Plan 决策点等待确认
+              </span>
+              <span v-else-if="isRunning" class="hint-info">
+                <el-icon><Loading class="spin" /></el-icon>
+                Agent 正在执行
+              </span>
+              <span v-else class="hint-info">
+                <el-icon><CircleCheck /></el-icon>
+                任务已结束
+              </span>
+            </span>
+            <el-button
+              type="primary"
+              :loading="sending"
+              :disabled="!chatInput.trim()"
+              @click="sendMessage"
+            >
+              <el-icon><Promotion /></el-icon>
+              发送
+            </el-button>
+          </div>
+        </div>
+      </section>
     </footer>
   </div>
 </template>
@@ -160,10 +201,14 @@ import { ElMessage } from 'element-plus'
 import {
   ArrowDown,
   ArrowLeft,
+  ChatLineRound,
   Check,
+  CircleCheck,
   Document,
+  Loading,
   Memo,
   Promotion,
+  Warning,
 } from '@element-plus/icons-vue'
 import { api } from '@/api'
 import { useTaskListStore } from '@/stores/taskList'
@@ -173,6 +218,7 @@ import ChatBubble from '@/components/ChatBubble.vue'
 import DecisionCheckpointCard from '@/components/DecisionCheckpointCard.vue'
 import PayloadCodeBlock from '@/components/PayloadCodeBlock.vue'
 import StatusBadge from '@/components/StatusBadge.vue'
+import ToolChainRail from '@/components/ToolChainRail.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -193,9 +239,32 @@ let scrollRafId = 0
 
 const state = computed(() => liveStore.getLiveState(taskId))
 const task = computed(() => state.value.task || listStore.getTaskById(taskId))
-const decisionEvents = computed(() =>
-  Array.isArray(state.value?.decisionEvents) ? state.value.decisionEvents : [],
-)
+
+// 后端 timestamp 是 HH:MM:SS 短格式,store 层虽然做了 sort 但 Vue3 reactive
+// 对原地 sort 触发依赖更新不一定可靠。这里在 view 层再 sort 一次作为最终防线,
+// 确保 rail/messages 的渲染顺序严格按事件先后。
+//
+// 比较器:
+//   1. 主 key = timestamp 字典序 (HH:MM:SS / ISO 都是字典序 = 时间序)
+//   2. tie-breaker = id 里的 idx (后端 push 顺序), 解决同秒 / 同 timestamp 时的稳定性
+function _eventIdx(id) {
+  const m = String(id || '').match(/^de-(\d+)-/)
+  return m ? Number(m[1]) : 0
+}
+function _compareEvents(a, b) {
+  const ta = String(a?.timestamp || '')
+  const tb = String(b?.timestamp || '')
+  const cmp = ta.localeCompare(tb)
+  if (cmp !== 0) return cmp
+  return _eventIdx(a?.id) - _eventIdx(b?.id)
+}
+
+const decisionEvents = computed(() => {
+  const raw = state.value?.decisionEvents
+  if (!Array.isArray(raw) || !raw.length) return []
+  // slice 后再 sort, 不影响 store 内部数组
+  return raw.slice().sort(_compareEvents)
+})
 const llmStreams = computed(() => state.value?.llmStreams || {})
 const isRunning = computed(() => ['pending', 'running'].includes(task.value?.status || ''))
 const needsApproval = computed(() => task.value?.current_phase === 'awaiting_approval')
@@ -496,6 +565,98 @@ const activeStreamBubbles = computed(() => {
   return result
 })
 
+// 给侧边工具链用的事件项: 收集 thought / tool / approval / checkpoint 类事件
+const railItems = computed(() => {
+  const events = decisionEvents.value.slice(-200)
+  const items = []
+  for (const ev of events) {
+    const action = ev?.action || ''
+    const id = ev?.id || ''
+    if (!id) continue
+
+    if (action === 'thought') {
+      items.push({
+        id,
+        action,
+        tone: 'primary',
+        title: 'AI 推理',
+        round: ev.round || 0,
+        purpose: ev.purpose || '',
+        thinking: ev.thinking || ev.message || '',
+        time: formatTime(ev.timestamp),
+      })
+    } else if (action === 'command_exec') {
+      items.push({
+        id,
+        action,
+        tone: (ev.exit_code ?? -1) === 0 ? 'success' : 'danger',
+        title: `命令执行 · ${ev.tool || inferToolFromCommand(ev.command || '') || 'shell'}`,
+        tool: ev.tool || '',
+        command: ev.command || '',
+        time: formatTime(ev.timestamp),
+      })
+    } else if (action === 'tool_start') {
+      items.push({
+        id,
+        action,
+        tone: 'primary',
+        title: `工具调用 · ${ev.tool || 'tool'}`,
+        tool: ev.tool || '',
+        time: formatTime(ev.timestamp),
+      })
+    } else if (action === 'tool_result' || action === 'tool_executed') {
+      items.push({
+        id,
+        action,
+        tone: Number(ev.exit_code ?? -1) === 0 ? 'success' : 'danger',
+        title: `调用结果 · ${ev.tool || 'tool'}`,
+        tool: ev.tool || '',
+        time: formatTime(ev.timestamp),
+      })
+    } else if (action === 'approval_required' || action === 'approval') {
+      items.push({
+        id,
+        action,
+        tone: 'warning',
+        title: '审批',
+        time: formatTime(ev.timestamp),
+      })
+    } else if (action === 'checkpoint_request') {
+      items.push({
+        id,
+        action,
+        tone: 'warning',
+        title: 'Plan 决策点',
+        summary: ev.summary || ev.recommendation || '',
+        time: formatTime(ev.timestamp),
+      })
+    } else if (action === 'checkpoint_resolved') {
+      items.push({
+        id,
+        action,
+        tone: 'success',
+        title: 'Plan 已决策',
+        time: formatTime(ev.timestamp),
+      })
+    }
+  }
+  return items
+})
+
+const activeRailId = ref('')
+
+function handleRailJump(id) {
+  if (!id || !streamRef.value) return
+  const target = streamRef.value.querySelector(`[data-bubble-id="${CSS.escape(id)}"]`)
+  if (!target) return
+  activeRailId.value = id
+  target.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  target.classList.add('bubble-flash')
+  setTimeout(() => target.classList.remove('bubble-flash'), 1400)
+  // 因为是手动跳转, 不再粘到底部
+  stickyBottom.value = false
+}
+
 const BOTTOM_THRESHOLD = 150
 
 function isNearBottom() {
@@ -611,7 +772,11 @@ onUnmounted(() => {
 .task-chat-page {
   display: flex;
   flex-direction: column;
-  height: 100vh;
+  /* 父级 (.main-content) 已经是 column flex 且 height = 100vh,
+     这里用 flex:1 + min-height:0 占满 topbar 之外的剩余高度,
+     避免之前 height:100vh 把 topbar 高度也算进来导致整页溢出。*/
+  flex: 1;
+  min-height: 0;
   background: var(--bg-base);
 }
 
@@ -648,9 +813,45 @@ onUnmounted(() => {
 .chat-main {
   flex: 1;
   min-height: 0;
+  display: flex;
+  align-items: stretch;
+  overflow: hidden;
+}
+.chat-rail {
+  flex-shrink: 0;
+}
+.chat-stream-wrap {
+  flex: 1;
+  min-width: 0;
   overflow-y: auto;
+  overflow-x: hidden;
   padding: 20px 28px 28px;
   position: relative;
+  /* Firefox 滚动条 */
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--text-primary) 22%, transparent) transparent;
+}
+/* WebKit 自定义滚动条,在 dark 主题下默认滚动条几乎不可见,做成 cursor 风格 */
+.chat-stream-wrap::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+.chat-stream-wrap::-webkit-scrollbar-track {
+  background: transparent;
+}
+.chat-stream-wrap::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--text-primary) 18%, transparent);
+  border: 2px solid transparent;
+  background-clip: content-box;
+  border-radius: 999px;
+  transition: background 0.15s ease;
+}
+.chat-stream-wrap::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--accent-blue) 55%, var(--text-primary) 30%);
+  background-clip: content-box;
+}
+.chat-stream-wrap::-webkit-scrollbar-corner {
+  background: transparent;
 }
 .bubble-stream {
   max-width: 1080px;
@@ -658,6 +859,15 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   gap: 14px;
+}
+.bubble-anchor {
+  scroll-margin-top: 40px;
+  border-radius: var(--radius-md);
+  transition: background 0.4s ease, box-shadow 0.4s ease;
+}
+.bubble-flash {
+  background: color-mix(in srgb, var(--accent-blue) 12%, transparent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-blue) 40%, transparent);
 }
 
 .thought-meta {
@@ -701,6 +911,16 @@ onUnmounted(() => {
   max-height: 280px;
   overflow-y: auto;
   font-family: var(--font-mono);
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--text-primary) 22%, transparent) transparent;
+}
+.thought-full::-webkit-scrollbar { width: 8px; }
+.thought-full::-webkit-scrollbar-track { background: transparent; }
+.thought-full::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--text-primary) 18%, transparent);
+  border: 2px solid transparent;
+  background-clip: content-box;
+  border-radius: 999px;
 }
 
 .checkpoint-slot { margin-top: 8px; }
@@ -805,20 +1025,89 @@ onUnmounted(() => {
 
 .chat-footer {
   flex-shrink: 0;
-  display: flex;
-  align-items: flex-end;
-  gap: 10px;
-  padding: 12px 28px;
+  padding: 14px 28px 18px;
   border-top: 1px solid var(--border);
   background: var(--bg-elevated);
 }
-.chat-input { flex: 1; }
-.chat-input :deep(.el-textarea__inner) {
+.composer {
+  max-width: 1080px;
+  margin: 0 auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
+  padding: 10px 12px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  box-shadow: 0 6px 24px color-mix(in srgb, #000000 24%, transparent);
+}
+.composer-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px dashed var(--border);
+}
+.composer-tip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.composer-shortcut {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--text-primary) 6%, transparent);
+}
+.input-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.prompt-input :deep(.el-textarea__inner) {
   background: var(--bg-base);
   border-color: var(--border);
   border-radius: var(--radius-md);
   font-size: 13px;
   line-height: 1.55;
 }
-.send-btn { flex-shrink: 0; }
+.send-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.hint {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.hint-warn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--accent-yellow);
+}
+.hint-info {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-secondary);
+}
+.spin {
+  animation: rotate 1.4s linear infinite;
+}
+@keyframes rotate {
+  from { transform: rotate(0); }
+  to { transform: rotate(360deg); }
+}
 </style>

@@ -74,6 +74,31 @@ export const api = {
     http.put('/auth/me', data),
 
   healthCheck: (): Promise<HealthInfo> => http.get('/health'),
+
+  parseTaskIntent: (payload: {
+    userPrompt: string
+    workflowMode?: 'pentest_engineer' | 'ctf_expert'
+  }): Promise<{
+    target: string
+    suggested_workflow_mode: string
+    priority_vulns: string[]
+    scope_note: string
+    extra_hint: string
+    summary: string
+    intents: string[]
+    confidence: number
+    fallback: boolean
+    error: string
+  }> =>
+    http.post(
+      '/tasks/parse-intent',
+      {
+        user_prompt: payload.userPrompt,
+        workflow_mode: payload.workflowMode ?? 'pentest_engineer',
+      },
+      { timeout: 12000 },
+    ),
+
   createTask: (payload: {
     target: string
     note?: string

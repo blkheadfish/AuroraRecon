@@ -49,6 +49,86 @@
       </section>
 
       <section class="composer">
+        <transition name="intent-fade">
+          <div
+            v-if="intentVisible"
+            class="intent-card"
+            :class="{ 'is-loading': intent.loading, 'is-fallback': intent.fallback }"
+          >
+            <div class="intent-head">
+              <span class="intent-badge">
+                <el-icon class="intent-icon"><MagicStick /></el-icon>
+                <span v-if="intent.loading">AI 正在解读你的描述</span>
+                <span v-else-if="intent.fallback">AI 暂不可用 · 已退化为正则提取</span>
+                <span v-else>AI 已解读你的描述</span>
+              </span>
+              <span v-if="!intent.loading && intent.confidence > 0" class="intent-confidence">
+                置信度 {{ Math.round(intent.confidence * 100) }}%
+              </span>
+            </div>
+
+            <p v-if="intent.summary" class="intent-summary">{{ intent.summary }}</p>
+
+            <div class="intent-grid">
+              <div v-if="intent.target" class="intent-row">
+                <span class="intent-label">目标</span>
+                <code class="intent-target">{{ intent.target }}</code>
+              </div>
+              <div
+                v-if="intent.suggestedMode && intent.suggestedMode !== form.workflowMode"
+                class="intent-row"
+              >
+                <span class="intent-label">推荐模式</span>
+                <span class="intent-mode-name">{{ modeLabel(intent.suggestedMode) }}</span>
+                <el-button
+                  size="small"
+                  type="primary"
+                  text
+                  bg
+                  @click="applySuggestedMode"
+                >采用</el-button>
+              </div>
+              <div v-if="intent.priorityVulns.length" class="intent-row">
+                <span class="intent-label">关注漏洞</span>
+                <el-tag
+                  v-for="vuln in intent.priorityVulns"
+                  :key="vuln"
+                  size="small"
+                  effect="plain"
+                  class="intent-tag"
+                >{{ vuln }}</el-tag>
+              </div>
+              <div v-if="intent.intents.length" class="intent-row">
+                <span class="intent-label">行动倾向</span>
+                <el-tag
+                  v-for="tag in intent.intents"
+                  :key="tag"
+                  size="small"
+                  effect="plain"
+                  type="info"
+                  class="intent-tag"
+                >{{ tag }}</el-tag>
+              </div>
+              <div
+                v-if="intent.scopeNote && intent.scopeNote !== form.scopeNote"
+                class="intent-row"
+              >
+                <span class="intent-label">scope</span>
+                <span class="intent-text">{{ intent.scopeNote }}</span>
+                <el-button size="small" text bg @click="applyIntentScope">应用</el-button>
+              </div>
+              <div
+                v-if="intent.extraHint && intent.extraHint !== form.extraHint"
+                class="intent-row"
+              >
+                <span class="intent-label">建议</span>
+                <span class="intent-text">{{ intent.extraHint }}</span>
+                <el-button size="small" text bg @click="applyIntentHint">应用</el-button>
+              </div>
+            </div>
+          </div>
+        </transition>
+
         <div class="composer-toolbar">
           <div class="mode-pills" role="tablist" aria-label="Agent 模式">
             <button
@@ -142,11 +222,17 @@
             <span class="hint">
               <span class="hint-shortcut">Ctrl/Cmd + Enter 发送</span>
               <span class="hint-divider">·</span>
-              <span class="hint-target" v-if="detectedTarget">
+              <span v-if="intent.loading" class="hint-target hint-target-loading">
+                <el-icon class="spin"><Loading /></el-icon>
+                AI 正在解析意图...
+              </span>
+              <span v-else-if="detectedTarget" class="hint-target">
                 <el-icon><Aim /></el-icon>
                 已识别目标: <code>{{ detectedTarget }}</code>
+                <span v-if="targetSource === 'llm'" class="hint-source">via AI</span>
+                <span v-else class="hint-source hint-source-fallback">via 正则</span>
               </span>
-              <span class="hint-target hint-target-missing" v-else>
+              <span v-else class="hint-target hint-target-missing">
                 <el-icon><Warning /></el-icon>
                 请在描述中包含目标 IP / 域名 / URL
               </span>
@@ -168,10 +254,21 @@
 </template>
 
 <script setup lang="ts">
-import { computed, defineAsyncComponent, nextTick, ref } from 'vue'
+import { computed, defineAsyncComponent, nextTick, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { ArrowLeft, Setting, Promotion, Aim, Warning, Cpu, Tools } from '@element-plus/icons-vue'
+import {
+  Aim,
+  ArrowLeft,
+  Cpu,
+  Loading,
+  MagicStick,
+  Promotion,
+  Setting,
+  Tools,
+  Warning,
+} from '@element-plus/icons-vue'
+import { api } from '@/api'
 import { useTaskListStore } from '@/stores/taskList'
 import { trackEvent } from '@/metrics/tracker'
 import type { WorkflowMode } from '@/types/task'
@@ -225,11 +322,175 @@ const messages = ref<ChatMessage[]>([
   },
 ])
 
-const detectedTarget = computed(() => extractTarget(form.value.userPrompt))
+interface IntentState {
+  target: string
+  suggestedMode: WorkflowMode | ''
+  priorityVulns: string[]
+  scopeNote: string
+  extraHint: string
+  summary: string
+  intents: string[]
+  confidence: number
+  fallback: boolean
+  loading: boolean
+  loaded: boolean
+  source: 'idle' | 'llm' | 'regex'
+}
+
+const intent = ref<IntentState>({
+  target: '',
+  suggestedMode: '',
+  priorityVulns: [],
+  scopeNote: '',
+  extraHint: '',
+  summary: '',
+  intents: [],
+  confidence: 0,
+  fallback: false,
+  loading: false,
+  loaded: false,
+  source: 'idle',
+})
+
+const intentVisible = computed(() => {
+  if (intent.value.loading) return true
+  if (!intent.value.loaded) return false
+  return Boolean(
+    intent.value.summary ||
+    intent.value.target ||
+    intent.value.priorityVulns.length ||
+    intent.value.intents.length ||
+    (intent.value.suggestedMode && intent.value.suggestedMode !== form.value.workflowMode) ||
+    (intent.value.scopeNote && intent.value.scopeNote !== form.value.scopeNote) ||
+    (intent.value.extraHint && intent.value.extraHint !== form.value.extraHint),
+  )
+})
+
+const detectedTarget = computed(() => intent.value.target || extractTarget(form.value.userPrompt))
+
+const targetSource = computed<'llm' | 'regex' | 'idle'>(() => {
+  if (intent.value.target && intent.value.source === 'llm') return 'llm'
+  if (detectedTarget.value) return 'regex'
+  return 'idle'
+})
 
 const canSubmit = computed(
   () => !creating.value && form.value.userPrompt.trim().length > 0 && !!detectedTarget.value,
 )
+
+let intentDebounceTimer: ReturnType<typeof setTimeout> | null = null
+let intentRequestSeq = 0
+
+function resetIntent() {
+  intent.value = {
+    target: '',
+    suggestedMode: '',
+    priorityVulns: [],
+    scopeNote: '',
+    extraHint: '',
+    summary: '',
+    intents: [],
+    confidence: 0,
+    fallback: false,
+    loading: false,
+    loaded: false,
+    source: 'idle',
+  }
+}
+
+async function runIntentParse(prompt: string, mode: WorkflowMode) {
+  const seq = ++intentRequestSeq
+  intent.value.loading = true
+  try {
+    const resp = await api.parseTaskIntent({ userPrompt: prompt, workflowMode: mode })
+    if (seq !== intentRequestSeq) return
+    intent.value = {
+      target: resp.target || '',
+      suggestedMode: (resp.suggested_workflow_mode as WorkflowMode | '') || '',
+      priorityVulns: Array.isArray(resp.priority_vulns) ? resp.priority_vulns : [],
+      scopeNote: resp.scope_note || '',
+      extraHint: resp.extra_hint || '',
+      summary: resp.summary || '',
+      intents: Array.isArray(resp.intents) ? resp.intents : [],
+      confidence: Number(resp.confidence) || 0,
+      fallback: Boolean(resp.fallback),
+      loading: false,
+      loaded: true,
+      source: resp.fallback ? 'regex' : 'llm',
+    }
+  } catch (e) {
+    if (seq !== intentRequestSeq) return
+    // 网络层失败:静默降级到正则提取,避免在用户没意识到时弹错误
+    intent.value = {
+      ...intent.value,
+      target: extractTarget(prompt) || '',
+      summary: '',
+      suggestedMode: '',
+      priorityVulns: [],
+      intents: [],
+      scopeNote: '',
+      extraHint: '',
+      confidence: 0,
+      fallback: true,
+      loading: false,
+      loaded: true,
+      source: 'regex',
+    }
+  }
+}
+
+function scheduleIntentParse() {
+  if (intentDebounceTimer) clearTimeout(intentDebounceTimer)
+  const prompt = form.value.userPrompt.trim()
+  // 太短就不触发 LLM,直接清空已有解析结果
+  if (prompt.length < 6) {
+    intentRequestSeq++
+    resetIntent()
+    return
+  }
+  intentDebounceTimer = setTimeout(() => {
+    runIntentParse(prompt, form.value.workflowMode)
+  }, 600)
+}
+
+watch(
+  () => [form.value.userPrompt, form.value.workflowMode] as const,
+  () => {
+    scheduleIntentParse()
+  },
+)
+
+onUnmounted(() => {
+  if (intentDebounceTimer) clearTimeout(intentDebounceTimer)
+  intentRequestSeq++
+})
+
+function modeLabel(value: string): string {
+  return MODES.find((m) => m.value === value)?.label || value
+}
+
+function applySuggestedMode() {
+  if (intent.value.suggestedMode) {
+    setMode(intent.value.suggestedMode as WorkflowMode)
+    trackEvent('task.intent.apply', { field: 'mode', value: intent.value.suggestedMode })
+  }
+}
+
+function applyIntentScope() {
+  if (intent.value.scopeNote) {
+    form.value.scopeNote = intent.value.scopeNote
+    trackEvent('task.intent.apply', { field: 'scope_note' })
+    ElMessage.success('已采用建议的 scope')
+  }
+}
+
+function applyIntentHint() {
+  if (intent.value.extraHint) {
+    form.value.extraHint = intent.value.extraHint
+    trackEvent('task.intent.apply', { field: 'extra_hint' })
+    ElMessage.success('已采用建议的提示')
+  }
+}
 
 const advancedSummary = computed(() => {
   const out: string[] = []
@@ -402,8 +663,11 @@ async function submit() {
 .chat-page {
   display: flex;
   flex-direction: column;
-  height: 100%;
-  min-height: 100vh;
+  /* 父级 .main-content 已经是 column flex 且 height = 100vh,顶部还有 ~48px sticky topbar。
+     如果这里写 min-height:100vh,整页会比 viewport 高一个 topbar,导致输入框被推出屏幕。
+     改成 flex:1 + min-height:0,由父级的 flex 布局自动分配剩余高度。*/
+  flex: 1;
+  min-height: 0;
   background: var(--bg-base);
 }
 
@@ -435,11 +699,26 @@ async function submit() {
 .message-stream {
   flex: 1;
   overflow-y: auto;
+  overflow-x: hidden;
   padding: 6px 4px 18px;
   display: flex;
   flex-direction: column;
   gap: 12px;
-  min-height: 280px;
+  min-height: 0;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--text-primary) 22%, transparent) transparent;
+}
+.message-stream::-webkit-scrollbar { width: 10px; }
+.message-stream::-webkit-scrollbar-track { background: transparent; }
+.message-stream::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--text-primary) 18%, transparent);
+  border: 2px solid transparent;
+  background-clip: content-box;
+  border-radius: 999px;
+}
+.message-stream::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--accent-blue) 55%, var(--text-primary) 30%);
+  background-clip: content-box;
 }
 
 .suggestion-row {
@@ -461,6 +740,7 @@ async function submit() {
 .adv-tag { font-family: var(--font-mono); }
 
 .composer {
+  flex-shrink: 0;
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   background: var(--bg-surface);
@@ -565,6 +845,133 @@ async function submit() {
 }
 .hint-target-missing {
   color: var(--accent-yellow);
+}
+.hint-target-loading {
+  color: var(--accent-blue);
+}
+.hint-source {
+  font-size: 10px;
+  font-family: var(--font-mono);
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--accent-blue) 18%, transparent);
+  color: var(--accent-blue);
+  margin-left: 4px;
+  letter-spacing: 0.04em;
+}
+.hint-source-fallback {
+  background: color-mix(in srgb, var(--text-muted) 22%, transparent);
+  color: var(--text-muted);
+}
+.spin {
+  animation: rotate 1.4s linear infinite;
+}
+@keyframes rotate {
+  from { transform: rotate(0); }
+  to   { transform: rotate(360deg); }
+}
+
+/* ── AI 意图解析卡 ─────────────────────────────── */
+.intent-card {
+  position: relative;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent-blue) 35%, var(--border));
+  border-left: 3px solid var(--accent-blue);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--accent-blue) 6%, var(--bg-elevated));
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.intent-card.is-loading {
+  border-left-color: color-mix(in srgb, var(--accent-blue) 60%, var(--text-muted));
+}
+.intent-card.is-fallback {
+  border-color: color-mix(in srgb, var(--accent-yellow) 30%, var(--border));
+  border-left-color: var(--accent-yellow);
+  background: color-mix(in srgb, var(--accent-yellow) 5%, var(--bg-elevated));
+}
+.intent-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.intent-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent-blue);
+}
+.intent-card.is-fallback .intent-badge {
+  color: var(--accent-yellow);
+}
+.intent-icon { font-size: 14px; }
+.intent-confidence {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+  padding: 1px 8px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--text-primary) 6%, transparent);
+}
+.intent-summary {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--text-primary);
+}
+.intent-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.intent-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.intent-label {
+  display: inline-block;
+  min-width: 56px;
+  font-weight: 600;
+  color: var(--text-muted);
+  letter-spacing: 0.02em;
+}
+.intent-target {
+  font-family: var(--font-mono);
+  padding: 1px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-base);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  font-size: 12px;
+}
+.intent-mode-name {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.intent-text {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-secondary);
+  word-break: break-word;
+}
+.intent-tag { font-family: var(--font-mono); }
+
+.intent-fade-enter-active,
+.intent-fade-leave-active {
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+.intent-fade-enter-from,
+.intent-fade-leave-to {
+  opacity: 0;
+  transform: translateY(-4px);
 }
 
 .adv-panel { display: flex; flex-direction: column; gap: 10px; }
