@@ -384,7 +384,7 @@ async function submit() {
       'primary',
     )
     ElMessage.success(`任务已创建: ${task.target}`)
-    setTimeout(() => router.push(`/tasks/${task.task_id}`), 600)
+    setTimeout(() => router.push(`/tasks/${task.task_id}/chat`), 600)
   } catch (e: unknown) {
     const detail =
       (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail ||

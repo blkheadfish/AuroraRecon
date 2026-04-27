@@ -14,7 +14,9 @@
         </div>
         <div class="title-actions" v-if="task">
           <StatusBadge :status="task.status" size="large" />
-          <el-button plain @click="router.push(`/tasks/${taskId}/decision`)">决策视图</el-button>
+          <el-button plain @click="router.push(`/tasks/${taskId}/chat`)">
+            <el-icon><ChatDotRound /></el-icon>对话视图
+          </el-button>
           <el-button v-if="task.report_path" type="success" plain @click="router.push(`/reports/${taskId}`)">
             报告中心
           </el-button>
@@ -43,7 +45,7 @@
         type="primary"
         size="small"
         plain
-        @click="activeTab = 'decision'"
+        @click="router.push(`/tasks/${taskId}/chat`)"
       >查看建议</el-button>
     </div>
 
@@ -66,20 +68,12 @@
       </el-card>
     </div>
 
-    <TaskProgressMermaid
+    <PhaseTree
       v-if="task"
-      :current-phase="task.current_phase"
-      :status="task.status"
-      :findings-count="findings.length"
-      :exploitable-count="exploitableCount"
-      :got-shell="task.got_shell || false"
-      :needs-approval="needsApproval"
-      :chain-visited="task.chain_visited || []"
-      :secondary-elided="task.secondary_elided || false"
-      :foothold-status="task.foothold_status || 'none'"
-      :privilege-level="task.privilege_level || ''"
-      :privesc-attempt-count="task.privesc_attempt_count || 0"
-      class="progress-mermaid"
+      :events="state.decisionEvents || task.decision_events || []"
+      :current="task.current_phase || ''"
+      :status="task.status || ''"
+      class="progress-tree"
     />
 
     <el-card class="main-card">
@@ -93,7 +87,7 @@
           </template>
           <div class="decision-summary-header">
             <span class="summary-hint">仅显示关键决策节点，详细工具调用请查看完整视图</span>
-            <el-button type="primary" link @click="router.push(`/tasks/${taskId}/decision`)">
+            <el-button type="primary" link @click="router.push(`/tasks/${taskId}/chat`)">
               查看完整决策 →
             </el-button>
           </div>
@@ -201,7 +195,7 @@ import { useTaskListStore } from '@/stores/taskList'
 import { useTaskLiveStore } from '@/stores/taskLive'
 import { trackEvent } from '@/metrics/tracker'
 import StatusBadge from '@/components/StatusBadge.vue'
-import TaskProgressMermaid from '@/components/TaskProgressMermaid.vue'
+import PhaseTree from '@/components/PhaseTree.vue'
 import FindingsPanel from '@/components/FindingsPanel.vue'
 import DecisionTimeline from '@/components/DecisionTimeline.vue'
 import DecisionCheckpointCard from '@/components/DecisionCheckpointCard.vue'
@@ -699,7 +693,7 @@ onUnmounted(() => {
 }
 .inline-approval-actions { display: flex; gap: 8px; }
 
-.progress-mermaid { margin-bottom: 12px; }
+.progress-tree { margin-bottom: 12px; }
 .main-card { border-radius: var(--radius-lg) !important; }
 .tab-label { display: inline-flex; align-items: center; gap: 5px; }
 .tab-badge { margin-left: 4px; }
