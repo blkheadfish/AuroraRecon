@@ -5,8 +5,10 @@ import { api } from '@/api'
 import { subscribeTaskEvents } from '@/services/wsManager'
 import { useTaskListStore } from '@/stores/taskList'
 import type {
+  BranchTreeItem,
   CheckpointPayload,
   DecisionEvent,
+  TaskBranch,
   TaskDetail,
 } from '@/types/task'
 
@@ -51,6 +53,14 @@ interface TaskLiveState {
   checkpointHistory: CheckpointPayload[]
   /** 当前 checkpoint 的提交状态,避免重复点击。 */
   checkpointState: CheckpointState
+  /** 任务分支树(Claude/Kimi 风格); branches[*].sibling_total 渲染 <n/m>。 */
+  branches: BranchTreeItem[]
+  /** 当前活动分支 id; 时间线/输入框 / 分支徽标都靠它高亮。 */
+  activeBranchId: string
+  /** 后端配置的单任务分支上限,用于在 UI 提前禁用 fork。 */
+  maxBranchesPerTask: number
+  /** 最近一次 fork 时间(毫秒), 用于发送动画。 */
+  branchFlashAt: number
   unsub?: () => void
 }
 
@@ -79,9 +89,129 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
         pendingCheckpoint: null,
         checkpointHistory: [],
         checkpointState: 'idle',
+        branches: [],
+        activeBranchId: '',
+        maxBranchesPerTask: 12,
+        branchFlashAt: 0,
       }
     }
     return taskStateMap.value[taskId]
+  }
+
+  // ── 分支树工具 ────────────────────────────────────────
+  /**
+   * 在不重算后端 sibling_total 的前提下尽量保留 BranchTreeItem 的视图字段。
+   * 如果是 ws 推送过来的全新 TaskBranch (没有 sibling_index/total),
+   * 我们用启发式: 同 (parent, fork_event_id) 计 sibling 数。
+   */
+  function computeSiblingTotals(items: BranchTreeItem[]): BranchTreeItem[] {
+    const groups = new Map<string, BranchTreeItem[]>()
+    for (const it of items) {
+      const key = `${it.parent_branch_id ?? ''}::${it.fork_event_id ?? ''}`
+      if (!groups.has(key)) groups.set(key, [])
+      groups.get(key)!.push(it)
+    }
+    for (const arr of groups.values()) {
+      arr.sort((a, b) => (a.created_at || '').localeCompare(b.created_at || ''))
+      arr.forEach((it, idx) => {
+        it.sibling_index = idx + 1
+        it.sibling_total = arr.length
+      })
+    }
+    return items
+  }
+
+  function upsertBranch(state: TaskLiveState, raw: TaskBranch | BranchTreeItem) {
+    if (!raw?.branch_id) return
+    const idx = state.branches.findIndex((b) => b.branch_id === raw.branch_id)
+    const baseItem: BranchTreeItem = {
+      branch_id: raw.branch_id,
+      task_id: raw.task_id,
+      parent_branch_id: raw.parent_branch_id ?? null,
+      fork_event_id: raw.fork_event_id ?? null,
+      fork_phase: raw.fork_phase || '',
+      fork_round: raw.fork_round ?? null,
+      thread_id: raw.thread_id || '',
+      status: raw.status,
+      label: raw.label || '',
+      initiating_prompt: raw.initiating_prompt || '',
+      is_root: Boolean(raw.is_root),
+      created_at: raw.created_at || '',
+      updated_at: raw.updated_at || '',
+      sibling_index: (raw as BranchTreeItem).sibling_index ?? 1,
+      sibling_total: (raw as BranchTreeItem).sibling_total ?? 1,
+      is_active: Boolean((raw as BranchTreeItem).is_active),
+      children: (raw as BranchTreeItem).children ?? [],
+    }
+    if (idx >= 0) {
+      state.branches.splice(idx, 1, { ...state.branches[idx], ...baseItem })
+    } else {
+      state.branches.push(baseItem)
+    }
+    computeSiblingTotals(state.branches)
+  }
+
+  function setActiveBranch(state: TaskLiveState, branchId: string) {
+    if (!branchId) return
+    state.activeBranchId = branchId
+    for (const b of state.branches) {
+      b.is_active = b.branch_id === branchId
+    }
+  }
+
+  async function refreshBranches(taskId: string) {
+    const state = ensureState(taskId)
+    try {
+      const tree = await api.listBranches(taskId)
+      state.branches = computeSiblingTotals([...(tree.branches || [])])
+      state.activeBranchId = tree.active_branch_id || state.activeBranchId
+      state.maxBranchesPerTask = tree.max_branches_per_task || state.maxBranchesPerTask
+      // 保持 is_active 对齐
+      for (const b of state.branches) {
+        b.is_active = b.branch_id === state.activeBranchId
+      }
+    } catch (e) {
+      // 老任务后端可能返回 404 / 500, 这里静默回退即可
+      // eslint-disable-next-line no-console
+      console.debug('[taskLive] refreshBranches failed', e)
+    }
+  }
+
+  async function activateBranch(taskId: string, branchId: string) {
+    const state = ensureState(taskId)
+    try {
+      const res = await api.activateBranch(taskId, branchId)
+      upsertBranch(state, res.branch)
+      setActiveBranch(state, branchId)
+      ElMessage.success('已切换分支')
+    } catch (e) {
+      ElMessage.error('切换分支失败')
+      throw e
+    }
+  }
+
+  async function resumeBranch(taskId: string, branchId: string) {
+    const state = ensureState(taskId)
+    try {
+      const res = await api.resumeBranch(taskId, branchId)
+      upsertBranch(state, res.branch)
+      setActiveBranch(state, branchId)
+      ElMessage.success('已恢复分支运行')
+    } catch (e) {
+      ElMessage.error('恢复分支失败')
+      throw e
+    }
+  }
+
+  async function pauseBranch(taskId: string, branchId: string) {
+    const state = ensureState(taskId)
+    try {
+      const res = await api.pauseBranch(taskId, branchId)
+      upsertBranch(state, res.branch)
+    } catch (e) {
+      ElMessage.error('暂停分支失败')
+      throw e
+    }
   }
 
   // ── checkpoint helpers ─────────────────────────────────
@@ -505,7 +635,33 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
         refreshTask(taskId).catch(() => {})
         return
       }
+      if (eventType === 'branch_forked') {
+        const ev = event as { branch?: TaskBranch; parent?: TaskBranch }
+        if (ev.parent) upsertBranch(state, { ...ev.parent, status: 'paused' })
+        if (ev.branch) {
+          upsertBranch(state, ev.branch)
+          setActiveBranch(state, ev.branch.branch_id)
+          state.branchFlashAt = Date.now()
+        }
+        return
+      }
+      if (eventType === 'branch_switched') {
+        const ev = event as { branch?: TaskBranch }
+        if (ev.branch) {
+          upsertBranch(state, ev.branch)
+          setActiveBranch(state, ev.branch.branch_id)
+        }
+        return
+      }
+      if (eventType === 'branch_status_changed') {
+        const ev = event as { branch?: TaskBranch }
+        if (ev.branch) upsertBranch(state, ev.branch)
+        return
+      }
     })
+
+    // 拉一份完整 branch tree, ws 之后的事件再做增量补丁。
+    refreshBranches(taskId).catch(() => {})
   }
 
   function detach(taskId: string) {
@@ -599,5 +755,9 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
     getLiveState,
     submitApproval,
     submitCheckpoint,
+    refreshBranches,
+    activateBranch,
+    resumeBranch,
+    pauseBranch,
   }
 })

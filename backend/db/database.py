@@ -160,6 +160,36 @@ class AdminOverrideRecord(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class TaskBranchRecord(Base):
+    """任务对话分支元数据 — Claude/Kimi 风格 branch tree。
+
+    payload 全部体检在 LangGraph checkpointer (postgres) 里, 这张表只存关系
+    元数据用于 UI 展示和路由。``thread_id`` 决定 LangGraph 落 checkpoint
+    的位置, 默认是 ``f"{task_id}:{branch_id}"``; root branch 为兼容老任务
+    会把 thread_id 直接设为 task_id (lazy_init_root 决定)。
+    """
+    __tablename__ = "task_branches"
+    branch_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    task_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    parent_branch_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    fork_event_id: Mapped[str] = mapped_column(String(128), default="")
+    fork_phase: Mapped[str] = mapped_column(String(64), default="")
+    fork_round: Mapped[int] = mapped_column(Integer, default=0)
+    thread_id: Mapped[str] = mapped_column(String(160), default="", index=True)
+    status: Mapped[str] = mapped_column(String(16), default="running")
+    label: Mapped[str] = mapped_column(String(128), default="")
+    initiating_prompt: Mapped[str] = mapped_column(Text, default="")
+    is_root: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow,
+    )
+    __table_args__ = (
+        Index("idx_task_branches_task", "task_id"),
+        Index("idx_task_branches_parent", "task_id", "parent_branch_id"),
+    )
+
+
 # ── 数据库操作 ────────────────────────────────────────────
 
 async def init_db():
@@ -728,3 +758,81 @@ async def update_user(user_id: str, **kwargs) -> Optional[UserRecord]:
         await session.commit()
         await session.refresh(user)
         return user
+
+
+# ── 任务分支 CRUD ─────────────────────────────────────────
+
+def _branch_record_to_dict(rec: TaskBranchRecord) -> dict:
+    return {
+        "branch_id": rec.branch_id,
+        "task_id": rec.task_id,
+        "parent_branch_id": rec.parent_branch_id or None,
+        "fork_event_id": rec.fork_event_id or None,
+        "fork_phase": rec.fork_phase or "",
+        "fork_round": int(rec.fork_round or 0) or None,
+        "thread_id": rec.thread_id or "",
+        "status": rec.status or "running",
+        "label": rec.label or "",
+        "initiating_prompt": rec.initiating_prompt or "",
+        "is_root": bool(rec.is_root),
+        "created_at": rec.created_at.isoformat() if rec.created_at else "",
+        "updated_at": rec.updated_at.isoformat() if rec.updated_at else "",
+    }
+
+
+async def upsert_branch(branch: dict) -> None:
+    """Insert or update a branch row keyed by branch_id."""
+    bid = branch.get("branch_id") or ""
+    if not bid:
+        raise ValueError("branch.branch_id is required")
+    async with async_session() as session:
+        rec = await session.get(TaskBranchRecord, bid)
+        if not rec:
+            rec = TaskBranchRecord(branch_id=bid)
+            session.add(rec)
+        rec.task_id = branch.get("task_id") or ""
+        rec.parent_branch_id = branch.get("parent_branch_id") or ""
+        rec.fork_event_id = branch.get("fork_event_id") or ""
+        rec.fork_phase = branch.get("fork_phase") or ""
+        rec.fork_round = int(branch.get("fork_round") or 0)
+        rec.thread_id = branch.get("thread_id") or ""
+        rec.status = branch.get("status") or "running"
+        rec.label = (branch.get("label") or "")[:128]
+        rec.initiating_prompt = branch.get("initiating_prompt") or ""
+        rec.is_root = bool(branch.get("is_root"))
+        rec.updated_at = datetime.utcnow()
+        await session.commit()
+
+
+async def list_branches_by_task(task_id: str) -> list[dict]:
+    async with async_session() as session:
+        result = await session.execute(
+            text(
+                "SELECT branch_id FROM task_branches "
+                "WHERE task_id = :tid ORDER BY created_at ASC"
+            ),
+            {"tid": task_id},
+        )
+        ids = [row.branch_id for row in result.fetchall()]
+        out = []
+        for bid in ids:
+            rec = await session.get(TaskBranchRecord, bid)
+            if rec:
+                out.append(_branch_record_to_dict(rec))
+        return out
+
+
+async def get_branch(branch_id: str) -> Optional[dict]:
+    async with async_session() as session:
+        rec = await session.get(TaskBranchRecord, branch_id)
+        return _branch_record_to_dict(rec) if rec else None
+
+
+async def delete_branch(branch_id: str) -> bool:
+    async with async_session() as session:
+        rec = await session.get(TaskBranchRecord, branch_id)
+        if not rec:
+            return False
+        await session.delete(rec)
+        await session.commit()
+        return True

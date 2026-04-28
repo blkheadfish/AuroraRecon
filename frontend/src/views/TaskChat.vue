@@ -37,12 +37,24 @@
     </header>
 
     <main class="chat-main">
-      <ToolChainRail
-        :items="railItems"
-        :active-id="activeRailId"
-        class="chat-rail"
-        @jump="handleRailJump"
-      />
+      <div class="chat-side">
+        <ToolChainRail
+          :items="railItems"
+          :active-id="activeRailId"
+          class="chat-rail"
+          @jump="handleRailJump"
+        />
+        <BranchTree
+          v-if="branches.length"
+          class="chat-branch-tree"
+          :items="branches"
+          :active-branch-id="activeBranchId"
+          :max-branches="state.maxBranchesPerTask || 12"
+          @activate="onBranchActivate"
+          @resume="onBranchResume"
+          @pause="onBranchPause"
+        />
+      </div>
 
       <div class="chat-stream-wrap" ref="streamRef" @scroll="onUserScroll">
         <div class="bubble-stream">
@@ -115,6 +127,33 @@
                 :total-len="Number(block.totalLen || 0)"
               />
             </div>
+
+            <div
+              v-if="msg.action === 'branch_forked' && msg.branchId && siblingNavFor(msg.branchId)"
+              class="branch-navigator"
+            >
+              <button
+                class="nav-btn"
+                :disabled="siblingNavFor(msg.branchId).total <= 1"
+                @click="gotoSibling(msg.branchId, -1)"
+                title="上一个兄弟分支"
+              >‹</button>
+              <span class="nav-counter">
+                &lt;{{ siblingNavFor(msg.branchId).index }}/{{ siblingNavFor(msg.branchId).total }}&gt;
+              </span>
+              <button
+                class="nav-btn"
+                :disabled="siblingNavFor(msg.branchId).total <= 1"
+                @click="gotoSibling(msg.branchId, 1)"
+                title="下一个兄弟分支"
+              >›</button>
+              <span class="nav-active" v-if="msg.branchId === activeBranchId">当前激活</span>
+              <button
+                v-else
+                class="nav-activate"
+                @click="activateBranch(msg.branchId)"
+              >切到此分支</button>
+            </div>
           </ChatBubble>
             </div>
           </template>
@@ -138,7 +177,28 @@
     </main>
 
     <footer class="chat-footer">
-      <section class="composer">
+      <section class="composer" :class="{ 'composer-flash': composerFlashing }">
+        <div v-if="branches.length > 1 || activeBranch" class="branch-status-band">
+          <span class="band-icon">
+            <el-icon><Promotion /></el-icon>
+          </span>
+          <span class="band-text">
+            <template v-if="activeBranch">
+              当前分支
+              <strong>{{ activeBranch.label || activeBranch.branch_id }}</strong>
+              <span class="band-status" :class="`status-${activeBranch.status}`">
+                · {{ branchStatusLabel(activeBranch.status) }}
+              </span>
+            </template>
+            <template v-else>
+              <strong>主分支(root)</strong> 进行中
+            </template>
+            <span v-if="branches.length > 1" class="band-count">
+              · 共 {{ branches.length }} 个分支
+            </span>
+          </span>
+          <span v-if="branchAtCap" class="band-cap">已达分支上限, 新输入将被合并到当前分支</span>
+        </div>
         <div class="composer-toolbar">
           <span class="composer-tip">
             <el-icon><ChatLineRound /></el-icon>
@@ -214,6 +274,7 @@ import { api } from '@/api'
 import { useTaskListStore } from '@/stores/taskList'
 import { useTaskLiveStore } from '@/stores/taskLive'
 import { trackEvent } from '@/metrics/tracker'
+import BranchTree from '@/components/BranchTree.vue'
 import ChatBubble from '@/components/ChatBubble.vue'
 import DecisionCheckpointCard from '@/components/DecisionCheckpointCard.vue'
 import PayloadCodeBlock from '@/components/PayloadCodeBlock.vue'
@@ -518,6 +579,20 @@ const messages = computed(() => {
       return
     }
 
+    if (entry.action === 'branch_forked') {
+      const branchId = String(entry.branch_id || '')
+      out.push({
+        id: baseId,
+        role: 'system',
+        tone: 'primary',
+        text: entry.message || '已基于此处分叉新分支',
+        timestamp: time,
+        action: 'branch_forked',
+        branchId,
+      })
+      return
+    }
+
     if (entry.action === 'log') {
       const msg = entry.message || entry.raw || ''
       if (!msg) return
@@ -705,13 +780,109 @@ async function sendMessage() {
   if (!text || sending.value) return
   sending.value = true
   try {
-    await api.sendChat(taskId, text)
+    const res = await api.sendChat(taskId, text)
     chatInput.value = ''
-    trackEvent('task.chat.send', { taskId })
+    trackEvent('task.chat.send', {
+      taskId,
+      forked: Boolean(res?.fork_active),
+      branch_id: res?.branch?.branch_id || '',
+    })
+    if (res?.fork_active) {
+      composerFlashAt.value = Date.now()
+    }
   } catch (e) {
     ElMessage.error(e?.response?.data?.detail || e?.message || '发送失败')
   } finally {
     sending.value = false
+  }
+}
+
+// ── 分支(branch tree)视图状态 ───────────────────────────
+
+const branches = computed(() => state.value?.branches || [])
+const activeBranchId = computed(() => state.value?.activeBranchId || '')
+const branchById = computed(() => {
+  const map = {}
+  for (const b of branches.value) map[b.branch_id] = b
+  return map
+})
+const activeBranch = computed(() => branchById.value[activeBranchId.value] || null)
+const branchAtCap = computed(() => {
+  const max = state.value?.maxBranchesPerTask || 12
+  return branches.value.length >= max
+})
+const composerFlashAt = ref(0)
+const composerFlashing = computed(() => {
+  if (!composerFlashAt.value) return false
+  return Date.now() - composerFlashAt.value < 2400
+})
+
+// 把 branch_forked 事件下方挂的 sibling navigator 用到的元数据集中算一次, 避免
+// v-for 内部闭包反复扫描 branches。key = branch_id。
+const navigatorBubbleMeta = computed(() => {
+  const out = {}
+  for (const b of branches.value) {
+    const total = Number(b.sibling_total || 1)
+    if (total <= 1) continue
+    const siblings = branches.value
+      .filter((s) => (s.parent_branch_id || '') === (b.parent_branch_id || '')
+        && (s.fork_event_id || '') === (b.fork_event_id || ''))
+      .sort((a, c) => (a.created_at || '').localeCompare(c.created_at || ''))
+    out[b.branch_id] = {
+      siblings: siblings.map((s) => ({
+        id: s.branch_id,
+        label: s.label || s.branch_id,
+        status: s.status,
+      })),
+      index: Math.max(1, Number(b.sibling_index || 1)),
+      total,
+    }
+  }
+  return out
+})
+
+function siblingNavFor(branchId) {
+  return navigatorBubbleMeta.value[branchId] || null
+}
+
+async function activateBranch(branchId) {
+  if (!branchId || branchId === activeBranchId.value) return
+  await liveStore.activateBranch(taskId, branchId)
+  trackEvent('task.branch.activate', { taskId, branch_id: branchId })
+}
+
+function onBranchActivate(branchId) {
+  return activateBranch(branchId)
+}
+
+async function onBranchResume(branchId) {
+  await liveStore.resumeBranch(taskId, branchId)
+  trackEvent('task.branch.resume', { taskId, branch_id: branchId })
+}
+
+async function onBranchPause(branchId) {
+  await liveStore.pauseBranch(taskId, branchId)
+  trackEvent('task.branch.pause', { taskId, branch_id: branchId })
+}
+
+async function gotoSibling(currentBranchId, delta) {
+  const meta = navigatorBubbleMeta.value[currentBranchId]
+  if (!meta) return
+  const siblings = meta.siblings
+  const cur = siblings.findIndex((s) => s.id === currentBranchId)
+  if (cur < 0) return
+  const next = (cur + delta + siblings.length) % siblings.length
+  const tgt = siblings[next]
+  if (tgt) await activateBranch(tgt.id)
+}
+
+function branchStatusLabel(status) {
+  switch (status) {
+    case 'running': return '运行中'
+    case 'paused': return '已暂停'
+    case 'completed': return '已完成'
+    case 'failed': return '失败'
+    default: return status || ''
   }
 }
 
@@ -817,8 +988,27 @@ onUnmounted(() => {
   align-items: stretch;
   overflow: hidden;
 }
+.chat-side {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-right: 8px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--text-primary) 22%, transparent) transparent;
+}
+.chat-side::-webkit-scrollbar { width: 8px; }
+.chat-side::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--text-primary) 18%, transparent);
+  border-radius: 4px;
+}
 .chat-rail {
   flex-shrink: 0;
+}
+.chat-branch-tree {
+  flex-shrink: 0;
+  width: 280px;
 }
 .chat-stream-wrap {
   flex: 1;
@@ -1109,5 +1299,94 @@ onUnmounted(() => {
 @keyframes rotate {
   from { transform: rotate(0); }
   to { transform: rotate(360deg); }
+}
+
+/* ── 分支(branch tree) UI ─────────────────────────────── */
+
+.branch-navigator {
+  margin-top: 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--accent-blue, #58a6ff) 10%, var(--bg-base));
+  border: 1px dashed color-mix(in srgb, var(--accent-blue, #58a6ff) 40%, transparent);
+  font-size: 11px;
+  font-family: var(--font-mono);
+}
+.nav-btn {
+  width: 22px;
+  height: 22px;
+  border-radius: 11px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+}
+.nav-btn[disabled] { cursor: not-allowed; opacity: 0.4; }
+.nav-counter {
+  font-weight: 600;
+  color: var(--accent-blue, #58a6ff);
+  letter-spacing: 0.5px;
+  min-width: 44px;
+  text-align: center;
+}
+.nav-active {
+  font-weight: 600;
+  font-size: 11px;
+  color: var(--accent-green, #3fb950);
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent-green, #3fb950) 12%, transparent);
+}
+.nav-activate {
+  font-size: 11px;
+  border: 1px solid var(--accent-blue, #58a6ff);
+  background: transparent;
+  color: var(--accent-blue, #58a6ff);
+  padding: 2px 10px;
+  border-radius: 999px;
+  cursor: pointer;
+}
+.nav-activate:hover {
+  background: color-mix(in srgb, var(--accent-blue, #58a6ff) 12%, transparent);
+}
+
+.branch-status-band {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--accent-blue, #58a6ff) 8%, var(--bg-base));
+  border: 1px solid color-mix(in srgb, var(--accent-blue, #58a6ff) 30%, transparent);
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.band-icon { color: var(--accent-blue, #58a6ff); }
+.band-text strong { color: var(--text-primary); margin-left: 4px; }
+.band-status { font-weight: 600; }
+.band-status.status-running  { color: var(--accent-green, #3fb950); }
+.band-status.status-paused   { color: var(--accent-yellow, #d29922); }
+.band-status.status-completed { color: var(--accent-blue, #58a6ff); }
+.band-status.status-failed   { color: var(--accent-red, #f85149); }
+.band-count { color: var(--text-muted); margin-left: 4px; }
+.band-cap {
+  margin-left: auto;
+  color: var(--accent-yellow, #d29922);
+  font-weight: 600;
+}
+
+@keyframes composerFlash {
+  0%   { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent-blue, #58a6ff) 60%, transparent); }
+  60%  { box-shadow: 0 0 0 8px color-mix(in srgb, var(--accent-blue, #58a6ff) 0%, transparent); }
+  100% { box-shadow: 0 6px 24px color-mix(in srgb, #000000 24%, transparent); }
+}
+.composer-flash {
+  animation: composerFlash 1.6s ease-out;
 }
 </style>

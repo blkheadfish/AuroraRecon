@@ -44,6 +44,26 @@ def _get_bus() -> TaskEventBus:
     return get_event_bus()
 
 
+async def _resolve_active_thread_id(task_id: str, state: PentestState) -> str:
+    """Return the thread_id LangGraph should target for this task right now.
+
+    Defaults to ``task_id`` (legacy / root behaviour). When the branch tree
+    has been bootstrapped, returns the active branch's ``thread_id``. Failures
+    are logged and we fall back to ``task_id`` so the legacy path keeps
+    working even if BranchManager is unhealthy.
+    """
+    try:
+        from backend.api.services.branch_manager import get_branch_manager
+        bm = get_branch_manager()
+        await bm.lazy_init_root(task_id, state)
+        active = await bm.get_active(task_id)
+        if active and active.thread_id:
+            return active.thread_id
+    except Exception as exc:
+        logger.warning(f"[branches] resolve active thread failed: {exc}")
+    return task_id
+
+
 def _enforce_task_owner(state: PentestState, request: Request, action: str) -> None:
     owner_id = getattr(request.state, "user_id", "") or ""
     tenant_id = getattr(request.state, "tenant_id", "") or "default"
@@ -313,6 +333,12 @@ async def create_task(req: CreateTaskRequest, request: Request):
             logger.warning(f"[DB] 保存失败: {e}")
 
     from backend.api.services.task_runner import run_task
+    from backend.api.services.branch_manager import get_branch_manager
+    # 注册 root 分支(thread_id == task_id 兼容老逻辑)
+    try:
+        await get_branch_manager().lazy_init_root(task_id, state)
+    except Exception as exc:
+        logger.warning(f"[create_task] lazy_init_root failed: {exc}")
     task_handle = asyncio.create_task(run_task(task_id, state))
     sm.register_bg_task(task_id, task_handle)
 
@@ -654,7 +680,17 @@ async def approve_task(task_id: str, req: ApproveRequest, request: Request):
 
     # 触发 resume,让 LangGraph 从 interrupt 处继续运行
     from backend.api.services.task_runner import resume_task
-    task_handle = asyncio.create_task(resume_task(task_id, req.approved))
+    from backend.api.services.branch_manager import get_branch_manager
+    bm = get_branch_manager()
+    try:
+        active_branch = await bm.lazy_init_root(task_id, state)
+    except Exception as exc:
+        logger.warning(f"[approve] lazy_init_root failed: {exc}")
+        active_branch = None
+    thread_id = active_branch.thread_id if active_branch else task_id
+    task_handle = asyncio.create_task(
+        resume_task(task_id, req.approved, thread_id=thread_id)
+    )
     sm.register_bg_task(task_id, task_handle)
 
     await bus.publish(task_id, {
@@ -722,7 +758,17 @@ async def respond_checkpoint(
     sm.set(task_id, state)
 
     from backend.api.services.task_runner import resume_task
-    task_handle = asyncio.create_task(resume_task(task_id, approved))
+    from backend.api.services.branch_manager import get_branch_manager
+    bm = get_branch_manager()
+    try:
+        active_branch = await bm.lazy_init_root(task_id, state)
+    except Exception as exc:
+        logger.warning(f"[checkpoint] lazy_init_root failed: {exc}")
+        active_branch = None
+    thread_id = active_branch.thread_id if active_branch else task_id
+    task_handle = asyncio.create_task(
+        resume_task(task_id, approved, thread_id=thread_id)
+    )
     sm.register_bg_task(task_id, task_handle)
 
     await bus.publish(task_id, {
@@ -742,19 +788,101 @@ async def respond_checkpoint(
 
 @router.post("/tasks/{task_id}/chat")
 async def send_chat_message(task_id: str, req: ChatMessageRequest, request: Request):
+    """Operator chat endpoint (PR2 — branching).
+
+    Behaviour matrix::
+
+        running              → fork a new branch from the active branch's
+                                LangGraph checkpoint; the old branch is
+                                cooperatively paused (snapshot kept for
+                                later resume); the new branch starts with
+                                ``pending_user_prompt`` + ``operator_intent``
+                                injected so the supervisor reroutes by the
+                                operator's intent.
+        awaiting_approval    → also fork: the parent's checkpoint is
+                                preserved (so the operator can return to it
+                                via "switch + resume"), and the new branch
+                                inherits the snapshot but is released
+                                immediately for the supervisor to act.
+        completed / failed   → no fork, just append to user_messages
+                                (laboratory-notebook semantics — branching
+                                from a finalized run isn't useful since the
+                                attack chain has terminated).
+    """
     sm = _get_sm()
     bus = _get_bus()
     state = sm.get(task_id)
     if not state:
         raise HTTPException(404, f"任务 {task_id} 不存在")
     _enforce_task_owner(state, request, "send_chat_message")
+
+    text = (req.text or "").strip()
+    if not text:
+        raise HTTPException(400, "消息不能为空")
+
+    now_iso = datetime.utcnow().isoformat()
     msg = {
         "role": "user",
-        "text": req.text.strip(),
-        "timestamp": datetime.utcnow().isoformat(),
+        "text": text,
+        "timestamp": now_iso,
     }
+
+    # Always record the message on the timeline (irrespective of status).
     state.user_messages.append(msg)
-    sm.set(task_id, state)
+
+    fork_active = state.status in (
+        TaskStatus.RUNNING, TaskStatus.AWAITING_APPROVAL,
+    )
+    new_branch_payload = None
+    if fork_active:
+        from backend.api.services.branch_manager import get_branch_manager
+        bm = get_branch_manager()
+        # Ensure root exists (lazy bootstrap for legacy tasks).
+        try:
+            await bm.lazy_init_root(task_id, state)
+        except Exception as exc:
+            logger.warning(
+                f"[chat] lazy_init_root failed task={task_id}: {exc}"
+            )
+
+        # Persist message + state *before* fork so the snapshot we copy
+        # already contains the operator instruction.
+        joined = (state.pending_user_prompt or "").strip()
+        state.pending_user_prompt = (
+            f"{joined}\n{text}" if joined else text
+        )
+        signals = dict(state.replan_signals or {})
+        signals["operator_intent"] = int(signals.get("operator_intent", 0)) + 1
+        state.replan_signals = signals
+        sm.set(task_id, state)
+
+        # Forking handles cooperative interrupt of the parent + checkpoint
+        # copy + bg task scheduling for the child.
+        try:
+            child = await bm.fork_from_active(
+                task_id,
+                user_prompt=text,
+                fork_event_id=f"chat-{len(state.user_messages)}",
+            )
+            new_branch_payload = child.model_dump()
+        except Exception as exc:
+            logger.error(
+                f"[chat] fork_from_active failed task={task_id}: {exc}",
+                exc_info=True,
+            )
+            # Fall back to PR1 behaviour: at least flip operator_intent +
+            # request_interrupt so the in-flight branch reroutes itself.
+            try:
+                from backend.agents.interrupt_registry import request_interrupt
+                request_interrupt(
+                    task_id, reason="operator_chat",
+                    payload={"text": text, "fallback": True},
+                )
+            except Exception:
+                pass
+    else:
+        sm.set(task_id, state)
+
     await bus.publish(task_id, {
         "type": "decision_event",
         "data": {
@@ -764,9 +892,33 @@ async def send_chat_message(task_id: str, req: ChatMessageRequest, request: Requ
             "action": "user_chat",
             "message": msg["text"],
             "tone": "primary",
+            "branch_id": (new_branch_payload or {}).get("branch_id")
+                or state.active_branch_id or "",
         },
     })
-    return {"status": "sent", "message": msg}
+    if new_branch_payload is not None:
+        await bus.publish(task_id, {
+            "type": "decision_event",
+            "data": {
+                "id": f"branch-fork-{new_branch_payload['branch_id']}",
+                "timestamp": now_iso,
+                "phase": state.current_phase,
+                "action": "branch_forked",
+                "message": (
+                    f"已从此处分叉新分支 ({new_branch_payload['label']});"
+                    " 老分支已暂停, 可随时切回继续运行"
+                ),
+                "tone": "primary",
+                "branch_id": new_branch_payload["branch_id"],
+            },
+        })
+    return {
+        "status": "sent",
+        "message": msg,
+        "task_status": state.status.value,
+        "fork_active": fork_active,
+        "branch": new_branch_payload,
+    }
 
 
 @router.get("/tasks/{task_id}/chat")
@@ -783,3 +935,97 @@ async def get_chat_history(task_id: str, request: Request):
         timeline.append({**m, "role": "agent"})
     timeline.sort(key=lambda x: x.get("timestamp", ""))
     return {"messages": timeline}
+
+
+# ── 任务分支 (Claude/Kimi 风格 branch tree) ────────────────
+
+@router.get("/tasks/{task_id}/branches")
+async def list_task_branches(task_id: str, request: Request):
+    """Return the full branch tree of a task plus sibling/active metadata."""
+    sm = _get_sm()
+    state = sm.get(task_id)
+    if not state:
+        raise HTTPException(404, f"任务 {task_id} 不存在")
+    _enforce_task_owner(state, request, "list_task_branches")
+
+    from backend.api.services.branch_manager import get_branch_manager
+    bm = get_branch_manager()
+    # Lazy bootstrap so the legacy task always shows at least its root.
+    try:
+        await bm.lazy_init_root(task_id, state)
+    except Exception as exc:
+        logger.warning(f"[branches] lazy_init_root failed: {exc}")
+
+    branches = await bm.list_branches(task_id)
+    active = await bm.get_active(task_id)
+    active_id = active.branch_id if active else (state.active_branch_id or "")
+    return bm.to_tree_payload(branches, active_id)
+
+
+@router.post("/tasks/{task_id}/branches/{branch_id}/activate")
+async def activate_task_branch(
+    task_id: str, branch_id: str, request: Request,
+):
+    """Switch the *active* branch (the one mirrored to TaskStateManager).
+
+    By default the previously-active branch is paused so we never have two
+    branches actively touching the target at once.
+    """
+    sm = _get_sm()
+    state = sm.get(task_id)
+    if not state:
+        raise HTTPException(404, f"任务 {task_id} 不存在")
+    _enforce_task_owner(state, request, "activate_task_branch")
+
+    from backend.api.services.branch_manager import get_branch_manager
+    bm = get_branch_manager()
+    try:
+        target = await bm.switch_active(task_id, branch_id, pause_current=True)
+    except KeyError:
+        raise HTTPException(404, f"分支 {branch_id} 不存在")
+    return {"status": "ok", "branch": target.model_dump()}
+
+
+@router.post("/tasks/{task_id}/branches/{branch_id}/resume")
+async def resume_task_branch(
+    task_id: str, branch_id: str, request: Request,
+):
+    """Resume a paused branch.
+
+    If the branch was previously paused (e.g. user forked away from it),
+    this re-schedules a background runner so it can continue from its
+    last LangGraph checkpoint.
+    """
+    sm = _get_sm()
+    state = sm.get(task_id)
+    if not state:
+        raise HTTPException(404, f"任务 {task_id} 不存在")
+    _enforce_task_owner(state, request, "resume_task_branch")
+
+    from backend.api.services.branch_manager import get_branch_manager
+    bm = get_branch_manager()
+    try:
+        branch = await bm.resume(task_id, branch_id)
+    except KeyError:
+        raise HTTPException(404, f"分支 {branch_id} 不存在")
+    return {"status": "ok", "branch": branch.model_dump()}
+
+
+@router.post("/tasks/{task_id}/branches/{branch_id}/pause")
+async def pause_task_branch(
+    task_id: str, branch_id: str, request: Request,
+):
+    """Cooperatively pause a running branch."""
+    sm = _get_sm()
+    state = sm.get(task_id)
+    if not state:
+        raise HTTPException(404, f"任务 {task_id} 不存在")
+    _enforce_task_owner(state, request, "pause_task_branch")
+
+    from backend.api.services.branch_manager import get_branch_manager
+    bm = get_branch_manager()
+    try:
+        branch = await bm.pause(task_id, branch_id)
+    except KeyError:
+        raise HTTPException(404, f"分支 {branch_id} 不存在")
+    return {"status": "ok", "branch": branch.model_dump()}

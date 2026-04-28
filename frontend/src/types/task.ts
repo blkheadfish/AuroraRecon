@@ -330,6 +330,55 @@ export interface WsHistoryLogsEvent {
   total?: number
 }
 
+// ── 任务分支(Claude/Kimi 风格 branch tree) ─────────────────
+
+export type BranchStatus = 'running' | 'paused' | 'completed' | 'failed'
+
+export interface TaskBranch {
+  branch_id: string
+  task_id: string
+  parent_branch_id?: string | null
+  fork_event_id?: string | null
+  fork_phase: string
+  fork_round?: number | null
+  thread_id: string
+  status: BranchStatus
+  label: string
+  initiating_prompt: string
+  is_root: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface BranchTreeItem extends TaskBranch {
+  sibling_index: number
+  sibling_total: number
+  is_active: boolean
+  children: string[]
+}
+
+export interface BranchTreePayload {
+  branches: BranchTreeItem[]
+  active_branch_id: string
+  max_branches_per_task: number
+}
+
+export interface WsBranchForkedEvent {
+  type: 'branch_forked'
+  branch: TaskBranch
+  parent: TaskBranch
+}
+
+export interface WsBranchSwitchedEvent {
+  type: 'branch_switched'
+  branch: TaskBranch
+}
+
+export interface WsBranchStatusChangedEvent {
+  type: 'branch_status_changed'
+  branch: TaskBranch
+}
+
 export type WsTaskEvent =
   | WsPhaseUpdateEvent
   | WsLogEvent
@@ -339,4 +388,7 @@ export type WsTaskEvent =
   | WsDecisionEvent
   | WsHistoryMetaEvent
   | WsHistoryLogsEvent
+  | WsBranchForkedEvent
+  | WsBranchSwitchedEvent
+  | WsBranchStatusChangedEvent
   | Record<string, unknown>

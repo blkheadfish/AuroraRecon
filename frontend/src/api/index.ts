@@ -1,9 +1,11 @@
 import axios from 'axios'
 import type { AxiosInstance } from 'axios'
 import type {
+  BranchTreePayload,
   HealthInfo,
   MetricsOverview,
   ReportData,
+  TaskBranch,
   TaskDetail,
   TaskLogsPage,
   TaskStats,
@@ -258,10 +260,26 @@ export const api = {
     results?: Record<string, boolean>
   }> => http.post('/knowledge/build', vulnId ? { vuln_id: vulnId } : {}, { timeout: 600000 }),
 
-  sendChat: (taskId: string, text: string): Promise<{ status: string; message: { role: string; text: string; timestamp: string } }> =>
+  sendChat: (taskId: string, text: string): Promise<{
+    status: string
+    message: { role: string; text: string; timestamp: string }
+    task_status?: string
+    fork_active?: boolean
+    branch?: TaskBranch | null
+  }> =>
     http.post(`/tasks/${taskId}/chat`, { text }),
   getChatHistory: (taskId: string): Promise<{ messages: Array<{ role: string; text: string; timestamp: string }> }> =>
     http.get(`/tasks/${taskId}/chat`),
+
+  // ── 任务分支 (Claude/Kimi 风格 branch tree) ─────────────────
+  listBranches: (taskId: string): Promise<BranchTreePayload> =>
+    http.get(`/tasks/${taskId}/branches`),
+  activateBranch: (taskId: string, branchId: string): Promise<{ status: string; branch: TaskBranch }> =>
+    http.post(`/tasks/${taskId}/branches/${branchId}/activate`),
+  resumeBranch: (taskId: string, branchId: string): Promise<{ status: string; branch: TaskBranch }> =>
+    http.post(`/tasks/${taskId}/branches/${branchId}/resume`),
+  pauseBranch: (taskId: string, branchId: string): Promise<{ status: string; branch: TaskBranch }> =>
+    http.post(`/tasks/${taskId}/branches/${branchId}/pause`),
 
   listMembers: (): Promise<Array<{ user_id: string; email: string; role: string }>> =>
     http.get('/team/members'),

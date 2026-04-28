@@ -93,6 +93,11 @@ def _rule_decide(state: PentestState) -> Optional[dict[str, Any]]:
 
     # ── 1. 反馈循环 signals 优先于阶段递推 ──────────────────────
     sig = state.replan_signals or {}
+
+    # 1.0 操作员实时意图(最高优先级): 不走任何规则, 交给 LLM 兜底,
+    # _llm_decide 会读取 user_messages / pending_user_prompt 决定下一阶段。
+    if int(sig.get("operator_intent", 0)) > 0:
+        return None
     if sig.get("re_recon_for_hosts") and _under_cap(state, "recon"):
         return {"next": "recon", "reason": "new hosts discovered", "rule": "replan.re_recon_for_hosts"}
     if sig.get("re_vuln_scan_for_creds") and _under_cap(state, "vuln_scan"):
@@ -163,11 +168,18 @@ async def _llm_decide(state: PentestState) -> Optional[dict[str, Any]]:
 
     LLM 不必对 supervisor 的每一跳都参与，因此这里走 short-prompt 模式，
     并在异常时静默回退到 report，避免阻塞流水线。
+
+    操作员实时指令(``replan_signals['operator_intent']``)被优先注入到 LLM
+    prompt 里 — `prompt_utils.attach_operator_guidance` 把 pending_user_prompt
+    与最近的 user_messages 包成"最高优先级"块贴到 prompt 首尾两端。LLM
+    挑出的 next phase 仍受 SUPERVISOR_PHASES 白名单限制, 因此操作员说"直接
+    打"也不会 bypass human_approval 等护栏。
     """
     try:
+        from backend.agents.prompt_utils import attach_operator_guidance
         from backend.llm.router import LLMRouter
 
-        prompt = (
+        base_prompt = (
             "You are a pentest workflow supervisor. Choose the next phase.\n"
             f"Available phases: {', '.join(SUPERVISOR_PHASES + ['report'])}\n"
             f"Current state summary:\n"
@@ -180,13 +192,17 @@ async def _llm_decide(state: PentestState) -> Optional[dict[str, Any]]:
             f"  approved_once={state.approved_once} post_approved_once={state.post_approved_once}\n"
             "Respond with strict JSON: {\"next\": \"<phase>\", \"reason\": \"<short>\"}"
         )
+        prompt = attach_operator_guidance(base_prompt, state)
         llm = LLMRouter()
         raw = await llm.chat(prompt, response_format="json", temperature=0.1, max_tokens=256)
         decision = json.loads(raw)
         nxt = (decision.get("next") or "").strip()
         if nxt not in SUPERVISOR_PHASES + ["report"]:
             return {"next": "report", "reason": f"llm 给了非法 phase={nxt}", "rule": "llm.invalid"}
-        return {"next": nxt, "reason": decision.get("reason", "llm tie-break"), "rule": "llm.decide"}
+        rule = "llm.decide"
+        if int((state.replan_signals or {}).get("operator_intent", 0)) > 0:
+            rule = "llm.operator_intent"
+        return {"next": nxt, "reason": decision.get("reason", "llm tie-break"), "rule": rule}
     except Exception as exc:
         logger.warning(f"[supervisor] LLM 决策失败，回退 report: {exc}")
         return {"next": "report", "reason": f"llm error: {exc}", "rule": "llm.error"}
@@ -201,11 +217,28 @@ async def node_supervisor(state: PentestState) -> PentestState:
     state.current_phase = "supervisor"
     state.supervisor_round = int(state.supervisor_round or 0) + 1
 
+    operator_intent_pending = int(
+        (state.replan_signals or {}).get("operator_intent", 0)
+    ) > 0
+
     decision = _rule_decide(state)
     if decision is None:
         decision = await _llm_decide(state)
     if decision is None:
         decision = {"next": "report", "reason": "fallback", "rule": "guard.no_decision"}
+
+    # 操作员意图已经由 LLM 兜底消化, 清掉信号 + 摘除 interrupt registry 里
+    # 那条记录, 避免下一轮反复回到 LLM 路径制造死循环。pending_user_prompt
+    # 故意不清空 — 它是 sticky 指令, 在新指令写入前一直对后续节点有效。
+    if operator_intent_pending:
+        signals = dict(state.replan_signals or {})
+        signals.pop("operator_intent", None)
+        state.replan_signals = signals
+        try:
+            from backend.agents.interrupt_registry import consume_interrupt
+            consume_interrupt(state.task_id)
+        except Exception:
+            pass
 
     state.next_phase = decision["next"]
 
@@ -227,6 +260,7 @@ async def node_supervisor(state: PentestState) -> PentestState:
         "thinking": (
             f"#{state.supervisor_round} → {decision['next']}"
             f" (rule={decision.get('rule', '')}); reason={decision.get('reason', '')}"
+            + (" [operator_intent]" if operator_intent_pending else "")
         ),
         "purpose": "supervisor 路由决策",
         "message": f"supervisor: {decision['next']}",
@@ -235,6 +269,7 @@ async def node_supervisor(state: PentestState) -> PentestState:
     state.log(
         f"[supervisor] #{state.supervisor_round} 路由 → {decision['next']}"
         f" (rule={decision.get('rule', '')})"
+        + (" [operator_intent]" if operator_intent_pending else "")
     )
     return state
 

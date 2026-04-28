@@ -83,13 +83,21 @@ async def _cache_redis_incremental(task_id: str, state: PentestState):
 
 # ── 主任务执行 ────────────────────────────────────────────
 
-async def run_task(task_id: str, initial_state: PentestState):
+async def run_task(
+    task_id: str,
+    initial_state: PentestState,
+    *,
+    thread_id: str | None = None,
+):
     """
     运行一个任务的主协程。
 
     调用方(tasks.create_task)负责把 workflow_mode 默认值和 per-task 覆盖项
     已经填入 initial_state;本函数只负责把它交给 Orchestrator 并把流式更新
     推给事件总线 / DB / Redis。
+
+    ``thread_id`` 默认等于 ``task_id`` (旧行为)。开启对话分支后, BranchManager
+    会传入 ``f"{task_id}:{branch_id}"`` 让 LangGraph checkpoint 落到独立 thread。
     """
     sm = get_state_manager()
     bus = get_event_bus()
@@ -104,7 +112,9 @@ async def run_task(task_id: str, initial_state: PentestState):
     set_task_sink(task_id, _decision_sink)
 
     try:
-        async for node_name, raw_state in orchestrator.run_stream(initial_state):
+        async for node_name, raw_state in orchestrator.run_stream(
+            initial_state, thread_id=thread_id,
+        ):
             # 检查取消
             if sm.redis_available:
                 try:
@@ -195,7 +205,12 @@ async def run_task(task_id: str, initial_state: PentestState):
 
 # ── 审批后恢复执行 ────────────────────────────────────────
 
-async def resume_task(task_id: str, approved: bool):
+async def resume_task(
+    task_id: str,
+    approved: bool,
+    *,
+    thread_id: str | None = None,
+):
     sm = get_state_manager()
     bus = get_event_bus()
     sm.mark_running(task_id)
@@ -208,7 +223,7 @@ async def resume_task(task_id: str, approved: bool):
 
     try:
         async for node_name, raw_state in orchestrator.resume_stream(
-            task_id=task_id, approved=approved,
+            task_id=task_id, approved=approved, thread_id=thread_id,
         ):
             if isinstance(raw_state, dict):
                 try:

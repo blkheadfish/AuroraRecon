@@ -83,6 +83,38 @@ class TaskStatus(str, Enum):
 	FAILED = "failed"
 
 
+# ───────────────────────────────────────────────────────
+# 分支(branch)模型 — 见 conversation_branching_like_claude_kimi 计划
+# ───────────────────────────────────────────────────────
+
+BranchStatus = Literal["running", "paused", "completed", "failed"]
+
+
+class TaskBranch(BaseModel):
+	"""一条任务对话/执行分支(类似 Claude/Kimi 的 message branch)。
+
+	每个分支映射到 LangGraph 一个独立的 ``thread_id`` ——
+	``thread_id = f"{task_id}:{branch_id}"`` —— 因此 checkpoint 树是物理
+	隔离的, fork 后两个分支的执行不会互相污染。
+
+	Sibling 计算规则: 共享 ``parent_branch_id`` 与 ``fork_event_id`` 的所有
+	分支构成 sibling 集合, UI 上 ``<n/m>`` 在那个 fork 点上展示。
+	"""
+	branch_id: str
+	task_id: str
+	parent_branch_id: Optional[str] = None
+	fork_event_id: Optional[str] = None     # 父分支 timeline 上的 decision_event.id
+	fork_phase: str = ""
+	fork_round: Optional[int] = None
+	thread_id: str = ""                     # f"{task_id}:{branch_id}"
+	status: BranchStatus = "running"
+	created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+	updated_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+	label: str = ""                         # 自动从 prompt 截 30 字
+	initiating_prompt: str = ""             # 触发本分支的 user_prompt(root 为空)
+	is_root: bool = False                   # 兼容老任务: 第一个 branch 标 is_root=True
+
+
 class PortInfo(BaseModel):
 	port: int
 	protocol: str = "tcp"
@@ -595,6 +627,14 @@ class PentestState(BaseModel):
 	# 顺手 upsert 进来。非 supervisor 模式也会被填充，前端可以独立展示。
 	attack_graph: AttackGraph = Field(default_factory=AttackGraph)
 
+	# ── 对话分支(Claude/Kimi 风格) ──────────────────────────
+	# 每个 task 是一棵以 root branch 为根的分支森林。BranchManager 维护
+	# task_branches 表 + 每个 branch 一个 LangGraph thread_id;
+	# active_branch_id 在切换时更新, 写到 PentestState 仅为前端 / API 回显。
+	# root_branch_id 在第一次 fork 之前, 由 lazy_init_root 写入。
+	active_branch_id: str = ""
+	root_branch_id: str = ""
+
 	def log(self, msg: str) -> None:
 		import logging
 		ts = datetime.utcnow().strftime("%H:%M:%S")
@@ -607,11 +647,18 @@ class PentestState(BaseModel):
 		logging.getLogger(__name__).info(entry)
 
 	def push_decision(self, event: dict) -> None:
-		"""Append a structured decision event and fire-and-forget to EventBus."""
+		"""Append a structured decision event and fire-and-forget to EventBus.
+
+		``timestamp`` 采用 ISO-8601 完整格式(``YYYY-MM-DDTHH:MM:SS.ffffff``),
+		确保前端按字典序排序时跨午夜、同秒抖动、Vue3 reactive sort 路径下
+		都能严格还原事件先后。前端 ``formatTime`` 会把 ISO 串转成本地时:分:秒
+		展示,渲染层无感升级。
+		"""
+		now = datetime.utcnow()
 		if "id" not in event:
-			event["id"] = f"de-{len(self.live_decision_events)}-{datetime.utcnow().strftime('%H%M%S%f')}"
+			event["id"] = f"de-{len(self.live_decision_events)}-{now.strftime('%H%M%S%f')}"
 		if "timestamp" not in event:
-			event["timestamp"] = datetime.utcnow().strftime("%H:%M:%S")
+			event["timestamp"] = now.isoformat(timespec="microseconds")
 		self.live_decision_events.append(event)
 		# Prevent unbounded growth in LangGraph checkpoint payload
 		if len(self.live_decision_events) > 5000:

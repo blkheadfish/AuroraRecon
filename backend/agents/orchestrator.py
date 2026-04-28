@@ -171,17 +171,59 @@ def _append_tool_record(
 
 
 def _operator_chat_block(state: PentestState) -> str:
-    """决策对话中最近若干条用户消息，注入 LLM 上下文（纯文本，避免结构注入）。"""
-    lines: list[str] = []
-    for m in state.user_messages[-12:]:
-        t = (m.get("text") or "").strip()
-        if t:
-            if len(t) > 800:
-                t = t[:800] + "…"
-            lines.append(t)
-    if not lines:
-        return ""
-    return "\n操作员实时补充（决策对话，请优先参考）：\n" + "\n".join(f"- {t}" for t in lines)
+    """决策对话中用户最近的实时指令(含 pending_user_prompt + user_messages)。
+
+    现在直接复用 ``prompt_utils.operator_guidance_block``,这样所有节点 /
+    Skill / ReAct 看到的都是同一份格式化后的"操作员指令"块,且 pending_user_prompt
+    也会被一起拼进去——之前这个字段写了没人读的 bug 顺带修掉。
+    """
+    from backend.agents.prompt_utils import operator_guidance_block
+    block = operator_guidance_block(state)
+    return ("\n" + block) if block else ""
+
+
+def _yield_if_interrupted(state: PentestState, node_name: str) -> bool:
+    """Cooperative-interrupt poll for LangGraph node functions.
+
+    Each ``node_*`` body should call this as the very first thing. When the
+    operator has tapped /chat or /branches/.../activate from the HTTP side,
+    ``check_interrupt`` returns a payload here; we write a decision_event
+    and the caller is expected to ``return state`` immediately so LangGraph
+    routes back to supervisor (in supervisor mode) or to the next node
+    (linear/feedback mode, where the new pending_user_prompt will at least
+    be visible to the next LLM call).
+
+    Returns True when the node should yield. Does *not* consume the
+    interrupt — supervisor's ``_llm_decide`` is the single consumer.
+    """
+    try:
+        from backend.agents.interrupt_registry import check_interrupt
+    except Exception:
+        return False
+    entry = check_interrupt(state.task_id)
+    if not entry:
+        return False
+    text_preview = (entry.get("payload") or {}).get("text", "")
+    if isinstance(text_preview, str) and len(text_preview) > 120:
+        text_preview = text_preview[:120] + "…"
+    state.push_decision({
+        "action": "node_yielded_to_operator",
+        "phase": node_name,
+        "message": (
+            f"[{node_name}] 检测到操作员实时指令, 暂停本节点交回 supervisor 重路由"
+            + (f": {text_preview}" if text_preview else "")
+        ),
+        "tone": "warning",
+        "purpose": "operator interrupt",
+        "thinking": (
+            f"interrupt.reason={entry.get('reason', '')}, "
+            f"count={entry.get('count', 0)}"
+        ),
+    })
+    state.log(
+        f"[{node_name}] 让步给操作员指令(reason={entry.get('reason','')})"
+    )
+    return True
 
 
 def _build_dir_intel(state: PentestState) -> dict[str, Any]:
@@ -416,6 +458,8 @@ async def node_recon(state: PentestState) -> PentestState:
     state.current_phase = "recon"
     _record_chain_visit(state, "recon")
     state.status = TaskStatus.RUNNING
+    if _yield_if_interrupted(state, "recon"):
+        return state
 
     # ── 增量入口：把 pending_seeds["hosts"] 并入；签名命中则跳过 ──
     seed_hosts = _consume_pending_seeds(state, "hosts")
@@ -573,6 +617,8 @@ async def node_vuln_scan(state: PentestState) -> PentestState:
     from backend.agents.vuln_agent import VulnAgent
     state.current_phase = "vuln_scan"
     _record_chain_visit(state, "vuln_scan")
+    if _yield_if_interrupted(state, "vuln_scan"):
+        return state
 
     # Consume paths discovered by intel_harvest and merge into attack surface
     if state.intel_discovered_paths:
@@ -783,6 +829,8 @@ async def node_surface_enum(state: PentestState) -> PentestState:
     from backend.tools.tool_coverage_planner import ToolCoveragePlanner
     state.current_phase = "surface_enum"
     _record_chain_visit(state, "surface_enum")
+    if _yield_if_interrupted(state, "surface_enum"):
+        return state
 
     # ── 增量入口：消费 pending_seeds["ports"]/["web_paths"] ──
     seed_ports = _consume_pending_seeds(state, "ports")
@@ -1269,6 +1317,8 @@ async def node_intel_harvest(state: PentestState) -> PentestState:
 
     state.current_phase = "intel_harvest"
     _record_chain_visit(state, "intel_harvest")
+    if _yield_if_interrupted(state, "intel_harvest"):
+        return state
 
     file_targets, page_targets = _classify_harvest_targets(state)
     # 增量幂等：基于本轮目标集合签名
@@ -1547,6 +1597,8 @@ async def node_exploit_decision(state: PentestState) -> PentestState:
     from backend.llm.router import LLMRouter
     state.current_phase = "exploit_decision"
     _record_chain_visit(state, "exploit_decision")
+    if _yield_if_interrupted(state, "exploit_decision"):
+        return state
     exploitable = [f for f in state.findings if f.exploitable]
     if not exploitable:
         state.log("无可利用漏洞，跳过利用阶段")
@@ -1716,6 +1768,8 @@ async def node_foothold_attempt(state: PentestState) -> PentestState:
     from backend.agents.exploit_agent import ExploitAgent
     state.current_phase = "foothold_attempt"
     _record_chain_visit(state, "foothold_attempt")
+    if _yield_if_interrupted(state, "foothold_attempt"):
+        return state
     exploitable = [f for f in state.findings if f.exploitable]
     before_snapshot = _snapshot_facts(state)
     _normalize_and_dedupe_state_facts(state, source_node="foothold_attempt_pre")
@@ -1830,6 +1884,8 @@ async def node_secondary_attack(state: PentestState) -> PentestState:
     from backend.agents.exploit_agent import ExploitAgent
     state.current_phase = "secondary_attack"
     _record_chain_visit(state, "secondary_attack")
+    if _yield_if_interrupted(state, "secondary_attack"):
+        return state
     # linear 模式保持兼容：done 标志仍然写为 True；feedback / supervisor 模式
     # 通过 secondary_attack_count + max_secondary_attacks 控制重入次数。
     state.secondary_attack_done = True
@@ -1942,6 +1998,8 @@ async def node_post_foothold_enum(state: PentestState) -> PentestState:
     from backend.agents.post_agent import PostExploitAgent
     state.current_phase = "post_foothold_enum"
     _record_chain_visit(state, "post_foothold_enum")
+    if _yield_if_interrupted(state, "post_foothold_enum"):
+        return state
     before_snapshot = _snapshot_facts(state)
     state.log("攻链: 立足后枚举")
     try:
@@ -2083,6 +2141,8 @@ async def node_privesc_attempt(state: PentestState) -> PentestState:
     from backend.agents.post_agent import PostExploitAgent
     state.current_phase = "privesc_attempt"
     _record_chain_visit(state, "privesc_attempt")
+    if _yield_if_interrupted(state, "privesc_attempt"):
+        return state
     state.privesc_attempt_count += 1
     before_snapshot = _snapshot_facts(state)
     if not _consume_risk_budget(state, cost=1):
@@ -2131,6 +2191,8 @@ async def node_objective_collect(state: PentestState) -> PentestState:
     from backend.agents.post_agent import PostExploitAgent
     state.current_phase = "objective_collect"
     _record_chain_visit(state, "objective_collect")
+    if _yield_if_interrupted(state, "objective_collect"):
+        return state
     state.log("攻链: 目标收集（flag / proof 线索）")
     try:
         agent = PostExploitAgent()
@@ -2677,10 +2739,14 @@ class Orchestrator:
         )
         return initial_state
 
-    async def run(self, initial_state: PentestState) -> PentestState:
+    async def run(
+        self, initial_state: PentestState, thread_id: Optional[str] = None,
+    ) -> PentestState:
         await self._ensure_graph()
         initial_state = self._prepare_state(initial_state)
-        config = self._make_run_config(initial_state.task_id)
+        # ``thread_id`` 决定 LangGraph checkpoint 落地的位置。
+        # 默认 == task_id (旧任务兼容); 分支模式下传入 f"{task_id}:{branch_id}"。
+        config = self._make_run_config(thread_id or initial_state.task_id)
         initial_state.log(f"任务启动,目标: {initial_state.target}")
         try:
             final_state: PentestState = await asyncio.wait_for(
@@ -2700,37 +2766,131 @@ class Orchestrator:
             return initial_state
         return final_state
 
-    async def run_stream(self, initial_state: PentestState):
+    async def run_stream(
+        self, initial_state: PentestState, thread_id: Optional[str] = None,
+    ):
         await self._ensure_graph()
         initial_state = self._prepare_state(initial_state)
-        config = self._make_run_config(initial_state.task_id)
+        config = self._make_run_config(thread_id or initial_state.task_id)
 
         async for event in self._graph.astream(initial_state, config=config):
             for node_name, state in event.items():
                 yield node_name, state
 
-    async def resume(self, task_id: str, approved: bool = True) -> None:
+    async def resume(
+        self, task_id: str, approved: bool = True,
+        thread_id: Optional[str] = None,
+    ) -> None:
         await self._ensure_graph()
-        config = self._make_run_config(task_id)
+        config = self._make_run_config(thread_id or task_id)
         update = await self._build_approval_update(config, approved)
         await self._graph.aupdate_state(config, update)
         await self._graph.ainvoke(None, config=config)
 
-    async def resume_stream(self, task_id: str, approved: bool = True):
+    async def resume_stream(
+        self, task_id: str, approved: bool = True,
+        thread_id: Optional[str] = None,
+    ):
         """
         流式恢复执行（审批后继续 exploit → post → report）。
 
         与 resume() 的区别：用 astream 代替 ainvoke，
         每个节点完成后 yield 状态更新，供 API 层实时推送。
+
+        ``thread_id`` 默认 = task_id; 分支模式传 branch.thread_id。
         """
         await self._ensure_graph()
-        config = self._make_run_config(task_id)
+        config = self._make_run_config(thread_id or task_id)
         update = await self._build_approval_update(config, approved)
         await self._graph.aupdate_state(config, update)
 
         async for event in self._graph.astream(None, config=config):
             for node_name, state in event.items():
                 yield node_name, state
+
+    async def resume_branch(
+        self,
+        thread_id: str,
+        *,
+        patch: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Resume a *branch* thread without touching approval gates.
+
+        Unlike :meth:`resume`, this does not write ``approved`` / ``post_approved``;
+        it just optionally applies ``patch`` (e.g. injecting ``pending_user_prompt``
+        or ``replan_signals``) and then invokes the graph to step through the
+        remaining nodes.
+        """
+        await self._ensure_graph()
+        config = self._make_run_config(thread_id)
+        if patch:
+            await self._graph.aupdate_state(config, patch)
+        await self._graph.ainvoke(None, config=config)
+
+    async def resume_branch_stream(
+        self,
+        thread_id: str,
+        *,
+        patch: Optional[dict[str, Any]] = None,
+    ):
+        """Streaming variant of ``resume_branch``."""
+        await self._ensure_graph()
+        config = self._make_run_config(thread_id)
+        if patch:
+            await self._graph.aupdate_state(config, patch)
+        async for event in self._graph.astream(None, config=config):
+            for node_name, state in event.items():
+                yield node_name, state
+
+    async def get_branch_state(self, thread_id: str) -> Optional[PentestState]:
+        """Read PentestState from a specific LangGraph thread/checkpoint."""
+        await self._ensure_graph()
+        config = {"configurable": {"thread_id": thread_id}}
+        snapshot = await self._graph.aget_state(config)
+        if snapshot and snapshot.values:
+            try:
+                return PentestState(**snapshot.values)
+            except Exception:
+                return None
+        return None
+
+    async def fork_branch_state(
+        self,
+        *,
+        source_thread_id: str,
+        target_thread_id: str,
+        patch: dict[str, Any],
+        as_node: Optional[str] = None,
+    ) -> bool:
+        """Copy the latest checkpoint of *source_thread_id* into *target_thread_id*
+        and apply ``patch`` (e.g. ``pending_user_prompt`` / ``replan_signals``).
+
+        Returns True on success, False if the source thread has no checkpoint
+        yet (e.g. fork issued before any node has run, very rare).
+        """
+        await self._ensure_graph()
+        src_cfg = {"configurable": {"thread_id": source_thread_id}}
+        snap = await self._graph.aget_state(src_cfg)
+        if not snap or not snap.values:
+            return False
+
+        # Combine existing snapshot values with the patch into a single payload
+        # written to the *new* thread. We use aupdate_state on the new thread
+        # which seeds its checkpoint history with this state.
+        try:
+            base = dict(snap.values)
+        except Exception:
+            base = {}
+        merged = dict(base)
+        for k, v in (patch or {}).items():
+            merged[k] = v
+
+        dst_cfg = {"configurable": {"thread_id": target_thread_id}}
+        if as_node:
+            await self._graph.aupdate_state(dst_cfg, merged, as_node=as_node)
+        else:
+            await self._graph.aupdate_state(dst_cfg, merged)
+        return True
 
     @staticmethod
     def _make_run_config(task_id: str) -> dict:
@@ -2762,9 +2922,11 @@ class Orchestrator:
             return {"post_approved": approved}
         return {"approved": approved}
 
-    async def get_state(self, task_id: str) -> Optional[PentestState]:
+    async def get_state(
+        self, task_id: str, thread_id: Optional[str] = None,
+    ) -> Optional[PentestState]:
         await self._ensure_graph()
-        config = {"configurable": {"thread_id": task_id}}
+        config = {"configurable": {"thread_id": thread_id or task_id}}
         snapshot = await self._graph.aget_state(config)
         if snapshot and snapshot.values:
             try:
