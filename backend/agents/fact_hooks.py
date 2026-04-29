@@ -43,22 +43,29 @@ def _safe_fact_key(fact_type: str, value: Any) -> str:
 
 
 def _project_confirmed_from_task_facts(task_facts: dict[str, TaskFact]) -> dict[str, Any]:
+    # 标量字段（lfi_param/lfi_depth/lfi_style/service_ssh_port）采用"首值优先"语义：
+    # 一旦某条事实被首次确认，后续不同值的同类事实不应覆盖它，避免假阳性观测污染。
+    # 因此按 first_seen_at 升序遍历，标量字段使用 setdefault；列表字段仍保持 union/dedup。
     confirmed: dict[str, Any] = {"lfi": {}, "services": {}, "creds": []}
-    for fact in (task_facts or {}).values():
+    sorted_facts = sorted(
+        (task_facts or {}).values(),
+        key=lambda f: getattr(f, "first_seen_at", "") or "",
+    )
+    for fact in sorted_facts:
         ft = fact.fact_type
         val = fact.value
         if ft == "lfi_param":
-            confirmed["lfi"]["param"] = val
+            confirmed["lfi"].setdefault("param", val)
         elif ft == "lfi_depth":
-            confirmed["lfi"]["depth"] = val
+            confirmed["lfi"].setdefault("depth", val)
         elif ft == "lfi_style":
-            confirmed["lfi"]["style"] = val
+            confirmed["lfi"].setdefault("style", val)
         elif ft == "lfi_readable_file":
             confirmed["lfi"].setdefault("readable_files", [])
             if val not in confirmed["lfi"]["readable_files"]:
                 confirmed["lfi"]["readable_files"].append(val)
         elif ft == "service_ssh_port":
-            confirmed["services"]["ssh_port"] = val
+            confirmed["services"].setdefault("ssh_port", val)
         elif ft == "service_log_readable":
             confirmed["services"].setdefault("log_readable", [])
             if val not in confirmed["services"]["log_readable"]:

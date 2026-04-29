@@ -2900,9 +2900,35 @@ class Orchestrator:
         for k, v in (patch or {}).items():
             merged[k] = v
 
+        # ── 关键: 提取源 checkpoint 的"上一个执行节点"作为 as_node ──
+        # 不传 as_node 时, LangGraph 在新 thread 上无法推断 ``next``,
+        # 会把 next 计算为 [] (相当于"已结束"), 导致后续
+        # ``astream(None)`` / ``run_branch_from_checkpoint_stream`` 看到空
+        # next 直接返回 0 个事件。子分支立刻被 ``_resume_branch_bg``
+        # 错误地标记成 paused, 用户看到"刚分叉就暂停"。
+        #
+        # 解决方案: 把源 checkpoint 的最后一个 writes 节点名透传给
+        # ``aupdate_state(as_node=...)``, LangGraph 据此重建 next 队列,
+        # 让子线程从 *父分支当时的下一个待执行节点* 继续运行。
+        effective_as_node = as_node
+        if not effective_as_node:
+            try:
+                meta = snap.metadata or {}
+                writes = meta.get("writes") if isinstance(meta, dict) else None
+                if isinstance(writes, dict) and writes:
+                    # writes 是 OrderedDict, 最后一个 key 是最近执行的节点
+                    effective_as_node = list(writes.keys())[-1]
+            except Exception as _exc:
+                logger.debug(
+                    f"[Orchestrator] fork_branch_state: extract as_node "
+                    f"failed: {_exc}"
+                )
+
         dst_cfg = {"configurable": {"thread_id": target_thread_id}}
-        if as_node:
-            await self._graph.aupdate_state(dst_cfg, merged, as_node=as_node)
+        if effective_as_node:
+            await self._graph.aupdate_state(
+                dst_cfg, merged, as_node=effective_as_node,
+            )
         else:
             await self._graph.aupdate_state(dst_cfg, merged)
         return True

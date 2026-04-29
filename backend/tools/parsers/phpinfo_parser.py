@@ -206,13 +206,23 @@ def parse_phpinfo(text: str) -> dict[str, Any]:
         facts["loaded_extensions"] = loaded
 
     if "php_version" not in facts:
-        m = re.search(r'PHP\s+Version\s*</?[^>]*>?\s*([\d.]+(?:-[\w.]+)?)',
-                      text, re.IGNORECASE)
+        # 兜底：HTML 排版可能把版本号放在 <h1>PHP Version 7.4.3</h1>（内联）
+        # 或 <td>PHP Version</td><td>7.4.3</td>（拆 cell），先剥标签再匹配
+        # 就能用同一条正则覆盖。CLI 的 "PHP Version => 7.4.33" 用第二条兜底。
+        plain = _TAG_STRIP_RE.sub(" ", text)
+        m = re.search(
+            r'PHP\s+Version\s+([\d.]+(?:-[\w.]+)?)',
+            plain,
+            re.IGNORECASE,
+        )
         if m:
             facts["php_version"] = m.group(1).strip()
         else:
-            m2 = re.search(r'PHP\s+Version\s*=>\s*([\d.]+(?:-[\w.]+)?)',
-                           text, re.IGNORECASE)
+            m2 = re.search(
+                r'PHP\s+Version\s*=>\s*([\d.]+(?:-[\w.]+)?)',
+                text,
+                re.IGNORECASE,
+            )
             if m2:
                 facts["php_version"] = m2.group(1).strip()
 

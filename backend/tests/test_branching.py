@@ -39,7 +39,8 @@ class FakeOrchestrator:
         self.threads: dict[str, dict] = {}
         # Per-thread block until released
         self.gates: dict[str, asyncio.Event] = {}
-        self.fork_calls: list[tuple[str, str, dict]] = []
+        # Each entry: (source_thread_id, target_thread_id, patch, source_checkpoint_id)
+        self.fork_calls: list[tuple[str, str, dict, str | None]] = []
 
     def _gate(self, thread_id: str) -> asyncio.Event:
         if thread_id not in self.gates:
@@ -56,8 +57,15 @@ class FakeOrchestrator:
     async def fork_branch_state(
         self, *, source_thread_id: str, target_thread_id: str,
         patch: dict[str, Any], as_node: str | None = None,
+        source_checkpoint_id: str | None = None,
     ) -> bool:
-        self.fork_calls.append((source_thread_id, target_thread_id, dict(patch)))
+        # 真实 Orchestrator.fork_branch_state 在 phase3 升级时新增了
+        # ``source_checkpoint_id`` 参数（可选），用来从历史中任意 checkpoint
+        # 分叉。FakeOrchestrator 也接住这个 kwarg，行为上不区分：
+        # 不论是否传 source_checkpoint_id，都从最新 thread 状态克隆。
+        self.fork_calls.append(
+            (source_thread_id, target_thread_id, dict(patch), source_checkpoint_id)
+        )
         src = self.threads.get(source_thread_id)
         if src is None:
             # Plant the patch verbatim so child can still bootstrap.

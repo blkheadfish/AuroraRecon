@@ -320,11 +320,35 @@ class BranchManager:
                 source_checkpoint_id=source_checkpoint_id,
             )
             if not forked:
-                # No source checkpoint: planted state from scratch via run_task.
+                # 源线程还没有任何 checkpoint(任务刚启动 <1s 内 fork) →
+                # ``aget_state`` 返回空, fork_branch_state 提前 return False。
+                # 旧代码到这里就只打日志, 但子线程依旧没有任何 checkpoint,
+                # ``_resume_branch_bg`` 跑 ``astream(None)`` 时立刻空转, 把
+                # 子分支错误标记成 paused — 用户感知就是"消息发出去 root 暂停
+                # 了, 但没有新分支在运行"。
+                # 兜底: 用内存里的当前 state(已注入 pending_user_prompt /
+                # operator_intent) + patch 直接植入子线程, 让 LangGraph 从
+                # 入口节点重新路由 supervisor。``as_node='__start__'`` 是
+                # LangGraph 的标准入口标识, aupdate_state 后 next 会指向
+                # 真正的第一个业务节点(supervisor)。
                 logger.info(
                     f"[BranchManager] source thread {parent.thread_id} has no "
-                    f"checkpoint; will start child {new_id} fresh"
+                    f"checkpoint; planting fresh state for child {new_id}"
                 )
+                try:
+                    fresh_values = state.model_dump()
+                    fresh_values.update(patch)
+                    dst_cfg = {"configurable": {"thread_id": new_thread}}
+                    await orchestrator._graph.aupdate_state(
+                        dst_cfg, fresh_values, as_node="__start__",
+                    )
+                    forked = True
+                except Exception as exc:
+                    logger.error(
+                        f"[BranchManager] fresh-plant for child {new_id} "
+                        f"failed: {exc}",
+                        exc_info=True,
+                    )
 
             # 4) Update in-memory state to reflect the active branch pointer
             # and advertise the fork on the timeline.
@@ -468,9 +492,13 @@ class BranchManager:
                     f"{FORK_INTERRUPT_TIMEOUT_SEC}s — cancelling"
                 )
                 bg.cancel()
+                # Python 3.11+ 起 ``asyncio.CancelledError`` 直接继承 ``BaseException``，
+                # ``except Exception`` 抓不到它。``bg.cancel()`` 之后等待 bg 结束时
+                # ``wait_for`` 会重新抛出 CancelledError，必须显式捕获，否则会逃出
+                # 整个 ``_pause_branch``，让 ``switch_active`` / ``pause`` 整体失败。
                 try:
                     await asyncio.wait_for(bg, timeout=2.0)
-                except Exception:
+                except (asyncio.CancelledError, Exception):
                     pass
             except asyncio.CancelledError:
                 pass
@@ -599,6 +627,15 @@ class BranchManager:
             branch.status = "failed"
             branch.updated_at = datetime.utcnow().isoformat()
             await self._persist(branch)
+            # 失败状态也要广播, 否则前端只能等下一次 refreshBranches 才能
+            # 看到红色徽标, "继续运行" 按钮的可见性也会延迟。
+            try:
+                await bus.publish(task_id, {
+                    "type": "branch_status_changed",
+                    "branch": branch.model_dump(),
+                })
+            except Exception:
+                pass
         else:
             # Natural completion: branch is done, status flips to completed
             # only when the underlying state is COMPLETED/FAILED.
@@ -611,6 +648,16 @@ class BranchManager:
                 branch.status = "paused"
             branch.updated_at = datetime.utcnow().isoformat()
             await self._persist(branch)
+            # 同步把分支的最终状态推给前端 — 这是前端及时把"running"徽标
+            # 切换成"已暂停 / 已完成 / 失败"的唯一实时通道。没有这个事件,
+            # 用户必须手动刷新或等 ws 下一次 phase_update 才能看到状态。
+            try:
+                await bus.publish(task_id, {
+                    "type": "branch_status_changed",
+                    "branch": branch.model_dump(),
+                })
+            except Exception:
+                pass
         finally:
             sm.mark_stopped(task_id)
             self._bg.pop(branch.branch_id, None)
@@ -625,10 +672,20 @@ class BranchManager:
             # Same idea for ``sm._bg_tasks``: only release the slot if it
             # still points at us. If a fork already swapped in a new owner,
             # don't strip it.
-            current_owner = sm._bg_tasks.get(task_id)
-            if current_owner is asyncio.current_task():
-                sm.unregister_bg_task(task_id)
-                clear_task_loop(task_id)
+            #
+            # ``asyncio.current_task()`` 需要"运行中的 event loop"才能调用，
+            # 在 pytest 关闭 loop 之后仍有 cancel 的 bg 任务跑到这里，会抛
+            # ``RuntimeError: no running event loop`` 让 ``finally`` 半途
+            # 中断，制造 unraisable warning。这里一起兜底：拿不到 task 就
+            # 直接放弃 owner 比对（保守跳过 unregister，避免误删别的
+            # branch 的 sink/loop 注册）。
+            try:
+                current_owner = sm._bg_tasks.get(task_id)
+                if current_owner is asyncio.current_task():
+                    sm.unregister_bg_task(task_id)
+                    clear_task_loop(task_id)
+            except RuntimeError:
+                pass
 
     def to_tree_payload(self, branches: list[TaskBranch], active_id: str) -> dict[str, Any]:
         """Compute sibling counts & active flags for the API tree response."""

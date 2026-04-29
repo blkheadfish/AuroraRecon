@@ -827,8 +827,14 @@ async def send_chat_message(task_id: str, req: ChatMessageRequest, request: Requ
         "timestamp": now_iso,
     }
 
-    fork_active = state.status in (
-        TaskStatus.RUNNING, TaskStatus.AWAITING_APPROVAL,
+    # ``state.status`` 是"业务状态"(running / awaiting_approval / completed),
+    # 但当某个分支被 ``_resume_branch_bg`` 错误标记为 paused 后, 任务仍然在
+    # 进行中(_running_tasks 集合 = 真正的 lifecycle 标识), 此时我们仍然要
+    # 允许 fork — 否则用户的"80端口有什么目录?"消息会落到 else 分支被
+    # 当成"终态追加"丢弃, 表现为 root 已暂停 + 没有新分支启动。
+    fork_active = (
+        state.status in (TaskStatus.RUNNING, TaskStatus.AWAITING_APPROVAL)
+        or sm.is_running(task_id)
     )
 
     # ── user_messages 写入责任划分 ──────────────────────────
