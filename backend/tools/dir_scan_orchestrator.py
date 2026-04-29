@@ -101,6 +101,39 @@ class DirScanOrchestrator:
         self._raw_outputs: list[str] = []
         self._recent_new_hints: set[str] = set()
         self._active_plan: list[dict] = []
+        self._tool_event_idx: int = 0
+
+    async def _push_tool_event(self, action: str, **fields: Any) -> None:
+        """Fire-and-forget 推送一条 decision_event 到 EventBus,让前端聊天
+        时间轴 (ToolChainRail) 在每个工具开始/结束的瞬间立刻有响应,不必
+        等节点 yield 才看到一批 phase_update。
+
+        - 走 ``get_task_sink`` 而不是直接 ``bus.publish``,这样能复用
+          ``task_runner._decision_sink`` 已经登记的包装逻辑(``type:
+          decision_event``, payload 在 data 下), 与 ``state.push_decision``
+          走同一条管道, 前端去重 / 排序 / 重连回放都自动适用。
+        - 任何异常都被吞掉: dir 扫描本身不应该因为 sink 抖动而中断。
+        """
+        if not self._task_id:
+            return
+        try:
+            from backend.api.event_bus import get_task_sink
+            from datetime import datetime
+            sink = get_task_sink(self._task_id)
+            if not sink:
+                return
+            self._tool_event_idx += 1
+            now = datetime.utcnow()
+            event = {
+                "id": f"de-dirorch-{self._tool_event_idx}-{now.strftime('%H%M%S%f')}",
+                "timestamp": now.isoformat(timespec="microseconds"),
+                "phase": "recon",
+                "action": action,
+                **fields,
+            }
+            await sink(event)
+        except Exception:
+            pass
 
     async def run(
         self,
@@ -136,12 +169,21 @@ class DirScanOrchestrator:
                 continue
 
             tool_name = tool_spec["name"]
+            cmd_preview = str(tool_spec.get("runtime_command") or tool_spec.get("script") or "")
+            cmd_preview = " ".join(cmd_preview.split())[:260]
             if self._log_cb:
-                cmd_preview = str(tool_spec.get("runtime_command") or tool_spec.get("script") or "")
-                cmd_preview = " ".join(cmd_preview.split())[:260]
                 await self._log_cb(
                     f"[DirOrch] 执行 {tool_name} | timeout={tool_spec['timeout']}s"
                 )
+            # 工具启动事件: 让 Chat 时间轴在第一时间显示"正在跑 feroxbuster"。
+            await self._push_tool_event(
+                "tool_use_start",
+                tool=tool_name,
+                command=cmd_preview,
+                timeout=int(tool_spec.get("timeout") or 0),
+                summary=f"开始目录扫描: {tool_name}",
+                message=f"开始目录扫描工具 {tool_name}",
+            )
 
             t0 = time.monotonic()
             try:
@@ -184,6 +226,21 @@ class DirScanOrchestrator:
                         await self._log_cb(
                             f"[DirOrch] {tool_name} 本轮新增路径: {detail}"
                         )
+                # 工具完成事件: 把"+N 条新路径 / 耗时"广播到 Chat 时间轴,
+                # 这样即使没有显式 finding, 用户也能持续看到进度而不是空白。
+                await self._push_tool_event(
+                    "tool_use_done",
+                    tool=tool_name,
+                    paths_found=int(new_count),
+                    paths_total=int(self.aggregator.count),
+                    elapsed=round(float(elapsed), 2),
+                    new_paths_preview=new_paths_only[:8],
+                    summary=(
+                        f"{tool_name} 完成: +{new_count} 路径 (累计 {self.aggregator.count}),"
+                        f" 耗时 {elapsed:.1f}s"
+                    ),
+                    message=f"{tool_name} 扫描完成,发现 {new_count} 条新路径",
+                )
 
                 self._round += 1
                 self._track_recent_hints(new_paths_only)
@@ -203,6 +260,15 @@ class DirScanOrchestrator:
                 )
                 if self._log_cb:
                     await self._log_cb(f"[DirOrch] {tool_name} 超时 ({elapsed:.0f}s)")
+                await self._push_tool_event(
+                    "tool_use_done",
+                    tool=tool_name,
+                    status="timeout",
+                    elapsed=round(float(elapsed), 2),
+                    summary=f"{tool_name} 超时 ({elapsed:.0f}s)",
+                    message=f"{tool_name} 执行超时",
+                    tone="warning",
+                )
                 self._round += 1
             except Exception as e:
                 elapsed = time.monotonic() - t0
@@ -211,6 +277,16 @@ class DirScanOrchestrator:
                     skip_reason=str(e)[:200], elapsed=elapsed,
                 )
                 logger.warning(f"[DirOrch] {tool_name} 异常: {e}")
+                await self._push_tool_event(
+                    "tool_use_done",
+                    tool=tool_name,
+                    status="failed",
+                    elapsed=round(float(elapsed), 2),
+                    error=str(e)[:200],
+                    summary=f"{tool_name} 异常: {str(e)[:120]}",
+                    message=f"{tool_name} 执行失败",
+                    tone="error",
+                )
                 self._round += 1
 
         # Step 1.5: deterministic backup variant probe for all source/config files

@@ -550,7 +550,15 @@ class ToolExecutor:
 
         start = time.monotonic()
         try:
-            use_streaming = stream_callback is not None and input_data is None
+            # 只要存在 log_callback 或 stream_callback,就走逐行 readline 模式,
+            # 让 feroxbuster / gobuster 等长时间扫描工具的每一行输出都能即时
+            # 通过 log_callback → state.log() → EventBus 推到前端 Log Panel,
+            # 而不是等 proc.communicate() 整个进程结束才一次性涌出。
+            # input_data 路径仍然走 communicate, 因为需要把 stdin 写完整。
+            use_streaming = (
+                (stream_callback is not None or log_callback is not None)
+                and input_data is None
+            )
 
             proc = await asyncio.create_subprocess_exec(
                 *cmd,

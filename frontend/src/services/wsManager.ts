@@ -22,6 +22,43 @@ const MAX_RETRIES = 30
 // 切到 LRU 风格后 set 永远保持 O(1) 大小,代价只是非常老的重复行可能漏判。
 const SEEN_LOGS_CAP = 4000
 
+// ── lastLogSeq sessionStorage 持久化 ────────────────────────
+// Pinia 是纯内存 store, 浏览器 F5 刷新后所有 store 状态都重置, 包括
+// channel.lastLogSeq → 重连时只能用默认 ``log_tail=200`` 拉一段历史,
+// 长任务下 200 条根本对不上用户上次看到的位置。这里把每个 task 的
+// lastLogSeq 同步进 sessionStorage, 刷新后能用 ``after_log_seq=K``
+// 精准请求增量, 既不重发已看过的日志也不漏。tab 关闭后 session 自动
+// 清理, 不会污染长期存储。
+const LOG_SEQ_KEY_PREFIX = 'ws_seq_'
+
+function loadSavedLogSeq(taskId: string): number {
+  try {
+    const raw = sessionStorage.getItem(LOG_SEQ_KEY_PREFIX + taskId)
+    if (!raw) return 0
+    const n = Number.parseInt(raw, 10)
+    return Number.isFinite(n) && n > 0 ? n : 0
+  } catch {
+    return 0
+  }
+}
+
+function persistLogSeq(taskId: string, seq: number) {
+  if (!Number.isFinite(seq) || seq <= 0) return
+  try {
+    sessionStorage.setItem(LOG_SEQ_KEY_PREFIX + taskId, String(seq))
+  } catch {
+    /* 配额 / 隐私模式 sessionStorage 不可用时静默忽略 */
+  }
+}
+
+function bumpLogSeq(taskId: string, channel: ChannelState, candidate: number) {
+  if (!Number.isFinite(candidate)) return
+  if (candidate > channel.lastLogSeq) {
+    channel.lastLogSeq = candidate
+    persistLogSeq(taskId, candidate)
+  }
+}
+
 function noteSeenLog(channel: ChannelState, line: string) {
   if (!line || channel.seenLogs.has(line)) return
   channel.seenLogs.add(line)
@@ -32,7 +69,7 @@ function noteSeenLog(channel: ChannelState, line: string) {
   }
 }
 
-function dedupeLogs(channel: ChannelState, event: WsTaskEvent): WsTaskEvent {
+function dedupeLogs(taskId: string, channel: ChannelState, event: WsTaskEvent): WsTaskEvent {
   if ((event as { type?: string }).type === 'phase_update') {
     const logs = ((event as { logs?: string[] }).logs || []).filter((line) => !channel.seenLogs.has(line))
     logs.forEach((line) => noteSeenLog(channel, line))
@@ -41,10 +78,10 @@ function dedupeLogs(channel: ChannelState, event: WsTaskEvent): WsTaskEvent {
   if ((event as { type?: string }).type === 'log') {
     const line = String((event as { data?: string }).data || '')
     const seq = (event as { seq?: number }).seq
-    // 推进 lastLogSeq,这样断线重连时 ?after_log_seq=N 只会补差值,
+    // 推进 lastLogSeq,这样断线重连/刷新时 ?after_log_seq=N 只会补差值,
     // 不会再让后端把最近 200 行 history_logs 整段重发。
     if (typeof seq === 'number' && Number.isFinite(seq)) {
-      channel.lastLogSeq = Math.max(channel.lastLogSeq, seq + 1)
+      bumpLogSeq(taskId, channel, seq + 1)
     }
     if (line && !channel.seenLogs.has(line)) {
       noteSeenLog(channel, line)
@@ -58,7 +95,7 @@ function dedupeLogs(channel: ChannelState, event: WsTaskEvent): WsTaskEvent {
     filtered.forEach((line) => noteSeenLog(channel, line))
     const meta = event as { start_seq?: number; next_seq?: number; total?: number }
     if (typeof meta.next_seq === 'number') {
-      channel.lastLogSeq = Math.max(channel.lastLogSeq, meta.next_seq)
+      bumpLogSeq(taskId, channel, meta.next_seq)
     }
     return { ...(event as object), data: filtered } as WsTaskEvent
   }
@@ -129,7 +166,7 @@ function connect(taskId: string) {
           })
           .catch(() => {})
       }
-      const event = dedupeLogs(channel, rawEvent)
+      const event = dedupeLogs(taskId, channel, rawEvent)
       const t = (event as { type?: string }).type
       if (t === 'heartbeat' || t === 'pong') return
       broadcast(taskId, event)
@@ -169,6 +206,10 @@ function connect(taskId: string) {
 export function subscribeTaskEvents(taskId: string, listener: Listener): () => void {
   let channel = channels.get(taskId)
   if (!channel) {
+    // 首次为该 task 建 channel 时, 从 sessionStorage 恢复上次见到的最大 seq,
+    // 这样 connect() 走 wsOptions.afterLogSeq 直接进入"只补增量"路径,
+    // 而不是默认拉最近 200 条 history_logs (跨刷新时往往全是已见过的)。
+    const savedSeq = loadSavedLogSeq(taskId)
     channel = {
       conn: {
         close: () => {},
@@ -183,7 +224,7 @@ export function subscribeTaskEvents(taskId: string, listener: Listener): () => v
       retries: 0,
       reconnectTimer: null,
       firstMessageAfterReconnect: false,
-      lastLogSeq: 0,
+      lastLogSeq: savedSeq,
     }
     channels.set(taskId, channel)
     connect(taskId)

@@ -28,9 +28,15 @@ router = APIRouter()
 
 # 建连首包默认回放的最近日志条数。任务超过该量级的历史日志走
 # /tasks/{id}/logs 的分页接口按需拉取,避免单帧回放数 MB 文本。
-WS_DEFAULT_HISTORY_LOG_TAIL = 200
+# 默认提到 500: 前端用 sessionStorage 持久化 lastLogSeq 后, 多数刷新
+# 场景会走 ``after_log_seq`` 增量路径而不是默认 tail; 但首次进入或
+# 清缓存的"冷启动"场景下, 200 条对长任务来说不够回填用户上次看到
+# 的位置, 提到 500 在带宽 (~50KB) 和体感 (能看到一段连贯历史) 之间
+# 取一个折中。decision_event tail 同步提到 300, 让 ToolChainRail
+# 重连后能展示更完整的工具链时间轴。
+WS_DEFAULT_HISTORY_LOG_TAIL = 500
 WS_MAX_HISTORY_LOG_TAIL = 5000
-WS_HISTORY_DECISION_TAIL = 120
+WS_HISTORY_DECISION_TAIL = 300
 
 
 @router.websocket("/ws/{task_id}")

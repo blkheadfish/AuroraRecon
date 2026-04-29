@@ -143,6 +143,7 @@ import { api } from '@/api'
 import { useTheme } from '@/composables/useTheme'
 import { useUiPrefsStore } from '@/stores/uiPrefs'
 import { useAuthStore } from '@/stores/auth'
+import { useTaskListStore } from '@/stores/taskList'
 import { storeToRefs } from 'pinia'
 
 const MOBILE_BREAKPOINT = 768
@@ -151,6 +152,7 @@ const route = useRoute()
 const router = useRouter()
 const uiPrefs = useUiPrefsStore()
 const auth = useAuthStore()
+const taskListStore = useTaskListStore()
 const { sidebarCollapsed } = storeToRefs(uiPrefs)
 const isMobile = ref(window.innerWidth < MOBILE_BREAKPOINT)
 
@@ -226,6 +228,20 @@ onMounted(() => {
   apiCheckTimer = setInterval(checkApi, 30000)
   window.addEventListener('resize', onResize)
   onResize()
+  // 已登录时立即拉一次任务列表: Pinia 是纯内存 store, 浏览器刷新后任务
+  // 列表 / 侧边栏徽标 / dashboard 概览全都会变空, 用户体感 "状态丢了"。
+  // 这里拉一次能让任意路由刷新后侧边栏立刻有数据, WS 重连再补增量。
+  if (auth.isLoggedIn) {
+    taskListStore.fetchTasks().catch(() => { /* 静默, 由 401 拦截器处理登录失效 */ })
+  }
+})
+
+// 登录态切换 (/login → 业务页) 也立刻拉一次, 否则首次登录后侧边栏要等用户
+// 主动进入 /tasks 才会刷新。
+watch(isLoggedIn, (val) => {
+  if (val) {
+    taskListStore.fetchTasks().catch(() => {})
+  }
 })
 
 onUnmounted(() => {
