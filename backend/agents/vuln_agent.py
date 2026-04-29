@@ -1839,41 +1839,106 @@ $PHUIP "{web_url}/index.php" 2>&1
                     "message": f"LLM 验证 {vuln_name}",
                 })
 
-            # 让 LLM 判断验证结果
-            analyze_prompt = (
-                f"分析以下漏洞验证命令的执行结果：\n\n"
-                f"验证目标: {vuln_name}\n"
-                f"执行命令: {command}\n"
-                f"期望标志: {success_indicator}\n\n"
-                f"stdout:\n```\n{exec_result.stdout[:2000]}\n```\n\n"
-                f"stderr:\n```\n{exec_result.stderr[:500]}\n```\n\n"
-                f"exit_code: {exec_result.exit_code}\n\n"
-                f"判定标准：\n"
-                f"- confirmed=true：输出中出现预期证据（如 /etc/passwd 的 root:x:0:0、"
-                f"phpinfo、SQL 报错、命令回显等），足以证明漏洞存在。\n"
-                f"- exploitable=true：漏洞可被进一步利用于渗透路径，包括但不限于：\n"
-                f"  * LFI / 任意文件读（可读敏感文件、配置、session、日志链 RCE）\n"
-                f"  * SQLi（可出数据或堆叠注入）\n"
-                f"  * RCE / 命令注入 / 反序列化 / SSTI / 上传绕过\n"
-                f"  * 已知 CVE 且探测成功\n"
-                f"  注意：即便没有直接 shell，只要能进入下一步利用链（如 LFI→log poisoning、"
-                f"LFI→session 读取、LFI→配置文件泄漏凭据），也应判 exploitable=true。\n"
-                f"- 仅当 confirmed=false 或只是信息泄露（banner/version/目录列举）时才 "
-                f"exploitable=false。\n\n"
-                f"只返回 JSON（不要代码块、不要解释）：\n"
-                f'{{"confirmed": true或false, "evidence": "判断依据", "exploitable": true或false}}'
-            )
+            # ── 预检测：对完整 stdout 做确定性 LFI/RCE 特征匹配 ──────
+            # LLM 只拿到截断后的输出，大响应体（如 phpinfo + /etc/passwd）时
+            # 文件内容出现在末尾，[:2000] 根本看不到 → 必须先对全文做硬判断
+            full_stdout = exec_result.stdout or ""
+            full_stdout_lower = full_stdout.lower()
 
-            analysis_raw: Optional[str] = None
-            try:
-                analysis_raw = await self.llm.chat(analyze_prompt, response_format="json")
-                analysis = json.loads(analysis_raw)
-            except Exception as e:
-                logger.warning(
-                    "[VulnAgent] LLM 分析 JSON 解析失败 vuln=%s err=%s raw=%r",
-                    vuln_name, e, (analysis_raw[:500] if analysis_raw else None),
+            # /etc/passwd 文件包含成功的特征
+            _LFI_PASSWD_SIGNS = [
+                "root:x:0:0:", "root:!:0:0:", "daemon:x:1:",
+                "bin:x:2:", "nobody:x:", "/bin/bash", "/bin/sh",
+                "www-data:x:", "nobody:/nonexistent",
+            ]
+            # 通用 RCE / 命令回显特征
+            _RCE_SIGNS = ["uid=0(root)", "uid=33(www-data)", "linux ", "gnu/linux"]
+            # SSTI 数学计算回显（如 7*7=49）
+            _SSTI_SIGNS = ["49", "7777777"]
+
+            _pre_confirmed = False
+            _pre_exploitable = False
+            _pre_evidence = ""
+
+            if any(sign in full_stdout for sign in _LFI_PASSWD_SIGNS):
+                _pre_confirmed = True
+                _pre_exploitable = True
+                # 找到 passwd 内容所在片段作为证据
+                for sign in _LFI_PASSWD_SIGNS:
+                    idx = full_stdout.find(sign)
+                    if idx != -1:
+                        _pre_evidence = f"LFI成功，/etc/passwd内容片段: {full_stdout[idx:idx+300]}"
+                        break
+                logger.info(
+                    "[VulnAgent] 预检测命中 LFI /etc/passwd 特征: %s -> confirmed=True",
+                    vuln_name,
                 )
-                analysis = {"confirmed": False}
+            elif any(sign in full_stdout_lower for sign in _RCE_SIGNS):
+                _pre_confirmed = True
+                _pre_exploitable = True
+                _pre_evidence = f"RCE特征命中: {full_stdout[:500]}"
+                logger.info(
+                    "[VulnAgent] 预检测命中 RCE 特征: %s -> confirmed=True",
+                    vuln_name,
+                )
+
+            # 如果预检测已确认，直接跳过 LLM
+            if _pre_confirmed:
+                analysis = {
+                    "confirmed": True,
+                    "exploitable": _pre_exploitable,
+                    "evidence": _pre_evidence,
+                }
+            else:
+                # ── 构造发给 LLM 的 stdout 片段（头 + 尾，避免大响应体截断漏证据）──
+                _HEAD = 1500
+                _TAIL = 800
+                if len(full_stdout) > _HEAD + _TAIL:
+                    stdout_for_llm = (
+                        full_stdout[:_HEAD]
+                        + f"\n... [截断 {len(full_stdout) - _HEAD - _TAIL} 字节] ...\n"
+                        + full_stdout[-_TAIL:]
+                    )
+                else:
+                    stdout_for_llm = full_stdout
+
+                # 让 LLM 判断验证结果
+                analyze_prompt = (
+                    f"分析以下漏洞验证命令的执行结果：\n\n"
+                    f"验证目标: {vuln_name}\n"
+                    f"执行命令: {command}\n"
+                    f"期望标志: {success_indicator}\n\n"
+                    f"stdout:\n```\n{stdout_for_llm}\n```\n\n"
+                    f"stderr:\n```\n{exec_result.stderr[:500]}\n```\n\n"
+                    f"exit_code: {exec_result.exit_code}\n\n"
+                    f"判定标准：\n"
+                    f"- confirmed=true：输出中出现预期证据（如 /etc/passwd 的 root:x:0:0、"
+                    f"phpinfo、SQL 报错、命令回显等），足以证明漏洞存在。\n"
+                    f"  **注意：如果响应先返回了正常页面（如 phpinfo），然后在末尾追加了"
+                    f"/etc/passwd 或命令回显内容，这同样是成功的证据。**\n"
+                    f"- exploitable=true：漏洞可被进一步利用于渗透路径，包括但不限于：\n"
+                    f"  * LFI / 任意文件读（可读敏感文件、配置、session、日志链 RCE）\n"
+                    f"  * SQLi（可出数据或堆叠注入）\n"
+                    f"  * RCE / 命令注入 / 反序列化 / SSTI / 上传绕过\n"
+                    f"  * 已知 CVE 且探测成功\n"
+                    f"  注意：即便没有直接 shell，只要能进入下一步利用链（如 LFI→log poisoning、"
+                    f"LFI→session 读取、LFI→配置文件泄漏凭据），也应判 exploitable=true。\n"
+                    f"- 仅当 confirmed=false 或只是信息泄露（banner/version/目录列举）时才 "
+                    f"exploitable=false。\n\n"
+                    f"只返回 JSON（不要代码块、不要解释）：\n"
+                    f'{{"confirmed": true或false, "evidence": "判断依据", "exploitable": true或false}}'
+                )
+
+                analysis_raw: Optional[str] = None
+                try:
+                    analysis_raw = await self.llm.chat(analyze_prompt, response_format="json")
+                    analysis = json.loads(analysis_raw)
+                except Exception as e:
+                    logger.warning(
+                        "[VulnAgent] LLM 分析 JSON 解析失败 vuln=%s err=%s raw=%r",
+                        vuln_name, e, (analysis_raw[:500] if analysis_raw else None),
+                    )
+                    analysis = {"confirmed": False}
 
             logger.info(
                 "[VulnAgent] LLM 判定 %s: confirmed=%s exploitable=%s evidence=%s",
