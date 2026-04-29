@@ -499,6 +499,12 @@ async def node_recon(state: PentestState) -> PentestState:
         _append_tool_record(state, record, default_phase="recon")
     async def _on_decision(event: dict):
         state.push_decision(event)
+    # 把操作员实时指令(/chat 写入的 pending_user_prompt + user_messages)
+    # 在调用 agent.run() 前预计算成一段文本块, 让 ReconAgent 内部的 LLM
+    # 调用都能感知用户意图(例如"看看80端口下有什么目录")。state-free 注入
+    # 避免 agent 类反向依赖 PentestState。
+    from backend.agents.prompt_utils import operator_guidance_block
+    _op_block = operator_guidance_block(state)
     result = await agent.run(
         target=state.target_host or state.target,
         target_port=state.target_port,
@@ -506,6 +512,7 @@ async def node_recon(state: PentestState) -> PentestState:
         log_callback=_on_tool_log,
         record_callback=_on_exec_record,
         decision_callback=_on_decision,
+        operator_block=_op_block,
     )
     state.open_ports = result.get("ports", [])
     state.os_info = _stringify_dict_keys(result.get("os_info", {}))
@@ -703,6 +710,8 @@ async def node_vuln_scan(state: PentestState) -> PentestState:
     if seed_ports:
         seeds_payload["ports"] = list(seed_ports)
 
+    from backend.agents.prompt_utils import operator_guidance_block
+    _op_block = operator_guidance_block(state)
     result = await agent.run(
         target=state.target_host or state.target,
         ports=state.open_ports,
@@ -718,6 +727,7 @@ async def node_vuln_scan(state: PentestState) -> PentestState:
         nmap_vuln_hints=nmap_vuln_hints,
         workflow_mode=state.workflow_mode,
         seeds=seeds_payload or None,
+        operator_block=_op_block,
     )
     state.findings = result.get("findings", [])
     # msgpack (LangGraph checkpoint) 不允许 int 作 dict key
@@ -1393,6 +1403,8 @@ async def node_intel_harvest(state: PentestState) -> PentestState:
     llm = LLMRouter()
     sem = asyncio.Semaphore(3)
 
+    from backend.agents.prompt_utils import attach_operator_guidance
+
     async def _analyze_file(entry: dict) -> dict[str, Any] | None:
         if not entry["body"] or entry["code"] in ("000", "404"):
             return None
@@ -1402,6 +1414,7 @@ async def node_intel_harvest(state: PentestState) -> PentestState:
             status_code=entry["code"],
             file_content=entry["body"][:8192],
         )
+        prompt = attach_operator_guidance(prompt, state)
         async with sem:
             try:
                 raw = await llm.chat(prompt, response_format="json", temperature=0.1, max_tokens=2048)
@@ -1420,6 +1433,7 @@ async def node_intel_harvest(state: PentestState) -> PentestState:
             response_headers=entry["headers"][:512],
             page_source=entry["body"][:12288],
         )
+        prompt = attach_operator_guidance(prompt, state)
         async with sem:
             try:
                 raw = await llm.chat(prompt, response_format="json", temperature=0.1, max_tokens=2048)
@@ -1606,8 +1620,10 @@ async def node_exploit_decision(state: PentestState) -> PentestState:
 
     state.log(f"LLM 分析 {len(exploitable)} 个漏洞的利用优先级...")
     try:
+        from backend.agents.prompt_utils import attach_operator_guidance
         llm = LLMRouter()
         prompt = _build_exploit_decision_prompt(state)
+        prompt = attach_operator_guidance(prompt, state)
         decision = await llm.chat(prompt, response_format="json")
         decision_data = json.loads(decision)
 
@@ -1829,6 +1845,8 @@ async def node_foothold_attempt(state: PentestState) -> PentestState:
                 key = f"guard_block:{code}"
                 state.guard_stats[key] = int(state.guard_stats.get(key, 0)) + 1
             state.push_decision(event)
+        from backend.agents.prompt_utils import operator_guidance_block
+        _op_block = operator_guidance_block(state)
         results = await agent.run(
             target=state.target_host or state.target,
             findings=exploitable,
@@ -1839,6 +1857,7 @@ async def node_foothold_attempt(state: PentestState) -> PentestState:
             record_callback=_on_exec_record,
             decision_callback=_on_decision,
             fact_sink=_make_fact_sink(state),
+            operator_block=_op_block,
         )
         state.exploit_results = results
         successes = [r for r in results if r.success]
@@ -1939,6 +1958,8 @@ async def node_secondary_attack(state: PentestState) -> PentestState:
                 key = f"guard_block:{code}"
                 state.guard_stats[key] = int(state.guard_stats.get(key, 0)) + 1
             state.push_decision(event)
+        from backend.agents.prompt_utils import operator_guidance_block
+        _op_block = operator_guidance_block(state)
         new_results = await agent.run(
             target=state.target_host or state.target,
             findings=findings_retry,
@@ -1949,6 +1970,7 @@ async def node_secondary_attack(state: PentestState) -> PentestState:
             record_callback=_on_exec_record,
             decision_callback=_on_decision,
             fact_sink=_make_fact_sink(state),
+            operator_block=_op_block,
         )
         by_id: dict[str, ExploitResult] = {r.vuln_id: r for r in state.exploit_results}
         for nr in new_results:

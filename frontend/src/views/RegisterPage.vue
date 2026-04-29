@@ -10,7 +10,9 @@
       <div class="logo-mark-sm">
         <span class="logo-monogram"><span class="mono-p">A</span><span class="mono-a">R</span></span>
       </div>
-      <h1 class="auth-title">AuroraRecon</h1>
+      <h1 class="auth-title" aria-label="AuroraRecon">
+        <span class="auth-title-aurora">Aurora</span><span class="auth-title-recon">Recon</span>
+      </h1>
       <p class="auth-sub">创建新账号</p>
 
       <div class="auth-card">
@@ -114,7 +116,33 @@ async function submit() {
 .logo-monogram { font-family: var(--font-orbitron); font-size: 22px; font-weight: 600; letter-spacing: 0.06em; color: color-mix(in srgb, var(--text-primary) 72%, var(--start-hacker-cyan)); }
 .mono-p { color: color-mix(in srgb, var(--text-primary) 78%, var(--start-hacker-cyan)); }
 .mono-a { color: color-mix(in srgb, var(--start-hacker-cyan) 62%, #9ec0d8); }
-.auth-title { font-family: var(--font-orbitron); font-size: 32px; font-weight: 600; letter-spacing: 0.04em; color: color-mix(in srgb, var(--text-primary) 88%, var(--start-hacker-cyan)); margin: 0 0 4px; }
+.auth-title { font-family: var(--font-orbitron); font-size: 32px; font-weight: 600; letter-spacing: 0.04em; margin: 0 0 4px; }
+.auth-title-aurora {
+  color: color-mix(in srgb, var(--text-primary) 88%, var(--start-hacker-cyan));
+  text-shadow:
+    0 0 14px color-mix(in srgb, var(--start-hacker-cyan) 22%, transparent),
+    0 0 28px color-mix(in srgb, var(--start-hacker-green) 12%, transparent);
+}
+.auth-title-recon {
+  margin-left: 0.06em;
+  color: color-mix(in srgb, var(--start-hacker-green) 52%, var(--text-primary));
+  text-shadow:
+    0 0 16px color-mix(in srgb, var(--start-hacker-green) 32%, transparent),
+    0 0 28px color-mix(in srgb, var(--start-hacker-cyan) 14%, transparent);
+}
+
+[data-theme='light'] .auth-title-aurora {
+  color: color-mix(in srgb, #1a3d4a 72%, var(--start-hacker-cyan));
+  text-shadow:
+    0 0 8px color-mix(in srgb, var(--start-hacker-cyan) 14%, transparent),
+    0 0 16px color-mix(in srgb, var(--start-hacker-green) 10%, transparent);
+}
+[data-theme='light'] .auth-title-recon {
+  color: color-mix(in srgb, var(--start-hacker-green) 48%, #1e4a42);
+  text-shadow:
+    0 0 10px color-mix(in srgb, var(--start-hacker-green) 20%, transparent),
+    0 0 18px color-mix(in srgb, var(--start-hacker-cyan) 8%, transparent);
+}
 .auth-sub { color: var(--text-secondary); font-size: 14px; margin-bottom: 20px; }
 .auth-card {
   width: 100%; padding: 28px 24px;

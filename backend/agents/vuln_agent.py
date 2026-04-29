@@ -47,6 +47,9 @@ class VulnAgent:
         self.llm = LLMRouter()
         self.kb = ExploitKB()
         self._decision_callback: DecisionCallback = None
+        # 操作员实时指令(由 node_vuln_scan 从 PentestState 计算后传入), 注入到
+        # 本 agent 的所有 LLM prompt 两端。空字符串等价于无指令(无副作用)。
+        self._operator_block: str = ""
 
     async def run(
         self,
@@ -64,6 +67,7 @@ class VulnAgent:
         nmap_vuln_hints: list[dict] | None = None,
         workflow_mode: str = "pentest_engineer",
         seeds: Optional[dict[str, list]] = None,
+        operator_block: str = "",
     ) -> dict[str, Any]:
         """
         Args:
@@ -82,6 +86,7 @@ class VulnAgent:
         """
         self._decision_callback = decision_callback
         self._workflow_mode = workflow_mode
+        self._operator_block = operator_block or ""
         self._seed_credentials: list[dict] = list((seeds or {}).get("credentials") or [])
         if self._seed_credentials:
             logger.info(
@@ -845,6 +850,8 @@ $PHUIP "{web_url}/index.php" 2>&1
             web_paths_json=json.dumps(web_paths[:30], ensure_ascii=False),
             path_contents_json=json.dumps(path_content_summary, ensure_ascii=False),
         )
+        from backend.agents.prompt_utils import wrap_prompt_with_block
+        prompt = wrap_prompt_with_block(prompt, self._operator_block)
 
         try:
             import uuid as _uuid
@@ -1670,6 +1677,8 @@ $PHUIP "{web_url}/index.php" 2>&1
             f"常见端点: {', '.join(entry.common_endpoints[:5])}\n\n"
             f"只返回一条完整的curl命令，不要任何解释。"
         )
+        from backend.agents.prompt_utils import wrap_prompt_with_block
+        prompt = wrap_prompt_with_block(prompt, self._operator_block)
         try:
             cmd = await self.llm.chat(prompt, temperature=0.1, max_tokens=500)
             cmd = cmd.strip().strip('`').strip()
@@ -1751,6 +1760,8 @@ $PHUIP "{web_url}/index.php" 2>&1
             path_contents=json.dumps((path_contents or [])[:12], ensure_ascii=False),
             existing_findings=existing_text,
         )
+        from backend.agents.prompt_utils import wrap_prompt_with_block
+        prompt = wrap_prompt_with_block(prompt, self._operator_block)
 
         try:
             import uuid as _uuid

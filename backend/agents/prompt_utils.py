@@ -84,3 +84,48 @@ def attach_operator_guidance(prompt: str, state: "PentestState") -> str:
         return prompt
     body = prompt or ""
     return f"{block}\n{body}\n\n{block}"
+
+
+def wrap_prompt_with_block(prompt: str, block: str) -> str:
+    """State-free 版本: 直接接受预计算的 operator block 字符串。
+
+    Agent 类不应该持有 PentestState (state 是 LangGraph 节点的边界对象, agent
+    只是无状态执行器), 所以 ``node_*`` 在调用 agent.run() 之前先用
+    ``operator_guidance_block(state)`` 算好 block, 再传给 agent。Agent 内部
+    所有 LLM 调用前用本函数把 block 双向贴到 prompt 两端。
+
+    空 block 时返回原 prompt, 完全无副作用 — 调用方可以无条件接入。
+    """
+    if not block:
+        return prompt or ""
+    body = prompt or ""
+    return f"{block}\n{body}\n\n{block}"
+
+
+def wrap_messages_with_block(
+    messages: list[dict], block: str,
+) -> list[dict]:
+    """State-free 版本, 适用于 multi-turn / chat_multi_turn_stream 接口。
+
+    把 operator block 注入到 messages 的 0 号 system 消息前后。如果 messages
+    第一条不是 system, 我们在最前面 prepend 一个 system 消息把 block 装进去。
+    返回的是新列表 (浅拷贝), 不修改输入。
+
+    空 block 直接返回原列表的浅拷贝, 行为等价于 no-op。
+    """
+    if not messages:
+        return [{"role": "system", "content": block}] if block else []
+    if not block:
+        return list(messages)
+
+    out: list[dict] = []
+    first = dict(messages[0])
+    if first.get("role") == "system":
+        existing = str(first.get("content") or "")
+        first["content"] = f"{block}\n{existing}\n\n{block}".strip() + "\n"
+        out.append(first)
+        out.extend(dict(m) for m in messages[1:])
+    else:
+        out.append({"role": "system", "content": block})
+        out.extend(dict(m) for m in messages)
+    return out

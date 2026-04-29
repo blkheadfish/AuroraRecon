@@ -85,6 +85,9 @@ class ReconAgent:
 	def __init__(self):
 		self.executor = ToolExecutor()
 		self.nmap_parser = NmapParser()
+		# 操作员实时指令(由 node_recon 从 PentestState 计算后传入), 让本 agent
+		# 内部所有 LLM 调用都能感知用户在对话视图发出的指示。空字符串等价于无指令。
+		self._operator_block: str = ""
 
 	async def run(
 		self,
@@ -94,6 +97,7 @@ class ReconAgent:
 		log_callback: LogCallback = None,
 		record_callback: RecordCallback = None,
 		decision_callback: Optional[Callable] = None,
+		operator_block: str = "",
 	) -> dict[str, Any]:
 		"""
 		执行侦察。
@@ -106,8 +110,12 @@ class ReconAgent:
 		    task_id:     任务 ID
 		    log_callback: 日志回调
 		    decision_callback: 实时决策事件回调（tool_start / tool_result / thought）
+		    operator_block: 操作员指令块(由 node_recon 从 state 提取), 注入到所有
+		                    LLM prompt 两端 — 不让 LLM 决策只看到"默认行为", 而是
+		                    看到用户实时输入的方向(例如"看看80端口下有什么目录")。
 		"""
 		self._decision_callback = decision_callback
+		self._operator_block = operator_block or ""
 
 		async def _tool_stream_cb(line: str) -> None:
 			"""Forward tool stdout/stderr lines as tool_stream decision events."""
@@ -569,6 +577,7 @@ class ReconAgent:
 		try:
 			from backend.llm.router import LLMRouter
 			from backend.llm.prompts.templates import RECON_ANALYSIS
+			from backend.agents.prompt_utils import wrap_prompt_with_block
 
 			if log_callback:
 				await log_callback("[ReconAgent] LLM 分析 Nmap 扫描结果...")
@@ -578,6 +587,7 @@ class ReconAgent:
 				target=target,
 				raw_output=nmap_snippet,
 			)
+			prompt = wrap_prompt_with_block(prompt, self._operator_block)
 			import json
 			response = await llm.chat(prompt, response_format="json")
 			hints = json.loads(response)
@@ -870,6 +880,8 @@ class ReconAgent:
 				waf_status="检测到 WAF" if has_waf else "未检测到 WAF",
 				initial_response=initial_resp or "无",
 			)
+			from backend.agents.prompt_utils import wrap_prompt_with_block
+			prompt = wrap_prompt_with_block(prompt, self._operator_block)
 
 			llm = LLMRouter()
 			raw = await llm.chat(
@@ -933,6 +945,8 @@ class ReconAgent:
 				dirlist_summary="  无目录列表检测结果",
 				special_checks_results="\n".join(special_results) if special_results else "  无",
 			)
+			from backend.agents.prompt_utils import wrap_prompt_with_block
+			prompt = wrap_prompt_with_block(prompt, self._operator_block)
 
 			llm = LLMRouter()
 			raw = await llm.chat(
