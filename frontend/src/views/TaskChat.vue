@@ -44,22 +44,28 @@
           class="chat-rail"
           @jump="handleRailJump"
         />
-        <BranchTree
-          v-if="branches.length"
-          class="chat-branch-tree"
-          :items="branches"
-          :active-branch-id="activeBranchId"
-          :max-branches="state.maxBranchesPerTask || 12"
-          @activate="onBranchActivate"
-          @resume="onBranchResume"
-          @pause="onBranchPause"
-        />
       </div>
 
       <div class="chat-stream-wrap" ref="streamRef" @scroll="onUserScroll">
         <div class="bubble-stream">
           <template v-for="msg in messages" :key="msg.id">
-            <div :data-bubble-id="msg.id" class="bubble-anchor">
+            <div
+              :data-bubble-id="msg.id"
+              class="bubble-anchor"
+              :class="{ 'bubble-fork-anchored': forkAnchor && forkAnchor.id === msg.id }"
+            >
+          <button
+            v-if="canForkFromMsg(msg)"
+            class="bubble-fork-btn"
+            type="button"
+            :title="forkAnchor && forkAnchor.id === msg.id
+              ? '已锚定此处, 再次点击取消'
+              : '在此处分叉一条新分支(基于该消息时刻的上下文)'"
+            @click="onClickForkFrom(msg)"
+          >
+            <el-icon><Share /></el-icon>
+            <span class="bubble-fork-text">在此分叉</span>
+          </button>
           <ChatBubble
             :role="msg.role"
             :text="msg.text"
@@ -165,6 +171,21 @@
             </div>
             <pre class="bubble-text">{{ bubble.text }}</pre>
           </div>
+
+          <div
+            v-for="bubble in activeToolStreamBubbles"
+            :key="`tool-${bubble.sid}`"
+            class="tool-stream-bubble"
+          >
+            <div class="bubble-header">
+              <span class="bubble-phase">{{ bubble.tool }}</span>
+              <span class="bubble-indicator">
+                正在执行<span class="dots">...</span>
+                · {{ bubble.total }} 行
+              </span>
+            </div>
+            <pre class="bubble-text">{{ bubble.lines.join('\n') }}</pre>
+          </div>
         </div>
 
         <transition name="fade">
@@ -178,9 +199,9 @@
 
     <footer class="chat-footer">
       <section class="composer" :class="{ 'composer-flash': composerFlashing }">
-        <div v-if="branches.length > 1 || activeBranch" class="branch-status-band">
+        <div v-if="branches.length || activeBranch" class="branch-status-band">
           <span class="band-icon">
-            <el-icon><Promotion /></el-icon>
+            <el-icon><Share /></el-icon>
           </span>
           <span class="band-text">
             <template v-if="activeBranch">
@@ -198,6 +219,40 @@
             </span>
           </span>
           <span v-if="branchAtCap" class="band-cap">已达分支上限, 新输入将被合并到当前分支</span>
+          <el-popover
+            v-if="branches.length"
+            placement="top-end"
+            trigger="click"
+            :width="420"
+            :teleported="false"
+            popper-class="branch-popover"
+          >
+            <template #reference>
+              <button type="button" class="band-switch" :title="`分支总数: ${branches.length}`">
+                <el-icon><Share /></el-icon>
+                全部分支 ({{ branches.length }}/{{ state.maxBranchesPerTask || 12 }})
+              </button>
+            </template>
+            <div class="branch-popover-body">
+              <div class="branch-popover-head">
+                <strong>分支</strong>
+                <span class="branch-popover-hint">点击「切到」激活, 「继续运行」恢复, 「暂停」挂起当前分支</span>
+              </div>
+              <div class="branch-popover-tree">
+                <BranchTreeNode
+                  v-for="node in branchRoots"
+                  :key="node.branch_id"
+                  :node="node"
+                  :children-by-parent="branchChildrenByParent"
+                  :active-id="activeBranchId"
+                  :depth="0"
+                  @activate="onBranchActivate"
+                  @resume="onBranchResume"
+                  @pause="onBranchPause"
+                />
+              </div>
+            </div>
+          </el-popover>
         </div>
         <div class="composer-toolbar">
           <span class="composer-tip">
@@ -205,6 +260,13 @@
             你可以追加指令影响后续决策, 或在决策点提出修改意见
           </span>
           <span class="composer-shortcut">Ctrl/Cmd + Enter 发送</span>
+        </div>
+        <div v-if="forkAnchor" class="fork-anchor-band">
+          <el-icon><Share /></el-icon>
+          <span class="fork-anchor-text">
+            将在 <strong>{{ forkAnchor.label || forkAnchor.id }}</strong> 处分叉新分支
+          </span>
+          <button type="button" class="fork-anchor-clear" @click="clearForkAnchor">取消</button>
         </div>
         <div class="input-bar">
           <el-input
@@ -268,15 +330,17 @@ import {
   Loading,
   Memo,
   Promotion,
+  Share,
   Warning,
 } from '@element-plus/icons-vue'
 import { api } from '@/api'
 import { useTaskListStore } from '@/stores/taskList'
 import { useTaskLiveStore } from '@/stores/taskLive'
 import { trackEvent } from '@/metrics/tracker'
-import BranchTree from '@/components/BranchTree.vue'
+import BranchTreeNode from '@/components/BranchTreeNode.vue'
 import ChatBubble from '@/components/ChatBubble.vue'
 import DecisionCheckpointCard from '@/components/DecisionCheckpointCard.vue'
+import { resolveToolDisplay } from '@/utils/toolDisplay'
 import PayloadCodeBlock from '@/components/PayloadCodeBlock.vue'
 import StatusBadge from '@/components/StatusBadge.vue'
 import ToolChainRail from '@/components/ToolChainRail.vue'
@@ -323,8 +387,19 @@ function _compareEvents(a, b) {
 const decisionEvents = computed(() => {
   const raw = state.value?.decisionEvents
   if (!Array.isArray(raw) || !raw.length) return []
+  // 按 activeBranchId 切片: 后端在 ``push_decision`` / WS sink 注入了
+  // ``branch_id``, 切到老分支时 chat 流和 ToolChainRail 只显示属于该
+  // 分支的事件; 没有 branch_id 的"全局事件"(老快照、approval_required
+  // 等系统事件)始终展示, 避免审批气泡因切分支而消失。
+  const activeBid = state.value?.activeBranchId || ''
+  const filtered = activeBid
+    ? raw.filter((ev) => {
+        const bid = String((ev || {}).branch_id || '')
+        return !bid || bid === activeBid
+      })
+    : raw
   // slice 后再 sort, 不影响 store 内部数组
-  return raw.slice().sort(_compareEvents)
+  return filtered.slice().sort(_compareEvents)
 })
 const llmStreams = computed(() => state.value?.llmStreams || {})
 const isRunning = computed(() => ['pending', 'running'].includes(task.value?.status || ''))
@@ -334,24 +409,6 @@ const approving = computed(() => approvalState.value === 'submitting')
 const showApprovalActions = computed(() => needsApproval.value && approvalState.value === 'idle')
 const pendingCheckpoint = computed(() => state.value?.pendingCheckpoint || null)
 const checkpointSubmitting = computed(() => state.value?.checkpointState === 'submitting')
-
-const _SHELL_NAMES = new Set(['/bin/bash', '/bin/sh', 'bash', 'sh', '/bin/zsh', 'zsh'])
-const _SKIP_RE = /^(set\s|export\s|cd\s|echo\s|#|if\s|then\b|else\b|fi\b|do\b|done\b|while\s|for\s|\[)/
-const _VAR_RE = /^\w+=/
-
-function inferToolFromCommand(cmd) {
-  if (!cmd) return ''
-  for (const seg of cmd.split(/[;\n|]|&&|\|\|/)) {
-    const trimmed = seg.trim()
-    if (!trimmed) continue
-    if (_SKIP_RE.test(trimmed)) continue
-    if (_VAR_RE.test(trimmed)) continue
-    const token = trimmed.split(/\s/)[0]
-    const name = token.split('/').pop()
-    if (name && !_SHELL_NAMES.has(name)) return name
-  }
-  return ''
-}
 
 function inferPayloadLang(text) {
   if (/^\s*\{[\s\S]*\}\s*$/.test(text)) return 'json'
@@ -476,9 +533,12 @@ const messages = computed(() => {
       const command = entry.command || '(empty command)'
       const stdout = entry.stdout || ''
       const stderr = entry.stderr || ''
-      const toolLabel = (entry.tool && !_SHELL_NAMES.has(entry.tool))
-        ? entry.tool
-        : inferToolFromCommand(entry.command) || 'shell'
+      const toolLabel = resolveToolDisplay({
+        display_tool: entry.display_tool,
+        tool: entry.tool,
+        command: entry.command,
+        purpose: entry.purpose,
+      })
       const head = entry.poc_or_vuln
         ? `命令执行 · ${entry.poc_or_vuln}`
         : `命令执行 · ${toolLabel}`
@@ -499,12 +559,28 @@ const messages = computed(() => {
     }
 
     if (entry.action === 'tool_start') {
+      const toolLabel = resolveToolDisplay({
+        display_tool: entry.display_tool,
+        tool: entry.tool,
+        command: entry.command,
+        purpose: entry.purpose,
+      })
+      // tool_start 通常没有 stdout/stderr,只是状态打点;这里给一个最小卡片
+      // 让用户至少看到「工具/阶段/目的」三件套,而不是工具链上多了节点但
+      // 主聊天区却找不到对应气泡。
+      const detailLines = []
+      if (entry.phase) detailLines.push(`阶段 ${entry.phase}`)
+      if (entry.purpose) detailLines.push(`目的 ${entry.purpose}`)
+      if (entry.message) detailLines.push(entry.message)
       out.push({
         id: baseId,
         role: 'agent',
         tone: 'primary',
-        text: `工具调用 · ${entry.tool || 'unknown'}\n阶段 ${entry.phase || '-'}\n${entry.message || ''}`.trim(),
+        text: `工具调用 · ${toolLabel}${detailLines.length ? '\n' + detailLines.join('\n') : ''}`,
         timestamp: time,
+        payloads: entry.command
+          ? [{ title: 'Command', language: inferPayloadLang(entry.command), code: entry.command }]
+          : null,
       })
       return
     }
@@ -512,12 +588,31 @@ const messages = computed(() => {
     if (entry.action === 'tool_result') {
       const exitText = entry.exit_code ?? '-'
       const elapsedText = entry.elapsed_ms ? `${entry.elapsed_ms}ms` : '-'
+      const toolLabel = resolveToolDisplay({
+        display_tool: entry.display_tool,
+        tool: entry.tool,
+        command: entry.command,
+        purpose: entry.purpose,
+      })
+      const command = entry.command || ''
+      const stdout = entry.stdout || ''
+      const stderr = entry.stderr || ''
+      // 给 tool_result 也补一组 payload 卡片: 即便没有命令也至少展示
+      // 一个 Output 占位,避免「工具链上有节点但聊天区一片空白」。
+      const payloads = (command || stdout || stderr)
+        ? buildExecPayloads(command, stdout, stderr, {
+            runtimeCommand: entry.runtime_command || '',
+            truncated: Boolean(entry.truncated),
+            totalLen: Number(entry.total_len || 0),
+          })
+        : [{ title: 'Output', language: 'text', code: '(仅状态事件,无命令输出)' }]
       out.push({
         id: baseId,
         role: 'agent',
         tone: Number(exitText) === 0 ? 'success' : 'danger',
-        text: `调用结果 · ${entry.tool || 'unknown'}\nexit=${exitText} ｜ elapsed=${elapsedText}\n${entry.message || ''}`.trim(),
+        text: `调用结果 · ${toolLabel}\nexit=${exitText} ｜ elapsed=${elapsedText}${entry.message ? '\n' + entry.message : ''}`.trim(),
         timestamp: time,
+        payloads,
       })
       return
     }
@@ -608,6 +703,20 @@ const messages = computed(() => {
     }
   })
 
+  // 给每条 message 注入原始事件 id / ISO 时间戳, 供"在此分叉"按钮把
+  // ``from_event_id`` / ``from_event_ts`` 透传到后端。message.timestamp
+  // 已经经过 formatTime 转成本地时分秒, 不能直接用作分叉锚点。
+  const tsByBase = {}
+  for (const ev of events) {
+    if (ev?.id) tsByBase[ev.id] = ev.timestamp || ''
+  }
+  for (const m of out) {
+    if (m && tsByBase[m.id] && !m.eventTs) {
+      m.eventTs = tsByBase[m.id]
+      m.eventId = m.id
+    }
+  }
+
   // 兜底: 如果有 pendingCheckpoint 但未在事件流中找到对应 checkpoint_request bubble, 单独追加一条
   if (pendingCheckpoint.value) {
     const cpId = pendingCheckpoint.value.checkpoint_id
@@ -640,6 +749,25 @@ const activeStreamBubbles = computed(() => {
   return result
 })
 
+// 工具命令的实时 stdout/stderr 流; 只展示尾部 N 行让用户看见工具正在干活,
+// 避免「ToolChainRail 上有节点但聊天区一片空白」的体感。命令完成后对应的
+// tool_result 会落到主消息流里, 这块可以淡出。
+const TOOL_STREAM_TAIL_VIEW = 12
+
+const activeToolStreamBubbles = computed(() => {
+  const streams = state.value?.toolStreams || {}
+  const result = []
+  // 显示的 stream id 跟 ``stream_id`` 一致 (executor 是 ``{display_tool}-{hash}``),
+  // 这里直接拿 stream id 第一段当工具名展示。
+  for (const [sid, lines] of Object.entries(streams)) {
+    if (!Array.isArray(lines) || !lines.length) continue
+    const tail = lines.slice(-TOOL_STREAM_TAIL_VIEW)
+    const tool = String(sid).split('-')[0] || 'tool'
+    result.push({ sid, tool, lines: tail, total: lines.length })
+  }
+  return result
+})
+
 // 给侧边工具链用的事件项: 收集 thought / tool / approval / checkpoint 类事件
 const railItems = computed(() => {
   const events = decisionEvents.value.slice(-200)
@@ -661,31 +789,52 @@ const railItems = computed(() => {
         time: formatTime(ev.timestamp),
       })
     } else if (action === 'command_exec') {
+      const toolLabel = resolveToolDisplay({
+        display_tool: ev.display_tool,
+        tool: ev.tool,
+        command: ev.command,
+        purpose: ev.purpose,
+      })
       items.push({
         id,
         action,
         tone: (ev.exit_code ?? -1) === 0 ? 'success' : 'danger',
-        title: `命令执行 · ${ev.tool || inferToolFromCommand(ev.command || '') || 'shell'}`,
+        title: `命令执行 · ${toolLabel}`,
         tool: ev.tool || '',
+        display_tool: toolLabel,
         command: ev.command || '',
         time: formatTime(ev.timestamp),
       })
     } else if (action === 'tool_start') {
+      const toolLabel = resolveToolDisplay({
+        display_tool: ev.display_tool,
+        tool: ev.tool,
+        command: ev.command,
+        purpose: ev.purpose,
+      })
       items.push({
         id,
         action,
         tone: 'primary',
-        title: `工具调用 · ${ev.tool || 'tool'}`,
+        title: `工具调用 · ${toolLabel}`,
         tool: ev.tool || '',
+        display_tool: toolLabel,
         time: formatTime(ev.timestamp),
       })
     } else if (action === 'tool_result' || action === 'tool_executed') {
+      const toolLabel = resolveToolDisplay({
+        display_tool: ev.display_tool,
+        tool: ev.tool,
+        command: ev.command,
+        purpose: ev.purpose,
+      })
       items.push({
         id,
         action,
         tone: Number(ev.exit_code ?? -1) === 0 ? 'success' : 'danger',
-        title: `调用结果 · ${ev.tool || 'tool'}`,
+        title: `调用结果 · ${toolLabel}`,
         tool: ev.tool || '',
+        display_tool: toolLabel,
         time: formatTime(ev.timestamp),
       })
     } else if (action === 'approval_required' || action === 'approval') {
@@ -775,17 +924,65 @@ watch(
   },
 )
 
+// "在此处分叉"上下文: 当用户右键/点击某条历史 chat bubble 选择"在此分叉"时,
+// 把对应 decision_event 的 id + timestamp 暂存到这里, 下一次 sendMessage
+// 会把它们作为 ``from_event_id`` / ``from_event_ts`` 一并传给后端,
+// 让 BranchManager 走 ``find_checkpoint_at_or_before`` 选定 source checkpoint。
+const forkAnchor = ref(null)
+
+function setForkAnchor(eventId, timestamp, label) {
+  forkAnchor.value = {
+    id: String(eventId || ''),
+    ts: String(timestamp || ''),
+    label: String(label || '').slice(0, 60),
+  }
+  ElMessage.info('已锚定分叉位置, 输入新指令后发送即可在此处开新分支')
+}
+function clearForkAnchor() {
+  forkAnchor.value = null
+}
+
+// 哪些 chat bubble 可以作为分叉锚点:
+// - 必须有原始 event ISO timestamp(从 decision_events 里冒上来的)
+// - 系统 / origin-user-prompt / branch_forked / approval / checkpoint
+//   等元事件不应作为分叉锚点(分叉它们语义不清)
+function canForkFromMsg(msg) {
+  if (!msg || !msg.eventTs || !msg.eventId) return false
+  if (msg.action === 'branch_forked') return false
+  if (msg.action === 'approval_required') return false
+  if (msg.action === 'checkpoint_request') return false
+  if (msg.action === 'checkpoint_resolved') return false
+  if (msg.role === 'system') return false
+  return true
+}
+
+function onClickForkFrom(msg) {
+  if (!canForkFromMsg(msg)) return
+  if (forkAnchor.value && forkAnchor.value.id === msg.eventId) {
+    clearForkAnchor()
+    return
+  }
+  const labelSrc = (msg.text || '').split('\n')[0] || msg.eventId
+  setForkAnchor(msg.eventId, msg.eventTs, labelSrc)
+}
+
 async function sendMessage() {
   const text = chatInput.value.trim()
   if (!text || sending.value) return
   sending.value = true
   try {
-    const res = await api.sendChat(taskId, text)
+    const anchor = forkAnchor.value
+    const res = await api.sendChat(taskId, text, anchor ? {
+      fromEventId: anchor.id,
+      fromEventTs: anchor.ts,
+    } : undefined)
     chatInput.value = ''
+    forkAnchor.value = null
     trackEvent('task.chat.send', {
       taskId,
       forked: Boolean(res?.fork_active),
       branch_id: res?.branch?.branch_id || '',
+      from_event_id: anchor?.id || '',
     })
     if (res?.fork_active) {
       composerFlashAt.value = Date.now()
@@ -815,6 +1012,26 @@ const composerFlashAt = ref(0)
 const composerFlashing = computed(() => {
   if (!composerFlashAt.value) return false
   return Date.now() - composerFlashAt.value < 2400
+})
+
+// 把分支按 parent_branch_id 聚合成 forest, 给 popover 内嵌 BranchTreeNode 用,
+// 同时也复用现有 sibling navigator 的查询逻辑。
+const branchChildrenByParent = computed(() => {
+  const map = new Map()
+  for (const it of branches.value) {
+    const key = it.parent_branch_id || ''
+    if (!map.has(key)) map.set(key, [])
+    map.get(key).push(it)
+  }
+  for (const arr of map.values()) {
+    arr.sort((a, b) => (a.created_at || '').localeCompare(b.created_at || ''))
+  }
+  return map
+})
+
+const branchRoots = computed(() => {
+  const map = branchChildrenByParent.value
+  return map.get('') || map.get(null) || []
 })
 
 // 把 branch_forked 事件下方挂的 sibling navigator 用到的元数据集中算一次, 避免
@@ -1005,10 +1222,8 @@ onUnmounted(() => {
 }
 .chat-rail {
   flex-shrink: 0;
-}
-.chat-branch-tree {
-  flex-shrink: 0;
-  width: 280px;
+  flex: 1;
+  min-height: 0;
 }
 .chat-stream-wrap {
   flex: 1;
@@ -1051,6 +1266,7 @@ onUnmounted(() => {
   gap: 14px;
 }
 .bubble-anchor {
+  position: relative;
   scroll-margin-top: 40px;
   border-radius: var(--radius-md);
   transition: background 0.4s ease, box-shadow 0.4s ease;
@@ -1058,6 +1274,68 @@ onUnmounted(() => {
 .bubble-flash {
   background: color-mix(in srgb, var(--accent-blue) 12%, transparent);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-blue) 40%, transparent);
+}
+.bubble-fork-anchored {
+  background: color-mix(in srgb, var(--accent-blue) 14%, transparent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-blue) 55%, transparent);
+}
+.bubble-fork-btn {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  font-size: 11px;
+  line-height: 1.5;
+  background: var(--bg-elevated, rgba(0, 0, 0, 0.04));
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color, rgba(0, 0, 0, 0.12));
+  border-radius: 999px;
+  cursor: pointer;
+  opacity: 0;
+  transform: translateY(-2px);
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+.bubble-anchor:hover .bubble-fork-btn,
+.bubble-fork-anchored .bubble-fork-btn {
+  opacity: 1;
+  transform: translateY(0);
+}
+.bubble-fork-btn:hover {
+  color: var(--accent-blue);
+  border-color: var(--accent-blue);
+}
+.bubble-fork-text {
+  font-weight: 500;
+}
+.fork-anchor-band {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0 4px;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  background: color-mix(in srgb, var(--accent-blue) 10%, transparent);
+  border: 1px dashed color-mix(in srgb, var(--accent-blue) 40%, transparent);
+  border-radius: var(--radius-md);
+}
+.fork-anchor-text strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+.fork-anchor-clear {
+  margin-left: auto;
+  background: transparent;
+  border: none;
+  color: var(--accent-blue);
+  font-size: 12px;
+  cursor: pointer;
+}
+.fork-anchor-clear:hover {
+  text-decoration: underline;
 }
 
 .thought-meta {
@@ -1152,6 +1430,22 @@ onUnmounted(() => {
   border-radius: var(--radius-md);
   background: color-mix(in srgb, var(--bg-base) 92%, var(--accent-purple, #a371f7) 8%);
   padding: 10px 12px;
+}
+/* 工具实时输出气泡: 让用户在 tool_result 落位之前就能看到工具在跑什么,
+ * 同时把样式与 LLM 推理流区分(蓝色,monospace)。 */
+.tool-stream-bubble {
+  align-self: stretch;
+  max-width: min(78%, 720px);
+  margin-left: 40px;
+  border: 1px solid color-mix(in srgb, var(--accent-blue, #58a6ff) 50%, transparent);
+  border-left: 3px solid var(--accent-blue, #58a6ff);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--bg-base) 92%, var(--accent-blue, #58a6ff) 6%);
+  padding: 10px 12px;
+}
+.tool-stream-bubble .bubble-phase {
+  color: var(--accent-blue, #58a6ff);
+  font-family: var(--font-mono);
 }
 .bubble-header {
   display: flex;
@@ -1379,6 +1673,55 @@ onUnmounted(() => {
   margin-left: auto;
   color: var(--accent-yellow, #d29922);
   font-weight: 600;
+}
+.band-switch {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent-blue, #58a6ff) 50%, transparent);
+  background: color-mix(in srgb, var(--accent-blue, #58a6ff) 6%, transparent);
+  color: var(--accent-blue, #58a6ff);
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.band-switch:hover {
+  background: color-mix(in srgb, var(--accent-blue, #58a6ff) 16%, transparent);
+  border-color: var(--accent-blue, #58a6ff);
+}
+.band-switch + .band-cap {
+  margin-left: 8px;
+}
+
+/* 分支选择 popover 内部 */
+.branch-popover-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.branch-popover-head {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+.branch-popover-head strong {
+  font-size: 13px;
+  color: var(--text-primary);
+}
+.branch-popover-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.branch-popover-tree {
+  max-height: 360px;
+  overflow-y: auto;
+  padding-right: 4px;
 }
 
 @keyframes composerFlash {

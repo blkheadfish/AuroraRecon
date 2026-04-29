@@ -149,10 +149,16 @@ class VulnFinding(BaseModel):
 
 
 class CommandExecutionRecord(BaseModel):
-	"""统一命令执行记录结构，供 exploit_results 与 decision_event 复用。"""
+	"""统一命令执行记录结构，供 exploit_results 与 decision_event 复用。
+
+	``tool`` 是后端逻辑用的工具 key（可能是 ``/bin/bash`` 这类 shell 包装），
+	``display_tool`` 是给 UI 显示的友好名（``nmap``/``curl``/``script`` 等），
+	避免前端工具链节点出现一堆 ``/bin/bash``。
+	"""
 	id: str = ""
 	phase: str = ""
 	tool: str = ""
+	display_tool: str = ""
 	backend: str = ""
 	runtime_command: str = ""
 	round: Optional[int] = None
@@ -173,6 +179,7 @@ class DecisionEvent(BaseModel):
 	phase: str = ""
 	action: str = "log"
 	tool: str = ""
+	display_tool: str = ""
 	backend: str = ""
 	poc_or_vuln: str = ""
 	command: str = ""
@@ -635,16 +642,71 @@ class PentestState(BaseModel):
 	active_branch_id: str = ""
 	root_branch_id: str = ""
 
+	# ── log seq 持久化(与 ``phase_log`` 等长) ─────────────────
+	# 每条日志在 task 维度上的单调 seq, 由 ``TaskStateManager.next_log_seq``
+	# 分配。fork 出的子分支会拷贝父分支的 phase_log + phase_log_seqs, 后续
+	# 各自向前推进时 seq 仍然由 task 级 counter 给, 因此跨分支重连用 bisect
+	# 定位 ``after_log_seq=K`` 的 start_idx, 不会再因为分支切换导致 seq 回退
+	# 让前端误以为"已经看过了, 跳过补丁"。
+	phase_log_seqs: list[int] = Field(default_factory=list)
+
 	def log(self, msg: str) -> None:
 		import logging
 		ts = datetime.utcnow().strftime("%H:%M:%S")
 		entry = f"[{ts}] [{self.current_phase}] {msg}"
+		# 先拿 seq 再 append: ``next_log_seq`` 内部加锁, 与 phase_log 自身
+		# 写入保持顺序对齐(seqs 与 phase_log 等长)。
+		try:
+			from backend.api.state import get_state_manager
+			anchor = self.phase_log_seqs[-1] if self.phase_log_seqs else None
+			seq = get_state_manager().next_log_seq(self.task_id, anchor=anchor)
+		except Exception:
+			seq = len(self.phase_log)
 		self.phase_log.append(entry)
+		self.phase_log_seqs.append(int(seq))
 		# 滚动淘汰: 反馈/监督模式下 phase_log 会随循环爆炸增长,
 		# 同 live_decision_events 一致, 超过 5000 行截留最近 2500 行.
+		# phase_log_seqs 必须与 phase_log 等长一起裁。
 		if len(self.phase_log) > 5000:
 			self.phase_log = self.phase_log[-2500:]
+			self.phase_log_seqs = self.phase_log_seqs[-2500:]
 		logging.getLogger(__name__).info(entry)
+		# 实时广播: 普通 phase_log 行也通过 EventBus 立刻送到 WS,
+		# 不再等下一次节点 yield 才随 phase_update 批量下发,
+		# 这样前端聊天流不会出现"卡半天突然涌一堆日志"的体感。
+		# 主协程线程: ``get_running_loop`` + ``create_task`` 直接派发;
+		# worker 线程(LLM 同步调用 / 阻塞 IO 线程池)走 ``set_task_loop``
+		# 注册的主 loop + ``run_coroutine_threadsafe`` 投递, 避免被
+		# ``RuntimeError: no running event loop`` 静默吞掉。
+		try:
+			import asyncio
+			from backend.api.event_bus import get_log_sink, get_task_loop
+			sink = get_log_sink(self.task_id)
+			if not sink:
+				return
+			# 直接复用刚刚分配的真实 seq(已写入 phase_log_seqs),
+			# 不再 ``len(phase_log)-1``: fork 后两条分支独立增长,
+			# 局部下标对 task 级 WS 客户端没有意义。
+			seq_emit = self.phase_log_seqs[-1] if self.phase_log_seqs else (len(self.phase_log) - 1)
+			try:
+				loop = asyncio.get_running_loop()
+				loop.create_task(sink(entry, seq_emit))
+			except RuntimeError:
+				main_loop = get_task_loop(self.task_id)
+				if main_loop is not None and not main_loop.is_closed():
+					try:
+						asyncio.run_coroutine_threadsafe(sink(entry, seq_emit), main_loop)
+					except Exception as exc:
+						logging.getLogger(__name__).warning(
+							"[state.log] cross-thread sink 投递失败: %s", exc,
+						)
+				else:
+					logging.getLogger(__name__).warning(
+						"[state.log] 无可用 main_loop, 丢弃日志事件 task=%s",
+						self.task_id,
+					)
+		except Exception:
+			pass
 
 	def push_decision(self, event: dict) -> None:
 		"""Append a structured decision event and fire-and-forget to EventBus.
@@ -659,18 +721,44 @@ class PentestState(BaseModel):
 			event["id"] = f"de-{len(self.live_decision_events)}-{now.strftime('%H%M%S%f')}"
 		if "timestamp" not in event:
 			event["timestamp"] = now.isoformat(timespec="microseconds")
+		# 自动注入 branch_id: 让前端按 ``activeBranchId`` 过滤事件流时
+		# 不必依赖外部上下文。``active_branch_id`` 在分支切换 / fork 时
+		# 已经写到 state, 所以直接复用。空字符串视为"未启用分支系统",
+		# 前端会按"全局视角"展示。
+		if "branch_id" not in event:
+			event["branch_id"] = self.active_branch_id or ""
 		self.live_decision_events.append(event)
 		# Prevent unbounded growth in LangGraph checkpoint payload
 		if len(self.live_decision_events) > 5000:
 			self.live_decision_events = self.live_decision_events[-2500:]
-		# Fire-and-forget to EventBus so WS clients see it immediately
+		# Fire-and-forget to EventBus so WS clients see it immediately.
+		# 跨线程 fallback 同 ``log()``: worker 线程拿不到 running loop 时,
+		# 退到 BranchManager / task_runner 入口 ``set_task_loop`` 注册的主 loop。
 		try:
 			import asyncio
-			from backend.api.event_bus import get_task_sink
+			from backend.api.event_bus import get_task_sink, get_task_loop
 			sink = get_task_sink(self.task_id)
-			if sink:
+			if not sink:
+				return
+			try:
 				loop = asyncio.get_running_loop()
 				loop.create_task(sink(event))
+			except RuntimeError:
+				main_loop = get_task_loop(self.task_id)
+				if main_loop is not None and not main_loop.is_closed():
+					try:
+						asyncio.run_coroutine_threadsafe(sink(event), main_loop)
+					except Exception as exc:
+						import logging as _lg
+						_lg.getLogger(__name__).warning(
+							"[push_decision] cross-thread sink 投递失败: %s", exc,
+						)
+				else:
+					import logging as _lg
+					_lg.getLogger(__name__).warning(
+						"[push_decision] 无可用 main_loop, 丢弃 decision 事件 task=%s",
+						self.task_id,
+					)
 		except Exception:
 			pass
 

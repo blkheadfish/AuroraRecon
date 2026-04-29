@@ -2861,15 +2861,30 @@ class Orchestrator:
         target_thread_id: str,
         patch: dict[str, Any],
         as_node: Optional[str] = None,
+        source_checkpoint_id: Optional[str] = None,
     ) -> bool:
-        """Copy the latest checkpoint of *source_thread_id* into *target_thread_id*
+        """Copy a checkpoint of *source_thread_id* into *target_thread_id*
         and apply ``patch`` (e.g. ``pending_user_prompt`` / ``replan_signals``).
 
-        Returns True on success, False if the source thread has no checkpoint
-        yet (e.g. fork issued before any node has run, very rare).
+        ``source_checkpoint_id`` 可选: 指定从历史里某个具体 checkpoint 复制
+        (Claude 风格"从任意历史节点分叉"); 不传时退化为复制最新 checkpoint
+        (沿用旧 ``fork_from_active`` 的行为)。
+
+        Returns True on success, False if the source thread has no matching
+        checkpoint (例如指定了 checkpoint_id 但被裁剪了 / 源 thread 还没跑过
+        任何节点)。
         """
         await self._ensure_graph()
-        src_cfg = {"configurable": {"thread_id": source_thread_id}}
+        src_cfg: dict[str, Any]
+        if source_checkpoint_id:
+            src_cfg = {
+                "configurable": {
+                    "thread_id": source_thread_id,
+                    "checkpoint_id": source_checkpoint_id,
+                }
+            }
+        else:
+            src_cfg = {"configurable": {"thread_id": source_thread_id}}
         snap = await self._graph.aget_state(src_cfg)
         if not snap or not snap.values:
             return False
@@ -2891,6 +2906,42 @@ class Orchestrator:
         else:
             await self._graph.aupdate_state(dst_cfg, merged)
         return True
+
+    async def find_checkpoint_at_or_before(
+        self, source_thread_id: str, ts_iso: str,
+    ) -> Optional[str]:
+        """在 *source_thread_id* 的历史里找出 ``created_at <= ts_iso`` 的
+        最新 checkpoint id, 用于"从某条历史 decision_event 处分叉"。
+
+        decision_event 没有直接挂在某个 LangGraph checkpoint 上(事件可能
+        在节点中途产生), 取"事件时间之前最近一次 checkpoint"作为最贴近
+        用户期望的快照。找不到时返回 None, 调用方应回落到 ``fork_from_active``
+        语义(从最新 checkpoint 分叉)。
+        """
+        await self._ensure_graph()
+        cfg = {"configurable": {"thread_id": source_thread_id}}
+        try:
+            history = self._graph.aget_state_history(cfg)
+        except Exception as exc:
+            logger.warning(
+                f"[Orchestrator] aget_state_history 失败 thread={source_thread_id}: {exc}"
+            )
+            return None
+        try:
+            async for snap in history:
+                created = getattr(snap, "created_at", "") or ""
+                if not created:
+                    continue
+                if created <= ts_iso:
+                    cfg_part = (snap.config or {}).get("configurable", {}) or {}
+                    cp_id = cfg_part.get("checkpoint_id")
+                    if cp_id:
+                        return str(cp_id)
+        except Exception as exc:
+            logger.warning(
+                f"[Orchestrator] iterate state history 失败 thread={source_thread_id}: {exc}"
+            )
+        return None
 
     @staticmethod
     def _make_run_config(task_id: str) -> dict:

@@ -269,6 +269,14 @@ class KnowledgeRawRequest(BaseModel):
 
 class ChatMessageRequest(BaseModel):
     text: str
+    # 可选: 让前端在某条历史 ``decision_event`` / 聊天气泡处右键"在此分叉"
+    # 时, 把对应事件的 ``id`` 与 ``timestamp`` 一并送回。
+    # ``from_event_id`` 仅作为 ``TaskBranch.fork_event_id`` 元数据落库, 让
+    # 树形分支视图能高亮"在哪条事件处分叉"。
+    # ``from_event_ts`` 才是真正用来定位 LangGraph checkpoint 的时间锚点
+    # (走 ``find_checkpoint_at_or_before`` 取该时间之前最近的 checkpoint)。
+    from_event_id: str | None = None
+    from_event_ts: str | None = None
 
 
 # ── 意图解析（LLM 驱动） ─────────────────────────────────

@@ -53,6 +53,51 @@ RecordCallback = Optional[Callable[[dict], Awaitable[None]]]
 DecisionCallback = Optional[Callable[[dict], Awaitable[None]]]
 
 
+# ── 工具名展示推断 ─────────────────────────────────────────
+# ``run_script()`` 把 ``tool`` 设成 ``/bin/bash``,真实命令在 script 里。
+# 直接把 ``/bin/bash`` 透传到前端工具链非常阴间,这里在 executor 层就把
+# 友好名(``curl``/``nmap``/``nuclei``/``script`` 等)算好,日志和 record
+# 里同时带上 ``display_tool``,避免每个调用方/前端各自再写 infer 逻辑。
+_DISPLAY_SHELL_NAMES = frozenset({"/bin/bash", "/bin/sh", "bash", "sh", "/bin/zsh", "zsh"})
+
+import re as _display_re
+
+_DISPLAY_SKIP_RE = _display_re.compile(
+    r"^(set\s|export\s|cd\s|echo\s|#|if\s|then\b|else\b|fi\b|do\b|done\b|while\s|for\s|\[)"
+)
+_DISPLAY_VAR_RE = _display_re.compile(r"^\w+=")
+
+
+def _infer_display_tool(tool: str, script_or_command: str = "", purpose: str = "") -> str:
+    """Best-effort 友好工具名。
+
+    优先级:
+      1. 已有非 shell 的 tool key → 直接用
+      2. 从脚本/命令第一段非赋值非控制流的 token 取
+      3. 退回到 record_purpose 的前缀(便于区分 sensitive_file_probe 这种 purpose)
+      4. 兜底 ``script``,绝不返回 ``/bin/bash``
+    """
+    if tool and tool not in _DISPLAY_SHELL_NAMES:
+        return tool
+    text = script_or_command or ""
+    if text:
+        for raw in _display_re.split(r"[;\n|]|&&|\|\|", text):
+            seg = raw.strip()
+            if not seg:
+                continue
+            if _DISPLAY_SKIP_RE.match(seg):
+                continue
+            if _DISPLAY_VAR_RE.match(seg):
+                continue
+            first = seg.split()[0]
+            name = first.rsplit("/", 1)[-1]
+            if name and name not in _DISPLAY_SHELL_NAMES:
+                return name
+    if purpose:
+        return purpose.split("_", 1)[0] or "script"
+    return "script"
+
+
 @dataclass
 class ExecuteResult:
     """工具执行结果"""
@@ -396,7 +441,11 @@ class ToolExecutor:
             ["docker", "exec", "-w", workdir] + path_args + env_args + [container_name] + cmd_parts + args
         ).strip()
 
-        log_msg = f"🔧 {tool} [exec→{container_name[:20]}]: {runtime_display_cmd}"
+        # 友好名(避免日志里出现 ``🔧 /bin/bash [exec→...]``)。
+        display_tool = _infer_display_tool(
+            tool, script_or_command=record_command or "", purpose=record_purpose or "",
+        )
+        log_msg = f"🔧 {display_tool} [exec→{container_name[:20]}]: {runtime_display_cmd}"
         logger.info(f"[Executor] {log_msg}")
         if log_callback:
             try: await log_callback(log_msg)
@@ -486,8 +535,14 @@ class ToolExecutor:
         stream_callback=None,
     ) -> ExecuteResult:
         cmd_display = " ".join(cmd)
-        stream_id = f"{tool}-{uuid.uuid4().hex[:8]}"
-        log_msg = f"🔧 执行 {tool} [{backend_label}]: {cmd_display}"
+        # 友好工具名: 让 phase_log 的 ``执行 {display_tool} [{backend}]`` 直接被
+        # state.py 的 TOOL_START_RE 抓到正确的工具名,前端工具链就不会再出现
+        # 一片 ``/bin/bash``。tool 仍按原值落库,后续按 tool 维度做统计仍然有效。
+        display_tool = _infer_display_tool(
+            tool, script_or_command=record_command or "", purpose=record_purpose or "",
+        )
+        stream_id = f"{display_tool}-{uuid.uuid4().hex[:8]}"
+        log_msg = f"🔧 执行 {display_tool} [{backend_label}]: {cmd_display}"
         logger.info(f"[Executor] {log_msg}")
         if log_callback:
             try: await log_callback(log_msg)
@@ -521,7 +576,8 @@ class ToolExecutor:
                         if stream_callback:
                             try:
                                 await stream_callback({
-                                    "tool": tool, "kind": kind, "line": text,
+                                    "tool": tool, "display_tool": display_tool,
+                                    "kind": kind, "line": text,
                                     "stream_id": stream_id,
                                 })
                             except Exception: pass
@@ -539,7 +595,7 @@ class ToolExecutor:
                     proc.kill()
                     await proc.wait()
                     elapsed = time.monotonic() - start
-                    msg = f"⏰ {tool} 超时 ({timeout}s)"
+                    msg = f"⏰ {display_tool} 超时 ({timeout}s)"
                     logger.warning(f"[Executor] {msg}")
                     if log_callback:
                         try: await log_callback(msg)
@@ -549,7 +605,8 @@ class ToolExecutor:
                         record={
                             "id": uuid.uuid4().hex[:16],
                             "phase": record_phase or "",
-                            "tool": tool, "backend": backend_label,
+                            "tool": tool, "display_tool": display_tool,
+                            "backend": backend_label,
                             "round": record_round,
                             "purpose": record_purpose or "",
                             "timestamp": datetime.utcnow().isoformat(),
@@ -585,7 +642,7 @@ class ToolExecutor:
                     proc.kill()
                     await proc.wait()
                     elapsed = time.monotonic() - start
-                    msg = f"⏰ {tool} 超时 ({timeout}s)"
+                    msg = f"⏰ {display_tool} 超时 ({timeout}s)"
                     logger.warning(f"[Executor] {msg}")
                     if log_callback:
                         try: await log_callback(msg)
@@ -595,7 +652,8 @@ class ToolExecutor:
                         record={
                             "id": uuid.uuid4().hex[:16],
                             "phase": record_phase or "",
-                            "tool": tool, "backend": backend_label,
+                            "tool": tool, "display_tool": display_tool,
+                            "backend": backend_label,
                             "round": record_round,
                             "purpose": record_purpose or "",
                             "timestamp": datetime.utcnow().isoformat(),
@@ -623,7 +681,7 @@ class ToolExecutor:
             success = exit_code == 0 or len(stdout.strip()) > 0
 
             status = "✅" if success else "❌"
-            log_msg = f"{status} {tool} 完成: exit={exit_code}, 输出={len(stdout)}B, 耗时={elapsed:.1f}s"
+            log_msg = f"{status} {display_tool} 完成: exit={exit_code}, 输出={len(stdout)}B, 耗时={elapsed:.1f}s"
             logger.info(f"[Executor] {log_msg}")
             if log_callback:
                 try: await log_callback(log_msg)
@@ -634,6 +692,7 @@ class ToolExecutor:
                     "id": uuid.uuid4().hex[:16],
                     "phase": record_phase or "",
                     "tool": tool,
+                    "display_tool": display_tool,
                     "backend": backend_label,
                     "round": record_round,
                     "purpose": record_purpose or "",
@@ -665,6 +724,7 @@ class ToolExecutor:
                     "id": uuid.uuid4().hex[:16],
                     "phase": record_phase or "",
                     "tool": tool,
+                    "display_tool": display_tool,
                     "backend": backend_label,
                     "round": record_round,
                     "purpose": record_purpose or "",
@@ -693,6 +753,7 @@ class ToolExecutor:
                     "id": uuid.uuid4().hex[:16],
                     "phase": record_phase or "",
                     "tool": tool,
+                    "display_tool": display_tool,
                     "backend": backend_label,
                     "round": record_round,
                     "purpose": record_purpose or "",

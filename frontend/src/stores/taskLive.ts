@@ -183,6 +183,10 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
       const res = await api.activateBranch(taskId, branchId)
       upsertBranch(state, res.branch)
       setActiveBranch(state, branchId)
+      // Claude 风格分支切换: 切换到目标分支后强制重新拉一次后端快照,
+      // 让 ``decision_events_tail`` 把目标分支视角的最近事件补齐, 避免
+      // 仅靠 store 里旧分支的累积导致 TaskChat 看不到目标分支的历史。
+      try { await refreshTask(taskId) } catch { /* 静默失败, ws 后续会补齐 */ }
       ElMessage.success('已切换分支')
     } catch (e) {
       ElMessage.error('切换分支失败')
@@ -196,6 +200,7 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
       const res = await api.resumeBranch(taskId, branchId)
       upsertBranch(state, res.branch)
       setActiveBranch(state, branchId)
+      try { await refreshTask(taskId) } catch { /* idem */ }
       ElMessage.success('已恢复分支运行')
     } catch (e) {
       ElMessage.error('恢复分支失败')
@@ -511,8 +516,14 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
       }
       if (eventType === 'log') {
         const line = String((event as { data?: string }).data || '')
+        const seq = (event as { seq?: number }).seq
         pushLog(state, line)
-        state.logTotal = Math.max(state.logTotal, state.logTotal + 1)
+        if (typeof seq === 'number' && Number.isFinite(seq)) {
+          // seq = append 后的 phase_log 下标,因此总数至少是 seq+1
+          state.logTotal = Math.max(state.logTotal, seq + 1)
+        } else {
+          state.logTotal = state.logTotal + 1
+        }
         return
       }
       if (eventType === 'decision_event') {
@@ -570,6 +581,19 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
           secondary_elided?: boolean
           attack_next_steps?: { stage?: string; action?: string; priority?: number }[]
           privesc_attempt_count?: number
+          branch_id?: string
+        }
+        // 当 phase_update 携带 branch_id 且不是当前 active 分支时, 不更新
+        // ``state.task`` 的 phase / status (避免把老分支的 phase 推到
+        // 当前视图)。logs 仍然 push 到 buffer, 但走 branch_id 注入路径让
+        // TaskChat 自己过滤展示。
+        const updateBid = String(patch.branch_id || '')
+        const sameBranch = !updateBid || !state.activeBranchId || updateBid === state.activeBranchId
+        if (!sameBranch) {
+          if (patch.logs?.length) {
+            for (const line of patch.logs) pushLog(state, line)
+          }
+          return
         }
         taskListStore.upsertTask({
           task_id: taskId,

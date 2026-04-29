@@ -29,6 +29,7 @@
 
 <script setup>
 import { computed, ref } from 'vue'
+import { resolveToolDisplay } from '@/utils/toolDisplay'
 
 const props = defineProps({
   items: { type: Array, default: () => [] },
@@ -61,43 +62,23 @@ const nodes = computed(() => {
   return result
 })
 
-const SHELL_NAMES = new Set(['/bin/bash', '/bin/sh', 'bash', 'sh', '/bin/zsh', 'zsh'])
-const SKIP_RE = /^(set\s|export\s|cd\s|echo\s|#|if\s|then\b|else\b|fi\b|do\b|done\b|while\s|for\s|\[)/
-const VAR_RE = /^\w+=/
-
-function inferToolFromCommand(cmd) {
-  if (!cmd) return ''
-  for (const seg of cmd.split(/[;\n|]|&&|\|\|/)) {
-    const trimmed = seg.trim()
-    if (!trimmed) continue
-    if (SKIP_RE.test(trimmed)) continue
-    if (VAR_RE.test(trimmed)) continue
-    const token = trimmed.split(/\s/)[0]
-    const name = token.split('/').pop()
-    if (name && !SHELL_NAMES.has(name)) return name
-  }
-  return ''
-}
-
 function extractToolName(item) {
-  if (item.tool && !SHELL_NAMES.has(item.tool)) return item.tool
-  const title = item.title || ''
-  const mCmd = title.match(/命令执行\s*·\s*(.+)/)
-  if (mCmd) return mCmd[1]
-  const mTool = title.match(/工具调用\s*·\s*(.+)/)
-  if (mTool) return mTool[1]
-  const mRes = title.match(/调用结果\s*·\s*(.+)/)
-  if (mRes) return mRes[1]
-  const fromCmd = inferToolFromCommand(item.command || '')
-  if (fromCmd) return fromCmd
-  return ''
+  // ``railItems`` 在 TaskChat 里已经把 display_tool 直接放进 item,这里
+  // 再走一遍 resolveToolDisplay 兜底,确保历史 item / 监督模式直接传入的
+  // 节点也不会暴露 ``/bin/bash``。
+  return resolveToolDisplay({
+    display_tool: item.display_tool,
+    tool: item.tool,
+    command: item.command,
+    purpose: item.purpose,
+  })
 }
 
 function extractLabel(item) {
   const action = item.action || ''
 
   if (action === 'command_exec') {
-    return (extractToolName(item) || 'shell').slice(0, 22)
+    return (extractToolName(item) || 'script').slice(0, 22)
   }
   if (action === 'tool_start') {
     const name = extractToolName(item) || 'tool'

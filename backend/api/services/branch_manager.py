@@ -25,7 +25,17 @@ from backend.agents.interrupt_registry import (
     request_interrupt,
 )
 from backend.agents.models import PentestState, TaskBranch, TaskStatus
-from backend.api.event_bus import get_event_bus, set_task_sink
+from backend.api.event_bus import (
+    get_event_bus,
+    set_task_sink,
+    set_log_sink,
+    clear_log_sink,
+    clear_task_sink,
+    get_log_sink,
+    get_task_sink,
+    set_task_loop,
+    clear_task_loop,
+)
 from backend.api.state import TaskStateManager, get_state_manager
 
 logger = logging.getLogger(__name__)
@@ -186,6 +196,7 @@ class BranchManager:
         *,
         user_prompt: str,
         fork_event_id: Optional[str] = None,
+        from_event_ts: Optional[str] = None,
     ) -> TaskBranch:
         """Create a new branch from the currently-active branch's head.
 
@@ -281,10 +292,32 @@ class BranchManager:
                 # is unnecessary — supervisor consumes per-thread.
                 "status": TaskStatus.RUNNING,
             }
+            # Claude 风格: 如果指定了 ``from_event_ts`` (用户在历史消息处
+            # 选择了"在此分叉"), 先到 LangGraph 历史里把 ``created_at <=
+            # from_event_ts`` 的最新 checkpoint 找出来当 source; 找不到就
+            # 退化成"从最新 checkpoint 分叉", 与老语义一致, 保证兜底能 fork。
+            source_checkpoint_id: Optional[str] = None
+            if from_event_ts:
+                try:
+                    source_checkpoint_id = await orchestrator.find_checkpoint_at_or_before(
+                        parent.thread_id, from_event_ts,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"[BranchManager] find_checkpoint_at_or_before failed "
+                        f"task={task_id} ts={from_event_ts}: {exc}"
+                    )
+                if not source_checkpoint_id:
+                    logger.info(
+                        f"[BranchManager] from_event_ts={from_event_ts} 找不到对应"
+                        f" checkpoint, 回落到最新 checkpoint 分叉"
+                    )
+
             forked = await orchestrator.fork_branch_state(
                 source_thread_id=parent.thread_id,
                 target_thread_id=new_thread,
                 patch=patch,
+                source_checkpoint_id=source_checkpoint_id,
             )
             if not forked:
                 # No source checkpoint: planted state from scratch via run_task.
@@ -298,6 +331,14 @@ class BranchManager:
             state.active_branch_id = new_id
             sm.set(task_id, state)
 
+            # CRITICAL: switch the BranchManager active pointer too.
+            # ``_resume_branch_bg`` mirrors ``state`` to the TaskStateManager
+            # only when ``self._active[task_id] == branch.branch_id``; if we
+            # leave it pointing at the parent (the original bug), the child
+            # runs but no ``phase_update`` ever fires and ``sm.set`` never
+            # updates so subsequent fork bookkeeping reads stale state.
+            self._active[task_id] = new_id
+
             try:
                 bus = get_event_bus()
                 await bus.publish(task_id, {
@@ -308,9 +349,15 @@ class BranchManager:
             except Exception:
                 pass
 
-            # 5) Schedule child execution.
+            # 5) Schedule child execution. Register the handle with both
+            # ``BranchManager._bg`` (per-branch) AND ``sm._bg_tasks`` (per
+            # task) so a future fork or ``cancel_task`` can target the right
+            # coroutine. Without the sm registration, a follow-up chat
+            # message would skip the lifecycle hand-off and cause the same
+            # race we just fixed (root cleanup tearing down the new branch).
             bg = asyncio.create_task(self._resume_branch_bg(task_id, child))
             self._bg[child.branch_id] = bg
+            sm.register_bg_task(task_id, bg)
 
             return child
 
@@ -360,6 +407,12 @@ class BranchManager:
 
         bg = asyncio.create_task(self._resume_branch_bg(task_id, branch))
         self._bg[branch.branch_id] = bg
+        # Mirror the ownership change into ``sm._bg_tasks`` so subsequent
+        # fork / cancel calls operate on the right coroutine. Without this
+        # the resumed branch is invisible to the global lifecycle controller
+        # and a chat message arriving later would re-trigger the original
+        # "fork but no logs" race (root finally clobbering child sinks).
+        get_state_manager().register_bg_task(task_id, bg)
 
         try:
             bus = get_event_bus()
@@ -425,6 +478,43 @@ class BranchManager:
                 logger.debug(f"[BranchManager] bg await error: {exc}")
 
         self._bg.pop(branch_id, None)
+
+        # Lifecycle ownership: root branches (and resumed branches that
+        # came from the legacy ``run_task`` / ``resume_task`` pathway) are
+        # tracked under ``sm._bg_tasks[task_id]`` instead of
+        # ``BranchManager._bg``. If we don't cancel + await that handle
+        # too, the old coroutine's ``finally`` block will eventually run —
+        # ``TaskContainerManager.stop(task_id)`` + ``publish('done')`` +
+        # ``clear_task_sink/clear_log_sink`` — all of which would silently
+        # tear down the resources the *new* (forked) branch just claimed.
+        # The end-user symptom: "fork happened but no logs ever stream".
+        #
+        # IMPORTANT order-of-operations:
+        #   1. ``unregister_bg_task`` FIRST — this is how the cancelled
+        #      ``run_task`` / ``resume_task`` knows it's no longer the
+        #      owner and must skip its cleanup tail (``stop container``,
+        #      ``publish('done')``, ``clear_*_sink``). The ownership check
+        #      inside those coroutines is ``sm._bg_tasks.get(task_id) is
+        #      my_task``, so dropping the slot before ``cancel`` flips
+        #      that check to ``False`` exactly when we want it to.
+        #   2. ``cancel`` + ``await`` — let the coroutine unwind cleanly.
+        sm = get_state_manager()
+        if self._active.get(task_id) == branch_id:
+            sm_bg = sm._bg_tasks.get(task_id)
+            if sm_bg and not sm_bg.done():
+                sm.unregister_bg_task(task_id)
+                sm_bg.cancel()
+                try:
+                    await asyncio.wait_for(
+                        sm_bg, timeout=FORK_INTERRUPT_TIMEOUT_SEC,
+                    )
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+                except Exception as exc:
+                    logger.debug(
+                        f"[BranchManager] sm bg await error task={task_id}: {exc}"
+                    )
+
         branch.status = "paused"
         branch.updated_at = datetime.utcnow().isoformat()
         await self._persist(branch)
@@ -446,9 +536,31 @@ class BranchManager:
         orchestrator = get_orchestrator()
 
         async def _decision_sink(ev: dict):
+            # 注入 branch_id 让前端按 activeBranchId 切片视图; sink 闭包里
+            # 能直接拿 ``branch.branch_id``, 比读 sm.get 更准确(sm 镜像有
+            # 可能短暂指向上一个 branch)。``push_decision`` 已经写了一份,
+            # 这里 setdefault 防止覆盖。
+            ev = dict(ev)
+            ev.setdefault("branch_id", branch.branch_id)
             await bus.publish(task_id, {"type": "decision_event", "data": ev})
 
+        async def _log_sink(line: str, seq: int):
+            await bus.publish(task_id, {
+                "type": "log",
+                "data": line,
+                "seq": seq,
+                "branch_id": branch.branch_id,
+            })
+
         set_task_sink(task_id, _decision_sink)
+        set_log_sink(task_id, _log_sink)
+        # 跨线程 sink fallback: 入口 capture 当前 main loop, 让
+        # ``state.log / push_decision`` 在 worker 线程命中时也能
+        # ``run_coroutine_threadsafe`` 把事件投递回这里。
+        try:
+            set_task_loop(task_id, asyncio.get_running_loop())
+        except RuntimeError:
+            pass
         sm.mark_running(task_id)
         try:
             async for node_name, raw_state in orchestrator.resume_branch_stream(
@@ -502,6 +614,21 @@ class BranchManager:
         finally:
             sm.mark_stopped(task_id)
             self._bg.pop(branch.branch_id, None)
+            # Ownership-aware sink cleanup: only clear what we registered.
+            # When a follow-up fork hand-off is in flight, the new branch
+            # may have already replaced our sinks; clearing here would
+            # silently kill the new branch's WS streaming.
+            if get_log_sink(task_id) is _log_sink:
+                clear_log_sink(task_id)
+            if get_task_sink(task_id) is _decision_sink:
+                clear_task_sink(task_id)
+            # Same idea for ``sm._bg_tasks``: only release the slot if it
+            # still points at us. If a fork already swapped in a new owner,
+            # don't strip it.
+            current_owner = sm._bg_tasks.get(task_id)
+            if current_owner is asyncio.current_task():
+                sm.unregister_bg_task(task_id)
+                clear_task_loop(task_id)
 
     def to_tree_payload(self, branches: list[TaskBranch], active_id: str) -> dict[str, Any]:
         """Compute sibling counts & active flags for the API tree response."""

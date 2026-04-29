@@ -15,7 +15,13 @@ import time
 from backend.agents.models import PentestState, TaskStatus
 from backend.agents.orchestrator import Orchestrator
 from backend.api.state import get_state_manager
-from backend.api.event_bus import get_event_bus, set_task_sink, clear_task_sink
+from backend.api.event_bus import (
+    get_event_bus,
+    set_task_sink, clear_task_sink,
+    set_log_sink, clear_log_sink,
+    set_task_loop, clear_task_loop,
+    get_dropped_count, reset_dropped_count,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -103,14 +109,47 @@ async def run_task(
     bus = get_event_bus()
     sm.mark_running(task_id)
     orchestrator = get_orchestrator()
+    # Ownership token: BranchManager.fork_from_active swaps in a new
+    # coroutine handle on ``sm._bg_tasks[task_id]`` to claim ownership of
+    # the task. We compare against this in ``finally`` so that, when fork
+    # has already taken over, we skip the cleanup tail (publish ``done`` /
+    # stop container / clear sinks) — otherwise we'd silently tear down
+    # the new branch's resources and the user would only see "branch
+    # forked, no further logs".
+    my_task = asyncio.current_task()
 
     # Register decision event sink so push_decision() inside agent nodes
     # can fire events to WS clients in real-time (not waiting for node yield).
     async def _decision_sink(ev: dict):
         await bus.publish(task_id, {"type": "decision_event", "data": ev})
 
-    set_task_sink(task_id, _decision_sink)
+    async def _log_sink(line: str, seq: int):
+        # ``seq`` 是 task 级单调 counter (TaskStateManager.next_log_seq),
+        # 前端用它推进 ``lastLogSeq`` 走 ``after_log_seq=K`` 增量重连。
+        # ``branch_id`` 由 sink 侧从 sm 当前 active 拿一次, 让前端按
+        # ``activeBranchId`` 过滤聊天流时, 任何路径的 phase_log 都能落到
+        # 正确的分支视图里。
+        cur = sm.get(task_id)
+        bid = (cur.active_branch_id if cur else "") or ""
+        await bus.publish(task_id, {
+            "type": "log",
+            "data": line,
+            "seq": seq,
+            "branch_id": bid,
+        })
 
+    set_task_sink(task_id, _decision_sink)
+    set_log_sink(task_id, _log_sink)
+    # 跨线程 sink fallback: 把当前 main loop 登记进 _TASK_LOOP, 让
+    # ``PentestState.log / push_decision`` 在 worker 线程命中时
+    # 能 ``run_coroutine_threadsafe`` 把事件投递回这里, 避免
+    # ``RuntimeError: no running event loop`` 让事件被静默吞掉。
+    try:
+        set_task_loop(task_id, asyncio.get_running_loop())
+    except RuntimeError:
+        pass
+
+    is_owner = True
     try:
         async for node_name, raw_state in orchestrator.run_stream(
             initial_state, thread_id=thread_id,
@@ -159,7 +198,21 @@ async def run_task(
             await _maybe_save_db(task_id, state, force=True)
     finally:
         sm.mark_stopped(task_id)
-        sm.unregister_bg_task(task_id)
+        # Ownership check: BranchManager.fork_from_active replaces the
+        # value of ``sm._bg_tasks[task_id]`` with the child branch's
+        # coroutine before we get here. If we're no longer the owner,
+        # someone else (the new branch) has claimed the task_id-scoped
+        # resources (sink / docker container) and we MUST NOT proceed
+        # with the cleanup tail below.
+        is_owner = sm._bg_tasks.get(task_id) is my_task
+        if is_owner:
+            sm.unregister_bg_task(task_id)
+
+    if not is_owner:
+        logger.info(
+            f"[API] 任务 {task_id} 已被分支管理器接管, run_task 跳过收尾"
+        )
+        return
 
     # 检测 LangGraph interrupt 暂停(等待人工审批)
     # auto_approve=True 的任务不会走到这里:edge_should_exploit 已经直通 foothold_attempt
@@ -200,6 +253,14 @@ async def run_task(
     _last_db_save.pop(task_id, None)
     _redis_log_cursor.pop(task_id, None)
     clear_task_sink(task_id)
+    clear_log_sink(task_id)
+    clear_task_loop(task_id)
+    dropped = get_dropped_count(task_id)
+    if dropped:
+        logger.warning(
+            f"[API] 任务 {task_id} 生命周期内累计丢弃 {dropped} 条事件"
+        )
+    reset_dropped_count(task_id)
     logger.info(f"[API] 任务 {task_id} 完成")
 
 
@@ -215,12 +276,32 @@ async def resume_task(
     bus = get_event_bus()
     sm.mark_running(task_id)
     orchestrator = get_orchestrator()
+    # See ``run_task`` for why we capture ownership: when a chat message
+    # forks mid-resume, the new branch claims ``sm._bg_tasks[task_id]``;
+    # cleanup logic below must be skipped in that case.
+    my_task = asyncio.current_task()
 
     async def _decision_sink(ev: dict):
         await bus.publish(task_id, {"type": "decision_event", "data": ev})
 
-    set_task_sink(task_id, _decision_sink)
+    async def _log_sink(line: str, seq: int):
+        cur = sm.get(task_id)
+        bid = (cur.active_branch_id if cur else "") or ""
+        await bus.publish(task_id, {
+            "type": "log",
+            "data": line,
+            "seq": seq,
+            "branch_id": bid,
+        })
 
+    set_task_sink(task_id, _decision_sink)
+    set_log_sink(task_id, _log_sink)
+    try:
+        set_task_loop(task_id, asyncio.get_running_loop())
+    except RuntimeError:
+        pass
+
+    is_owner = True
     try:
         async for node_name, raw_state in orchestrator.resume_stream(
             task_id=task_id, approved=approved, thread_id=thread_id,
@@ -257,12 +338,25 @@ async def resume_task(
     finally:
         sm.mark_stopped(task_id)
         sm.clear_approval_inflight(task_id)
-        sm.unregister_bg_task(task_id)
-        try:
-            from backend.tools.executor import TaskContainerManager
-            await TaskContainerManager.stop(task_id)
-        except Exception:
-            pass
+        # Ownership-aware cleanup: don't tear down task_id-scoped
+        # resources (container, sinks, bg slot) when a fork has already
+        # claimed them.
+        is_owner = sm._bg_tasks.get(task_id) is my_task
+        if is_owner:
+            sm.unregister_bg_task(task_id)
+
+    if not is_owner:
+        logger.info(
+            f"[API] 任务 {task_id} resume 已被分支管理器接管, 跳过收尾"
+        )
+        return
+
+    # Stop container only when we're the legitimate lifecycle owner.
+    try:
+        from backend.tools.executor import TaskContainerManager
+        await TaskContainerManager.stop(task_id)
+    except Exception:
+        pass
 
     # 最终持久化
     state = sm.get(task_id)
@@ -278,6 +372,14 @@ async def resume_task(
     _last_db_save.pop(task_id, None)
     _redis_log_cursor.pop(task_id, None)
     clear_task_sink(task_id)
+    clear_log_sink(task_id)
+    clear_task_loop(task_id)
+    dropped = get_dropped_count(task_id)
+    if dropped:
+        logger.warning(
+            f"[API] 任务 {task_id} resume 期间累计丢弃 {dropped} 条事件"
+        )
+    reset_dropped_count(task_id)
     logger.info(f"[API] 任务 {task_id} resume 完成")
 
 

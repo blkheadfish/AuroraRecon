@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import re
 import logging
+import threading
 from datetime import datetime
 from typing import Optional
 
@@ -108,6 +109,17 @@ class TaskStateManager:
         # cancel / delete 时可以精确取消对应协程,避免 zombie 残留。
         self._bg_tasks: dict[str, asyncio.Task] = {}
 
+        # ── task 级单调 log seq counter ────────────────────
+        # ``PentestState.log()`` 把 ``len(phase_log)-1`` 当作 seq 给 WS 用,
+        # 但 fork 出新分支时 child 的 phase_log 是父分支的拷贝, 之后两条
+        # 分支各自向前追加, seq 在 task 维度上不再单调; WS 重连按 seq 增量
+        # 补丁的逻辑会乱。改用进程内 task 级 counter, 配合
+        # ``PentestState.phase_log_seqs`` 持久化每条日志的真实 seq, WS
+        # 重连用 bisect 定位 start_idx, 跨分支也能严格单调对齐。
+        # counter 可能在 worker 线程被 ``state.log`` 间接读到, 加锁保证原子。
+        self._log_seq_counter: dict[str, int] = {}
+        self._log_seq_lock = threading.Lock()
+
     # ── 任务 CRUD ─────────────────────────────────────────
 
     def get(self, task_id: str) -> Optional[PentestState]:
@@ -117,6 +129,12 @@ class TaskStateManager:
         self._tasks[task_id] = state
 
     def pop(self, task_id: str) -> Optional[PentestState]:
+        # 任务彻底退出时一并清理 task-scoped 缓存, 避免 task_id 复用
+        # (rare, 测试 / 重启场景) 时把旧的 decision_cache / log seq
+        # 当成新任务的初始值。
+        self._decision_cache.pop(task_id, None)
+        self._decision_cursor.pop(task_id, None)
+        self.reset_log_seq(task_id)
         return self._tasks.pop(task_id, None)
 
     def all_states(self) -> list[PentestState]:
@@ -163,9 +181,50 @@ class TaskStateManager:
     def unregister_bg_task(self, task_id: str) -> None:
         self._bg_tasks.pop(task_id, None)
 
+    # ── 任务级 log seq ────────────────────────────────────
+
+    def next_log_seq(self, task_id: str, *, anchor: int | None = None) -> int:
+        """返回 ``task_id`` 维度下一条日志的单调 seq。
+
+        - 跨分支(fork 后两条分支各自向 phase_log 追加)仍能单调推进;
+        - WS 重连 ``after_log_seq`` 用这条 seq 走 bisect, 不会再漏补;
+        - ``anchor`` 给 hydrate / resume 路径用: 进程重启后第一次 log 时
+          从 ``state.phase_log_seqs[-1]`` 同步起点, 避免 counter 退回 0
+          以致前端重连 ``after_log_seq=K`` 时被错误地当作"全部要补"。
+
+        线程安全: ``threading.Lock`` 保证 worker 线程 ``state.log()`` 间接
+        调用时 counter 不会与主协程互相吞掉自增。
+        """
+        with self._log_seq_lock:
+            cur = self._log_seq_counter.get(task_id, -1)
+            if anchor is not None and anchor > cur:
+                cur = int(anchor)
+            cur += 1
+            self._log_seq_counter[task_id] = cur
+            return cur
+
+    def reset_log_seq(self, task_id: str) -> None:
+        with self._log_seq_lock:
+            self._log_seq_counter.pop(task_id, None)
+
+    def peek_log_seq(self, task_id: str) -> int:
+        with self._log_seq_lock:
+            return self._log_seq_counter.get(task_id, -1)
+
     def cancel_bg_task(self, task_id: str) -> bool:
-        """主动取消 run_task/resume_task 协程。返回是否发起了取消。"""
-        task = self._bg_tasks.pop(task_id, None)
+        """主动取消 run_task/resume_task 协程。返回是否发起了取消。
+
+        语义说明:
+            ``run_task`` / ``resume_task`` / ``_resume_branch_bg`` 内部都用
+            ``sm._bg_tasks.get(task_id) is my_task`` 判断自己是不是当前
+            owner——是 owner 才走 ``stop container`` / ``publish('done')`` /
+            ``clear_*_sink`` 的收尾。如果这里直接 ``pop``,``cancel`` 唤醒
+            后的 finally 会把自己误判成"被分支接管",于是整个用户主动 cancel
+            的语义就被吞掉了 (容器不关、done 不发、sink 不清)。所以
+            ``cancel_bg_task`` 只发取消信号,真正的 unregister 由协程自己
+            在 finally 里完成。
+        """
+        task = self._bg_tasks.get(task_id)
         if not task or task.done():
             return False
         task.cancel()
@@ -414,10 +473,22 @@ class TaskStateManager:
 
     def ws_phase_payload(self, state: PentestState, log_tail: int = 5) -> dict:
         tail = max(1, min(log_tail, 50))
+        log_total = len(state.phase_log or [])
+        seqs = list(getattr(state, "phase_log_seqs", []) or [])
+        last_seq = (
+            int(seqs[-1])
+            if (seqs and len(seqs) == log_total and log_total)
+            else (log_total - 1 if log_total else -1)
+        )
         return {
             "phase": state.current_phase,
             "status": state.status.value,
             "logs": state.phase_log[-tail:],
+            # 把 phase_log 当前末尾的 task 级 seq 透出, 让前端 phase_update
+            # 也能推进 ``lastLogSeq``, 与 history_logs / log 事件统一口径。
+            "log_seq_last": last_seq,
+            # 便于前端按 activeBranchId 过滤 phase_update 事件流。
+            "branch_id": getattr(state, "active_branch_id", "") or "",
             "findings_count": len(state.findings),
             "got_shell": state.got_shell,
             "privilege_level": state.privilege_level,
@@ -436,6 +507,53 @@ class TaskStateManager:
         if not match:
             return "", "", log_entry or ""
         return match.group("ts"), match.group("phase"), match.group("msg")
+
+    @staticmethod
+    def _normalize_phase_log_ts(
+        state_created_at: str, ts_short: str, prev_iso: str
+    ) -> str:
+        """把 phase_log 里的 ``[HH:MM:SS]`` 短时间戳标准化成 ISO-8601 串,
+        与 ``push_decision`` 写入的 ``timestamp`` 对齐, 这样前端字典序 sort
+        可以严格还原时间序, 不会再出现"HH:MM:SS 永远排在 YYYY-MM-DDTHH:MM
+        前面"的错位。
+
+        规则:
+            - 输入已是 ISO (含 ``T``) → 直接透传
+            - 否则用 ``prev_iso`` 的日期作为 anchor;
+              若当前 HH:MM:SS 比 ``prev`` 的 HH:MM:SS 小, 视为跨午夜, 日期 +1
+            - 没有 prev 时退到 ``state.created_at`` 的日期; 都没有就用 utcnow
+            - ``ts_short`` 无法解析时返回空串 (调用方兜底)
+        """
+        if not ts_short:
+            return ""
+        if "T" in ts_short and len(ts_short) >= 10:
+            return ts_short
+        m = re.match(r"^(\d{2}):(\d{2}):(\d{2})", ts_short)
+        if not m:
+            return ""
+        cur_hms = f"{m.group(1)}:{m.group(2)}:{m.group(3)}"
+
+        base_date = ""
+        base_hms = ""
+        if prev_iso and len(prev_iso) >= 10 and prev_iso[4] == "-":
+            base_date = prev_iso[:10]
+            tm = re.search(r"T(\d{2}:\d{2}:\d{2})", prev_iso)
+            if tm:
+                base_hms = tm.group(1)
+        if not base_date:
+            if state_created_at and len(state_created_at) >= 10:
+                base_date = state_created_at[:10]
+            else:
+                base_date = datetime.utcnow().strftime("%Y-%m-%d")
+
+        if base_hms and cur_hms < base_hms:
+            try:
+                from datetime import date as _date, timedelta as _td
+                base_date = (_date.fromisoformat(base_date) + _td(days=1)).isoformat()
+            except Exception:
+                pass
+
+        return f"{base_date}T{cur_hms}"
 
     def build_decision_events(self, state: PentestState) -> list[dict]:
         """Build decision events with incremental caching."""
@@ -458,12 +576,25 @@ class TaskStateManager:
             if ev.get("action") == "command_exec":
                 seen_exec_keys.add((ts, phase, cmd))
 
+        # 增量构造 phase_log 派生事件时, 用上一次缓存里最末一条 ISO 时间戳作为
+        # anchor, 跨调用维持 prev_iso, 让跨午夜推进逻辑稳定。
+        prev_iso = ""
+        for ev in reversed(events):
+            ts = ev.get("timestamp", "")
+            if ts and "T" in ts and len(ts) >= 10:
+                prev_iso = ts
+                break
+        state_created_at = getattr(state, "created_at", "") or ""
+
         base_idx = prev[0] if tid in self._decision_cache else 0
 
         # 1) incremental phase_log
         for idx in range(base_idx, cur_log):
             entry = state.phase_log[idx]
-            ts, phase, msg = self._extract_phase_log(entry)
+            ts_short, phase, msg = self._extract_phase_log(entry)
+            ts = self._normalize_phase_log_ts(state_created_at, ts_short, prev_iso) or ts_short
+            if ts and "T" in ts:
+                prev_iso = ts
             tone = "info"
             action = "log"
             tool = ""
@@ -494,12 +625,19 @@ class TaskStateManager:
                 action = "thought"
                 tone = "primary"
 
+            # 历史日志里 tool 就是 TOOL_START_RE / TOOL_DONE_RE 抓到的字面;
+            # executor 已经把 ``/bin/bash`` 替换成 display_tool, 但兼容残留
+            # 老日志 / 直接被监督模式注入的旧文本: 命中 shell 名就退一步显示
+            # ``script``,否则前端工具链还会出现 ``/bin/bash``。
+            if tool and tool in _SHELL_NAMES:
+                tool = "script"
             events.append({
                 "id": f"log-{idx}",
                 "timestamp": ts,
                 "phase": phase,
                 "action": action,
                 "tool": tool,
+                "display_tool": tool,
                 "backend": backend,
                 "poc_or_vuln": "",
                 "command": "",
@@ -528,9 +666,16 @@ class TaskStateManager:
             stderr = str(payload.get("stderr") or "")
             timestamp = str(payload.get("timestamp") or "")
             phase = str(payload.get("phase") or "")
+            # display_tool 由 executor 直接落库,老记录没有时回退到 ``tool`` +
+            # 命令推断,确保前端工具链不会再看到 ``/bin/bash``。
+            display_tool = str(payload.get("display_tool") or "").strip()
             tool = str(payload.get("tool") or "shell")
-            if tool in _SHELL_NAMES:
-                tool = _infer_tool_from_command(cmd)
+            if not display_tool:
+                if tool in _SHELL_NAMES:
+                    display_tool = _infer_tool_from_command(cmd)
+                else:
+                    display_tool = tool
+            tool = display_tool
             backend = str(payload.get("backend") or "")
             exit_code = payload.get("exit_code")
             elapsed = payload.get("elapsed")
@@ -557,6 +702,7 @@ class TaskStateManager:
                 "phase": phase or "unknown",
                 "action": "command_exec",
                 "tool": tool,
+                "display_tool": display_tool,
                 "backend": backend,
                 "poc_or_vuln": "",
                 "command": cmd,
@@ -603,15 +749,21 @@ class TaskStateManager:
                 if dedupe_key in seen_exec_keys:
                     continue
                 seen_exec_keys.add(dedupe_key)
+                rec_display_tool = str(record.get("display_tool") or "").strip()
                 rec_tool = str(record.get("tool") or "shell")
-                if rec_tool in _SHELL_NAMES:
-                    rec_tool = _infer_tool_from_command(cmd)
+                if not rec_display_tool:
+                    if rec_tool in _SHELL_NAMES:
+                        rec_display_tool = _infer_tool_from_command(cmd)
+                    else:
+                        rec_display_tool = rec_tool
+                rec_tool = rec_display_tool
                 events.append({
                     "id": f"cmd-{ridx}-{cidx}",
                     "timestamp": timestamp,
                     "phase": str(record.get("phase") or "exploit"),
                     "action": "command_exec",
                     "tool": rec_tool,
+                    "display_tool": rec_display_tool,
                     "backend": str(record.get("backend") or ""),
                     "poc_or_vuln": vuln_id,
                     "command": cmd,
@@ -635,6 +787,8 @@ class TaskStateManager:
             event.setdefault("truncated", False)
             event.setdefault("total_len", 0)
             event.setdefault("runtime_command", "")
+            # 前端 helper 优先读 display_tool 渲染节点,兜底到 tool。
+            event.setdefault("display_tool", event.get("tool") or "")
 
         self._decision_cache[tid] = events
         self._decision_cursor[tid] = (cur_log, cur_rec, cur_exp)

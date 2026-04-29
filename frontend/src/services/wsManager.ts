@@ -40,6 +40,12 @@ function dedupeLogs(channel: ChannelState, event: WsTaskEvent): WsTaskEvent {
   }
   if ((event as { type?: string }).type === 'log') {
     const line = String((event as { data?: string }).data || '')
+    const seq = (event as { seq?: number }).seq
+    // 推进 lastLogSeq,这样断线重连时 ?after_log_seq=N 只会补差值,
+    // 不会再让后端把最近 200 行 history_logs 整段重发。
+    if (typeof seq === 'number' && Number.isFinite(seq)) {
+      channel.lastLogSeq = Math.max(channel.lastLogSeq, seq + 1)
+    }
     if (line && !channel.seenLogs.has(line)) {
       noteSeenLog(channel, line)
       return event

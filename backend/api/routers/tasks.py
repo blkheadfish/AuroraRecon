@@ -827,12 +827,18 @@ async def send_chat_message(task_id: str, req: ChatMessageRequest, request: Requ
         "timestamp": now_iso,
     }
 
-    # Always record the message on the timeline (irrespective of status).
-    state.user_messages.append(msg)
-
     fork_active = state.status in (
         TaskStatus.RUNNING, TaskStatus.AWAITING_APPROVAL,
     )
+
+    # ── user_messages 写入责任划分 ──────────────────────────
+    # fork 路径: 此处不 append 到 ``sm.state.user_messages``。
+    #   ``BranchManager.fork_from_active`` 内部已经基于父分支 user_messages
+    #   构造 ``new_messages = parent_msgs + [new_msg]`` 写到 child thread
+    #   的 LangGraph checkpoint 里; 如果这里又往 sm.state 追加, fork 出
+    #   的子分支 user_messages 就会出现"父历史 + 当前 + 当前"的双写,
+    #   前端按 branch_id 过滤后会显示同一条用户消息出现两次。
+    # 终态路径(completed/failed): 不会 fork, 这里写入是唯一记录点。
     new_branch_payload = None
     if fork_active:
         from backend.api.services.branch_manager import get_branch_manager
@@ -858,11 +864,20 @@ async def send_chat_message(task_id: str, req: ChatMessageRequest, request: Requ
 
         # Forking handles cooperative interrupt of the parent + checkpoint
         # copy + bg task scheduling for the child.
+        # Claude 风格: 若前端指定了 ``from_event_id`` (在某条历史消息处分叉),
+        # 把它当作 ``TaskBranch.fork_event_id`` 落库, 并用 ``from_event_ts``
+        # 作为时间锚点交给 ``find_checkpoint_at_or_before`` 找对应 checkpoint。
+        fork_event_id = (
+            req.from_event_id
+            if req.from_event_id
+            else f"chat-{len(state.user_messages) + 1}"
+        )
         try:
             child = await bm.fork_from_active(
                 task_id,
                 user_prompt=text,
-                fork_event_id=f"chat-{len(state.user_messages)}",
+                fork_event_id=fork_event_id,
+                from_event_ts=req.from_event_ts,
             )
             new_branch_payload = child.model_dump()
         except Exception as exc:
@@ -881,6 +896,8 @@ async def send_chat_message(task_id: str, req: ChatMessageRequest, request: Requ
             except Exception:
                 pass
     else:
+        # 终态/无 fork 场景下唯一的写入点。
+        state.user_messages.append(msg)
         sm.set(task_id, state)
 
     await bus.publish(task_id, {

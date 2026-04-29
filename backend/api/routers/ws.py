@@ -12,13 +12,14 @@ routers/ws.py —— WebSocket 实时推送
 from __future__ import annotations
 
 import asyncio
+import bisect
 import logging
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 
 from backend.api.deps import decode_jwt
 from backend.api.state import get_state_manager, TaskStateManager, TOOL_START_RE, TOOL_DONE_RE
-from backend.api.event_bus import get_event_bus, TaskEventBus
+from backend.api.event_bus import get_event_bus, TaskEventBus, get_dropped_count
 from backend.agents.models import TaskStatus
 
 logger = logging.getLogger(__name__)
@@ -91,21 +92,42 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
         state = sm.get(task_id)
         if state:
             log_total = len(state.phase_log or [])
+            seqs = list(getattr(state, "phase_log_seqs", []) or [])
             if after_log_seq >= 0:
-                # 增量回放:只补客户端缺失的部分
-                start_idx = max(0, after_log_seq)
+                # 增量回放: 用 task 级单调 seq + bisect 定位首条未送达的
+                # 日志, 避免老逻辑 ``start_idx = after_log_seq`` 在 fork
+                # 后用错下标 (子分支的局部下标 ≠ 父分支客户端的 seq)。
+                # 兜底: 老 state 还没有 ``phase_log_seqs`` 时退回老语义。
+                if seqs and len(seqs) == log_total:
+                    start_idx = bisect.bisect_right(seqs, after_log_seq)
+                else:
+                    start_idx = max(0, after_log_seq)
             else:
                 # 首次连接:仅回放最近 log_tail_param 条
                 start_idx = max(0, log_total - log_tail_param)
 
             history_logs = state.phase_log[start_idx:log_total] if log_total > start_idx else []
+            history_seq_start = (
+                int(seqs[start_idx])
+                if (seqs and len(seqs) == log_total and start_idx < log_total)
+                else start_idx
+            )
+            history_seq_next = (
+                int(seqs[-1]) + 1
+                if (seqs and len(seqs) == log_total and history_logs)
+                else start_idx + len(history_logs)
+            )
 
-            # 先发 history_meta,前端可据此决定是否再走分页接口拉更早历史
+            # 先发 history_meta,前端可据此决定是否再走分页接口拉更早历史。
+            # ``dropped_count`` 透出累计丢弃事件数: 队列满意味着此前消费者
+            # 太慢, 历史回放可能并不完整, 前端可以据此提示"已丢弃 N 条事件,
+            # 建议刷新看完整记录"或自动触发 ``GET /tasks/{id}/decision_events``。
             if not await _send({
                 "type": "history_meta",
                 "phase_log_total": log_total,
                 "phase_log_start": start_idx,
                 "phase_log_replayed": len(history_logs),
+                "dropped_count": int(get_dropped_count(task_id) or 0),
             }):
                 return
 
@@ -113,8 +135,11 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
                 if not await _send({
                     "type": "history_logs",
                     "data": history_logs,
-                    "start_seq": start_idx,
-                    "next_seq": start_idx + len(history_logs),
+                    # ``start_seq`` / ``next_seq`` 现在是 task 级单调 seq,
+                    # 前端 ``lastLogSeq`` 直接据此推进, 重连 ``after_log_seq``
+                    # 也按这个口径回填即可。
+                    "start_seq": history_seq_start,
+                    "next_seq": history_seq_next,
                     "total": log_total,
                 }):
                     return
@@ -122,6 +147,13 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
             existing_events = sm.build_decision_events(state)
             for de in state.live_decision_events:
                 existing_events.append(de)
+            # ``build_decision_events`` 把 phase_log → ISO ts 后直接 append,
+            # 接着拼接的 ``live_decision_events`` 是 push_decision 路径,
+            # 二者时间戳已经统一为 ISO-8601。但顺序仍可能交错(同一秒内
+            # phase_log 和 push_decision 各自单调, 合并后未必字典序有序),
+            # 因此先按 ``timestamp`` 稳定排序再 tail, 保证前端 chat 流和
+            # ToolChainRail 重连后看到的历史顺序与实时事件流一致。
+            existing_events.sort(key=lambda ev: str(ev.get("timestamp") or ""))
             snapshot = (
                 existing_events[-WS_HISTORY_DECISION_TAIL:]
                 if len(existing_events) > WS_HISTORY_DECISION_TAIL

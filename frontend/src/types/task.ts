@@ -117,6 +117,7 @@ export interface CommandExecutionRecord {
   id?: string
   phase?: string
   tool?: string
+  display_tool?: string
   backend?: string
   runtime_command?: string
   round?: number
@@ -180,6 +181,11 @@ export interface DecisionEvent {
   phase?: string
   action?: string
   tool?: string
+  /**
+   * 展示用工具名(由 executor 层算好), 前端 helper 优先用它而不是 ``tool``,
+   * 避免把 ``/bin/bash`` 这类 shell 包装直接渲染到工具链节点。
+   */
+  display_tool?: string
   backend?: string
   poc_or_vuln?: string
   command?: string
@@ -294,6 +300,11 @@ export interface WsPhaseUpdateEvent {
 export interface WsLogEvent {
   type: 'log'
   data: string
+  /**
+   * 后端 phase_log 数组下标(append 后立即取的索引)。前端用它推进
+   * `lastLogSeq`,保证 WS 重连只补缺失增量,而不会从默认 tail 再吃一遍。
+   */
+  seq?: number
 }
 
 export interface WsDoneEvent {

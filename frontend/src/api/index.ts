@@ -260,14 +260,24 @@ export const api = {
     results?: Record<string, boolean>
   }> => http.post('/knowledge/build', vulnId ? { vuln_id: vulnId } : {}, { timeout: 600000 }),
 
-  sendChat: (taskId: string, text: string): Promise<{
+  sendChat: (
+    taskId: string,
+    text: string,
+    options?: { fromEventId?: string; fromEventTs?: string },
+  ): Promise<{
     status: string
     message: { role: string; text: string; timestamp: string }
     task_status?: string
     fork_active?: boolean
     branch?: TaskBranch | null
   }> =>
-    http.post(`/tasks/${taskId}/chat`, { text }),
+    http.post(`/tasks/${taskId}/chat`, {
+      text,
+      // 仅在用户从历史气泡选择"在此分叉"时才回传, 让 BranchManager
+      // 走 ``find_checkpoint_at_or_before`` 找具体 checkpoint。
+      from_event_id: options?.fromEventId,
+      from_event_ts: options?.fromEventTs,
+    }),
   getChatHistory: (taskId: string): Promise<{ messages: Array<{ role: string; text: string; timestamp: string }> }> =>
     http.get(`/tasks/${taskId}/chat`),
 
