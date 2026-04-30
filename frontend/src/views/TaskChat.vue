@@ -72,6 +72,66 @@
             :timestamp="msg.timestamp"
             :tone="msg.tone"
           >
+            <div v-if="msg.action === 'operator_replan' && msg.operatorPlan" class="replan-card">
+              <div class="replan-row" v-if="msg.operatorPlan.intent_summary">
+                <span class="replan-label">理解</span>
+                <span class="replan-value">{{ msg.operatorPlan.intent_summary }}</span>
+              </div>
+              <div class="replan-row" v-if="msg.operatorPlan.next_phase || msg.operatorPlan.rerun_current">
+                <span class="replan-label">下一步</span>
+                <span class="replan-value">
+                  <code v-if="msg.operatorPlan.next_phase">{{ msg.operatorPlan.next_phase }}</code>
+                  <span v-if="msg.operatorPlan.rerun_current" class="replan-pill">重跑当前阶段</span>
+                </span>
+              </div>
+              <div class="replan-row" v-if="msg.operatorPlan.target_phases && msg.operatorPlan.target_phases.length">
+                <span class="replan-label">阶段序列</span>
+                <span class="replan-value">{{ msg.operatorPlan.target_phases.join(' → ') }}</span>
+              </div>
+              <div class="replan-row" v-if="msg.operatorPlan.focus_targets && msg.operatorPlan.focus_targets.length">
+                <span class="replan-label">聚焦目标</span>
+                <span class="replan-value">
+                  <span
+                    v-for="(t, ti) in msg.operatorPlan.focus_targets"
+                    :key="ti"
+                    class="replan-chip"
+                  >{{ t.type }}={{ t.value }}</span>
+                </span>
+              </div>
+              <div class="replan-row" v-if="msg.operatorPlan.preferred_tools && msg.operatorPlan.preferred_tools.length">
+                <span class="replan-label">工具偏好</span>
+                <span class="replan-value">
+                  <span v-for="t in msg.operatorPlan.preferred_tools" :key="t" class="replan-chip chip-tool">{{ t }}</span>
+                </span>
+              </div>
+              <div class="replan-row" v-if="msg.operatorPlan.avoided_tools && msg.operatorPlan.avoided_tools.length">
+                <span class="replan-label">禁用工具</span>
+                <span class="replan-value">
+                  <span v-for="t in msg.operatorPlan.avoided_tools" :key="t" class="replan-chip chip-warn">{{ t }}</span>
+                </span>
+              </div>
+              <div class="replan-row" v-if="msg.operatorPlan.keyword_hints && msg.operatorPlan.keyword_hints.length">
+                <span class="replan-label">关键词</span>
+                <span class="replan-value">
+                  <span v-for="k in msg.operatorPlan.keyword_hints.slice(0, 12)" :key="k" class="replan-chip chip-soft">{{ k }}</span>
+                </span>
+              </div>
+              <div class="replan-row" v-if="msg.operatorPlan.skip_phases && msg.operatorPlan.skip_phases.length">
+                <span class="replan-label">跳过</span>
+                <span class="replan-value">
+                  <span v-for="p in msg.operatorPlan.skip_phases" :key="p" class="replan-chip chip-warn">{{ p }}</span>
+                </span>
+              </div>
+              <div class="replan-row" v-if="!msg.operatorPlan.needs_human_approval">
+                <span class="replan-label">授权</span>
+                <span class="replan-value chip-warn-text">用户授权: 跳过人工审批</span>
+              </div>
+              <div class="replan-rationale" v-if="msg.operatorPlan.rationale">
+                <span class="replan-label">推理</span>
+                <p>{{ msg.operatorPlan.rationale }}</p>
+              </div>
+            </div>
+
             <div v-if="msg.purpose" class="thought-meta">
               <span class="meta-label">目标</span> {{ msg.purpose }}
             </div>
@@ -79,14 +139,25 @@
               <span class="meta-label">预期</span> {{ msg.expected }}
             </div>
             <div v-if="Array.isArray(msg.plan) && msg.plan.length" class="thought-plan">
-              <span class="meta-label">攻击计划</span>
+              <span class="meta-label">{{ msg.action === 'operator_replan' ? '执行要点' : '攻击计划' }}</span>
               <ol>
                 <li v-for="(step, si) in msg.plan" :key="si">{{ step }}</li>
               </ol>
             </div>
-            <details v-if="msg.thinking" class="thought-expand">
-              <summary>展开完整推理</summary>
+            <!-- 默认展示推理摘要(不再让用户每条都点"展开"); 长文本超过 600
+                 字才折叠剩余部分。这样 chat 流里"AI 推理"卡片不再只显示一句
+                 头部, 用户能一眼看到当前节点究竟在想什么。 -->
+            <div v-if="msg.thinkingPreview" class="thought-preview">
+              <span class="meta-label">推理</span>
+              <p class="thought-preview-text">{{ msg.thinkingPreview }}</p>
+            </div>
+            <details v-if="msg.thinkingHasMore" class="thought-expand">
+              <summary>展开完整推理 ({{ msg.thinkingFullLen }} 字)</summary>
               <pre class="thought-full">{{ msg.thinking }}</pre>
+            </details>
+            <details v-if="msg.reasoning" class="thought-expand reasoning-expand">
+              <summary>展开 LLM 思考链 (reasoning)</summary>
+              <pre class="thought-full reasoning-full">{{ msg.reasoning }}</pre>
             </details>
 
             <div v-if="msg.action === 'checkpoint_request'" class="checkpoint-slot">
@@ -488,18 +559,59 @@ const messages = computed(() => {
     const time = formatTime(entry.timestamp)
     const baseId = entry.id || `ev-${idx}`
 
-    if (entry.action === 'thought') {
-      const roundLabel = entry.round ? `第 ${entry.round} 轮` : ''
-      const vulnLabel = entry.vuln_name ? ` · ${entry.vuln_name}` : ''
-      const head = `AI 推理${roundLabel ? ' · ' + roundLabel : ''}${vulnLabel}`
-      const summary = (entry.message || entry.thinking || '').slice(0, 240)
+    // 操作员实时重规划: 由后端 ``backend.agents.operator_replanner`` 在
+    // chat 触发 fork 时同步生成的 OperatorPlan, 走专用高亮卡片渲染。
+    if (entry.action === 'operator_replan') {
+      const headBits = ['操作员重规划']
+      if (entry.phase) headBits.push(entry.phase)
+      const summary = entry.message || entry.operator_plan?.intent_summary || '已重规划'
       out.push({
         id: baseId,
         role: 'agent',
         tone: 'primary',
-        text: summary ? `${head}\n${summary}` : head,
+        action: 'operator_replan',
+        text: `${headBits.join(' · ')}\n${summary}`,
         timestamp: time,
-        thinking: entry.thinking || entry.message || '',
+        purpose: entry.purpose || '',
+        plan: entry.plan || [],
+        thinking: '',
+        thinkingPreview: '',
+        thinkingHasMore: false,
+        thinkingFullLen: 0,
+        reasoning: '',
+        operatorPlan: entry.operator_plan || null,
+      })
+      return
+    }
+
+    if (entry.action === 'thought') {
+      const roundLabel = entry.round ? `第 ${entry.round} 轮` : ''
+      const vulnLabel = entry.vuln_name ? ` · ${entry.vuln_name}` : ''
+      const head = `AI 推理${roundLabel ? ' · ' + roundLabel : ''}${vulnLabel}`
+      // 头部展示 message(短句状态), 不放 thinking, 避免 ChatBubble 文本框
+      // 把整段推理压成单行、同时还要再"展开完整推理". 推理正文走下面的
+      // thinkingPreview / thinking 字段, 默认就在卡片里渲染一段摘要,
+      // 解决"AI 决策结果过于精简、只有一行 head" 的问题。
+      const headline = String(entry.message || '').trim()
+      const thinkingFull = String(entry.thinking || '').trim()
+      const reasoningFull = String(entry.reasoning || '').trim()
+      const PREVIEW_LIMIT = 600
+      const preview = thinkingFull.length > PREVIEW_LIMIT
+        ? thinkingFull.slice(0, PREVIEW_LIMIT).replace(/\s+$/, '') + '…'
+        : thinkingFull
+      const text = headline ? `${head}\n${headline}` : head
+      out.push({
+        id: baseId,
+        role: 'agent',
+        tone: 'primary',
+        action: 'thought',
+        text,
+        timestamp: time,
+        thinking: thinkingFull,
+        thinkingPreview: preview,
+        thinkingHasMore: thinkingFull.length > PREVIEW_LIMIT,
+        thinkingFullLen: thinkingFull.length,
+        reasoning: reasoningFull,
         purpose: entry.purpose || '',
         expected: entry.expected || '',
         plan: entry.plan || [],
@@ -1366,6 +1478,7 @@ onUnmounted(() => {
   font-weight: 500;
   user-select: none;
 }
+.reasoning-expand summary { color: color-mix(in srgb, var(--accent-blue) 60%, var(--text-secondary)); }
 .thought-full {
   margin: 6px 0 0;
   padding: 8px 10px;
@@ -1381,6 +1494,124 @@ onUnmounted(() => {
   font-family: var(--font-mono);
   scrollbar-width: thin;
   scrollbar-color: color-mix(in srgb, var(--text-primary) 22%, transparent) transparent;
+}
+.reasoning-full {
+  background: color-mix(in srgb, var(--bg-base) 80%, var(--text-secondary) 8%);
+  font-style: italic;
+}
+
+/* AI 推理"摘要"区: 默认展示 thinking 前 600 字, 不再让用户每条都点
+   "展开完整推理"才能看到内容。 */
+.thought-preview {
+  margin: 6px 0 0;
+  font-size: 12.5px;
+  line-height: 1.65;
+  color: var(--text-primary);
+}
+.thought-preview-text {
+  margin: 4px 0 0;
+  padding: 8px 10px;
+  background: color-mix(in srgb, var(--bg-base) 70%, var(--accent-blue) 6%);
+  border-left: 3px solid color-mix(in srgb, var(--accent-blue) 50%, transparent);
+  border-radius: 0 var(--radius-md) var(--radius-md) 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* operator_replan 卡片: 高亮"agent 听懂了"反馈 */
+.replan-card {
+  margin: 6px 0 0;
+  padding: 10px 12px;
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--accent-blue) 14%, transparent),
+    color-mix(in srgb, var(--accent-blue) 4%, transparent)
+  );
+  border: 1px solid color-mix(in srgb, var(--accent-blue) 40%, transparent);
+  border-radius: var(--radius-md);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.replan-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  flex-wrap: wrap;
+}
+.replan-label {
+  flex-shrink: 0;
+  min-width: 4.5em;
+  font-weight: 600;
+  color: var(--accent-blue);
+  font-size: 12px;
+}
+.replan-value {
+  flex: 1;
+  color: var(--text-primary);
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+}
+.replan-value code {
+  padding: 1px 6px;
+  font-size: 12px;
+  font-family: var(--font-mono);
+  background: color-mix(in srgb, var(--bg-base) 60%, var(--accent-blue) 12%);
+  border: 1px solid color-mix(in srgb, var(--accent-blue) 30%, transparent);
+  border-radius: 4px;
+}
+.replan-pill {
+  padding: 1px 8px;
+  font-size: 11px;
+  background: color-mix(in srgb, var(--accent-blue) 20%, transparent);
+  border-radius: 999px;
+  color: var(--accent-blue);
+}
+.replan-chip {
+  display: inline-flex;
+  padding: 2px 8px;
+  font-size: 11.5px;
+  background: color-mix(in srgb, var(--bg-base) 70%, var(--accent-blue) 10%);
+  border: 1px solid color-mix(in srgb, var(--accent-blue) 25%, transparent);
+  border-radius: 999px;
+  color: var(--text-primary);
+}
+.replan-chip.chip-tool {
+  background: color-mix(in srgb, var(--bg-base) 70%, #2ea043 12%);
+  border-color: color-mix(in srgb, #2ea043 35%, transparent);
+  color: color-mix(in srgb, #2ea043 80%, var(--text-primary));
+}
+.replan-chip.chip-warn {
+  background: color-mix(in srgb, var(--bg-base) 70%, #d29922 12%);
+  border-color: color-mix(in srgb, #d29922 35%, transparent);
+  color: color-mix(in srgb, #d29922 80%, var(--text-primary));
+}
+.replan-chip.chip-soft {
+  background: color-mix(in srgb, var(--bg-base) 80%, transparent);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.chip-warn-text {
+  color: color-mix(in srgb, #d29922 90%, var(--text-primary));
+  font-weight: 500;
+}
+.replan-rationale {
+  margin-top: 4px;
+  padding-top: 6px;
+  border-top: 1px dashed color-mix(in srgb, var(--accent-blue) 25%, transparent);
+}
+.replan-rationale p {
+  margin: 4px 0 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 .thought-full::-webkit-scrollbar { width: 8px; }
 .thought-full::-webkit-scrollbar-track { background: transparent; }

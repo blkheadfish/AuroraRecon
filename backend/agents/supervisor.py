@@ -67,6 +67,31 @@ def _high_value_path_seen(state: PentestState) -> bool:
     return False
 
 
+def _is_plan_consumed_by(plan: Any, consumer: str) -> bool:
+    """判断 ``plan`` 是否已经被 ``consumer`` 消费过。
+
+    ``plan.consumed_by`` 是一个字符串列表(节点名 / 路由名), supervisor 第一次
+    读完 plan 之后会把自己 append 进去, 防止后续每一轮 supervisor 都重复
+    "按 plan 路由"造成死循环 — operator_plan 的语义是"在用户给出新指令的
+    那一跳起作用", 不应永远 sticky 控制路由。
+    """
+    if plan is None:
+        return False
+    return consumer in (getattr(plan, "consumed_by", None) or [])
+
+
+def _mark_plan_consumed_by(plan: Any, consumer: str) -> None:
+    if plan is None:
+        return
+    consumed = list(getattr(plan, "consumed_by", None) or [])
+    if consumer not in consumed:
+        consumed.append(consumer)
+        try:
+            plan.consumed_by = consumed
+        except Exception:
+            pass
+
+
 def _no_new_facts(state: PentestState, k: int = 3) -> bool:
     """Check the last *k* supervisor rounds — if they produced no fact churn."""
     hist = list(state.supervisor_history or [])
@@ -94,7 +119,37 @@ def _rule_decide(state: PentestState) -> Optional[dict[str, Any]]:
     # ── 1. 反馈循环 signals 优先于阶段递推 ──────────────────────
     sig = state.replan_signals or {}
 
-    # 1.0 操作员实时意图(最高优先级): 不走任何规则, 交给 LLM 兜底,
+    # 1.0a 操作员重规划计划(最高优先级): 如果 Operator Replanner 已经把
+    # 用户的指令翻译成 OperatorPlan, 这里直接落地到路由, 不必再走 LLM
+    # 兜底——plan.next_phase 已经在 ALLOWED_PHASES 白名单内。
+    plan = getattr(state, "operator_plan", None)
+    if plan is not None and not _is_plan_consumed_by(plan, "supervisor"):
+        nxt = (plan.next_phase or "").strip()
+        if nxt:
+            return {
+                "next": nxt,
+                "reason": (
+                    f"operator_plan: {plan.intent_summary or '按操作员指令路由'}"
+                ),
+                "rule": "plan.next_phase",
+            }
+        if plan.rerun_current and (plan.source_phase or state.current_phase):
+            target = plan.source_phase or state.current_phase
+            return {
+                "next": target,
+                "reason": f"operator_plan: 重跑 {target}",
+                "rule": "plan.rerun_current",
+            }
+        if plan.target_phases:
+            return {
+                "next": plan.target_phases[0],
+                "reason": (
+                    f"operator_plan: 阶段序列 {' → '.join(plan.target_phases)}"
+                ),
+                "rule": "plan.target_phases",
+            }
+
+    # 1.0b 操作员实时意图(次优先级): 没有结构化 plan 时退回到 LLM 兜底,
     # _llm_decide 会读取 user_messages / pending_user_prompt 决定下一阶段。
     if int(sig.get("operator_intent", 0)) > 0:
         return None
@@ -220,12 +275,21 @@ async def node_supervisor(state: PentestState) -> PentestState:
     operator_intent_pending = int(
         (state.replan_signals or {}).get("operator_intent", 0)
     ) > 0
+    plan_pending = (
+        getattr(state, "operator_plan", None) is not None
+        and not _is_plan_consumed_by(state.operator_plan, "supervisor")
+    )
 
     decision = _rule_decide(state)
     if decision is None:
         decision = await _llm_decide(state)
     if decision is None:
         decision = {"next": "report", "reason": "fallback", "rule": "guard.no_decision"}
+
+    # 标记 operator_plan 已被 supervisor 消费, 防止后续每一轮 supervisor
+    # 都按同一份 plan 强制路由制造死循环。
+    if plan_pending:
+        _mark_plan_consumed_by(state.operator_plan, "supervisor")
 
     # 操作员意图已经由 LLM 兜底消化, 清掉信号 + 摘除 interrupt registry 里
     # 那条记录, 避免下一轮反复回到 LLM 路径制造死循环。pending_user_prompt
@@ -254,13 +318,20 @@ async def node_supervisor(state: PentestState) -> PentestState:
     history.append(history_entry)
     state.supervisor_history = history[-50:]
 
+    badges = []
+    if operator_intent_pending:
+        badges.append("[operator_intent]")
+    if plan_pending:
+        badges.append("[operator_plan]")
+    badge_str = "".join(f" {b}" for b in badges)
+
     state.push_decision({
         "action": "supervisor_route",
         "phase": "supervisor",
         "thinking": (
             f"#{state.supervisor_round} → {decision['next']}"
             f" (rule={decision.get('rule', '')}); reason={decision.get('reason', '')}"
-            + (" [operator_intent]" if operator_intent_pending else "")
+            + badge_str
         ),
         "purpose": "supervisor 路由决策",
         "message": f"supervisor: {decision['next']}",
@@ -269,7 +340,7 @@ async def node_supervisor(state: PentestState) -> PentestState:
     state.log(
         f"[supervisor] #{state.supervisor_round} 路由 → {decision['next']}"
         f" (rule={decision.get('rule', '')})"
-        + (" [operator_intent]" if operator_intent_pending else "")
+        + badge_str
     )
     return state
 

@@ -292,6 +292,63 @@ class BranchManager:
                 # is unnecessary — supervisor consumes per-thread.
                 "status": TaskStatus.RUNNING,
             }
+
+            # ── Operator Replanner: 在 fork 之前同步算一次结构化战术计划 ──
+            # 关键: 这里直接在 *父分支的 in-memory state* 上算 plan, 把结果
+            # 一并打进 patch, 这样新分支的第一个节点(supervisor / linear 入
+            # 口)就能直接读到 ``state.operator_plan`` 决定路由 + 工具偏好,
+            # 不必等节点入口再触发一次 LLM 调用。同时 plan 一旦算出来就立
+            # 即推到 EventBus, 用户在 chat 输入框敲完回车后 1~3 秒内可以
+            # 看到"已重规划"卡片, 体感上 agent "听到了"。
+            replan_plan = None
+            try:
+                # 临时把 chat 文本注入 state 以便 replanner 能看到; 调用
+                # 完毕后会把 plan / 派生 signals 写进 patch, 父 state 不
+                # 再继续依赖这块拼接结果(子分支会从 patch 重建)。
+                merged_messages = list(state.user_messages or [])
+                if not merged_messages or merged_messages[-1].get("text") != (user_prompt or "").strip():
+                    merged_messages = list(merged_messages) + [{
+                        "role": "user",
+                        "text": (user_prompt or "").strip(),
+                        "timestamp": now,
+                    }]
+                _stash_pending = state.pending_user_prompt
+                _stash_messages = state.user_messages
+                state.pending_user_prompt = joined_prompt
+                state.user_messages = merged_messages
+                try:
+                    from backend.agents.operator_replanner import (
+                        llm_replan,
+                        plan_to_decision_event,
+                    )
+                    replan_plan = await llm_replan(state)
+                finally:
+                    # Restore父分支 state, 避免 chat 写入污染 (子分支已经
+                    # 通过 patch 拿到所需字段)。
+                    state.pending_user_prompt = _stash_pending
+                    state.user_messages = _stash_messages
+
+                if replan_plan is not None:
+                    # 把派生 signals 合并到子分支的 replan_signals; 但保留
+                    # operator_intent=1 让节点入口的兜底逻辑(后续 PR)仍能
+                    # 触发, 这里只是把"原始信号"升级成"结构化 plan"。
+                    derived = dict(replan_plan.derived_replan_signals or {})
+                    merged_sig = dict(new_signals)
+                    for k, v in derived.items():
+                        merged_sig[k] = max(
+                            int(merged_sig.get(k, 0) or 0), int(v or 0),
+                        )
+                    patch["replan_signals"] = merged_sig
+                    patch["operator_plan"] = replan_plan.model_dump()
+                    patch["operator_plan_history"] = (
+                        [p.model_dump() for p in (state.operator_plan_history or [])]
+                        + [replan_plan.model_dump()]
+                    )[-20:]
+            except Exception as exc:
+                logger.warning(
+                    f"[BranchManager] operator replan 失败 task={task_id}: {exc}",
+                    exc_info=True,
+                )
             # Claude 风格: 如果指定了 ``from_event_ts`` (用户在历史消息处
             # 选择了"在此分叉"), 先到 LangGraph 历史里把 ``created_at <=
             # from_event_ts`` 的最新 checkpoint 找出来当 source; 找不到就
@@ -370,6 +427,23 @@ class BranchManager:
                     "branch": child.model_dump(),
                     "parent": parent.model_dump(),
                 })
+                # Operator Replan 卡片: 用户敲完回车 → fork 完成的这条链路
+                # 是用户感知 "agent 听到了" 的最短路径。这里立即把 plan 作为
+                # decision_event 推到 task 频道, 前端 ``TaskChat.vue`` 将其
+                # 渲染为高亮的 ``operator_replan`` 卡片, 不再等子分支跑到
+                # 第一个节点才出现反馈。
+                if replan_plan is not None:
+                    from backend.agents.operator_replanner import plan_to_decision_event
+                    event_data = plan_to_decision_event(replan_plan)
+                    event_data.update({
+                        "id": f"replan-{replan_plan.plan_id}",
+                        "timestamp": now,
+                        "branch_id": new_id,
+                    })
+                    await bus.publish(task_id, {
+                        "type": "decision_event",
+                        "data": event_data,
+                    })
             except Exception:
                 pass
 

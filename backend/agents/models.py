@@ -84,6 +84,88 @@ class TaskStatus(str, Enum):
 
 
 # ───────────────────────────────────────────────────────
+# OperatorPlan — 操作员实时重规划计划
+#
+# 设计:
+#   用户在任务执行过程中给出新指令时, Operator Replanner 一次 LLM 调用把
+#   "用户的话 + 当前事实"翻译成一份**结构化战术计划**, 沿 PentestState
+#   透传到 supervisor / 各阶段节点 / ToolCoveragePlanner, 让下游确定性逻辑
+#   按计划执行, 而不是各自再去解读一遍 pending_user_prompt 字符串。
+#
+# 字段语义:
+#   - 阶段层(`next_phase` / `target_phases` / `skip_phases` / `rerun_current`)
+#     由 supervisor / linear-edge 直接消费, 决定路由
+#   - 战术层(`focus_targets` / `preferred_tools` / `avoided_tools` /
+#     `keyword_hints` / `extra_constraints`)由节点内 planner 消费, 影响工具
+#     选择 / 路径过滤 / 字典生成
+#   - 安全层(`needs_human_approval`)由 human_approval / privesc 节点消费,
+#     用户明确授权时才允许跳过审批
+# ───────────────────────────────────────────────────────
+
+
+class OperatorFocusTarget(BaseModel):
+	"""一个聚焦目标。``type`` 通常是 port/path/host/service/cve, ``value`` 是值。"""
+	type: str
+	value: str
+
+
+class OperatorPlan(BaseModel):
+	plan_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:8])
+	created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+
+	# 触发本次重规划时的"原始用户指令"(operator_guidance_block 的拼接产物),
+	# 仅作审计 / 回放用, 不应直接喂给下游节点。
+	user_request: str = ""
+
+	# 触发时的当前阶段, 用于 rerun_current / 派生 re_<phase>_for_operator 信号。
+	source_phase: str = ""
+
+	# ── LLM 输出的语义层 ─────────────────────────────────────
+	intent_summary: str = ""    # 一句话回放你听到的核心意图(给前端展示)
+	rationale: str = ""         # 2~4 句解释为什么这么规划
+
+	# ── 阶段层 ────────────────────────────────────────────────
+	next_phase: Optional[str] = None       # 强烈建议下一阶段(supervisor 优先采纳)
+	target_phases: list[str] = Field(default_factory=list)
+	skip_phases: list[str] = Field(default_factory=list)
+	rerun_current: bool = False            # 当前阶段是否要求重跑
+
+	# ── 战术层 ────────────────────────────────────────────────
+	focus_targets: list[OperatorFocusTarget] = Field(default_factory=list)
+	preferred_tools: list[str] = Field(default_factory=list)
+	avoided_tools: list[str] = Field(default_factory=list)
+	keyword_hints: list[str] = Field(default_factory=list)
+	extra_constraints: dict[str, Any] = Field(default_factory=dict)
+
+	# ── 安全层 ────────────────────────────────────────────────
+	needs_human_approval: bool = True
+
+	# ── 协同 / 衍生 ──────────────────────────────────────────
+	# 已经被哪些节点 / 路由消费过, 用于"一次性指令"语义和过期判断。
+	consumed_by: list[str] = Field(default_factory=list)
+	# 由 _derive_signals 计算, 写到 state.replan_signals 让 feedback DAG 复用
+	# 现有的 re_recon_for_hosts / re_vuln_scan_for_creds 等信号通路。
+	derived_replan_signals: dict[str, int] = Field(default_factory=dict)
+
+	@field_validator("focus_targets", mode="before")
+	@classmethod
+	def _coerce_focus_targets(cls, v):
+		if not v:
+			return []
+		out: list[Any] = []
+		for item in v:
+			if isinstance(item, OperatorFocusTarget):
+				out.append(item)
+				continue
+			if isinstance(item, dict):
+				ttype = str(item.get("type", "")).strip().lower()
+				tval = str(item.get("value", "")).strip()
+				if ttype and tval:
+					out.append(OperatorFocusTarget(type=ttype, value=tval))
+		return out
+
+
+# ───────────────────────────────────────────────────────
 # 分支(branch)模型 — 见 conversation_branching_like_claude_kimi 计划
 # ───────────────────────────────────────────────────────
 
@@ -586,6 +668,15 @@ class PentestState(BaseModel):
 	# 用户-代理对话（决策视图交互式对话）
 	user_messages: list[dict] = Field(default_factory=list)
 	agent_replies: list[dict] = Field(default_factory=list)
+
+	# ── 操作员实时重规划(Operator Replanner)───────────────────
+	# 由 backend.agents.operator_replanner.llm_replan() 在 chat 触发 fork 时
+	# 同步生成一份结构化战术计划; supervisor / 各阶段节点 / ToolCoveragePlanner
+	# 统一从这里取数, 避免每个节点各自再去解读 pending_user_prompt 字符串。
+	# 计划是 sticky 的, 直到下一次新指令产生新的 OperatorPlan 才被覆盖。
+	operator_plan: Optional[OperatorPlan] = None
+	# 历史计划(末尾追加, 限长 20), 用于审计 / 调试 / 回放。
+	operator_plan_history: list[OperatorPlan] = Field(default_factory=list)
 
 	# 结构化决策事件队列（ReAct thinking / Skill reasoning），供 WS 增量推送
 	live_decision_events: list[dict] = Field(default_factory=list)

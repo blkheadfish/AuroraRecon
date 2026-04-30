@@ -214,6 +214,43 @@ export interface DecisionEvent {
   context?: Record<string, unknown>
   response?: CheckpointPayload['response']
   replay?: boolean
+  // Operator Replanner 事件(action === 'operator_replan')附带的结构化战术
+  // 计划, 由后端 ``backend.agents.operator_replanner.plan_to_decision_event``
+  // 注入。前端 ``TaskChat.vue`` 据此渲染高亮重规划卡片。
+  operator_plan?: OperatorPlanPayload
+  // Agent 推理事件(action === 'thought')可附带的 LLM 思考链(reasoning_content)
+  reasoning?: string
+  expected?: string
+  plan?: string[]
+  vuln_name?: string
+  // 节点 yield-to-operator 事件(action === 'node_yielded_to_operator')附带的 phase
+  branch_id?: string
+}
+
+export interface OperatorPlanFocusTarget {
+  type: string
+  value: string
+}
+
+export interface OperatorPlanPayload {
+  plan_id: string
+  created_at: string
+  user_request?: string
+  source_phase?: string
+  intent_summary?: string
+  rationale?: string
+  next_phase?: string | null
+  target_phases?: string[]
+  skip_phases?: string[]
+  rerun_current?: boolean
+  focus_targets?: OperatorPlanFocusTarget[]
+  preferred_tools?: string[]
+  avoided_tools?: string[]
+  keyword_hints?: string[]
+  extra_constraints?: Record<string, unknown>
+  needs_human_approval?: boolean
+  consumed_by?: string[]
+  derived_replan_signals?: Record<string, number>
 }
 
 export interface TaskStats {
