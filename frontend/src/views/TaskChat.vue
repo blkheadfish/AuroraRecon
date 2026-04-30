@@ -174,7 +174,10 @@
               </div>
             </div>
 
-            <div v-if="msg.action === 'approval_required'" class="approval-slot">
+            <div
+              v-if="msg.action === 'approval_required' || msg.action === 'approval'"
+              class="approval-slot"
+            >
               <div v-if="showApprovalActions && msg.isLastApproval" class="inline-approval">
                 <span class="inline-approval-text">是否继续执行?</span>
                 <div class="inline-approval-actions">
@@ -539,10 +542,15 @@ const messages = computed(() => {
   }
 
   const events = decisionEvents.value.slice(-160)
-  // 找到最新一个 approval_required event 的 id, 用于决定哪条审批 bubble 可交互
+  // 找到最新一个审批气泡的 id, 用于决定哪条审批 bubble 可交互。
+  // 同时认 'approval_required' (后端 WS bus 推) 和 'approval'
+  // (phase_log 文本"等待审批"派生) 两种 action: 任何一种事件存在都能让
+  // 用户点按钮, 哪怕另一条因为 WS race / 时间戳排序错位丢失了, 兜底通路
+  // 始终在线 — 这是用户截图里 "审批节点卡片有但按钮没有" 的根本修复。
   let lastApprovalId = ''
   for (let i = events.length - 1; i >= 0; i--) {
-    if (events[i]?.action === 'approval_required') {
+    const a = events[i]?.action
+    if (a === 'approval_required' || a === 'approval') {
       lastApprovalId = events[i]?.id || ''
       break
     }
@@ -804,12 +812,19 @@ const messages = computed(() => {
     }
 
     if (entry.action === 'approval') {
+      // 由 phase_log 文本 "⏸ 等待人工审批,请在前端点击「授权并继续」" 派生。
+      // 之前这条只渲染纯文本, WS 那条 approval_required 又因为时间戳格式
+      // 不一致被排到历史最早处看不到 → 用户屏幕上"审批节点"卡片有, 但
+      // 按钮没有。现在让本卡片本身也具备"我是最新一条审批 → 渲染按钮"
+      // 的能力, 保证 phase_log 落地任意一条都能让用户点。
       out.push({
         id: baseId,
         role: 'agent',
         tone: 'warning',
         text: `审批节点\n${entry.message || entry.raw || ''}`,
         timestamp: time,
+        action: 'approval',
+        isLastApproval: baseId === lastApprovalId,
       })
       return
     }
@@ -1090,6 +1105,7 @@ function canForkFromMsg(msg) {
   if (!msg || !msg.eventTs || !msg.eventId) return false
   if (msg.action === 'branch_forked') return false
   if (msg.action === 'approval_required') return false
+  if (msg.action === 'approval') return false
   if (msg.action === 'checkpoint_request') return false
   if (msg.action === 'checkpoint_resolved') return false
   if (msg.role === 'system') return false

@@ -221,10 +221,16 @@ async def run_task(
         state.current_phase = "awaiting_approval"
         state.log("⏸ 等待人工审批,请在前端点击「授权并继续」")
         sm.set(task_id, state)
+        # ``server_iso`` 是给前端做时间戳排序对齐用的 — phase_log 派生事件
+        # 是 ISO, 这里也得给 ISO, 否则前端 ``_compareDecisionEvents`` 会把
+        # 短格式时间戳排到字典序最前 (字符 '1' < '2'), 直接让审批气泡掉出
+        # MAX_DECISION_EVENTS 窗口, 用户连按钮都看不到。
+        from datetime import datetime as _dt
         await bus.publish(task_id, {
             "type": "approval_required",
             "phase": "awaiting_approval",
             "status": "running",
+            "server_iso": _dt.utcnow().isoformat(),
             "logs": state.phase_log[-3:],
             "findings_count": len(state.findings),
             "got_shell": state.got_shell,

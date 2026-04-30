@@ -181,16 +181,10 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
 
         # 如果任务等待审批，发送审批信号
         if state and state.current_phase in ("awaiting_approval", "post_foothold_approval"):
-            # server_iso 防御前端时间戳字典序排序错位 (见 taskLive.ts
-            # _compareDecisionEvents); 重连/首连重放也得把 ISO 带上, 否则
-            # 用户切回任务详情页时, approval_required 气泡会因字典序差异
-            # 跑到历史最早处, 用户看不到按钮。
-            from datetime import datetime as _dt
             await _send({
                 "type": "approval_required",
                 "phase": state.current_phase,
                 "status": "running",
-                "server_iso": _dt.utcnow().isoformat(),
                 "findings_count": len(state.findings),
                 "exploitable_count": sum(1 for f in state.findings if f.exploitable),
                 "got_shell": state.got_shell,

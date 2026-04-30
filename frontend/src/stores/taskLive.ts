@@ -350,11 +350,36 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
     const m = String(id || '').match(/^de-(\d+)-/)
     return m ? Number(m[1]) : 0
   }
+  // 把任意时间戳字符串(ISO / "HH:MM:SS" / 本地化字符串)归一化成毫秒 epoch,
+  // 用于排序。不能直接对原始字符串做 localeCompare —— 后端给的 ISO 形如
+  // ``2026-04-30T11:33:53`` 以字符 '2' 开头, 而前端 ``toLocaleTimeString``
+  // 短格式 ``11:33:53`` 以字符 '1' 开头, 字典序会把短格式时间戳排到任何
+  // ISO 时间戳之前, 直接导致同一时刻产生的 approval_required 卡片被错误排到
+  // 历史最早处 → 滚出 MAX_DECISION_EVENTS 窗口 → 用户根本看不到审批按钮。
+  function _toEpoch(ts: string): number {
+    if (!ts) return 0
+    // ISO 或可被 Date 解析的串走 Date.parse
+    const direct = Date.parse(ts)
+    if (!Number.isNaN(direct)) return direct
+    // 仅 "HH:MM:SS(.fraction)" 这种短格式: 拼今天的日期再 parse
+    const short = ts.match(/^(\d{1,2}):(\d{2}):(\d{2})(\.\d+)?$/)
+    if (short) {
+      const now = new Date()
+      const built = new Date(
+        now.getFullYear(), now.getMonth(), now.getDate(),
+        Number(short[1]), Number(short[2]), Number(short[3]),
+        short[4] ? Math.round(Number(short[4]) * 1000) : 0,
+      )
+      return built.getTime()
+    }
+    // 兜底: 把字符串转 0, 让 tie-breaker (id idx) 接管, 不会产生跨字符前缀
+    // 的诡异排序。
+    return 0
+  }
   function _compareDecisionEvents(a: DecisionEvent, b: DecisionEvent): number {
-    const ta = String(a?.timestamp || '')
-    const tb = String(b?.timestamp || '')
-    const cmp = ta.localeCompare(tb)
-    if (cmp !== 0) return cmp
+    const ea = _toEpoch(String(a?.timestamp || ''))
+    const eb = _toEpoch(String(b?.timestamp || ''))
+    if (ea !== eb) return ea - eb
     return _decisionEventIdx(String(a?.id || '')) - _decisionEventIdx(String(b?.id || ''))
   }
 
@@ -641,9 +666,15 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
           state.approvalNonce = incomingNonce
         }
 
+        // 时间戳必须是 ISO 才能跟后端 phase_log 派生事件一起正确排序;
+        // 之前用 toLocaleTimeString() 形如 "11:33:53" 字典序会把这个气泡
+        // 排到所有 ISO 时间戳之前, 直接落出消息窗口让按钮"消失"。
+        // 优先用后端给的 server_iso (见 task_runner.py 推 WS 时的字段),
+        // 没有就回退到本地 ISO。
+        const serverIso = (event as { server_iso?: string }).server_iso
         const approvalEvent: DecisionEvent = {
           id: `approval-req-${taskId}-${incomingNonce}`,
-          timestamp: new Date().toLocaleTimeString(),
+          timestamp: serverIso || new Date().toISOString(),
           phase: 'awaiting_approval',
           action: 'approval_required',
           message: '系统检测到可利用路径，等待人工审批。',
