@@ -963,84 +963,11 @@ async def node_surface_enum(state: PentestState) -> PentestState:
     aggregator = PathAggregator()
     aggregator.add_paths(state.web_paths or [], source="recon_phase")
 
-    # ── plan-driven port 兜底 ──
-    # 用户在 init 阶段直接给"扫 80 端口"指令时, replanner 会路由到
-    # surface_enum, 但此时 recon 还没跑过, state.open_ports=[],
-    # web_ports 也就一定是空, 后面所有目录爆破都会被静默跳过, 最终
-    # vuln_scan 没指纹只能瞎猜常见路径(就是用户截图里看到的现象)。
-    # 这里从 operator_plan.focus_targets 抽 type=port 的条目, 临时补
-    # 进 state.open_ports 当作 http 端口, 让工具循环至少能跑起来。
-    # 这是降级路径, 不替代正常 recon -> surface_enum 流程。
-    plan_obj_for_ports = getattr(state, "operator_plan", None)
-    if plan_obj_for_ports is not None:
-        existing_ports = {p.port for p in (state.open_ports or [])}
-        injected_ports: list[int] = []
-        for tgt in (getattr(plan_obj_for_ports, "focus_targets", None) or []):
-            ttype = (getattr(tgt, "type", "") or "").lower()
-            tval = (getattr(tgt, "value", "") or "").strip()
-            if ttype != "port" or not tval:
-                continue
-            try:
-                port_num = int(tval.split("/")[0])
-            except (ValueError, AttributeError):
-                continue
-            if port_num <= 0 or port_num > 65535 or port_num in existing_ports:
-                continue
-            # service="http" 是合理猜测: surface_enum 的 web_ports
-            # 过滤器恰好认 service 含 http 的; 真错了 (例如指 22) 后续
-            # tool 调用会自然失败而不会污染数据。
-            state.open_ports.append(PortInfo(port=port_num, service="http"))
-            existing_ports.add(port_num)
-            injected_ports.append(port_num)
-        if injected_ports:
-            state.log(
-                f"[surface_enum] open_ports 为空但 plan.focus_targets 指定了 "
-                f"{injected_ports} → 临时注入为 http 端口, 让目录爆破能真的跑起来"
-            )
-            state.push_decision({
-                "action": "operator_plan_applied",
-                "phase": "surface_enum",
-                "consumer": "surface_enum_port_inject",
-                "tone": "warning",
-                "message": (
-                    f"recon 数据缺失但操作员指定了端口 {injected_ports}, "
-                    f"已临时注入为 http 端口避免空跑 (建议下次让 recon 先跑)"
-                ),
-                "purpose": "operator_plan -> 端口兜底",
-                "thinking": (
-                    "用户在 init 阶段直接指定端口, 但 state.open_ports 为空, "
-                    "为了让目录爆破工具真的跑起来, 把 plan 端口当 http 注入。"
-                ),
-                "plan": [f"注入端口: {p}" for p in injected_ports],
-            })
-
     web_ports = [
         p for p in state.open_ports
         if p.port in (80, 443, 8080, 8443, 8000, 8888, 8081, 8090, 9000, 9090)
         or "http" in (p.service or "").lower()
     ]
-    if not web_ports:
-        # 显式告诉用户为什么没跑工具, 避免"卡片说切了策略, 但实际啥也没干"
-        # 的体感。decision_event 走 warning tone, 比 logger 更可见。
-        state.log("[surface_enum] 无可用 web 端口, 跳过 web 探测/目录爆破")
-        if state.open_ports:
-            ports_repr = ", ".join(str(p.port) for p in state.open_ports[:10])
-        else:
-            ports_repr = "(无)"
-        state.push_decision({
-            "action": "surface_enum_no_web_ports",
-            "phase": "surface_enum",
-            "tone": "warning",
-            "message": (
-                "surface_enum 没有可探测的 web 端口, 工具循环跳过。"
-                f" open_ports={ports_repr}"
-            ),
-            "purpose": "surface_enum 空跑诊断",
-            "thinking": (
-                "执行目录爆破/敏感文件探测需要至少一个 http(s) 端口; "
-                "请先让 recon 完成端口扫描, 或在指令里明确目标 URL/端口。"
-            ),
-        })
 
     # Extract tech hints from recon phase for dynamic probe list generation
     _raw_recon = state.raw_recon or {}
