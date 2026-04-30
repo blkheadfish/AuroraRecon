@@ -13,11 +13,45 @@ from __future__ import annotations
 import ipaddress
 import logging
 import os
+import re
 from typing import Optional
 
 from backend.knowledge.exploit_kb import ExploitEntry, ExploitKB
 
 logger = logging.getLogger(__name__)
+
+
+_SCHEME_BEFORE_TARGET_RE = re.compile(r"https?://\{TARGET\}", re.IGNORECASE)
+
+
+def _substitute_target(template: str, target_placeholder: str) -> str:
+    """智能替换 ``{TARGET}`` 占位符，避免 scheme 重复拼接。
+
+    KB / Skill YAML 里历史上有两种写法：
+      ① ``curl http://{TARGET}/x``  ← 模板自带 scheme，{TARGET} 应当只是 host:port
+      ② ``curl {TARGET}/x``          ← 模板没 scheme，{TARGET} 应当是完整 URL
+
+    实际传进来的 ``target_placeholder`` 多数情况已经带 scheme（例如
+    ``http://10.0.0.5:8080``），如果遇到 ① 就会被拼成 ``http://http://10.0.0.5:8080/x``。
+    这里做一次正则探测：模板里有 ``http(s)?://{TARGET}`` 时，把 placeholder
+    的 scheme 剥掉再替换；其他情况按字面替换。
+    """
+    if not template or "{TARGET}" not in template:
+        return template
+
+    bare = target_placeholder
+    m_scheme = re.match(r"^(https?://)(.*)$", target_placeholder, re.IGNORECASE)
+    if m_scheme:
+        bare = m_scheme.group(2)
+
+    if _SCHEME_BEFORE_TARGET_RE.search(template):
+        # 模板已有 scheme，{TARGET} 仅作 host:port
+        result = template.replace("{TARGET}", bare)
+    else:
+        # 模板无 scheme，{TARGET} 充当完整 URL
+        result = template.replace("{TARGET}", target_placeholder)
+
+    return result
 
 
 def check_can_reverse(lhost: str) -> bool:
@@ -238,14 +272,22 @@ class KnowledgeRetriever:
             lines.append(f"\n**漏洞检测方法:**")
             lines.append(f"  {entry.detection_method}")
 
-        # 利用步骤（核心）
-        if entry.exploit_steps:
+        # 派发到 Skill 的提示（已交给 Skill 引擎，KB 仅作为背景知识）
+        if entry.dispatch_skill:
+            lines.append(
+                f"\n**利用方法**: 已由 Skill `{entry.dispatch_skill}` 接管，"
+                f"KB 仅提供原理与回连约束，请勿依赖 KB 文本去拼命令。"
+            )
+
+        # 利用步骤（仅在 KB 没有 dispatch_skill 时作为 LLM 兜底参考）
+        # 标记为 deprecated 的条目同样不再展开（避免与 Skill 双份维护）
+        skip_exploit_steps = bool(entry.dispatch_skill or entry.exploit_steps_deprecated)
+        if entry.exploit_steps and not skip_exploit_steps:
             lines.append(f"\n**利用步骤 ({len(entry.exploit_steps)} 步):**")
             for step in entry.exploit_steps:
                 lines.append(f"\n  步骤{step.step}: {step.description}")
                 if step.command:
-                    # 替换 TARGET 占位符
-                    cmd = step.command.replace("{TARGET}", target_placeholder)
+                    cmd = _substitute_target(step.command, target_placeholder)
                     lines.append(f"  命令: {cmd}")
                 if step.expected_result:
                     lines.append(f"  预期结果: {step.expected_result}")
@@ -254,7 +296,7 @@ class KnowledgeRetriever:
 
         # 验证命令
         if entry.verification_command:
-            cmd = entry.verification_command.replace("{TARGET}", target_placeholder)
+            cmd = _substitute_target(entry.verification_command, target_placeholder)
             lines.append(f"\n**RCE验证命令:** {cmd}")
         if entry.verification_success_sign:
             lines.append(f"**成功标志:** {entry.verification_success_sign}")
@@ -268,7 +310,7 @@ class KnowledgeRetriever:
                     continue
                 st = t.get("stage", "")
                 pre = t.get("precondition", "")
-                act = (t.get("action", "") or "").replace("{TARGET}", target_placeholder)
+                act = _substitute_target(t.get("action", "") or "", target_placeholder)
                 sig = t.get("success_sign", "")
                 nx = t.get("next_stage", "")
                 lines.append(f"\n  {i}. [{st}] {act}")

@@ -1,5 +1,6 @@
 {
   "vuln_id": "activemq_cve2022_41678",
+  "dispatch_skill": "activemq_rce",
   "description": "Apache ActiveMQ Jolokia 后台任意文件写入导致的远程代码执行漏洞",
   "category": "config_exploit",
   "cves": [
@@ -26,27 +27,47 @@
     "/api/jolokia"
   ],
   "detection_method": "发送GET请求到 http://{TARGET}/admin/ 使用默认凭据 admin:admin，如果返回200状态码且页面包含ActiveMQ内容，则存在弱口令；进一步访问 /api/jolokia/list 查看MBeans列表确认漏洞",
-  "exploit_steps": [
+  "probes": [
     {
-      "step": 1,
-      "description": "列出所有可用的MBeans以识别可利用的组件",
-      "command": "curl -u admin:admin -X GET http://{TARGET}/api/jolokia/list -H 'Host: localhost:8161' -H 'Accept: */*' -H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' -H 'Connection: close' -H 'Authorization: Basic YWRtaW46YWRtaW4='",
-      "expected_result": "返回JSON响应包含MBeans列表，如 org.apache.logging.log4j.core.jmx.LoggerContextAdminMBean 或 jdk.management.jfr.FlightRecorderMXBean",
-      "notes": "需要有效的管理员凭据"
+      "id": "activemq_admin_probe",
+      "description": "GET /admin/ 默认凭据探测",
+      "method": "GET",
+      "path": "/admin/",
+      "headers": {
+        "Authorization": "Basic YWRtaW46YWRtaW4="
+      },
+      "timeout": 10,
+      "success_signs": {
+        "status_codes": [
+          200
+        ],
+        "body_contains_any": [
+          "ActiveMQ",
+          "Apache ActiveMQ"
+        ]
+      },
+      "confidence": 0.85
     },
     {
-      "step": 2,
-      "description": "利用Log4j2 MBean写入Webshell（方法1）",
-      "command": "python poc.py -u admin -p admin http://{TARGET}",
-      "expected_result": "Webshell成功写入到 /admin/shell.jsp",
-      "notes": "仅适用于ActiveMQ 5.17.0及以上版本（因Log4j2引入）"
-    },
-    {
-      "step": 3,
-      "description": "利用FlightRecorder MBean写入Webshell（方法2）",
-      "command": "python poc.py -u admin -p admin --exploit jfr http://{TARGET}",
-      "expected_result": "Webshell成功写入到 /admin/shelljfr.jsp",
-      "notes": "需要OpenJDK 11及以上版本支持FlightRecorder"
+      "id": "activemq_jolokia_probe",
+      "description": "GET /api/jolokia/list 验证 Jolokia 接口可达",
+      "method": "GET",
+      "path": "/api/jolokia/list",
+      "headers": {
+        "Authorization": "Basic YWRtaW46YWRtaW4="
+      },
+      "timeout": 10,
+      "success_signs": {
+        "status_codes": [
+          200
+        ],
+        "body_contains_any": [
+          "MBean",
+          "org.apache.activemq",
+          "value"
+        ]
+      },
+      "confidence": 0.95
     }
   ],
   "verification_command": "resp=$(curl -s -u admin:admin -D - \"http://{TARGET}/admin/\" --max-time 10); echo \"$resp\" | head -5; if echo \"$resp\" | grep -qi \"ActiveMQ\"; then echo \"ACTIVEMQ_ADMIN_CONFIRMED\"; fi",

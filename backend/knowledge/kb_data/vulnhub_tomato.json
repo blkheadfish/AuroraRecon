@@ -1170,5 +1170,7 @@
     -0.0056333704851567745,
     -0.0536227710545063,
     0.0038048161659389734
-  ]
+  ],
+  "_exploit_steps_deprecated": true,
+  "_exploit_steps_note": "DEPRECATED: 利用步骤已迁移到对应 Skill YAML (backend/skills/<category>/<name>.yaml)。保留此字段仅用于向后兼容旧的 KnowledgeRetriever LLM 检索路径。"
 }

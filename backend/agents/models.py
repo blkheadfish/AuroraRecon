@@ -513,6 +513,12 @@ class PentestState(BaseModel):
 	# Paths discovered from file content analysis (new_paths from FILE_INTEL_EXTRACT),
 	# consumed by vuln_scan to expand the attack surface
 	intel_discovered_paths: list[str] = Field(default_factory=list)
+	# KB 探针扫描命中：在 intel_harvest 阶段由 ProbeScanner 产出
+	# 结构：[{"vuln_id": "shiro_cve2016_4437", "dispatch_skill": "shiro_rce",
+	#         "confidence": 0.95, "base_url": "http://10.0.0.5:8080",
+	#         "port": 8080, "evidence": "...", "cves": [...]}]
+	# 后续 SkillRegistry.match() 会读取此字段加权对应 Skill。
+	kb_probe_hits: list[dict[str, Any]] = Field(default_factory=list)
 
 	subdomains: list[str] = Field(default_factory=list)
 	raw_recon: dict = Field(default_factory=dict)

@@ -815,14 +815,18 @@ class SkillEngine:
 
             conversation.append({"role": "assistant", "content": response_raw})
 
-            try:
-                decision = json.loads(response_raw)
-            except json.JSONDecodeError:
+            from backend.agents.react_base import (
+                parse_react_decision,
+                feedback_for_invalid_json,
+            )
+            parsed = parse_react_decision(response_raw)
+            if not parsed.ok:
                 conversation.append({
                     "role": "user",
-                    "content": "输出不是合法 JSON，请重新回答。",
+                    "content": feedback_for_invalid_json(),
                 })
                 continue
+            decision = parsed.decision
 
             action = decision.get("action", "")
             purpose = decision.get("purpose", "")
@@ -913,26 +917,29 @@ class SkillEngine:
             cmd = decision.get("command", "").strip()
             if not cmd:
                 continue
-            guard_decision = self.guard.evaluate(
+
+            from backend.agents.react_base import (
+                check_command_safety as _react_check_safety,
+                normalize_command as _react_normalize,
+            )
+            # SkillEngine 的去重容器：以 ctx.commands_run 为权威集合
+            _seen = {_react_normalize(c) for c in ctx.commands_run}
+            safety = _react_check_safety(
                 cmd,
+                seen_commands=_seen,
+                guard=self.guard,
                 confirmed_facts=ctx.confirmed_facts,
                 failed_commands=ctx.variables.get("_failed_commands") or [],
             )
-            if not guard_decision.allowed:
-                conversation.append({
-                    "role": "user",
-                    "content": (
-                        f"该命令被执行前置 Guard 拒绝({guard_decision.code}): "
-                        f"{guard_decision.reason}。请基于已确认事实重新规划。"
-                    ),
-                })
-                if self._decision_callback:
+            if not safety.allowed:
+                conversation.append({"role": "user", "content": safety.reason})
+                if safety.code.startswith("guard:") and self._decision_callback:
                     await self._decision_callback({
                         "action": "guard_block",
                         "phase": "foothold_attempt",
                         "round": round_num + 1,
-                        "message": guard_decision.reason,
-                        "guard_code": guard_decision.code,
+                        "message": safety.reason,
+                        "guard_code": safety.code.replace("guard:", "", 1),
                         "command": cmd[:300],
                         "tone": "warning",
                     })

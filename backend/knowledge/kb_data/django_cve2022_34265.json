@@ -1,5 +1,6 @@
 {
   "vuln_id": "django_cve2022_34265",
+  "dispatch_skill": "django_sqli",
   "description": "Django框架中Trunc()和Extract()数据库函数存在SQL注入漏洞",
   "category": "sql_injection",
   "cves": [
@@ -23,20 +24,21 @@
     "/"
   ],
   "detection_method": "发送GET请求到目标URL，参数date包含SQL注入payload（如xxxx'xxxx），如果返回SQL错误信息则存在漏洞",
-  "exploit_steps": [
+  "probes": [
     {
-      "step": 1,
-      "description": "访问目标网站，确认存在漏洞参数",
-      "command": "curl -s 'http://{TARGET}/?date=minute'",
-      "expected_result": "返回正常的页面内容，显示每分钟点击次数",
-      "notes": "确认目标使用Trunc函数处理date参数"
-    },
-    {
-      "step": 2,
-      "description": "发送SQL注入payload触发错误",
-      "command": "curl -s 'http://{TARGET}/?date=xxxx\\'xxxx'",
-      "expected_result": "返回SQL错误信息，如语法错误或数据库错误",
-      "notes": "使用单引号闭合SQL语句触发注入"
+      "id": "django_admin_probe",
+      "description": "GET /admin/ 探测 Django 后台",
+      "method": "GET",
+      "path": "/admin/",
+      "timeout": 8,
+      "success_signs": {
+        "body_contains_any": [
+          "Django administration",
+          "Log in | Django site admin",
+          "csrfmiddlewaretoken"
+        ]
+      },
+      "confidence": 0.7
     }
   ],
   "verification_command": "curl -s \"http://{TARGET}/?date=xxxx%27xxxx\"",

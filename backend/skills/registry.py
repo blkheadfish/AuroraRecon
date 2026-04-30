@@ -2,12 +2,13 @@
 skills/registry.py
 Skill 注册表
 
-匹配策略（v2 评分制）：
-  CVE 精确命中    +100  （最强信号，明确就是这个漏洞）
-  漏洞名称命中    +60   （VulnAgent 已经识别了漏洞名）
-  json_probe 命中 +40   （主动探测确认）
-  指纹关键词命中  +20   （框架级匹配，可能是宿主而非漏洞本身）
-  证据关键词命中  +10   （最弱信号，容易误触发）
+匹配策略（v3 评分制）：
+  KB 探针 dispatch_skill +150  （最强信号，KB 主动探针已确认漏洞 + 显式派发）
+  CVE 精确命中           +100  （强信号，明确就是这个漏洞）
+  漏洞名称命中           +60   （VulnAgent 已经识别了漏洞名）
+  json_probe 命中        +40   （主动探测确认）
+  指纹关键词命中         +20   （框架级匹配，可能是宿主而非漏洞本身）
+  证据关键词命中         +10   （最弱信号，容易误触发）
 
   多个 Skill 匹配时，选评分最高的。
   同分时，category 越具体越优先（java_deserialization > server_misconfig）。
@@ -84,6 +85,7 @@ class SkillRegistry:
         workflow_mode: str = "pentest_engineer",
         min_score: Optional[int] = None,
         weak_signal_boost: Optional[int] = None,
+        kb_hits: Optional[list[dict]] = None,
     ) -> Optional[Skill]:
         """
         根据漏洞发现匹配最适用的 Skill(评分制 + mode 权重)。
@@ -92,6 +94,11 @@ class SkillRegistry:
             workflow_mode: pentest_engineer / ctf_expert,用作阈值兜底。
             min_score: 任务显式指定的下限(per-task,覆盖 mode 默认值)。
             weak_signal_boost: 任务显式指定的弱信号加权。
+            kb_hits: KB 探针扫描产出的命中列表。每条 dict 形如 ``{
+              "vuln_id", "dispatch_skill", "confidence", "base_url", "port",
+              "cves", "finding_vuln_id"}``。当 kb_hit 与当前 finding 关联
+              （finding_vuln_id 匹配 / target+cve 匹配 / port 匹配）时，
+              其 dispatch_skill 指向的 Skill 直接 +150 分，压过一切关键词匹配。
         """
         self.ensure_loaded()
 
@@ -106,11 +113,18 @@ class SkillRegistry:
         min_threshold = cfg["min_score"] if min_score is None else int(min_score)
         boost = cfg["weak_signal_boost"] if weak_signal_boost is None else int(weak_signal_boost)
 
+        # KB 命中 → Skill 加分映射：{skill_id: extra_score}
+        kb_skill_boost = self._compute_kb_dispatch_boost(finding, kb_hits or [])
+
         scored: list[tuple[int, Skill]] = []
 
         for skill in self._skills:
             score = self._score_skill(skill, finding, combined_fp, json_probe)
-            if score > 0 and boost and score < 60:
+            kb_extra = kb_skill_boost.get(skill.skill_id, 0)
+            if kb_extra:
+                score += kb_extra
+            if score > 0 and boost and score < 60 and not kb_extra:
+                # 弱信号加权仅对 KB 未命中的低分 Skill 生效，避免与 +150 叠加
                 score += boost
             if score >= min_threshold:
                 scored.append((score, skill))
@@ -140,11 +154,79 @@ class SkillRegistry:
             )
 
         best_score, chosen = scored[0]
+        kb_marker = " [KB 派发]" if kb_skill_boost.get(chosen.skill_id) else ""
         logger.info(
             f"[SkillRegistry] ✅ 选择 Skill: {chosen.skill_id} "
-            f"(得分={best_score}) ← {finding.name} ({finding.cve})"
+            f"(得分={best_score}{kb_marker}) ← {finding.name} ({finding.cve})"
         )
         return chosen
+
+    @staticmethod
+    def _compute_kb_dispatch_boost(
+        finding: VulnFinding,
+        kb_hits: list[dict],
+    ) -> dict[str, int]:
+        """
+        从 KB 探针命中里挑出与当前 finding 关联的 hit，返回 ``{skill_id: 加分}``。
+
+        关联策略（任一满足即视为关联）：
+          1. ``finding_vuln_id`` 与 ``finding.vuln_id`` 一致（最强信号，直接是
+             由这次 KB 探针生成的 finding）；
+          2. ``port`` 一致 + (CVE 一致 / target host 一致 / 描述包含 vuln_id)。
+        """
+        if not kb_hits:
+            return {}
+
+        boost: dict[str, int] = {}
+        finding_vuln_id = getattr(finding, "vuln_id", "") or ""
+        finding_cves = {(finding.cve or "").lower()} if finding.cve else set()
+        finding_port = finding.port
+        finding_target = (finding.target or "").lower()
+        finding_text = " ".join([
+            (finding.name or ""), (finding.description or ""),
+            (finding.evidence or "")[:300],
+        ]).lower()
+
+        for hit in kb_hits:
+            if not isinstance(hit, dict):
+                continue
+            skill_id = hit.get("dispatch_skill")
+            if not skill_id:
+                continue
+
+            associated = False
+
+            if hit.get("finding_vuln_id") and hit.get("finding_vuln_id") == finding_vuln_id:
+                associated = True
+            else:
+                same_port = (
+                    finding_port and hit.get("port") == finding_port
+                )
+                hit_cves = {str(c).lower() for c in (hit.get("cves") or [])}
+                cve_overlap = bool(finding_cves & hit_cves)
+                same_target = bool(
+                    finding_target and (hit.get("base_url") or "").lower()
+                    and (hit.get("base_url") or "").lower() in finding_target
+                )
+                kb_vuln_id = (hit.get("vuln_id") or "").lower()
+                vuln_id_in_text = bool(kb_vuln_id) and kb_vuln_id in finding_text
+
+                if same_port and (cve_overlap or vuln_id_in_text or same_target):
+                    associated = True
+                elif cve_overlap:
+                    associated = True
+
+            if not associated:
+                continue
+
+            # 置信度越高加分越多，但全部 ≥ 100，确保超过 CVE 关键词 +60
+            confidence = float(hit.get("confidence") or 0.7)
+            extra = 150 if confidence >= 0.85 else 120
+            prev = boost.get(skill_id, 0)
+            if extra > prev:
+                boost[skill_id] = extra
+
+        return boost
 
     def match_all(
         self,
