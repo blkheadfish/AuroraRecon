@@ -584,6 +584,34 @@ const messages = computed(() => {
       return
     }
 
+    // 战术层 (planner / agent.run) 真消费 OperatorPlan 后推送的事件;
+    // 与 operator_replan 卡片的区别在于: replan 是"我听懂了你要做什么",
+    // plan_applied 是"我把你说的工具偏好真的塞进了本阶段的执行序列",
+    // 这两条事件配合可以让用户清楚看到"路由 + 工具选型"两层都改了。
+    if (entry.action === 'operator_plan_applied') {
+      const headBits = ['战术计划已应用']
+      if (entry.phase) headBits.push(entry.phase)
+      if (entry.consumer) headBits.push(entry.consumer)
+      const headline = entry.message || '已注入工具偏好'
+      const text = `${headBits.join(' · ')}\n${headline}`
+      out.push({
+        id: baseId,
+        role: 'agent',
+        tone: 'success',
+        action: 'operator_plan_applied',
+        text,
+        timestamp: time,
+        purpose: entry.purpose || '',
+        plan: entry.plan || [],
+        thinking: String(entry.thinking || '').trim(),
+        thinkingPreview: String(entry.thinking || '').trim().slice(0, 320),
+        thinkingHasMore: String(entry.thinking || '').length > 320,
+        thinkingFullLen: String(entry.thinking || '').length,
+        reasoning: '',
+      })
+      return
+    }
+
     if (entry.action === 'thought') {
       const roundLabel = entry.round ? `第 ${entry.round} 轮` : ''
       const vulnLabel = entry.vuln_name ? ` · ${entry.vuln_name}` : ''

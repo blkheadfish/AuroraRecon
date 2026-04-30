@@ -226,6 +226,86 @@ def _yield_if_interrupted(state: PentestState, node_name: str) -> bool:
     return True
 
 
+def _consume_operator_plan_for_phase(
+    state: PentestState,
+    consumer_label: str,
+    tool_plan: list[dict] | None = None,
+) -> None:
+    """战术层(planner / agent run)消费 ``state.operator_plan`` 后调用本函数,
+    干两件事:
+
+    1. 给前端推一条 ``operator_plan_applied`` decision event, 告诉用户"你说
+       的工具偏好已经体现到本阶段的工具列表里了" —— 解决用户那条 "确实切了
+       策略, 但我看不出工具是不是真的换了" 的反馈。
+    2. 在 plan.consumed_by 上追加 consumer label, 这样多次消费可观测, 后续
+       supervisor 也能凭此判断"是否还需要再为同一个 plan 走一次重规划"。
+    """
+    plan_obj = getattr(state, "operator_plan", None)
+    if not plan_obj:
+        return
+
+    # Track who has consumed this plan; idempotent per consumer label.
+    try:
+        consumed = list(getattr(plan_obj, "consumed_by", None) or [])
+        if consumer_label not in consumed:
+            consumed.append(consumer_label)
+            plan_obj.consumed_by = consumed
+    except Exception:
+        # consumed_by 写失败不能炸主流程 (旧 plan 可能没有这个字段)
+        pass
+
+    preferred = list(getattr(plan_obj, "preferred_tools", None) or [])
+    avoided = list(getattr(plan_obj, "avoided_tools", None) or [])
+    keywords = list(getattr(plan_obj, "keyword_hints", None) or [])
+
+    # 没有任何战术维度提示就不必发事件 (路由型 plan 已由 operator_replan 卡片
+    # 表达过, 这里再发一条只会造成噪音)。
+    if not (preferred or avoided or keywords):
+        return
+
+    plan_lines: list[str] = []
+    if preferred:
+        plan_lines.append(f"优先工具: {', '.join(preferred[:6])}")
+    if avoided:
+        plan_lines.append(f"禁用工具: {', '.join(avoided[:6])}")
+    if keywords:
+        plan_lines.append(f"关键词字典+ {', '.join(keywords[:8])}")
+
+    selected_names: list[str] = []
+    skipped_names: list[str] = []
+    if tool_plan:
+        # tool_plan 已经被 planner 按 plan 重排过 + 滤过 avoided, 这里只是
+        # 把"实际会执行的工具序列"回显给用户, 形成"我说要 gobuster -> agent
+        # 真的把 gobuster 排在了第一位"的可解释闭环。
+        for spec in tool_plan[:8]:
+            name = spec.get("name", "?")
+            if spec.get("operator_preferred"):
+                selected_names.append(f"⭐{name}")
+            else:
+                selected_names.append(name)
+        if avoided:
+            avoided_set = {a.lower() for a in avoided}
+            for a in avoided:
+                if a.lower() in avoided_set:
+                    skipped_names.append(a)
+        if selected_names:
+            plan_lines.append("本阶段执行序列: " + " → ".join(selected_names))
+
+    state.push_decision({
+        "action": "operator_plan_applied",
+        "phase": state.current_phase or consumer_label,
+        "message": (
+            f"操作员战术计划已注入到 {consumer_label}: "
+            f"{plan_obj.intent_summary or '(未命名意图)'}"
+        ),
+        "tone": "primary",
+        "thinking": plan_obj.rationale or plan_obj.intent_summary or "",
+        "purpose": "operator_plan -> 战术层",
+        "plan": plan_lines,
+        "consumer": consumer_label,
+    })
+
+
 def _build_dir_intel(state: PentestState) -> dict[str, Any]:
     """Build structured directory intelligence from web_paths_inventory and related state."""
     intel: dict[str, Any] = {
@@ -507,6 +587,7 @@ async def node_recon(state: PentestState) -> PentestState:
     # 避免 agent 类反向依赖 PentestState。
     from backend.agents.prompt_utils import operator_guidance_block
     _op_block = operator_guidance_block(state)
+    _op_plan = getattr(state, "operator_plan", None)
     result = await agent.run(
         target=state.target_host or state.target,
         target_port=state.target_port,
@@ -515,7 +596,12 @@ async def node_recon(state: PentestState) -> PentestState:
         record_callback=_on_exec_record,
         decision_callback=_on_decision,
         operator_block=_op_block,
+        operator_plan=_op_plan,
     )
+    if _op_plan is not None:
+        # _dir_scan 内部对 plan 的消费已经发生 (plan 已注入 dir_discovery
+        # planner), 这里只是补一条 chain 上的可观测事件。
+        _consume_operator_plan_for_phase(state, "recon_dir_scan", None)
     state.open_ports = result.get("ports", [])
     state.os_info = _stringify_dict_keys(result.get("os_info", {}))
     state.web_paths = result.get("web_paths", [])
@@ -714,6 +800,9 @@ async def node_vuln_scan(state: PentestState) -> PentestState:
 
     from backend.agents.prompt_utils import operator_guidance_block
     _op_block = operator_guidance_block(state)
+    _op_plan = getattr(state, "operator_plan", None)
+    if _op_plan is not None:
+        _consume_operator_plan_for_phase(state, "vuln_scan_tactic", None)
     result = await agent.run(
         target=state.target_host or state.target,
         ports=state.open_ports,
@@ -730,6 +819,7 @@ async def node_vuln_scan(state: PentestState) -> PentestState:
         workflow_mode=state.workflow_mode,
         seeds=seeds_payload or None,
         operator_block=_op_block,
+        operator_plan=_op_plan,
     )
     state.findings = result.get("findings", [])
     # msgpack (LangGraph checkpoint) 不允许 int 作 dict key
@@ -995,7 +1085,15 @@ async def node_surface_enum(state: PentestState) -> PentestState:
                 max_tools=4,
                 max_stage_runtime=360,
             )
-            plan = planner.build_plan(base_url, existing_paths_count=aggregator.count)
+            # 把 operator_plan 透传给 planner, 让用户的"重点用 gobuster /
+            # 别用 dirsearch"在战术层真的生效, 而不是只停留在 supervisor 路由。
+            _op_plan = getattr(state, "operator_plan", None)
+            plan = planner.build_plan(
+                base_url,
+                existing_paths_count=aggregator.count,
+                operator_plan=_op_plan,
+            )
+            _consume_operator_plan_for_phase(state, "surface_enum_tactic", plan)
 
             for tool_spec in plan:
                 should, skip_reason = planner.should_run(tool_spec)
@@ -2558,6 +2656,66 @@ def edge_after_privesc_v2(state: PentestState) -> str:
 # 构建图（按 ATTACK_CHAIN_MODE 分发）
 # ───────────────────────────────────────────────────────
 
+# linear / feedback 模式入口的可路由阶段集合: 操作员指令直跳的合法目标。
+# 不能直接跳到 ``human_approval`` / ``post_foothold_approval`` (那两个是审
+# 批节点, 必须由前置阶段触发); ``report`` 也不允许直跳, 防止"用户随口一
+# 句"就提前出报告。
+_LINEAR_ENTRY_PHASES: set[str] = {
+    "recon", "surface_enum", "intel_harvest", "vuln_scan",
+    "exploit_decision", "foothold_attempt", "secondary_attack",
+    "post_foothold_enum", "privesc_attempt", "objective_collect",
+}
+
+
+def edge_initial_route(state: PentestState) -> str:
+    """linear / feedback 模式下的"入口 plan-aware 路由"。
+
+    没有 ``state.operator_plan`` 时维持历史行为(START → recon)。一旦
+    Operator Replanner 给出了带 ``next_phase`` 的结构化计划, 这里直接把
+    新分支送到目标阶段, 并在 plan.consumed_by 上打标避免后续每次 START
+    都重复同样的跳转。
+
+    与 supervisor 模式的区别:
+      - supervisor 模式有专用 supervisor 节点反复读 plan 路由
+      - linear / feedback 没有 supervisor, plan 只在 START 这一跳生效;
+        之后仍按 DAG 推进, plan 的 ``preferred_tools`` / ``focus_targets``
+        等战术字段由各阶段节点自行消费
+    """
+    plan = getattr(state, "operator_plan", None)
+    if plan is not None and "linear_entry" not in (
+        getattr(plan, "consumed_by", None) or []
+    ):
+        nxt = (plan.next_phase or "").strip()
+        # rerun_current 比 next_phase 优先级低一档: next_phase 明确指了就听它,
+        # 否则再看是否要求重跑 source_phase。
+        if not nxt and getattr(plan, "rerun_current", False):
+            nxt = (plan.source_phase or "").strip()
+        if nxt in _LINEAR_ENTRY_PHASES:
+            consumed = list(getattr(plan, "consumed_by", None) or [])
+            consumed.append("linear_entry")
+            try:
+                plan.consumed_by = consumed
+            except Exception:
+                pass
+            try:
+                state.push_decision({
+                    "action": "operator_plan_routed",
+                    "phase": nxt,
+                    "message": f"按操作员重规划路由到 {nxt}",
+                    "thinking": (
+                        f"linear_entry: 检测到 operator_plan(plan_id="
+                        f"{getattr(plan, 'plan_id', '')}), next_phase="
+                        f"{plan.next_phase!r}, 直接跳过 START → recon 默认链"
+                    ),
+                    "purpose": "operator plan 入口路由",
+                    "tone": "primary",
+                })
+            except Exception:
+                pass
+            return nxt
+    return "recon"
+
+
 def build_graph(checkpointer=None):
     """根据 ATTACK_CHAIN_MODE 分发到对应的图构造器。
 
@@ -2591,7 +2749,23 @@ def _build_graph_linear(checkpointer=None):
     graph.add_node("objective_collect",   node_objective_collect)
     graph.add_node("report",              node_report)
 
-    graph.add_edge(START, "recon")
+    # 入口: 默认 START → recon, 但带 operator_plan 时 plan-aware 路由
+    # 直跳到 plan.next_phase / plan.source_phase。
+    graph.add_conditional_edges(
+        START, edge_initial_route,
+        {
+            "recon":              "recon",
+            "surface_enum":       "surface_enum",
+            "intel_harvest":      "intel_harvest",
+            "vuln_scan":          "vuln_scan",
+            "exploit_decision":   "exploit_decision",
+            "foothold_attempt":   "foothold_attempt",
+            "secondary_attack":   "secondary_attack",
+            "post_foothold_enum": "post_foothold_enum",
+            "privesc_attempt":    "privesc_attempt",
+            "objective_collect":  "objective_collect",
+        },
+    )
     graph.add_edge("recon", "surface_enum")
     graph.add_edge("surface_enum", "intel_harvest")
     graph.add_edge("intel_harvest", "vuln_scan")
@@ -2666,7 +2840,22 @@ def _build_graph_feedback(checkpointer=None):
     graph.add_node("objective_collect",   node_objective_collect)
     graph.add_node("report",              node_report)
 
-    graph.add_edge(START, "recon")
+    # 入口: 与 linear 一致, 默认 START → recon, plan-aware 时直跳。
+    graph.add_conditional_edges(
+        START, edge_initial_route,
+        {
+            "recon":              "recon",
+            "surface_enum":       "surface_enum",
+            "intel_harvest":      "intel_harvest",
+            "vuln_scan":          "vuln_scan",
+            "exploit_decision":   "exploit_decision",
+            "foothold_attempt":   "foothold_attempt",
+            "secondary_attack":   "secondary_attack",
+            "post_foothold_enum": "post_foothold_enum",
+            "privesc_attempt":    "privesc_attempt",
+            "objective_collect":  "objective_collect",
+        },
+    )
     graph.add_edge("recon", "surface_enum")
     graph.add_edge("surface_enum", "intel_harvest")
     graph.add_edge("intel_harvest", "vuln_scan")

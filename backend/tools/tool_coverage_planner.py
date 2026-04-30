@@ -219,6 +219,7 @@ class ToolCoveragePlanner:
         has_waf: bool = False,
         tech_hints: list[str] | None = None,
         scan_strategy: dict | None = None,
+        operator_plan: Any = None,
     ) -> list[dict]:
         """Build an ordered list of tool specs to execute.
 
@@ -229,10 +230,44 @@ class ToolCoveragePlanner:
             tech_hints: detected technologies (e.g. ["PHP", "Tomcat"])
             scan_strategy: LLM-generated strategy dict with keys like
                 ``extensions``, ``custom_wordlist_entries``, ``scan_profile``
+            operator_plan: 来自 ``operator_replanner`` 的 :class:`OperatorPlan`,
+                用于把"用户想用 gobuster 不要 dirsearch"这种意图体现到工具
+                选择和顺序上。当前消费的字段:
+                - ``preferred_tools``: 列表内的工具被置顶且强制 must_run
+                - ``avoided_tools``: 直接从 plan 里剔除
+                - ``keyword_hints``:  并入 ``custom_wordlist_entries``
 
         Returns list of dicts with keys: name, category, script, timeout, must_run.
         """
         scan_strategy = scan_strategy or {}
+
+        # ── operator_plan 战术注入 (非破坏式: 仅做规范化提取) ────────────────
+        # 在外面单独处理 plan 字段, 后面循环再读, 避免 build 主流程被打断。
+        preferred_tools_lc: set[str] = set()
+        avoided_tools_lc: set[str] = set()
+        plan_keyword_hints: list[str] = []
+        if operator_plan is not None:
+            try:
+                preferred_tools_lc = {
+                    str(t).strip().lower()
+                    for t in (getattr(operator_plan, "preferred_tools", None) or [])
+                    if str(t).strip()
+                }
+                avoided_tools_lc = {
+                    str(t).strip().lower()
+                    for t in (getattr(operator_plan, "avoided_tools", None) or [])
+                    if str(t).strip()
+                }
+                plan_keyword_hints = [
+                    str(k).strip()
+                    for k in (getattr(operator_plan, "keyword_hints", None) or [])
+                    if str(k).strip()
+                ]
+            except Exception:
+                # plan 字段读取失败也不能炸主流程
+                preferred_tools_lc = set()
+                avoided_tools_lc = set()
+                plan_keyword_hints = []
 
         threads = "10" if has_waf else "40"
         depth = "3" if not has_waf else "2"
@@ -252,8 +287,16 @@ class ToolCoveragePlanner:
         else:
             extensions = self._build_extensions(tech_hints)
 
+        # 把 plan.keyword_hints 合并到 custom_wordlist_entries 里, 让用户的
+        # "重点扫 admin / backup / .env" 这种关键词真的进字典。
         self._custom_wordlist_path = ""
-        custom_entries = scan_strategy.get("custom_wordlist_entries") or []
+        custom_entries = list(scan_strategy.get("custom_wordlist_entries") or [])
+        if plan_keyword_hints:
+            existing_lc = {str(e).strip().lower() for e in custom_entries}
+            for kw in plan_keyword_hints:
+                if kw.lower() not in existing_lc:
+                    custom_entries.append(kw)
+                    existing_lc.add(kw.lower())
         if custom_entries:
             self._custom_wordlist_path = self._write_custom_wordlist(custom_entries)
 
@@ -269,6 +312,20 @@ class ToolCoveragePlanner:
         for cat in self._categories:
             tools = CATEGORY_TOOLS.get(cat, [])
             for t in sorted(tools, key=lambda x: x["priority"]):
+                tname_lc = t["name"].lower()
+                # 用户明确禁用的工具直接踢出, 从根上避免被执行 / 凑覆盖率。
+                if tname_lc in avoided_tools_lc:
+                    logger.info(
+                        "[Planner] operator_plan 排除工具 %s (avoided_tools)",
+                        t["name"],
+                    )
+                    continue
+
+                is_preferred = tname_lc in preferred_tools_lc
+                # preferred 一律 must_run, 即便它原本是 optional, 也保证
+                # ``should_run`` 不会因 early-stop / 覆盖率达标而跳过它。
+                effective_must_run = bool(t["must_run"]) or is_preferred
+
                 script = t["script"].format(**fmt_vars)
                 if self._custom_wordlist_path and cat == "dir_discovery":
                     script = self._inject_custom_wordlist(t["name"], script)
@@ -278,8 +335,21 @@ class ToolCoveragePlanner:
                     "script": script,
                     "runtime_command": script,
                     "timeout": min(t["timeout"], MAX_TOOL_TIMEOUT),
-                    "must_run": t["must_run"],
+                    "must_run": effective_must_run,
+                    "operator_preferred": is_preferred,
                 })
+
+        # preferred_tools 置顶: 同 category 内 preferred 排在前面, 跨 category
+        # 也把 preferred 移到队首, 这样万一被 max_tools / 时间预算砍掉, 也是
+        # 砍掉非 preferred 的尾巴, 而不是反过来。
+        if preferred_tools_lc:
+            plan.sort(key=lambda spec: (
+                0 if spec.get("operator_preferred") else 1,
+                # 同 preferred 内继续按 category 顺序保持稳定
+                self._categories.index(spec["category"])
+                if spec["category"] in self._categories else 999,
+            ))
+
         self._records = [
             ToolExecRecord(name=p["name"], category=p["category"])
             for p in plan

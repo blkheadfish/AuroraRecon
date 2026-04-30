@@ -262,6 +262,17 @@ class LLMRouter:
         max_tokens: int = LLM_MAX_TOKENS,
     ) -> tuple[str, str]:
         """Streaming multi-turn chat with callbacks. Returns (content, reasoning)."""
+        # 防御: response_format='json' 时, content delta 是机器读的 JSON 字符
+        # 流, 直接推给前端会让用户看到一大坨原始 JSON ("正在思考..." 气泡)。
+        # 这里强制丢弃 on_content_delta, 调用方应该等 ``return`` 后再用结构
+        # 化 thought 事件展示解析结果; reasoning delta 是人类可读的思考链,
+        # 仍允许流式推送。
+        if response_format == "json" and on_content_delta is not None:
+            logger.debug(
+                "[LLMRouter] chat_multi_turn_stream: dropping on_content_delta "
+                "for json response_format (raw JSON would leak to UI)"
+            )
+            on_content_delta = None
         full_messages = [
             {"role": "system", "content": system_prompt or SECURITY_EXPERT_SYSTEM_PROMPT},
             *messages,
@@ -436,6 +447,14 @@ class LLMRouter:
         Streaming chat that fires callbacks for each delta, then returns
         the full (content, reasoning) strings.
         """
+        # 同 ``chat_multi_turn_stream``: JSON 输出场景拒绝把 content 流推到
+        # UI, 防止前端出现原始 JSON 字符流。
+        if response_format == "json" and on_content_delta is not None:
+            logger.debug(
+                "[LLMRouter] chat_with_stream_callback: dropping on_content_delta "
+                "for json response_format"
+            )
+            on_content_delta = None
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
 

@@ -88,6 +88,10 @@ class ReconAgent:
 		# 操作员实时指令(由 node_recon 从 PentestState 计算后传入), 让本 agent
 		# 内部所有 LLM 调用都能感知用户在对话视图发出的指示。空字符串等价于无指令。
 		self._operator_block: str = ""
+		# 结构化战术计划 (operator_replanner 产出的 OperatorPlan 实例或 None);
+		# _dir_scan 透传给 planner, 实现"用户偏好工具/关键词字典"在目录爆破阶段
+		# 的直接落地。
+		self._operator_plan: Any = None
 
 	async def run(
 		self,
@@ -98,6 +102,7 @@ class ReconAgent:
 		record_callback: RecordCallback = None,
 		decision_callback: Optional[Callable] = None,
 		operator_block: str = "",
+		operator_plan: Any = None,
 	) -> dict[str, Any]:
 		"""
 		执行侦察。
@@ -113,9 +118,16 @@ class ReconAgent:
 		    operator_block: 操作员指令块(由 node_recon 从 state 提取), 注入到所有
 		                    LLM prompt 两端 — 不让 LLM 决策只看到"默认行为", 而是
 		                    看到用户实时输入的方向(例如"看看80端口下有什么目录")。
+		    operator_plan:  ``operator_replanner`` 产出的 ``OperatorPlan`` 结构化
+		                    战术计划; 内部 ``_dir_scan`` 会把它透传给
+		                    ``ToolCoveragePlanner.build_plan``, 让 ``preferred_tools``
+		                    / ``avoided_tools`` / ``keyword_hints`` 直接影响目录爆破
+		                    的工具序列与字典生成 (例如用户说要 gobuster 时, 让
+		                    gobuster 真的被排到第一位且 must_run)。
 		"""
 		self._decision_callback = decision_callback
 		self._operator_block = operator_block or ""
+		self._operator_plan = operator_plan
 
 		async def _tool_stream_cb(line: str) -> None:
 			"""Forward tool stdout/stderr lines as tool_stream decision events."""
@@ -819,9 +831,14 @@ class ReconAgent:
 			max_tools=6,
 			max_stage_runtime=480,
 		)
+		# operator_plan 透传到 build_plan: ``preferred_tools`` 强制置顶且
+		# must_run, ``avoided_tools`` 直接踢掉, ``keyword_hints`` 加入自定义
+		# 字典 — 这样用户那句"重点用 gobuster 加 admin/backup 字典"在目录
+		# 爆破阶段才是真的发生作用, 而不是只在 supervisor 路由层闪一下。
 		plan = planner.build_plan(
 			web_target, has_waf=has_waf, tech_hints=tech_hints,
 			scan_strategy=scan_strategy,
+			operator_plan=getattr(self, "_operator_plan", None),
 		)
 		aggregator = PathAggregator()
 

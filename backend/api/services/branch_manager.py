@@ -370,11 +370,28 @@ class BranchManager:
                         f" checkpoint, 回落到最新 checkpoint 分叉"
                     )
 
+            # 关键: 如果 Operator Replanner 已经给出了带 next_phase 的结构化
+            # 计划, 强制把 ``as_node='__start__'`` 让 LangGraph 重新走入口
+            # 条件边 (``edge_initial_route``), 由 plan-aware 路由跳到
+            # ``plan.next_phase``。
+            #
+            # 不这样做的话, ``fork_branch_state`` 会从父分支最后写过的节点
+            # 推断 ``effective_as_node``, 然后 next 默认走线性 DAG 的下一节
+            # 点 (e.g. recon → surface_enum), 完全绕过 plan 路由 — 用户感
+            # 知就是"操作员重规划只是前端做给我看的, agent 还在按旧管道
+            # 跑"。
+            explicit_as_node: Optional[str] = None
+            if replan_plan is not None and (
+                replan_plan.next_phase or replan_plan.rerun_current
+            ):
+                explicit_as_node = "__start__"
+
             forked = await orchestrator.fork_branch_state(
                 source_thread_id=parent.thread_id,
                 target_thread_id=new_thread,
                 patch=patch,
                 source_checkpoint_id=source_checkpoint_id,
+                as_node=explicit_as_node,
             )
             if not forked:
                 # 源线程还没有任何 checkpoint(任务刚启动 <1s 内 fork) →

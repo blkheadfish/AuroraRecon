@@ -68,6 +68,7 @@ class VulnAgent:
         workflow_mode: str = "pentest_engineer",
         seeds: Optional[dict[str, list]] = None,
         operator_block: str = "",
+        operator_plan: Any = None,
     ) -> dict[str, Any]:
         """
         Args:
@@ -87,6 +88,14 @@ class VulnAgent:
         self._decision_callback = decision_callback
         self._workflow_mode = workflow_mode
         self._operator_block = operator_block or ""
+        # 结构化战术 plan; 用于:
+        #   1) ``_active_vuln_discovery`` prompt 里把 plan.preferred_tools /
+        #      plan.focus_targets 作为额外约束注入, 让 LLM 生成 verify_command
+        #      时倾向用户偏好的工具(例如 sqlmap 而非 curl 注入)。
+        #   2) 主动验证阶段在 _select_skills / scan strategy 里降权 avoided
+        #      tools 对应的扫描类型。
+        # 当前 P0 仅做存放与 prompt 注入, 工具级精挑由后续 PR 接入 _select_skills。
+        self._operator_plan: Any = operator_plan
         self._seed_credentials: list[dict] = list((seeds or {}).get("credentials") or [])
         if self._seed_credentials:
             logger.info(
@@ -1763,20 +1772,59 @@ $PHUIP "{web_url}/index.php" 2>&1
         from backend.agents.prompt_utils import wrap_prompt_with_block
         prompt = wrap_prompt_with_block(prompt, self._operator_block)
 
+        # 结构化 plan 提示注入: 让 LLM 在生成 verify_command 时显式倾向用户
+        # 偏好的工具/聚焦目标。注意这里和 operator_block 的关系是:
+        #   - operator_block 是用户原话(LLM 自己解读)
+        #   - operator_plan 是已经被 replanner 翻译过的结构化偏好(LLM 直接套)
+        # 二者并存可以互相印证, plan 缺字段时还能 fallback 到原话。
+        plan_obj = getattr(self, "_operator_plan", None)
+        if plan_obj is not None:
+            plan_lines: list[str] = []
+            preferred = list(getattr(plan_obj, "preferred_tools", None) or [])
+            avoided = list(getattr(plan_obj, "avoided_tools", None) or [])
+            focus = list(getattr(plan_obj, "focus_targets", None) or [])
+            kw = list(getattr(plan_obj, "keyword_hints", None) or [])
+            if preferred:
+                plan_lines.append(
+                    "preferred_tools(verify_command 优先使用): "
+                    + ", ".join(str(t) for t in preferred[:6])
+                )
+            if avoided:
+                plan_lines.append(
+                    "avoided_tools(避免使用): "
+                    + ", ".join(str(t) for t in avoided[:6])
+                )
+            if focus:
+                focus_repr = ", ".join(
+                    f"{getattr(t, 'type', '?')}={getattr(t, 'value', '?')}"
+                    for t in focus[:6]
+                )
+                plan_lines.append(f"focus_targets(优先排查): {focus_repr}")
+            if kw:
+                plan_lines.append(
+                    "keyword_hints(检查涉及到的关键路径/参数): "
+                    + ", ".join(kw[:8])
+                )
+            if plan_lines:
+                plan_directive = (
+                    "\n\n【操作员战术计划 - 结构化偏好】\n"
+                    + "\n".join(f"- {ln}" for ln in plan_lines)
+                    + "\n请在生成 checks[] 时优先满足上述偏好; "
+                    + "若偏好工具不适用某 vuln_name, 在 hypothesis 字段说明原因。"
+                )
+                prompt = prompt + plan_directive
+
         try:
             import uuid as _uuid
             stream_id = f"llm-discovery-{_uuid.uuid4().hex[:8]}"
 
-            async def _on_content(delta: str):
-                if self._decision_callback:
-                    await self._decision_callback({
-                        "action": "llm_delta",
-                        "phase": "vuln_scan",
-                        "delta": delta,
-                        "stream_id": stream_id,
-                        "kind": "content",
-                    })
-
+            # 注意: 这里 LLM 输出是 JSON (response_format='json'), content
+            # delta 全是 ``{"checks":[{"vuln_name":...}, ...]}`` 这种带引号
+            # 的原始 JSON 字符序列, 直接推到 chat 流会让 "正在思考..." 气泡
+            # 显示一大坨没格式化的 JSON, 用户根本读不下去。
+            # 解决方式: **不流 content**, 只把人类可读的 reasoning(LLM r1
+            # 思考链)推到前端; 解析后的结构化结果通过下面的 thought 事件
+            # 以"建议验证 N 个潜在漏洞 + 计划列表"形式呈现。
             async def _on_reasoning(delta: str):
                 if self._decision_callback:
                     await self._decision_callback({
@@ -1789,7 +1837,6 @@ $PHUIP "{web_url}/index.php" 2>&1
 
             result, reasoning = await self.llm.chat_with_stream_callback(
                 prompt,
-                on_content_delta=_on_content,
                 on_reasoning_delta=_on_reasoning,
                 response_format="json",
             )
