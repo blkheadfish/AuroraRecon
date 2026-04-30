@@ -80,6 +80,15 @@ REPLAN_SYSTEM_PROMPT = """你是 PentestAI 的实时战术重规划器(Operator 
    表示, 可省略, 但只要有就要类型 + 值都填齐。
 6. intent_summary 用一句中文回放你听到的核心意图(不要复述用户原话, 不超过 80 字)。
 7. rationale 解释为什么这么规划, 2~4 句。
+8. **前置数据约束(很重要)**: 后续节点能不能干活强依赖前序事实快照里的数据:
+   - surface_enum / intel_harvest 需要 ``open_ports`` 至少有 1 个 web 端口;
+   - vuln_scan 需要 ``open_ports`` 和 ``web_paths``(或 ``findings`` 里的指纹);
+   - exploit_decision 需要 ``findings`` 中至少一条可利用项。
+   如果当前事实快照不满足要求 (current_phase 为空/init, 或 open_ports 为空,
+   或 web_paths 为空), 你**必须**把 ``next_phase`` 设为 recon 先把数据补齐;
+   把用户聚焦的端口/路径放到 ``focus_targets`` 与 ``preferred_tools`` /
+   ``keyword_hints``, recon 结束后下游节点会自动消费这些偏好。
+   不要为了"快"就直接跳到 surface_enum/vuln_scan, 那会让工具空跑、LLM 瞎猜。
 
 【输出 schema】
 {
@@ -200,6 +209,63 @@ def _validate_plan(raw: dict[str, Any], state: PentestState, op_block: str) -> O
     if next_phase and next_phase not in ALLOWED_PHASES:
         logger.info("[Replanner] 丢弃非法 next_phase=%r", next_phase)
         next_phase = None
+
+    # ── 前置数据护栏 ──
+    # LLM 偶尔会无视 prompt 里的"前置数据约束", 直接让 next_phase 跳到
+    # surface_enum/intel_harvest/vuln_scan, 但事实快照里根本没 open_ports
+    # 或 web_paths, 这会导致下游节点空跑 + 后续 vuln_scan 没指纹只能瞎猜
+    # 常见路径(用户截图里的失败模式)。这里用代码强行纠偏: 缺数据就退回
+    # recon, 让端口扫描先把事实补齐, 再去执行用户聚焦的工作。
+    has_open_ports = bool(state.open_ports)
+    has_web_paths = bool(state.web_paths)
+    cur_phase_norm = (state.current_phase or "").strip().lower()
+    is_init_phase = cur_phase_norm in ("", "init", "start", "__start__")
+
+    _data_dependent_phases = {
+        "surface_enum": (not has_open_ports),
+        "intel_harvest": (not has_open_ports),
+        "vuln_scan": (not has_open_ports and not has_web_paths),
+        "exploit_decision": (not has_open_ports and not state.findings),
+    }
+    if next_phase in _data_dependent_phases and _data_dependent_phases[next_phase]:
+        logger.info(
+            "[Replanner] 前置数据缺失 (current_phase=%r, open_ports=%d, "
+            "web_paths=%d), 把 next_phase=%r 强制改写为 recon",
+            cur_phase_norm, len(state.open_ports or []),
+            len(state.web_paths or []), next_phase,
+        )
+        # 把原计划记到 target_phases 头部, 等 recon 跑完 supervisor / 下一轮
+        # replan 还能继续推进到用户原本想去的阶段。
+        original_next = next_phase
+        next_phase = "recon"
+        existing_targets = list(raw.get("target_phases") or [])
+        if original_next not in existing_targets:
+            existing_targets.insert(0, original_next)
+            raw["target_phases"] = existing_targets
+        # 在 rationale 后追加一行护栏说明, 让前端卡片可以解释为何"没去
+        # surface_enum 而是先 recon", 避免用户再次质疑"切了策略却不动"。
+        prev_rationale = str(raw.get("rationale") or "").strip()
+        guard_note = (
+            f"[前置数据护栏] open_ports={len(state.open_ports or [])} / "
+            f"web_paths={len(state.web_paths or [])} / "
+            f"current_phase={cur_phase_norm or 'init'}, "
+            f"原计划 next_phase={original_next} 强制改为 recon 先补齐端口/路径数据, "
+            f"recon 完成后会自动推进到 {original_next}。"
+        )
+        raw["rationale"] = (prev_rationale + "\n" + guard_note).strip()
+    elif is_init_phase and not has_open_ports and not next_phase and not raw.get(
+        "rerun_current"
+    ):
+        # 用户在 init 阶段直接发指令(常见: 目标刚创建就追问"扫 80 端口"),
+        # LLM 有时会让 next_phase=null + rerun_current=false, 此时整个 plan
+        # 既不路由也不重跑, 等于哑火。直接默认进 recon。
+        logger.info("[Replanner] init 阶段且 open_ports 为空, 默认 next_phase=recon")
+        next_phase = "recon"
+        prev_rationale = str(raw.get("rationale") or "").strip()
+        raw["rationale"] = (
+            prev_rationale
+            + "\n[前置数据护栏] 任务尚未跑过 recon, 自动从 recon 开始以确保后续工具有数据可用。"
+        ).strip()
 
     target_phases = [
         p for p in (raw.get("target_phases") or [])
