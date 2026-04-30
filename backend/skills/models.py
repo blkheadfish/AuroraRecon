@@ -324,6 +324,9 @@ class MatchRule:
     # finding.tool 精确匹配，用于让 fact_sink 合成的 service-level finding
     # （例如 tool="cred-replay" / tool="service-sweep"）能高精度命中专用 Skill。
     tool_is: str = ""
+    # 运行时变量存在性检查: 列表中任一变量在 context 中存在且为 truthy 即匹配。
+    # 用于解耦 skill 间的衔接——上游 skill 产出变量后，下游 skill 通过此字段自声明依赖。
+    variable_present: list[str] = field(default_factory=list)
 
     def matches(
         self,
@@ -334,6 +337,7 @@ class MatchRule:
         service: str = "",
         port: Optional[int] = None,
         tool: str = "",
+        variables: Optional[dict[str, Any]] = None,
     ) -> bool:
         """检查是否匹配。所有非空字段必须全部满足。"""
         fp_lower = fingerprint.lower()
@@ -374,6 +378,15 @@ class MatchRule:
         if self.tool_is:
             checks.append(
                 self.tool_is.lower() == (tool or "").lower()
+            )
+
+        if self.variable_present:
+            variables = variables or {}
+            checks.append(
+                any(
+                    bool(variables.get(var_name))
+                    for var_name in self.variable_present
+                )
             )
 
         # 无条件 = 不匹配

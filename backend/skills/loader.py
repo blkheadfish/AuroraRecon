@@ -97,6 +97,7 @@ def _parse_match_rule(raw: dict) -> MatchRule:
         service_is=raw.get("service_is", ""),
         port_is=_ensure_list(raw.get("port_is", [])),
         tool_is=raw.get("tool_is", ""),
+        variable_present=_ensure_list(raw.get("variable_present", [])),
     )
 
 

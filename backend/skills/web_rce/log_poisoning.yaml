@@ -24,6 +24,10 @@ match:
     - evidence_contains: ["file inclusion", "log"]
     - evidence_contains: ["LFI", "auth.log"]
     - evidence_contains: ["LFI", "access.log"]
+    # 运行时变量驱动（确定性衔接）：上游 LFI skill 的 enumerate_files 产出后触发
+    - variable_present: ["auth_log_readable"]
+    - variable_present: ["apache_log_readable"]
+    - variable_present: ["nginx_log_readable"]
 
 probes:
   - id: check_ssh_port

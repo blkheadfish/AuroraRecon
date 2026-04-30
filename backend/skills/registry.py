@@ -19,7 +19,7 @@ import logging
 import os
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from backend.agents.models import VulnFinding
 from backend.skills.loader import load_all_skills
@@ -86,6 +86,7 @@ class SkillRegistry:
         min_score: Optional[int] = None,
         weak_signal_boost: Optional[int] = None,
         kb_hits: Optional[list[dict]] = None,
+        context_vars: Optional[dict[str, Any]] = None,
     ) -> Optional[Skill]:
         """
         根据漏洞发现匹配最适用的 Skill(评分制 + mode 权重)。
@@ -99,6 +100,8 @@ class SkillRegistry:
               "cves", "finding_vuln_id"}``。当 kb_hit 与当前 finding 关联
               （finding_vuln_id 匹配 / target+cve 匹配 / port 匹配）时，
               其 dispatch_skill 指向的 Skill 直接 +150 分，压过一切关键词匹配。
+            context_vars: 当前上下文变量字典（如 auth_log_readable 等），供
+              MatchRule.variable_present 条件使用。
         """
         self.ensure_loaded()
 
@@ -119,7 +122,7 @@ class SkillRegistry:
         scored: list[tuple[int, Skill]] = []
 
         for skill in self._skills:
-            score = self._score_skill(skill, finding, combined_fp, json_probe)
+            score = self._score_skill(skill, finding, combined_fp, json_probe, context_vars)
             kb_extra = kb_skill_boost.get(skill.skill_id, 0)
             if kb_extra:
                 score += kb_extra
@@ -293,6 +296,7 @@ class SkillRegistry:
         finding: VulnFinding,
         fingerprint: str,
         json_probe: str,
+        context_vars: Optional[dict[str, Any]] = None,
     ) -> int:
         """
         计算 Skill 的匹配得分。0 = 不匹配。
@@ -300,6 +304,7 @@ class SkillRegistry:
         评分维度（每条规则独立打分，取最高分）：
           CVE 精确匹配    +100
           漏洞名称命中    +60
+          运行时变量命中  +30   (NEW: variable_present)
           json_probe 命中 +40
           指纹关键词命中  +20
           证据关键词命中  +10
@@ -310,6 +315,7 @@ class SkillRegistry:
         cve_lower = (finding.cve or "").lower()
         ev_lower = (finding.evidence or "").lower()
         jp_lower = json_probe.lower()
+        vars_dict = context_vars or {}
 
         # 排除规则优先
         for ex_rule in match_cfg.exclude:
@@ -321,6 +327,7 @@ class SkillRegistry:
                 service="",
                 port=finding.port,
                 tool=finding.tool or "",
+                variables=vars_dict,
             ):
                 return 0
 
@@ -328,6 +335,12 @@ class SkillRegistry:
 
         for rule in match_cfg.rules:
             rule_score = 0
+
+            # variable_present 是门控条件：若声明但无匹配变量，跳过整条规则
+            if rule.variable_present:
+                if not any(bool(vars_dict.get(v)) for v in rule.variable_present):
+                    continue
+                rule_score += 30  # 运行时变量命中（强信号）
 
             # tool_is 精确匹配（最强信号）：用于 fact_sink / VulnAgent 合成的
             # service-level finding（cred-replay / service-sweep）精确路由到
@@ -385,6 +398,7 @@ class SkillRegistry:
         port: int,
         service: str = "",
         fingerprint: str = "",
+        context_vars: Optional[dict[str, Any]] = None,
     ) -> Optional[Skill]:
         """Match a skill purely by port/service when no VulnFinding matched.
 
@@ -402,6 +416,7 @@ class SkillRegistry:
         return self.match(
             finding=synthetic,
             fingerprint=fingerprint,
+            context_vars=context_vars,
         )
 
 
