@@ -1,0 +1,201 @@
+# ══════════════════════════════════════════════════════════════
+# 漏洞发现过滤规则
+# ══════════════════════════════════════════════════════════════
+# 用途: 将纯服务探测/组件识别类的结果从漏洞列表中剔除，
+#       降级为侦察附属信息，避免误报干扰真实漏洞判断。
+#
+# 维护: 新增需要过滤的关键词/模式时，在对应列表追加即可，
+#       重启服务后生效。不依赖LLM。
+# ══════════════════════════════════════════════════════════════
+
+detection_filter:
+
+  # ── 强否定标记：命中则直接判定为"非漏洞" ──────────────
+  # 不进入漏洞列表，降级为侦察结果
+
+  # 匹配规则: finding.name 中包含以下任一关键词即为纯探测结果
+  name_keywords:
+    # 纯服务识别
+    - "http service detected"
+    - "http service - detect"
+    - "http service"
+    - "ftp service detected"
+    - "ftp service - detect"
+    - "ssh service detected"
+    - "ssh service - detect"
+    - "ssh service"
+    - "smtp service detected"
+    - "smtp service - detect"
+    - "telnet service detected"
+    - "telnet service - detect"
+    - "rdp service detected"
+    - "rdp service - detect"
+    - "dns service detected"
+    - "dns service - detect"
+    - "pop3 service detected"
+    - "imap service detected"
+    - "snmp service detected"
+    - "vnc service detected"
+    - "mysql service detected"
+    - "redis service detected"
+    - "mongodb service detected"
+    - "mssql service detected"
+    - "postgresql service detected"
+    - "oracle service detected"
+    - "service detected"
+    - "service - detect"
+
+    # 纯组件版本探测（非漏洞，是信息收集）
+    - "apache detection"
+    - "nginx detection"
+    - "iis detection"
+    - "tomcat detection"
+    - "jetty detection"
+    - "jboss detection"
+    - "weblogic detection"
+    - "websphere detection"
+    - "php detection"
+    - "python detection"
+    - "node.js detection"
+    - "nodejs detection"
+    - "ruby detection"
+    - "django detection"
+    - "flask detection"
+    - "spring detection"
+    - "laravel detection"
+    - "wordpress detection"
+    - "drupal detection"
+    - "joomla detection"
+    - "struts detection"
+    - "fastjson detection"
+    - "shiro detection"
+    - "vsftpd service"
+    - "vsftpd detect"
+    - "vsftpd detection"
+    - "proftpd service"
+    - "proftpd detect"
+    - "pure-ftpd service"
+    - "openssh detection"
+    - "openssh detect"
+    - "dropbear detection"
+    - "samba detection"
+    - "smb detection"
+
+    # 与上述模式匹配的通配形式
+    - "technologies detected"
+    - "technology detection"
+    - "waf detected"
+    - "waf detection"
+    - "cdn detected"
+    - "cdn detection"
+    - "load balancer detect"
+    - "reverse proxy detect"
+
+    # HTTP 方法/头探测（信息收集）
+    - "allowed http methods"
+    - "http methods"
+    - "options method"
+    - "- method: options"
+    - "security headers missing"
+    - "suggested security header"
+    - "http headers"
+    - "server header"
+    - "x-powered-by"
+    - "cookies"
+    - "set-cookie"
+
+    # 开放目录/列表（非漏洞，仅信息暴露）
+    - "directory listing"
+    - "directory listing enabled"
+    - "open directory"
+
+    # 端口开放在没有漏洞上下文时只是信息
+    - "port - detect"
+    - "open port"
+    - "tcp port"
+    - "udp port"
+
+  # ── description/evidence 关键词辅助判断 ──────────────
+  description_keywords:
+    # 纯信息性描述开头
+    - "this template detects"
+    - "detects the presence"
+    - "detects whether"
+    - "detects if"
+    - "checks if the"
+    - "checks whether"
+    - "detection template"
+    - "detection only"
+    - "used to detect"
+
+  # ── nuclei template-id 模式（从 template-id 字段匹配）──
+  template_id_patterns:
+    # 纯探测类 nuclei 模板ID特征
+    - "-detect"
+    - "-detection"
+    - "detection-"
+    - "tech-detect"
+    - "service-detect"
+    - "waf-detect"
+    - "cdn-detect"
+    - "-fingerprint"
+    - "fingerprint-"
+
+  # ── 需要保留的低置信度 finding（即使命中检测模式也保留）─
+  # 这些是"虽然是检测类但有安全意义"的结果
+  keep_always_patterns:
+    # 未授权访问
+    - "unauthorized"
+    - "unauthenticated"
+    - "anonymous"
+    - "no authentication"
+    - "authentication bypass"
+    - "auth bypass"
+    # info.php / phpinfo
+    - "phpinfo"
+    - "info.php"
+    - "php_info"
+    # end-of-life 版本
+    - "end of life"
+    - "end-of-life"
+    - "eol"
+    - "unsupported version"
+    # 实际利用路径
+    - "rce"
+    - "remote code execution"
+    - "file inclusion"
+    - "lfi"
+    - "rfi"
+    - "sql injection"
+    - "sqli"
+    - "command injection"
+    - "cmdi"
+    - "xss"
+    - "csrf"
+    - "ssrf"
+    - "ssti"
+    - "path traversal"
+    - "directory traversal"
+    - "file upload"
+    - "deserialization"
+    - "privilege escalation"
+    - "information disclosure"
+    - "sensitive file"
+    - "exposed"
+    - ".env file"
+    - "config leak"
+    - "backup file"
+    - "source code disclosure"
+    - "default credentials"
+    - "default password"
+    - "weak password"
+    - "hardcoded"
+    - ".git exposed"
+    - ".svn exposed"
+    - ".ds_store"
+
+  # ── 严重程度控制 ──────────────────────────────────────
+  # 过滤策略: info 级别 + 命中检测关键词 → 过滤
+  # info 级别 + nikto 工具 → 过滤
+  # 但命中 keep_always 白名单的始终保留
+  exclude_info_if_detection: true

@@ -371,14 +371,33 @@ class VulnAgent:
             for f in all_findings
         ]
 
+        # ── Phase 7: 纯探测类结果过滤 ────────────────────
+        # 将 nuclei/nikto 的纯服务识别、组件版本探测等结果
+        # 从漏洞列表移除，降级为侦察附属信息
+        from backend.agents.detection_filter import filter_findings
+        all_findings, detection_results = filter_findings(all_findings)
+        if detection_results:
+            logger.info(
+                f"[VulnAgent] 过滤纯探测类结果: {len(detection_results)} 个 → "
+                + ", ".join(f.name[:60] for f in detection_results[:5])
+                + (f" ... +{len(detection_results) - 5}" if len(detection_results) > 5 else "")
+            )
+
         confirmed_count = sum(1 for f in all_findings if f.verification_status == "confirmed")
         rejected_count = sum(1 for f in all_findings if f.verification_status == "rejected")
         logger.info(
             f"[VulnAgent] 扫描完成，共 {len(all_findings)} 个发现 "
-            f"(confirmed={confirmed_count}, rejected={rejected_count})"
+            f"(confirmed={confirmed_count}, rejected={rejected_count}, "
+            f"filtered_detection={len(detection_results)})"
         )
 
-        return {"findings": all_findings, "raw_nuclei": "", "raw_nikto": "", "fingerprints": fingerprints}
+        return {
+            "findings": all_findings,
+            "raw_nuclei": "",
+            "raw_nikto": "",
+            "fingerprints": fingerprints,
+            "detection_results": [f.model_dump() for f in detection_results],
+        }
 
     _PHUIP_STRONG_SIGNALS = ("attack params found", "was able to execute", "php_value")
     _PHUIP_WEAK_SIGNALS = (
@@ -1006,7 +1025,7 @@ $PHUIP "{web_url}/index.php" 2>&1
                 "-t", "http/vulnerabilities/",
                 "-t", "http/misconfiguration/",
                 "-t", "http/exposures/",
-                "-severity", "critical,high,medium,low",
+                "-severity", "critical,high,medium",
                 "-etags", "default-login",
                 "-jsonl",
                 "-silent",
