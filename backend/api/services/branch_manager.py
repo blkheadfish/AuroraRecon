@@ -25,8 +25,8 @@ from backend.agents.interrupt_registry import (
     request_interrupt,
 )
 from backend.agents.models import PentestState, TaskBranch, TaskStatus
+from backend.api import event_stream
 from backend.api.event_bus import (
-    get_event_bus,
     set_task_sink,
     set_log_sink,
     clear_log_sink,
@@ -438,12 +438,14 @@ class BranchManager:
             self._active[task_id] = new_id
 
             try:
-                bus = get_event_bus()
-                await bus.publish(task_id, {
-                    "type": "branch_forked",
-                    "branch": child.model_dump(),
-                    "parent": parent.model_dump(),
-                })
+                await event_stream.publish(
+                    task_id, type="branch_forked",
+                    payload={
+                        "branch": child.model_dump(),
+                        "parent": parent.model_dump(),
+                    },
+                    branch_id=new_id,
+                )
                 # Operator Replan 卡片: 用户敲完回车 → fork 完成的这条链路
                 # 是用户感知 "agent 听到了" 的最短路径。这里立即把 plan 作为
                 # decision_event 推到 task 频道, 前端 ``TaskChat.vue`` 将其
@@ -457,10 +459,10 @@ class BranchManager:
                         "timestamp": now,
                         "branch_id": new_id,
                     })
-                    await bus.publish(task_id, {
-                        "type": "decision_event",
-                        "data": event_data,
-                    })
+                    await event_stream.publish(
+                        task_id, type="decision_event",
+                        payload=event_data, branch_id=new_id,
+                    )
             except Exception:
                 pass
 
@@ -497,11 +499,11 @@ class BranchManager:
             sm.set(task_id, state)
 
         try:
-            bus = get_event_bus()
-            await bus.publish(task_id, {
-                "type": "branch_switched",
-                "branch": target.model_dump(),
-            })
+            await event_stream.publish(
+                task_id, type="branch_switched",
+                payload={"branch": target.model_dump()},
+                branch_id=branch_id,
+            )
         except Exception:
             pass
         return target
@@ -530,11 +532,11 @@ class BranchManager:
         get_state_manager().register_bg_task(task_id, bg)
 
         try:
-            bus = get_event_bus()
-            await bus.publish(task_id, {
-                "type": "branch_status_changed",
-                "branch": branch.model_dump(),
-            })
+            await event_stream.publish(
+                task_id, type="branch_status_changed",
+                payload={"branch": branch.model_dump()},
+                branch_id=branch_id,
+            )
         except Exception:
             pass
         return branch
@@ -639,37 +641,37 @@ class BranchManager:
         await self._persist(branch)
 
         try:
-            bus = get_event_bus()
-            await bus.publish(task_id, {
-                "type": "branch_status_changed",
-                "branch": branch.model_dump(),
-            })
+            await event_stream.publish(
+                task_id, type="branch_status_changed",
+                payload={"branch": branch.model_dump()},
+                branch_id=branch_id,
+            )
         except Exception:
             pass
 
     async def _resume_branch_bg(self, task_id: str, branch: TaskBranch) -> None:
         """Background runner for a branch — wires sink + state mirroring."""
         sm = get_state_manager()
-        bus = get_event_bus()
         from backend.api.services.task_runner import get_orchestrator
         orchestrator = get_orchestrator()
 
         async def _decision_sink(ev: dict):
             # 注入 branch_id 让前端按 activeBranchId 切片视图; sink 闭包里
             # 能直接拿 ``branch.branch_id``, 比读 sm.get 更准确(sm 镜像有
-            # 可能短暂指向上一个 branch)。``push_decision`` 已经写了一份,
-            # 这里 setdefault 防止覆盖。
+            # 可能短暂指向上一个 branch)。
             ev = dict(ev)
             ev.setdefault("branch_id", branch.branch_id)
-            await bus.publish(task_id, {"type": "decision_event", "data": ev})
+            await event_stream.publish(
+                task_id, type="decision_event",
+                payload=ev, branch_id=branch.branch_id,
+            )
 
         async def _log_sink(line: str, seq: int):
-            await bus.publish(task_id, {
-                "type": "log",
-                "data": line,
-                "seq": seq,
-                "branch_id": branch.branch_id,
-            })
+            await event_stream.publish(
+                task_id, type="log",
+                payload={"line": line, "seq": seq},
+                branch_id=branch.branch_id,
+            )
 
         set_task_sink(task_id, _decision_sink)
         set_log_sink(task_id, _log_sink)
@@ -703,10 +705,12 @@ class BranchManager:
                 if self._active.get(task_id) == branch.branch_id:
                     state.active_branch_id = branch.branch_id
                     sm.set(task_id, state)
-                    await bus.publish(task_id, {
-                        "type": "phase_update",
-                        **sm.ws_phase_payload(state, log_tail=5),
-                    })
+                    payload = sm.ws_phase_payload(state, log_tail=5)
+                    await event_stream.publish(
+                        task_id, type="phase_update",
+                        payload=payload,
+                        branch_id=payload.get("branch_id", "") or branch.branch_id,
+                    )
         except asyncio.CancelledError:
             logger.info(f"[BranchManager] branch {branch.branch_id} cancelled")
             raise
@@ -721,10 +725,11 @@ class BranchManager:
             # 失败状态也要广播, 否则前端只能等下一次 refreshBranches 才能
             # 看到红色徽标, "继续运行" 按钮的可见性也会延迟。
             try:
-                await bus.publish(task_id, {
-                    "type": "branch_status_changed",
-                    "branch": branch.model_dump(),
-                })
+                await event_stream.publish(
+                    task_id, type="branch_status_changed",
+                    payload={"branch": branch.model_dump()},
+                    branch_id=branch.branch_id,
+                )
             except Exception:
                 pass
         else:
@@ -743,10 +748,11 @@ class BranchManager:
             # 切换成"已暂停 / 已完成 / 失败"的唯一实时通道。没有这个事件,
             # 用户必须手动刷新或等 ws 下一次 phase_update 才能看到状态。
             try:
-                await bus.publish(task_id, {
-                    "type": "branch_status_changed",
-                    "branch": branch.model_dump(),
-                })
+                await event_stream.publish(
+                    task_id, type="branch_status_changed",
+                    payload={"branch": branch.model_dump()},
+                    branch_id=branch.branch_id,
+                )
             except Exception:
                 pass
         finally:

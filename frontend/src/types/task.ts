@@ -427,6 +427,168 @@ export interface WsBranchStatusChangedEvent {
   branch: TaskBranch
 }
 
+// ── 协议 v2 WS 事件 (envelope 风格, 直接对应 Redis Stream body) ──
+
+/** 首包: 服务端告知协议版本 / 回放条数 / 后端模式 */
+export interface WsHelloV2 {
+  type: 'hello'
+  protocol_version: number
+  task_id: string
+  replay_count: number
+  after_id: string
+  stream_redis_backed: boolean
+}
+
+/** 历史回放: 包含一批 envelope, 前端按 event.id 去重后批量注入 store */
+export interface WsHistoryV2 {
+  type: 'history'
+  events: Record<string, unknown>[]
+  first_id: string
+  last_id: string
+}
+
+/** 单条日志 */
+export interface WsLogV2 {
+  type: 'log'
+  id: string
+  task_id: string
+  branch_id: string
+  ts: string
+  v: number
+  payload: { line: string; seq: number }
+}
+
+/** 决策事件 (tool_start / tool_result / thought / checkpoint_* / llm_delta / ...) */
+export interface WsDecisionEventV2 {
+  type: 'decision_event'
+  id: string
+  task_id: string
+  branch_id: string
+  ts: string
+  v: number
+  payload: Record<string, unknown>
+}
+
+/** 阶段更新 */
+export interface WsPhaseUpdateV2 {
+  type: 'phase_update'
+  id: string
+  task_id: string
+  branch_id: string
+  ts: string
+  v: number
+  payload: {
+    phase: string
+    status: string
+    logs: string[]
+    log_seq_last: number
+    branch_id: string
+    findings_count: number
+    got_shell: boolean
+    privilege_level?: string
+    foothold_status?: string
+    chain_visited?: string[]
+    secondary_elided?: boolean
+    attack_next_steps?: { stage?: string; action?: string; priority?: number }[]
+    privesc_attempt_count?: number
+  }
+}
+
+/** 等待审批 */
+export interface WsApprovalRequiredV2 {
+  type: 'approval_required'
+  id: string
+  task_id: string
+  branch_id: string
+  ts: string
+  v: number
+  payload: {
+    phase: string
+    status: string
+    server_iso: string
+    logs: string[]
+    findings_count: number
+    got_shell: boolean
+  }
+}
+
+/** 任务结束 */
+export interface WsDoneV2 {
+  type: 'done'
+  id: string
+  task_id: string
+  branch_id: string
+  ts: string
+  v: number
+  payload: {
+    status: string
+    findings_count: number
+    got_shell: boolean
+  }
+}
+
+/** 分支分叉 */
+export interface WsBranchForkedV2 {
+  type: 'branch_forked'
+  id: string
+  task_id: string
+  branch_id: string
+  ts: string
+  v: number
+  payload: {
+    branch: TaskBranch
+    parent: TaskBranch
+  }
+}
+
+/** 分支切换 */
+export interface WsBranchSwitchedV2 {
+  type: 'branch_switched'
+  id: string
+  task_id: string
+  branch_id: string
+  ts: string
+  v: number
+  payload: {
+    branch: TaskBranch
+  }
+}
+
+/** 分支状态变更 */
+export interface WsBranchStatusChangedV2 {
+  type: 'branch_status_changed'
+  id: string
+  task_id: string
+  branch_id: string
+  ts: string
+  v: number
+  payload: {
+    branch: TaskBranch
+  }
+}
+
+/** 鉴权/任务校验错误 */
+export interface WsErrorV2 {
+  type: 'error'
+  code: string
+  message: string
+}
+
+/** 服务端心跳 */
+export interface WsHeartbeatV2 {
+  type: 'heartbeat'
+}
+
+/** 服务端 pong */
+export interface WsPongV2 {
+  type: 'pong'
+}
+
+/** 内部事件: 重连成功后触发 store 拉快照 */
+export interface WsInternalReconnected {
+  type: '_reconnected'
+}
+
 export type WsTaskEvent =
   | WsPhaseUpdateEvent
   | WsLogEvent
@@ -439,4 +601,18 @@ export type WsTaskEvent =
   | WsBranchForkedEvent
   | WsBranchSwitchedEvent
   | WsBranchStatusChangedEvent
+  | WsHelloV2
+  | WsHistoryV2
+  | WsLogV2
+  | WsDecisionEventV2
+  | WsPhaseUpdateV2
+  | WsApprovalRequiredV2
+  | WsDoneV2
+  | WsBranchForkedV2
+  | WsBranchSwitchedV2
+  | WsBranchStatusChangedV2
+  | WsErrorV2
+  | WsHeartbeatV2
+  | WsPongV2
+  | WsInternalReconnected
   | Record<string, unknown>

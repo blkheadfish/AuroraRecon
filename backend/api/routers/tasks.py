@@ -20,7 +20,7 @@ from backend.api.schemas import (
     ParseIntentRequest, ParseIntentResponse,
 )
 from backend.api.state import get_state_manager, TaskStateManager
-from backend.api.event_bus import get_event_bus, TaskEventBus
+from backend.api import event_stream
 
 logger = logging.getLogger(__name__)
 
@@ -38,10 +38,6 @@ async def _stop_task_container(task_id: str) -> None:
 
 def _get_sm() -> TaskStateManager:
     return get_state_manager()
-
-
-def _get_bus() -> TaskEventBus:
-    return get_event_bus()
 
 
 async def _resolve_active_thread_id(task_id: str, state: PentestState) -> str:
@@ -559,10 +555,63 @@ async def get_logs(
     }
 
 
+@router.get("/tasks/{task_id}/events")
+async def get_task_events(
+    task_id: str,
+    request: Request,
+    after_id: str = "",
+    count: int = 500,
+):
+    """协议 v2 历史事件分页接口。
+
+    用法:
+        * 首次进入页面: ``after_id=""`` 拿最早的 ``count`` 条;
+        * 翻历史: 把第一帧的 ``first_id`` 当作下一次 ``before_id`` 用 (本期暂未
+          实现 before_id 翻向更早, 通过分批 ``after_id`` 拉到尾后再切往前看)。
+        * WS 重连补差量: ``after_id=<lastEventId>`` 拿大于该 id 的事件。
+
+    返回:
+        events     : envelope list (按 stream id 升序)
+        first_id   : 本批最早的 id
+        last_id    : 本批最末的 id (前端可推进 ``lastEventId``)
+        has_more   : 当前批次满 ``count`` 时为 true, 提示前端继续往后翻
+    """
+    sm = _get_sm()
+    state = sm.get(task_id)
+    if not state and sm.db_available:
+        try:
+            from backend.db.database import load_task
+            state = await load_task(task_id)
+        except Exception:
+            state = None
+    if state is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    _enforce_task_owner(state, request, "get_task_events")
+
+    safe_count = max(1, min(int(count or 500), 2000))
+    try:
+        events = await event_stream.replay(
+            task_id, after_id=(after_id or "0"), count=safe_count,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[events] replay failed task=%s after_id=%s err=%s",
+            task_id, after_id, exc,
+        )
+        events = []
+
+    return {
+        "events": events,
+        "count": len(events),
+        "first_id": events[0]["id"] if events else "",
+        "last_id": events[-1]["id"] if events else "",
+        "has_more": len(events) >= safe_count,
+    }
+
+
 @router.post("/tasks/{task_id}/cancel")
 async def cancel_task(task_id: str, request: Request):
     sm = _get_sm()
-    bus = _get_bus()
     state = sm.get(task_id)
     if not state:
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -593,7 +642,11 @@ async def cancel_task(task_id: str, request: Request):
             pass
 
     sm.mark_stopped(task_id)
-    await bus.publish(task_id, {"type": "done", "status": "failed", "message": "任务已取消"})
+    await event_stream.publish(
+        task_id, type="done",
+        payload={"status": "failed", "message": "任务已取消"},
+        branch_id=state.active_branch_id or "",
+    )
     return {"status": "cancelled", "task_id": task_id}
 
 
@@ -628,6 +681,12 @@ async def delete_task(task_id: str, request: Request):
             await delete_cached_task(task_id)
         except Exception:
             pass
+    # 协议 v2: 把 task 的 Stream 连同本地降级 ring 一起回收, 避免新建的同 id
+    # 任务读到老事件污染界面。
+    try:
+        await event_stream.drop(task_id)
+    except Exception:
+        pass
     try:
         from backend.storage.minio_client import get_storage
         get_storage().delete_task_files(task_id)
@@ -652,7 +711,6 @@ async def approve_task(task_id: str, req: ApproveRequest, request: Request):
          避免 UI 和引擎看到不一致的状态。
     """
     sm = _get_sm()
-    bus = _get_bus()
     state = sm.get(task_id)
     if not state:
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -693,11 +751,13 @@ async def approve_task(task_id: str, req: ApproveRequest, request: Request):
     )
     sm.register_bg_task(task_id, task_handle)
 
-    await bus.publish(task_id, {
-        "type": "phase_update",
-        **sm.ws_phase_payload(state, log_tail=3),
-        "status": "running",
-    })
+    payload = sm.ws_phase_payload(state, log_tail=3)
+    payload["status"] = "running"
+    await event_stream.publish(
+        task_id, type="phase_update",
+        payload=payload,
+        branch_id=payload.get("branch_id", ""),
+    )
     return {"status": "ok", "approved": req.approved}
 
 
@@ -718,7 +778,6 @@ async def respond_checkpoint(
       * ``user_prompt`` 会被写进 state.pending_user_prompt,后续节点可消费。
     """
     sm = _get_sm()
-    bus = _get_bus()
     state = sm.get(task_id)
     if not state:
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -771,11 +830,13 @@ async def respond_checkpoint(
     )
     sm.register_bg_task(task_id, task_handle)
 
-    await bus.publish(task_id, {
-        "type": "phase_update",
-        **sm.ws_phase_payload(state, log_tail=3),
-        "status": "running",
-    })
+    payload = sm.ws_phase_payload(state, log_tail=3)
+    payload["status"] = "running"
+    await event_stream.publish(
+        task_id, type="phase_update",
+        payload=payload,
+        branch_id=payload.get("branch_id", ""),
+    )
     return {
         "status": "ok",
         "approved": approved,
@@ -810,7 +871,6 @@ async def send_chat_message(task_id: str, req: ChatMessageRequest, request: Requ
                                 attack chain has terminated).
     """
     sm = _get_sm()
-    bus = _get_bus()
     state = sm.get(task_id)
     if not state:
         raise HTTPException(404, f"任务 {task_id} 不存在")
@@ -906,23 +966,28 @@ async def send_chat_message(task_id: str, req: ChatMessageRequest, request: Requ
         state.user_messages.append(msg)
         sm.set(task_id, state)
 
-    await bus.publish(task_id, {
-        "type": "decision_event",
-        "data": {
+    chat_branch_id = (
+        (new_branch_payload or {}).get("branch_id")
+        or state.active_branch_id
+        or ""
+    )
+    await event_stream.publish(
+        task_id, type="decision_event",
+        payload={
             "id": f"chat-user-{len(state.user_messages)}",
             "timestamp": msg["timestamp"],
             "phase": state.current_phase,
             "action": "user_chat",
             "message": msg["text"],
             "tone": "primary",
-            "branch_id": (new_branch_payload or {}).get("branch_id")
-                or state.active_branch_id or "",
+            "branch_id": chat_branch_id,
         },
-    })
+        branch_id=chat_branch_id,
+    )
     if new_branch_payload is not None:
-        await bus.publish(task_id, {
-            "type": "decision_event",
-            "data": {
+        await event_stream.publish(
+            task_id, type="decision_event",
+            payload={
                 "id": f"branch-fork-{new_branch_payload['branch_id']}",
                 "timestamp": now_iso,
                 "phase": state.current_phase,
@@ -934,7 +999,8 @@ async def send_chat_message(task_id: str, req: ChatMessageRequest, request: Requ
                 "tone": "primary",
                 "branch_id": new_branch_payload["branch_id"],
             },
-        })
+            branch_id=new_branch_payload["branch_id"],
+        )
     return {
         "status": "sent",
         "message": msg,

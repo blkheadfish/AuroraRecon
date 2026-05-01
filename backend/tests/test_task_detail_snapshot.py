@@ -96,29 +96,18 @@ class TestSnapshotShape:
         ):
             assert key in snap, f"snapshot missing per-task key {key}"
 
-    def test_snapshot_decision_tail_and_total(self):
+    def test_snapshot_decision_tail_is_empty_under_v2(self):
+        """协议 v2 之后, 实时事件不再由 state 派生; 首屏快照里 decision tail
+        始终为空, 前端进入页面后从 IndexedDB / WS history 帧补齐。"""
         sm = TaskStateManager()
         state = _build_state(log_count=300)
-        # 同时塞 live_decision_events 触发 build_decision_events 组合后裁剪
-        for i in range(50):
-            state.live_decision_events.append({
-                "id": f"de-{i}",
-                "timestamp": "00:00:00",
-                "phase": "recon",
-                "action": "thought",
-                "message": f"thought-{i}",
-                "tone": "primary",
-            })
 
         snap = sm.to_detail_snapshot(state, decision_tail=20)
 
-        assert snap["decision_events_total"] >= 50
-        assert len(snap["decision_events_tail"]) == 20
+        assert snap["decision_events_total"] == 0
+        assert snap["decision_events_tail"] == []
         # 兼容字段: 旧前端 read decision_events
-        assert snap["decision_events"] == snap["decision_events_tail"]
-        # 必须按时间顺序保留最近的: 包含 thought-49
-        ids = {ev.get("id") for ev in snap["decision_events_tail"]}
-        assert "de-49" in ids
+        assert snap["decision_events"] == []
 
 
 class TestSnapshotPathContentTruncation:

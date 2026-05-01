@@ -24,13 +24,20 @@ _pool: Optional[aioredis.Redis] = None
 
 
 async def get_redis() -> aioredis.Redis:
-    """获取 Redis 连接（懒初始化连接池）"""
+    """获取 Redis 连接（懒初始化连接池）
+
+    ``max_connections`` 需要覆盖:
+      - 每个 WS 客户端 1 条 XREAD BLOCK 长连接 (25s 持有)
+      - task_runner 高频 publish (XADD + EXPIRE)
+      - redis_cache helpers (cache_state / append_log / is_cancelled)
+    20 个并发连接在多 Tab + 多任务场景下不够用, 提高到 100。
+    """
     global _pool
     if _pool is None:
         _pool = aioredis.from_url(
             REDIS_URL,
             decode_responses=True,
-            max_connections=20,
+            max_connections=int(os.getenv("REDIS_MAX_CONNECTIONS", "100")),
         )
     return _pool
 

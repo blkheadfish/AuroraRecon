@@ -3,6 +3,7 @@ import { ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { api } from '@/api'
 import { subscribeTaskEvents } from '@/services/wsManager'
+import { loadEvents } from '@/services/eventStore'
 import { useTaskListStore } from '@/stores/taskList'
 import type {
   BranchTreeItem,
@@ -16,9 +17,6 @@ type ApprovalState = 'idle' | 'submitting' | 'submitted' | 'error'
 type CheckpointState = 'idle' | 'submitting' | 'submitted' | 'error'
 
 // ── 有界缓存阈值 ───────────────────────────────────────
-// 长任务运行起来日志/工具流/决策事件都会无限堆积,直接 push 进响应式
-// 数组会让前端内存与 DOM 越跑越慢直到卡死。统一在 store 层做 LRU 裁剪,
-// 由前端组件按需再缩成「可见 tail」交给 DOM。
 const MAX_LOG_BUFFER = 3000
 const MAX_DECISION_EVENTS = 1000
 const MAX_TOOL_STREAM_LINES = 500
@@ -35,9 +33,7 @@ interface TaskLiveState {
   task: TaskDetail | null
   logs: string[]
   logSet: Set<string>
-  /** 已知 server 端 phase_log 总条数,用于增量拉取/分页加载更早历史。 */
   logTotal: number
-  /** 已加载历史的最早 index(0 表示已经从头加载)。 */
   logEarliestSeq: number
   decisionEvents: DecisionEvent[]
   decisionEventIds: Set<string>
@@ -47,19 +43,12 @@ interface TaskLiveState {
   approvalNonce: string
   approvalSubmittedAt: number
   lastWsUpdate: number
-  /** 当前 pending 的 Plan 风格 checkpoint(若有),来自后端 decision_event。 */
   pendingCheckpoint: CheckpointPayload | null
-  /** 已 resolve 的 checkpoint 历史(最新的在末尾),用于审计与时间线展示。 */
   checkpointHistory: CheckpointPayload[]
-  /** 当前 checkpoint 的提交状态,避免重复点击。 */
   checkpointState: CheckpointState
-  /** 任务分支树(Claude/Kimi 风格); branches[*].sibling_total 渲染 <n/m>。 */
   branches: BranchTreeItem[]
-  /** 当前活动分支 id; 时间线/输入框 / 分支徽标都靠它高亮。 */
   activeBranchId: string
-  /** 后端配置的单任务分支上限,用于在 UI 提前禁用 fork。 */
   maxBranchesPerTask: number
-  /** 最近一次 fork 时间(毫秒), 用于发送动画。 */
   branchFlashAt: number
   unsub?: () => void
 }
@@ -99,11 +88,6 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
   }
 
   // ── 分支树工具 ────────────────────────────────────────
-  /**
-   * 在不重算后端 sibling_total 的前提下尽量保留 BranchTreeItem 的视图字段。
-   * 如果是 ws 推送过来的全新 TaskBranch (没有 sibling_index/total),
-   * 我们用启发式: 同 (parent, fork_event_id) 计 sibling 数。
-   */
   function computeSiblingTotals(items: BranchTreeItem[]): BranchTreeItem[] {
     const groups = new Map<string, BranchTreeItem[]>()
     for (const it of items) {
@@ -166,12 +150,10 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
       state.branches = computeSiblingTotals([...(tree.branches || [])])
       state.activeBranchId = tree.active_branch_id || state.activeBranchId
       state.maxBranchesPerTask = tree.max_branches_per_task || state.maxBranchesPerTask
-      // 保持 is_active 对齐
       for (const b of state.branches) {
         b.is_active = b.branch_id === state.activeBranchId
       }
     } catch (e) {
-      // 老任务后端可能返回 404 / 500, 这里静默回退即可
       // eslint-disable-next-line no-console
       console.debug('[taskLive] refreshBranches failed', e)
     }
@@ -183,9 +165,6 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
       const res = await api.activateBranch(taskId, branchId)
       upsertBranch(state, res.branch)
       setActiveBranch(state, branchId)
-      // Claude 风格分支切换: 切换到目标分支后强制重新拉一次后端快照,
-      // 让 ``decision_events_tail`` 把目标分支视角的最近事件补齐, 避免
-      // 仅靠 store 里旧分支的累积导致 TaskChat 看不到目标分支的历史。
       try { await refreshTask(taskId) } catch { /* 静默失败, ws 后续会补齐 */ }
       ElMessage.success('已切换分支')
     } catch (e) {
@@ -260,14 +239,12 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
   function applyCheckpointRequest(state: TaskLiveState, event: DecisionEvent) {
     const ckpt = decisionEventToCheckpoint(event)
     if (!ckpt) return
-    // 已 resolve 过的 checkpoint 不应再次激活(replay 场景)
     const archived = state.checkpointHistory.find(
       (h) => h.checkpoint_id === ckpt.checkpoint_id && h.status === 'resolved',
     )
     if (archived) return
     state.pendingCheckpoint = ckpt
     if (state.checkpointState === 'submitting' || state.checkpointState === 'submitted') {
-      // 新 checkpoint 进入,重置交互态
       state.checkpointState = 'idle'
     }
   }
@@ -318,7 +295,6 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
       }
     }
     if (pending && pending.checkpoint_id) {
-      // 后端权威:有 pending 就强制采用快照里的 pending(可能是首次刷新加载)
       const archived = state.checkpointHistory.find(
         (h) => h.checkpoint_id === pending.checkpoint_id && h.status === 'resolved',
       )
@@ -328,7 +304,6 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
         state.pendingCheckpoint = null
       }
     } else if (state.pendingCheckpoint) {
-      // 后端没有 pending, 但本地仍有 → 说明已被消费, 清掉
       state.pendingCheckpoint = null
     }
   }
@@ -340,49 +315,11 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
     if (state.logs.length > MAX_LOG_BUFFER) {
       const drop = state.logs.length - MAX_LOG_BUFFER
       const evicted = state.logs.splice(0, drop)
-      for (const line of evicted) state.logSet.delete(line)
+      for (const l of evicted) state.logSet.delete(l)
     }
   }
 
-  // 比较器: 主 key = timestamp 字典序; tie-breaker = id 中的递增 idx
-  // (id 形如 "de-{idx}-{HHMMSSffffff}", idx 是后端 push 时的真实顺序)
-  function _decisionEventIdx(id: string): number {
-    const m = String(id || '').match(/^de-(\d+)-/)
-    return m ? Number(m[1]) : 0
-  }
-  // 把任意时间戳字符串(ISO / "HH:MM:SS" / 本地化字符串)归一化成毫秒 epoch,
-  // 用于排序。不能直接对原始字符串做 localeCompare —— 后端给的 ISO 形如
-  // ``2026-04-30T11:33:53`` 以字符 '2' 开头, 而前端 ``toLocaleTimeString``
-  // 短格式 ``11:33:53`` 以字符 '1' 开头, 字典序会把短格式时间戳排到任何
-  // ISO 时间戳之前, 直接导致同一时刻产生的 approval_required 卡片被错误排到
-  // 历史最早处 → 滚出 MAX_DECISION_EVENTS 窗口 → 用户根本看不到审批按钮。
-  function _toEpoch(ts: string): number {
-    if (!ts) return 0
-    // ISO 或可被 Date 解析的串走 Date.parse
-    const direct = Date.parse(ts)
-    if (!Number.isNaN(direct)) return direct
-    // 仅 "HH:MM:SS(.fraction)" 这种短格式: 拼今天的日期再 parse
-    const short = ts.match(/^(\d{1,2}):(\d{2}):(\d{2})(\.\d+)?$/)
-    if (short) {
-      const now = new Date()
-      const built = new Date(
-        now.getFullYear(), now.getMonth(), now.getDate(),
-        Number(short[1]), Number(short[2]), Number(short[3]),
-        short[4] ? Math.round(Number(short[4]) * 1000) : 0,
-      )
-      return built.getTime()
-    }
-    // 兜底: 把字符串转 0, 让 tie-breaker (id idx) 接管, 不会产生跨字符前缀
-    // 的诡异排序。
-    return 0
-  }
-  function _compareDecisionEvents(a: DecisionEvent, b: DecisionEvent): number {
-    const ea = _toEpoch(String(a?.timestamp || ''))
-    const eb = _toEpoch(String(b?.timestamp || ''))
-    if (ea !== eb) return ea - eb
-    return _decisionEventIdx(String(a?.id || '')) - _decisionEventIdx(String(b?.id || ''))
-  }
-
+  // ── 协议 v2: 按 event.id 字典序排序 (Stream ID 天然时序单调) ──
   function mergeDecisionEvents(state: TaskLiveState, incoming: DecisionEvent[] = []) {
     if (!Array.isArray(incoming) || !incoming.length) return
     for (const event of incoming) {
@@ -391,9 +328,10 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
       state.decisionEventIds.add(id)
       state.decisionEvents.push(event)
     }
-    // 用副本 sort + splice 重建,避免 Vue3 reactive 对原地 sort 触发依赖更新
-    // 不可靠的问题(实测在 Pinia + computed 链路下偶发 rail 渲染顺序不刷新)。
-    const sorted = state.decisionEvents.slice().sort(_compareDecisionEvents)
+    // 协议 v2: 按 event.id 字典序排序 (Stream ID 形如 "1735689600123-0" 天然时序递增)
+    const sorted = state.decisionEvents.slice().sort((a, b) =>
+      String(a?.id || '').localeCompare(String(b?.id || '')),
+    )
     state.decisionEvents.splice(0, state.decisionEvents.length, ...sorted)
     if (state.decisionEvents.length > MAX_DECISION_EVENTS) {
       const drop = state.decisionEvents.length - MAX_DECISION_EVENTS
@@ -412,12 +350,9 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
   }
 
   async function refreshTask(taskId: string) {
-    // 后端默认返回轻量快照: phase_log 留空, phase_log_tail/phase_log_total
-    // 描述完整大小, decision_events 等价于 decision_events_tail。
     const full = await api.getTask(taskId)
     const state = ensureState(taskId)
     mergeDecisionEvents(state, full.decision_events_tail || full.decision_events || [])
-    // 同步 Plan 风格 checkpoint(刷新/重连后用于回填确认卡片)
     syncCheckpointFromSnapshot(
       state,
       (full.pending_checkpoint as CheckpointPayload | null | undefined) ?? null,
@@ -445,7 +380,6 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
       }
     }
 
-    // 兼容: 老接口返回 phase_log,新接口返回 phase_log_tail
     const tail = (full.phase_log_tail && full.phase_log_tail.length)
       ? full.phase_log_tail
       : (full.phase_log || [])
@@ -455,7 +389,6 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
     if (typeof full.phase_log_total === 'number') {
       state.logTotal = full.phase_log_total
       const tailLen = tail.length
-      // tail 来自最近 tail_len 条,因此最早可见 index 至少是 total - tailLen
       const minEarliest = Math.max(0, full.phase_log_total - tailLen)
       state.logEarliestSeq = state.logEarliestSeq
         ? Math.min(state.logEarliestSeq, minEarliest)
@@ -474,7 +407,6 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
     try {
       const page = await api.getLogs(taskId, { offset: start, limit: end - start })
       const logs = Array.isArray(page.logs) ? page.logs : []
-      // 旧日志 prepend: 用 unshift 保持时间顺序,同时维持 dedup set
       for (let i = logs.length - 1; i >= 0; i--) {
         const line = logs[i]
         if (!line || state.logSet.has(line)) continue
@@ -484,7 +416,7 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
       if (state.logs.length > MAX_LOG_BUFFER) {
         const drop = state.logs.length - MAX_LOG_BUFFER
         const evicted = state.logs.splice(state.logs.length - drop, drop)
-        for (const line of evicted) state.logSet.delete(line)
+        for (const l of evicted) state.logSet.delete(l)
       }
       state.logEarliestSeq = page.offset
       if (typeof page.total === 'number') state.logTotal = page.total
@@ -494,40 +426,89 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
     }
   }
 
-  async function attach(taskId: string) {
-    const state = ensureState(taskId)
-    if (state.unsub) return
+  // ── 协议 v2: 统一事件入口 applyEvent ──────────────────
+  function applyEvent(state: TaskLiveState, taskId: string, raw: Record<string, unknown>) {
+    const eventType = String(raw.type || '')
 
-    state.unsub = subscribeTaskEvents(taskId, (event) => {
-      const eventType = (event as { type?: string }).type
+    // ── 历史回放 (v2 history 帧) ──────────────────────
+    if (eventType === 'history') {
+      const events = (raw.events || []) as Record<string, unknown>[]
+      const dEvents: DecisionEvent[] = []
+      for (const ev of events) {
+        const et = String(ev.type || '')
+        if (et === 'log') {
+          const p = (ev.payload || {}) as { line?: string; seq?: number }
+          if (p.line) pushLog(state, p.line)
+          if (typeof p.seq === 'number') {
+            state.logTotal = Math.max(state.logTotal, p.seq + 1)
+          }
+        } else if (et === 'decision_event') {
+          const p = (ev.payload || {}) as Record<string, unknown>
+          const de = { id: String(ev.id || ''), timestamp: String(ev.ts || ''), ...p } as DecisionEvent
+          dEvents.push(de)
+          const action = String(p.action || '')
+          if (action === 'checkpoint_request') applyCheckpointRequest(state, de)
+          if (action === 'checkpoint_resolved') applyCheckpointResolved(state, de)
+        }
+      }
+      if (dEvents.length) {
+        mergeDecisionEvents(state, dEvents)
+        if (state.task) {
+          state.task = {
+            ...state.task,
+            decision_events: state.decisionEvents.slice(),
+            pending_checkpoint: state.pendingCheckpoint,
+            checkpoint_history: state.checkpointHistory.slice(),
+          }
+        }
+      }
+      return
+    }
 
-      if (eventType === 'history_meta') {
-        const total = Number((event as { phase_log_total?: number }).phase_log_total || 0)
-        if (total > 0) state.logTotal = total
-        return
+    // ── 单条日志 (v2 log envelope) ────────────────────
+    if (eventType === 'log') {
+      const p = (raw.payload || {}) as { line?: string; seq?: number }
+      if (p.line) pushLog(state, p.line)
+      if (typeof p.seq === 'number') {
+        state.logTotal = Math.max(state.logTotal, p.seq + 1)
+      } else {
+        state.logTotal = state.logTotal + 1
       }
-      if (eventType === 'history_logs') {
-        const lines = (event as { data?: string[] }).data || []
-        for (const line of lines) pushLog(state, line)
-        const meta = event as { start_seq?: number; total?: number }
-        if (typeof meta.start_seq === 'number') {
-          state.logEarliestSeq = state.logEarliestSeq
-            ? Math.min(state.logEarliestSeq, meta.start_seq)
-            : meta.start_seq
+      return
+    }
+
+    // ── 决策事件 (v2 decision_event envelope) ─────────
+    if (eventType === 'decision_event') {
+      const p = (raw.payload || {}) as Record<string, unknown>
+      const de = {
+        id: String(raw.id || ''),
+        timestamp: String(raw.ts || ''),
+        branch_id: String(raw.branch_id || ''),
+        ...p,
+      } as DecisionEvent
+
+      const action = String(p.action || '')
+
+      if (action === 'llm_delta') {
+        const sid = (p.stream_id as string) || 'default'
+        const delta = (p.delta as string) || ''
+        const phase = (p.phase as string) || ''
+        const kind = (p.kind as string) || 'content'
+        if (!state.llmStreams[sid]) {
+          state.llmStreams[sid] = { streamId: sid, phase, kind, text: '', updatedAt: Date.now() }
         }
-        if (typeof meta.total === 'number') state.logTotal = meta.total
-        return
-      }
-      if (eventType === 'history_events') {
-        const events = (event as { data?: DecisionEvent[] }).data || []
-        mergeDecisionEvents(state, events)
-        // 重连/首连时回放历史 checkpoint 事件,保证刷新后卡片仍能恢复。
-        // 顺序处理:先 request 把 pendingCheckpoint 填上,再用 resolved 覆盖。
-        for (const e of events) {
-          if (e?.action === 'checkpoint_request') applyCheckpointRequest(state, e)
-        }
-        for (const e of events) {
-          if (e?.action === 'checkpoint_resolved') applyCheckpointResolved(state, e)
+        state.llmStreams[sid].text += delta
+        state.llmStreams[sid].updatedAt = Date.now()
+      } else if (action === 'tool_stream') {
+        const sid = (p.stream_id as string) || 'default'
+        const line = (p.line as string) || ''
+        pushToolStreamLine(state, sid, line)
+      } else {
+        mergeDecisionEvents(state, [de])
+        if (action === 'checkpoint_request') {
+          applyCheckpointRequest(state, de)
+        } else if (action === 'checkpoint_resolved') {
+          applyCheckpointResolved(state, de)
         }
         if (state.task) {
           state.task = {
@@ -537,185 +518,179 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
             checkpoint_history: state.checkpointHistory.slice(),
           }
         }
-        return
       }
-      if (eventType === 'log') {
-        const line = String((event as { data?: string }).data || '')
-        const seq = (event as { seq?: number }).seq
-        pushLog(state, line)
-        if (typeof seq === 'number' && Number.isFinite(seq)) {
-          // seq = append 后的 phase_log 下标,因此总数至少是 seq+1
-          state.logTotal = Math.max(state.logTotal, seq + 1)
-        } else {
-          state.logTotal = state.logTotal + 1
-        }
-        return
-      }
-      if (eventType === 'decision_event') {
-        const payload = (event as { data?: Record<string, unknown> }).data
-        if (payload && typeof payload === 'object') {
-          const action = payload.action as string | undefined
+      return
+    }
 
-          if (action === 'llm_delta') {
-            const sid = (payload.stream_id as string) || 'default'
-            const delta = (payload.delta as string) || ''
-            const phase = (payload.phase as string) || ''
-            const kind = (payload.kind as string) || 'content'
-            if (!state.llmStreams[sid]) {
-              state.llmStreams[sid] = { streamId: sid, phase, kind, text: '', updatedAt: Date.now() }
-            }
-            state.llmStreams[sid].text += delta
-            state.llmStreams[sid].updatedAt = Date.now()
-          } else if (action === 'tool_stream') {
-            const sid = (payload.stream_id as string) || 'default'
-            const line = (payload.line as string) || ''
-            pushToolStreamLine(state, sid, line)
-          } else {
-            const decisionEvent = payload as unknown as DecisionEvent
-            mergeDecisionEvents(state, [decisionEvent])
-            // Plan 风格 checkpoint 协议:实时把 pending_checkpoint 同步进 store,
-            // 任务详情页的 DecisionCheckpointCard 直接订阅 state.pendingCheckpoint。
-            if (action === 'checkpoint_request') {
-              applyCheckpointRequest(state, decisionEvent)
-            } else if (action === 'checkpoint_resolved') {
-              applyCheckpointResolved(state, decisionEvent)
-            }
-            if (state.task) {
-              state.task = {
-                ...state.task,
-                decision_events: state.decisionEvents.slice(),
-                pending_checkpoint: state.pendingCheckpoint,
-                checkpoint_history: state.checkpointHistory.slice(),
-              }
-            }
-          }
-        }
-        return
+    // ── 阶段更新 (v2 phase_update envelope) ───────────
+    if (eventType === 'phase_update') {
+      state.lastWsUpdate = Date.now()
+      const p = (raw.payload || {}) as Record<string, unknown>
+      const patch = {
+        phase: String(p.phase || ''),
+        status: String(p.status || ''),
+        findings_count: Number(p.findings_count || 0),
+        got_shell: Boolean(p.got_shell),
+        logs: (p.logs || []) as string[],
+        privilege_level: String(p.privilege_level || ''),
+        foothold_status: String(p.foothold_status || ''),
+        chain_visited: (p.chain_visited || []) as string[],
+        secondary_elided: Boolean(p.secondary_elided),
+        attack_next_steps: (p.attack_next_steps || []) as { stage?: string; action?: string; priority?: number }[],
+        privesc_attempt_count: Number(p.privesc_attempt_count || 0),
+        branch_id: String(p.branch_id || raw.branch_id || ''),
       }
-      if (eventType === 'phase_update') {
-        state.lastWsUpdate = Date.now()
-        const patch = event as {
-          phase?: string
-          status?: string
-          findings_count?: number
-          got_shell?: boolean
-          logs?: string[]
-          privilege_level?: string
-          foothold_status?: string
-          chain_visited?: string[]
-          secondary_elided?: boolean
-          attack_next_steps?: { stage?: string; action?: string; priority?: number }[]
-          privesc_attempt_count?: number
-          branch_id?: string
-        }
-        // 当 phase_update 携带 branch_id 且不是当前 active 分支时, 不更新
-        // ``state.task`` 的 phase / status (避免把老分支的 phase 推到
-        // 当前视图)。logs 仍然 push 到 buffer, 但走 branch_id 注入路径让
-        // TaskChat 自己过滤展示。
-        const updateBid = String(patch.branch_id || '')
-        const sameBranch = !updateBid || !state.activeBranchId || updateBid === state.activeBranchId
-        if (!sameBranch) {
-          if (patch.logs?.length) {
-            for (const line of patch.logs) pushLog(state, line)
-          }
-          return
-        }
-        taskListStore.upsertTask({
-          task_id: taskId,
-          current_phase: patch.phase,
-          status: patch.status as TaskDetail['status'],
-          findings_count: patch.findings_count,
-          got_shell: patch.got_shell,
-        })
-        if (state.task && patch.phase) {
-          const prevPhase = state.task.current_phase
-          state.task = {
-            ...state.task,
-            current_phase: patch.phase,
-            status: (patch.status as TaskDetail['status']) ?? state.task.status,
-            got_shell: patch.got_shell ?? state.task.got_shell,
-            privilege_level: patch.privilege_level ?? state.task.privilege_level,
-            foothold_status: patch.foothold_status ?? state.task.foothold_status,
-            chain_visited: patch.chain_visited ?? state.task.chain_visited,
-            secondary_elided: patch.secondary_elided ?? state.task.secondary_elided,
-            attack_next_steps: patch.attack_next_steps ?? state.task.attack_next_steps,
-            privesc_attempt_count: patch.privesc_attempt_count ?? state.task.privesc_attempt_count,
-          }
-          if (prevPhase === 'awaiting_approval' && patch.phase !== 'awaiting_approval') {
-            state.approvalState = 'idle'
-          }
-        }
+
+      const updateBid = patch.branch_id
+      const sameBranch = !updateBid || !state.activeBranchId || updateBid === state.activeBranchId
+      if (!sameBranch) {
         if (patch.logs?.length) {
           for (const line of patch.logs) pushLog(state, line)
         }
         return
       }
-      if (eventType === 'approval_required') {
-        state.lastWsUpdate = Date.now()
-        const incomingNonce = (event as { nonce?: string }).nonce || `ar-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-        taskListStore.upsertTask({ task_id: taskId, current_phase: 'awaiting_approval', status: 'running' })
-        if (state.task) {
-          state.task = { ...state.task, current_phase: 'awaiting_approval' }
+      taskListStore.upsertTask({
+        task_id: taskId,
+        current_phase: patch.phase,
+        status: patch.status as TaskDetail['status'],
+        findings_count: patch.findings_count,
+        got_shell: patch.got_shell,
+      })
+      if (state.task && patch.phase) {
+        const prevPhase = state.task.current_phase
+        state.task = {
+          ...state.task,
+          current_phase: patch.phase,
+          status: (patch.status as TaskDetail['status']) ?? state.task.status,
+          got_shell: patch.got_shell ?? state.task.got_shell,
+          privilege_level: patch.privilege_level ?? state.task.privilege_level,
+          foothold_status: patch.foothold_status ?? state.task.foothold_status,
+          chain_visited: patch.chain_visited ?? state.task.chain_visited,
+          secondary_elided: patch.secondary_elided ?? state.task.secondary_elided,
+          attack_next_steps: patch.attack_next_steps ?? state.task.attack_next_steps,
+          privesc_attempt_count: patch.privesc_attempt_count ?? state.task.privesc_attempt_count,
         }
-
-        const withinProtection = Date.now() - state.approvalSubmittedAt < APPROVAL_PROTECTION_MS
-        if (state.approvalState === 'submitted' && !withinProtection) {
-          state.approvalNonce = incomingNonce
+        if (prevPhase === 'awaiting_approval' && patch.phase !== 'awaiting_approval') {
           state.approvalState = 'idle'
-        } else if (state.approvalState === 'idle') {
-          state.approvalNonce = incomingNonce
         }
+      }
+      if (patch.logs?.length) {
+        for (const line of patch.logs) pushLog(state, line)
+      }
+      return
+    }
 
-        // 时间戳必须是 ISO 才能跟后端 phase_log 派生事件一起正确排序;
-        // 之前用 toLocaleTimeString() 形如 "11:33:53" 字典序会把这个气泡
-        // 排到所有 ISO 时间戳之前, 直接落出消息窗口让按钮"消失"。
-        // 优先用后端给的 server_iso (见 task_runner.py 推 WS 时的字段),
-        // 没有就回退到本地 ISO。
-        const serverIso = (event as { server_iso?: string }).server_iso
-        const approvalEvent: DecisionEvent = {
-          id: `approval-req-${taskId}-${incomingNonce}`,
-          timestamp: serverIso || new Date().toISOString(),
-          phase: 'awaiting_approval',
-          action: 'approval_required',
-          message: '系统检测到可利用路径，等待人工审批。',
-          tone: 'warning',
-        } as DecisionEvent
-        mergeDecisionEvents(state, [approvalEvent])
-        if (state.task) {
-          state.task = { ...state.task, decision_events: state.decisionEvents.slice() }
+    // ── 等待审批 (v2 approval_required envelope) ──────
+    if (eventType === 'approval_required') {
+      state.lastWsUpdate = Date.now()
+      const incomingNonce = `ar-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+      taskListStore.upsertTask({ task_id: taskId, current_phase: 'awaiting_approval', status: 'running' })
+      if (state.task) {
+        state.task = { ...state.task, current_phase: 'awaiting_approval' }
+      }
+
+      const withinProtection = Date.now() - state.approvalSubmittedAt < APPROVAL_PROTECTION_MS
+      if (state.approvalState === 'submitted' && !withinProtection) {
+        state.approvalNonce = incomingNonce
+        state.approvalState = 'idle'
+      } else if (state.approvalState === 'idle') {
+        state.approvalNonce = incomingNonce
+      }
+
+      const p = (raw.payload || {}) as Record<string, unknown>
+      const serverIso = String(p.server_iso || '')
+      const approvalEvent: DecisionEvent = {
+        id: String(raw.id || `approval-req-${taskId}-${incomingNonce}`),
+        timestamp: serverIso || String(raw.ts || new Date().toISOString()),
+        phase: 'awaiting_approval',
+        action: 'approval_required',
+        message: '系统检测到可利用路径，等待人工审批。',
+        tone: 'warning',
+      } as DecisionEvent
+      mergeDecisionEvents(state, [approvalEvent])
+      if (state.task) {
+        state.task = { ...state.task, decision_events: state.decisionEvents.slice() }
+      }
+      return
+    }
+
+    // ── 任务结束 (v2 done envelope) ────────────────────
+    if (eventType === 'done') {
+      refreshTask(taskId).catch(() => {})
+      return
+    }
+
+    // ── 分支事件 (v2) ─────────────────────────────────
+    if (eventType === 'branch_forked') {
+      const p = (raw.payload || {}) as Record<string, unknown>
+      if (p.parent) upsertBranch(state, { ...(p.parent as TaskBranch), status: 'paused' })
+      if (p.branch) {
+        upsertBranch(state, p.branch as TaskBranch)
+        setActiveBranch(state, (p.branch as TaskBranch).branch_id)
+        state.branchFlashAt = Date.now()
+      }
+      return
+    }
+    if (eventType === 'branch_switched') {
+      const p = (raw.payload || {}) as Record<string, unknown>
+      if (p.branch) {
+        upsertBranch(state, p.branch as TaskBranch)
+        setActiveBranch(state, (p.branch as TaskBranch).branch_id)
+      }
+      return
+    }
+    if (eventType === 'branch_status_changed') {
+      const p = (raw.payload || {}) as Record<string, unknown>
+      if (p.branch) upsertBranch(state, p.branch as TaskBranch)
+      return
+    }
+
+    // ── 重连内部事件 ──────────────────────────────────
+    if (eventType === '_reconnected') {
+      refreshTask(taskId).catch(() => {})
+      return
+    }
+  }
+
+  // ── attach / detach ──────────────────────────────────
+  async function attach(taskId: string) {
+    const state = ensureState(taskId)
+    if (state.unsub) return
+
+    // 协议 v2: 从 IndexedDB 预热历史事件, 避免 WS 首包到之前时间线空白
+    try {
+      const cached = await loadEvents(taskId, 2000)
+      if (cached.length) {
+        const dEvents: DecisionEvent[] = []
+        for (const ev of cached) {
+          const et = String(ev.type || '')
+          if (et === 'log') {
+            const p = (ev.payload || {}) as { line?: string; seq?: number }
+            if (p.line) pushLog(state, p.line)
+            if (typeof p.seq === 'number') state.logTotal = Math.max(state.logTotal, p.seq + 1)
+          } else if (et === 'decision_event') {
+            const p = (ev.payload || {}) as Record<string, unknown>
+            dEvents.push({
+              id: String(ev.id || ''),
+              timestamp: String(ev.ts || ''),
+              ...p,
+            } as DecisionEvent)
+          }
         }
-        return
+        if (dEvents.length) mergeDecisionEvents(state, dEvents)
       }
-      if (eventType === 'done') {
-        refreshTask(taskId).catch(() => {})
-        return
-      }
-      if (eventType === 'branch_forked') {
-        const ev = event as { branch?: TaskBranch; parent?: TaskBranch }
-        if (ev.parent) upsertBranch(state, { ...ev.parent, status: 'paused' })
-        if (ev.branch) {
-          upsertBranch(state, ev.branch)
-          setActiveBranch(state, ev.branch.branch_id)
-          state.branchFlashAt = Date.now()
-        }
-        return
-      }
-      if (eventType === 'branch_switched') {
-        const ev = event as { branch?: TaskBranch }
-        if (ev.branch) {
-          upsertBranch(state, ev.branch)
-          setActiveBranch(state, ev.branch.branch_id)
-        }
-        return
-      }
-      if (eventType === 'branch_status_changed') {
-        const ev = event as { branch?: TaskBranch }
-        if (ev.branch) upsertBranch(state, ev.branch)
-        return
-      }
+    } catch {
+      // IndexedDB 不可用, 跳过预热
+    }
+
+    // 先拉一份任务快照 (含 phase_log_tail / decision_events_tail / checkpoint)
+    refreshTask(taskId).catch(() => {})
+
+    state.unsub = subscribeTaskEvents(taskId, (event) => {
+      applyEvent(state, taskId, event)
     })
 
-    // 拉一份完整 branch tree, ws 之后的事件再做增量补丁。
+    // 拉完整 branch tree
     refreshBranches(taskId).catch(() => {})
   }
 
@@ -773,8 +748,6 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
     s.checkpointState = 'submitting'
     try {
       await api.respondCheckpoint(taskId, payload)
-      // 后续真正的 resolved 状态由 ws 推送的 checkpoint_resolved 事件统一收尾,
-      // 这里只标记本地按钮 loading 收回,避免界面残留。
       s.checkpointState = 'submitted'
       s.approvalSubmittedAt = Date.now()
       const tip = (

@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from fastapi import APIRouter, Request
 
 from backend.agents.models import PentestState, TaskStatus
-from backend.api.state import get_state_manager, TOOL_START_RE, TOOL_DONE_RE
+from backend.api.state import get_state_manager
 
 logger = logging.getLogger(__name__)
 
@@ -104,31 +104,43 @@ def _build_tool_invocation_overview(tasks: list[PentestState]) -> dict:
     total_elapsed = 0.0
     done_count = 0
 
+    # 协议 v2: 工具调用统计直接从 ``tool_records`` 读, 不再走 phase_log 字符串
+    # 反推。``display_tool`` 已经由 executor 写入, 没有的话兜底到 ``tool``。
     for state in tasks:
-        for entry in state.phase_log:
-            start_match = TOOL_START_RE.search(entry)
-            if start_match:
-                tool_name = start_match.group(1).strip()
-                backend = start_match.group(2).strip()
-                calls_by_tool[tool_name] += 1
-                backend_calls[backend] += 1
-                backend_by_tool[tool_name][backend] += 1
-                total_calls += 1
+        for rec in state.tool_records or []:
+            payload = rec.model_dump() if hasattr(rec, "model_dump") else dict(rec or {})
+            tool_name = (
+                str(payload.get("display_tool") or "").strip()
+                or str(payload.get("tool") or "").strip()
+                or "unknown"
+            )
+            backend = str(payload.get("backend") or "").strip() or "shell"
+            calls_by_tool[tool_name] += 1
+            backend_calls[backend] += 1
+            backend_by_tool[tool_name][backend] += 1
+            total_calls += 1
 
-            done_match = TOOL_DONE_RE.search(entry)
-            if done_match:
-                tool_name = done_match.group(1).strip()
-                exit_code = int(done_match.group(2))
-                elapsed = float(done_match.group(3))
-                done_by_tool[tool_name] += 1
-                elapsed_sum_by_tool[tool_name] += elapsed
-                total_elapsed += elapsed
-                done_count += 1
-                if exit_code == 0:
-                    success_by_tool[tool_name] += 1
-                    success_calls += 1
-                else:
-                    failed_calls += 1
+            exit_code = payload.get("exit_code")
+            if exit_code is None:
+                continue
+            try:
+                exit_code_val = int(exit_code)
+            except Exception:
+                continue
+            elapsed = payload.get("elapsed")
+            try:
+                elapsed_val = float(elapsed) if elapsed is not None else 0.0
+            except Exception:
+                elapsed_val = 0.0
+            done_by_tool[tool_name] += 1
+            elapsed_sum_by_tool[tool_name] += elapsed_val
+            total_elapsed += elapsed_val
+            done_count += 1
+            if exit_code_val == 0:
+                success_by_tool[tool_name] += 1
+                success_calls += 1
+            else:
+                failed_calls += 1
 
     top_tools = []
     for tool_name, calls in sorted(calls_by_tool.items(), key=lambda item: item[1], reverse=True):
@@ -160,13 +172,15 @@ def _build_tool_invocation_overview(tasks: list[PentestState]) -> dict:
 
 def _build_guard_overview(tasks: list[PentestState]) -> dict:
     guard_totals: dict[str, int] = defaultdict(int)
-    llm_rejects = 0
     for state in tasks:
         for k, v in (state.guard_stats or {}).items():
             guard_totals[k] += int(v or 0)
-        for ev in (state.live_decision_events or []):
-            if ev.get("action") == "guard_block":
-                llm_rejects += 1
+    # 协议 v2: ``llm_preflight_reject`` 也走 ``guard_stats`` 累计 (节点侧
+    # 已经把 LLM 拒判的次数计入对应 guard code), 不再扫 ``live_decision_events``。
+    llm_rejects = sum(
+        v for k, v in guard_totals.items()
+        if "preflight" in k or "llm_reject" in k
+    )
     return {
         "reprobe_intercept_count": sum(v for k, v in guard_totals.items() if "reprobe" in k or "enum" in k),
         "repeat_failed_command_intercept_count": sum(v for k, v in guard_totals.items() if "repeat_failed" in k),
@@ -181,6 +195,7 @@ async def health_check(request: Request):
     admin_routes = sorted(
         {r.path for r in request.app.routes if getattr(r, "path", "").startswith("/admin")}
     )
+    from backend.api import event_stream
     return {
         "status": "ok",
         "version": "2.0.0",
@@ -190,6 +205,13 @@ async def health_check(request: Request):
         "redis": "connected" if sm.redis_available else "unavailable",
         "msf": "connected" if sm.msf_available else "unavailable",
         "active_tasks": sm.running_count,
+        "realtime_protocol": {
+            "version": event_stream.PROTOCOL_VERSION,
+            "backend": "redis_stream" if event_stream.is_redis_backed() else "local_fallback",
+            "stream_maxlen": event_stream.STREAM_MAXLEN,
+            "stream_ttl_seconds": event_stream.STREAM_TTL_SECONDS,
+            "xread_block_ms": event_stream.XREAD_BLOCK_MS,
+        },
         "admin_routes_count": len(admin_routes),
         "admin_routes": admin_routes,
         "timestamp": datetime.utcnow().isoformat(),

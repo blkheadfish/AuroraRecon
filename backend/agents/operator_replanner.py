@@ -247,6 +247,42 @@ def _validate_plan(raw: dict[str, Any], state: PentestState, op_block: str) -> O
         needs_human_approval=bool(raw.get("needs_human_approval", True)),
     )
     plan.derived_replan_signals = _derive_signals(plan, state)
+
+    # ── 前置数据护栏 ─────────────────────────────────────────
+    # LLM 偶尔会在没有基础数据时"冒进"到下游阶段(例如 surface_enum 需要
+    # open_ports 才有意义, 但 init 阶段还没跑 recon)。检测到前置数据缺失
+    # 时, 强制回退到 recon, 但把原计划保留在 target_phases 头部, 等 recon
+    # 补完后自然接续。
+    _needs_ports = {"surface_enum", "vuln_scan", "intel_harvest"}
+    has_ports = bool(state.open_ports)
+    redirected = False
+
+    if plan.next_phase in _needs_ports and not has_ports:
+        original = plan.next_phase
+        plan.next_phase = "recon"
+        if original not in (plan.target_phases or []):
+            plan.target_phases = [original] + list(plan.target_phases or [])
+        redirected = True
+
+    # init 阶段 + 无端口数据 + plan 等于哑火(无 next_phase 也无 rerun)时,
+    # 默认填 recon, 至少保证流水线动起来。
+    cur_phase = (state.current_phase or "").strip()
+    if (
+        not redirected
+        and cur_phase in ("", "init")
+        and not has_ports
+        and not plan.next_phase
+        and not plan.rerun_current
+    ):
+        plan.next_phase = "recon"
+        redirected = True
+
+    if redirected:
+        plan.rationale = (
+            f"前置数据护栏: open_ports 为空, 必须先完成 recon 才能进入下游阶段。"
+            f" 原始规划意图已保留。\n{plan.rationale}"
+        )
+
     return plan
 
 

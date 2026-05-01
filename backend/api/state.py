@@ -3,11 +3,17 @@ state.py —— 全局状态管理器
 
 将散落的全局变量封装为 TaskStateManager 类，
 所有 Router / Service 通过依赖注入获取同一实例。
+
+协议 v2 之后, ``build_decision_events`` 那一套从 ``phase_log`` 字符串里
+正则反推 tool/thought/log 的派生逻辑全部下线 -- 实时事件由 Redis Stream
+持久化, 前端直接消费 envelope, 不再用 phase_log 重新拼一份"伪事件流"。
+对应的 TOOL_START_RE / TOOL_DONE_RE / _SHELL_NAMES / _command_preview /
+_infer_tool_from_command 等正则与工具推断函数也一并删掉, 减少误推断带来的
+"工具名乱跳"问题。
 """
 from __future__ import annotations
 
 import asyncio
-import re
 import logging
 import threading
 from datetime import datetime
@@ -16,74 +22,6 @@ from typing import Optional
 from backend.agents.models import PentestState, TaskStatus
 
 logger = logging.getLogger(__name__)
-
-# 模块级编译正则（避免循环内重复 compile）
-TOOL_START_RE = re.compile(r"执行\s+([^\s]+)\s+\[([^\]]+)\]")
-TOOL_DONE_RE = re.compile(r"(?:✅|❌)\s+([^\s]+)\s+完成:\s+exit=([-]?\d+),.*?耗时=([\d.]+)s")
-THOUGHT_RE = re.compile(
-    r"LLM|分析|决策|策略|推理|建议|主动发现|KB|知识库|扫描策略|优先级|"
-    r"Skill 引擎|ReAct|模型",
-    re.IGNORECASE,
-)
-
-
-_SHELL_NAMES = {"/bin/bash", "/bin/sh", "bash", "sh", "/bin/zsh", "zsh"}
-_SKIP_PREFIX_RE = re.compile(
-    r"^(set\s|export\s|cd\s|echo\s|#|if\s|then\b|else\b|fi\b|do\b|done\b|while\s|for\s|\[)"
-)
-_VAR_ASSIGN_RE = re.compile(r"^\w+=")
-
-
-def _infer_tool_from_command(cmd: str) -> str:
-    """Extract the primary tool name from a shell command/script string."""
-    if not cmd:
-        return "script"
-    for segment in re.split(r"[;\n|]|&&|\|\|", cmd):
-        segment = segment.strip()
-        if not segment:
-            continue
-        if _SKIP_PREFIX_RE.match(segment):
-            continue
-        if _VAR_ASSIGN_RE.match(segment):
-            continue
-        first_token = segment.split()[0]
-        name = first_token.rsplit("/", 1)[-1]
-        if name and name not in _SHELL_NAMES:
-            return name
-    return "script"
-
-
-def _command_preview(command: str, max_len: int = 280) -> str:
-    """Compress command while retaining suspicious fragments for debugging."""
-    normalized = " ".join((command or "").split())
-    if not normalized:
-        return ""
-    if len(normalized) <= max_len:
-        return normalized
-
-    markers = (
-        "<?php",
-        "system($_GET",
-        "sshpass -p",
-        "auth.log",
-        "User-Agent:",
-    )
-    marker_pos = -1
-    for marker in markers:
-        marker_pos = normalized.find(marker)
-        if marker_pos >= 0:
-            break
-
-    if marker_pos >= 0:
-        head_len = min(90, max_len // 3)
-        tail_len = min(90, max_len // 3)
-        window_len = max_len - head_len - tail_len - len(" ...  ... ")
-        start = max(0, marker_pos - window_len // 3)
-        mid = normalized[start:start + window_len]
-        return f"{normalized[:head_len]} ... {mid} ... {normalized[-tail_len:]}"
-
-    keep = max_len // 2
-    return f"{normalized[:keep]} ... {normalized[-keep:]}"
 
 
 class TaskStateManager:
@@ -100,10 +38,6 @@ class TaskStateManager:
         self.msf_available = False
 
         self._tool_registry_cache = None
-
-        # 增量 decision_events 缓存
-        self._decision_cache: dict[str, list[dict]] = {}
-        self._decision_cursor: dict[str, tuple[int, int, int]] = {}
 
         # 后台任务句柄注册表(run_task / resume_task 的 asyncio.Task)
         # cancel / delete 时可以精确取消对应协程,避免 zombie 残留。
@@ -129,11 +63,8 @@ class TaskStateManager:
         self._tasks[task_id] = state
 
     def pop(self, task_id: str) -> Optional[PentestState]:
-        # 任务彻底退出时一并清理 task-scoped 缓存, 避免 task_id 复用
-        # (rare, 测试 / 重启场景) 时把旧的 decision_cache / log seq
-        # 当成新任务的初始值。
-        self._decision_cache.pop(task_id, None)
-        self._decision_cursor.pop(task_id, None)
+        # 任务彻底退出时清理 task-scoped 缓存, 避免 task_id 复用 (测试 / 重启)
+        # 时把旧的 log seq 当成新任务初始值。
         self.reset_log_seq(task_id)
         return self._tasks.pop(task_id, None)
 
@@ -273,7 +204,11 @@ class TaskStateManager:
             "findings": [f.model_dump() for f in state.findings],
             "exploit_results": [r.model_dump() for r in state.exploit_results],
             "tool_records": [r.model_dump() for r in state.tool_records],
-            "decision_events": self.build_decision_events(state) + list(state.live_decision_events),
+            # 协议 v2: 实时事件不再由 state 派生; 这里 ``decision_events`` 字段
+            # 留空数组保持响应 schema 兼容, 老前端读到空数组只会渲染一个空
+            # 时间线 (新前端会忽略它直接走 WS / IndexedDB)。完整事件历史走
+            # ``GET /tasks/{id}/events?after_id=&count=``。
+            "decision_events": [],
             "post_findings": state.post_findings,
             "report_md": state.report_md,
             "phase_log": state.phase_log,
@@ -367,11 +302,10 @@ class TaskStateManager:
             list(state.phase_log[-log_tail:]) if (log_tail and log_total) else []
         )
 
-        all_events = self.build_decision_events(state) + list(state.live_decision_events)
-        decision_total = len(all_events)
-        decision_tail_slice = (
-            all_events[-decision_tail:] if decision_tail and decision_total else []
-        )
+        # 协议 v2: 不再从 state 派生 decision events; 首屏快照里这两个字段
+        # 留空, 让前端进入页面时主动从 IndexedDB 预热 + WS history 帧补齐。
+        decision_total = 0
+        decision_tail_slice: list[dict] = []
 
         path_contents_snapshot: list[dict] = []
         for c in (state.path_contents or []):
@@ -499,15 +433,9 @@ class TaskStateManager:
             "privesc_attempt_count": state.privesc_attempt_count,
         }
 
-    # ── 增量 decision_events 构建 ─────────────────────────
-
-    @staticmethod
-    def _extract_phase_log(log_entry: str) -> tuple[str, str, str]:
-        match = re.match(r"^\[(?P<ts>[^\]]+)\]\s+\[(?P<phase>[^\]]+)\]\s+(?P<msg>.*)$", log_entry or "")
-        if not match:
-            return "", "", log_entry or ""
-        return match.group("ts"), match.group("phase"), match.group("msg")
-
+    # ── 仅保留: 时间戳标准化辅助 (DB 字段写入用) ──────────
+    # 历史上 ``build_decision_events`` 用过的 phase_log 反推逻辑全部移除,
+    # 仅留下这个 staticmethod 给迁移期单测用。新代码不要再调用。
     @staticmethod
     def _normalize_phase_log_ts(
         state_created_at: str, ts_short: str, prev_iso: str
@@ -524,11 +452,12 @@ class TaskStateManager:
             - 没有 prev 时退到 ``state.created_at`` 的日期; 都没有就用 utcnow
             - ``ts_short`` 无法解析时返回空串 (调用方兜底)
         """
+        import re as _re
         if not ts_short:
             return ""
         if "T" in ts_short and len(ts_short) >= 10:
             return ts_short
-        m = re.match(r"^(\d{2}):(\d{2}):(\d{2})", ts_short)
+        m = _re.match(r"^(\d{2}):(\d{2}):(\d{2})", ts_short)
         if not m:
             return ""
         cur_hms = f"{m.group(1)}:{m.group(2)}:{m.group(3)}"
@@ -537,7 +466,7 @@ class TaskStateManager:
         base_hms = ""
         if prev_iso and len(prev_iso) >= 10 and prev_iso[4] == "-":
             base_date = prev_iso[:10]
-            tm = re.search(r"T(\d{2}:\d{2}:\d{2})", prev_iso)
+            tm = _re.search(r"T(\d{2}:\d{2}:\d{2})", prev_iso)
             if tm:
                 base_hms = tm.group(1)
         if not base_date:
@@ -555,244 +484,6 @@ class TaskStateManager:
 
         return f"{base_date}T{cur_hms}"
 
-    def build_decision_events(self, state: PentestState) -> list[dict]:
-        """Build decision events with incremental caching."""
-        tid = state.task_id
-
-        cur_log = len(state.phase_log or [])
-        cur_rec = len(state.tool_records or [])
-        cur_exp = len(state.exploit_results or [])
-        prev = self._decision_cursor.get(tid, (0, 0, 0))
-
-        if prev == (cur_log, cur_rec, cur_exp) and tid in self._decision_cache:
-            return list(self._decision_cache[tid])
-
-        events = list(self._decision_cache.get(tid, []))
-        seen_exec_keys: set[tuple[str, str, str]] = set()
-        for ev in events:
-            ts = ev.get("timestamp", "")
-            phase = ev.get("phase", "")
-            cmd = ev.get("command", "")
-            if ev.get("action") == "command_exec":
-                seen_exec_keys.add((ts, phase, cmd))
-
-        # 增量构造 phase_log 派生事件时, 用上一次缓存里最末一条 ISO 时间戳作为
-        # anchor, 跨调用维持 prev_iso, 让跨午夜推进逻辑稳定。
-        prev_iso = ""
-        for ev in reversed(events):
-            ts = ev.get("timestamp", "")
-            if ts and "T" in ts and len(ts) >= 10:
-                prev_iso = ts
-                break
-        state_created_at = getattr(state, "created_at", "") or ""
-
-        base_idx = prev[0] if tid in self._decision_cache else 0
-
-        # 1) incremental phase_log
-        for idx in range(base_idx, cur_log):
-            entry = state.phase_log[idx]
-            ts_short, phase, msg = self._extract_phase_log(entry)
-            ts = self._normalize_phase_log_ts(state_created_at, ts_short, prev_iso) or ts_short
-            if ts and "T" in ts:
-                prev_iso = ts
-            tone = "info"
-            action = "log"
-            tool = ""
-            backend = ""
-            exit_code = None
-            elapsed_ms = None
-
-            start_match = TOOL_START_RE.search(msg)
-            if start_match:
-                tool = start_match.group(1).strip()
-                backend = start_match.group(2).strip()
-                action = "tool_start"
-                tone = "primary"
-
-            done_match = TOOL_DONE_RE.search(msg)
-            if done_match:
-                tool = done_match.group(1).strip()
-                exit_code = int(done_match.group(2))
-                elapsed_ms = int(float(done_match.group(3)) * 1000.0)
-                action = "tool_result"
-                tone = "success" if exit_code == 0 else "danger"
-
-            if "审批" in msg or "授权" in msg:
-                action = "approval"
-                tone = "warning"
-
-            if action == "log" and THOUGHT_RE.search(msg):
-                action = "thought"
-                tone = "primary"
-
-            # 历史日志里 tool 就是 TOOL_START_RE / TOOL_DONE_RE 抓到的字面;
-            # executor 已经把 ``/bin/bash`` 替换成 display_tool, 但兼容残留
-            # 老日志 / 直接被监督模式注入的旧文本: 命中 shell 名就退一步显示
-            # ``script``,否则前端工具链还会出现 ``/bin/bash``。
-            if tool and tool in _SHELL_NAMES:
-                tool = "script"
-            events.append({
-                "id": f"log-{idx}",
-                "timestamp": ts,
-                "phase": phase,
-                "action": action,
-                "tool": tool,
-                "display_tool": tool,
-                "backend": backend,
-                "poc_or_vuln": "",
-                "command": "",
-                "runtime_command": "",
-                "stdout": "",
-                "stderr": "",
-                "exit_code": exit_code,
-                "elapsed_ms": elapsed_ms,
-                "purpose": "",
-                "round": None,
-                "truncated": False,
-                "total_len": 0,
-                "message": msg,
-                "raw": entry,
-                "tone": tone,
-            })
-
-        # 2) incremental tool_records
-        rec_start = prev[1] if tid in self._decision_cache else 0
-        for ridx in range(rec_start, cur_rec):
-            record = state.tool_records[ridx]
-            payload = record.model_dump() if hasattr(record, "model_dump") else dict(record or {})
-            cmd = str(payload.get("command") or "")
-            runtime_cmd = str(payload.get("runtime_command") or "")
-            stdout = str(payload.get("stdout") or "")
-            stderr = str(payload.get("stderr") or "")
-            timestamp = str(payload.get("timestamp") or "")
-            phase = str(payload.get("phase") or "")
-            # display_tool 由 executor 直接落库,老记录没有时回退到 ``tool`` +
-            # 命令推断,确保前端工具链不会再看到 ``/bin/bash``。
-            display_tool = str(payload.get("display_tool") or "").strip()
-            tool = str(payload.get("tool") or "shell")
-            if not display_tool:
-                if tool in _SHELL_NAMES:
-                    display_tool = _infer_tool_from_command(cmd)
-                else:
-                    display_tool = tool
-            tool = display_tool
-            backend = str(payload.get("backend") or "")
-            exit_code = payload.get("exit_code")
-            elapsed = payload.get("elapsed")
-            purpose = str(payload.get("purpose") or "")
-            round_no = payload.get("round")
-            truncated = bool(payload.get("truncated") or False)
-            total_len = payload.get("total_len")
-            if total_len is None:
-                total_len = len(stdout) + len(stderr)
-            try:
-                total_len_val = int(total_len)
-            except Exception:
-                total_len_val = len(stdout) + len(stderr)
-
-            dedupe_key = (timestamp, phase, cmd)
-            if dedupe_key in seen_exec_keys:
-                continue
-            seen_exec_keys.add(dedupe_key)
-
-            rec_id = str(payload.get("id") or f"tool-rec-{ridx}")
-            events.append({
-                "id": f"exec-{rec_id}",
-                "timestamp": timestamp,
-                "phase": phase or "unknown",
-                "action": "command_exec",
-                "tool": tool,
-                "display_tool": display_tool,
-                "backend": backend,
-                "poc_or_vuln": "",
-                "command": cmd,
-                "runtime_command": runtime_cmd,
-                "stdout": stdout,
-                "stderr": stderr,
-                "exit_code": exit_code,
-                "elapsed_ms": int(float(elapsed) * 1000.0) if elapsed is not None else None,
-                "purpose": purpose,
-                "round": round_no,
-                "truncated": truncated,
-                "total_len": total_len_val,
-                "message": f"命令执行: {tool} {_command_preview(cmd)}".strip(),
-                "raw": "",
-                "tone": "success" if exit_code == 0 else "danger",
-            })
-
-        # 3) incremental exploit_results
-        exp_start = prev[2] if tid in self._decision_cache else 0
-        for ridx in range(exp_start, cur_exp):
-            result = state.exploit_results[ridx]
-            result_payload = result.model_dump() if hasattr(result, "model_dump") else result
-            vuln_id = result_payload.get("vuln_id", "")
-            records = result_payload.get("command_records") or result_payload.get("command_results") or []
-            for cidx, record in enumerate(records):
-                cmd = str(record.get("command") or "")
-                runtime_cmd = str(record.get("runtime_command") or "")
-                stdout = str(record.get("stdout") or "")
-                stderr = str(record.get("stderr") or "")
-                exit_code = record.get("exit_code")
-                elapsed = record.get("elapsed")
-                timestamp = str(record.get("timestamp") or "")
-                purpose = str(record.get("purpose") or "")
-                round_no = record.get("round")
-                truncated = bool(record.get("truncated") or False)
-                total_len = record.get("total_len")
-                if total_len is None:
-                    total_len = len(stdout) + len(stderr)
-                try:
-                    total_len_val = int(total_len)
-                except Exception:
-                    total_len_val = len(stdout) + len(stderr)
-                dedupe_key = (timestamp, "exploit", cmd)
-                if dedupe_key in seen_exec_keys:
-                    continue
-                seen_exec_keys.add(dedupe_key)
-                rec_display_tool = str(record.get("display_tool") or "").strip()
-                rec_tool = str(record.get("tool") or "shell")
-                if not rec_display_tool:
-                    if rec_tool in _SHELL_NAMES:
-                        rec_display_tool = _infer_tool_from_command(cmd)
-                    else:
-                        rec_display_tool = rec_tool
-                rec_tool = rec_display_tool
-                events.append({
-                    "id": f"cmd-{ridx}-{cidx}",
-                    "timestamp": timestamp,
-                    "phase": str(record.get("phase") or "exploit"),
-                    "action": "command_exec",
-                    "tool": rec_tool,
-                    "display_tool": rec_display_tool,
-                    "backend": str(record.get("backend") or ""),
-                    "poc_or_vuln": vuln_id,
-                    "command": cmd,
-                    "runtime_command": runtime_cmd,
-                    "stdout": stdout,
-                    "stderr": stderr,
-                    "exit_code": exit_code,
-                    "elapsed_ms": int(float(elapsed) * 1000.0) if elapsed is not None else None,
-                    "purpose": purpose,
-                    "round": round_no,
-                    "truncated": truncated,
-                    "total_len": total_len_val,
-                    "message": f"命令执行: {_command_preview(cmd)}",
-                    "raw": "",
-                    "tone": "success" if exit_code == 0 else "danger",
-                })
-
-        for event in events:
-            event.setdefault("purpose", "")
-            event.setdefault("round", None)
-            event.setdefault("truncated", False)
-            event.setdefault("total_len", 0)
-            event.setdefault("runtime_command", "")
-            # 前端 helper 优先读 display_tool 渲染节点,兜底到 tool。
-            event.setdefault("display_tool", event.get("tool") or "")
-
-        self._decision_cache[tid] = events
-        self._decision_cursor[tid] = (cur_log, cur_rec, cur_exp)
-        return events
 
 
 # ── 模块级单例 ────────────────────────────────────────────

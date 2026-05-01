@@ -15,10 +15,16 @@ Covers the full contract surface:
 """
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from backend.agents.models import PentestState, TaskStatus, VulnFinding
 from backend.agents.orchestrator import node_human_approval
+from backend.api.event_bus import (
+    set_task_sink, clear_task_sink,
+    set_task_loop, clear_task_loop,
+)
 from backend.api.state import TaskStateManager
 
 
@@ -38,21 +44,85 @@ def _build_state(*, auto_approve: bool = False, exploitable: bool = True) -> Pen
     return state
 
 
+class _DecisionCapture:
+    """协议 v2: ``push_decision`` 不再 append 到 state, 走 sink 投递。
+    这个 helper 注册一个 sink 把投递到 EventBus 的事件捕获到 list 里, 测试
+    再断言 list 内容。
+
+    用法::
+
+        with _DecisionCapture(state) as cap:
+            asyncio.run(...)  # 同一个 event loop 里跑
+        assert cap.events[-1]["action"] == ...
+
+    必须在 ``asyncio.run`` 里调用 ``state.push_decision`` (或调用方法间接触发),
+    因为 ``push_decision`` 派发用 ``loop.create_task``。
+    """
+
+    def __init__(self, state: PentestState) -> None:
+        self.state = state
+        self.events: list[dict] = []
+
+    def __enter__(self) -> "_DecisionCapture":
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        set_task_loop(self.state.task_id, self._loop)
+
+        async def _sink(ev: dict) -> None:
+            self.events.append(dict(ev))
+
+        set_task_sink(self.state.task_id, _sink)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        clear_task_sink(self.state.task_id)
+        clear_task_loop(self.state.task_id)
+        # 让所有 pending sink 任务跑完再关 loop
+        try:
+            pending = asyncio.all_tasks(self._loop)
+            if pending:
+                self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        except Exception:
+            pass
+        self._loop.close()
+        asyncio.set_event_loop(None)
+
+    def run(self, coro_factory):
+        """在 capture loop 里跑一段协程, 同时跑两轮 sleep(0) 让 sink 落盘。"""
+        async def _go():
+            result = await coro_factory()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            return result
+        return self._loop.run_until_complete(_go())
+
+    def call_sync(self, fn, *args, **kwargs):
+        """同步方法 (如 ``state.open_checkpoint``) 内会用 ``loop.create_task``
+        派发 sink, 必须把这次调用放在 capture loop 上下文里执行, 然后跑两轮
+        ``sleep(0)`` 让 sink 真正写入 events。"""
+        async def _go():
+            result = fn(*args, **kwargs)
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            return result
+        return self._loop.run_until_complete(_go())
+
+
 class TestCheckpointHelpers:
     def test_open_checkpoint_registers_pending_and_emits_decision(self):
         state = _build_state()
-
-        ckpt = state.open_checkpoint({
-            "checkpoint_type": "exploit_gate",
-            "summary": "approve before exploit",
-            "thinking": "1 high finding",
-            "recommendation": "approve",
-            "risk": "高风险",
-            "options": [
-                {"id": "approve", "label": "go", "action": "approve"},
-                {"id": "reject", "label": "stop", "action": "reject"},
-            ],
-        })
+        with _DecisionCapture(state) as cap:
+            ckpt = cap.call_sync(state.open_checkpoint, {
+                "checkpoint_type": "exploit_gate",
+                "summary": "approve before exploit",
+                "thinking": "1 high finding",
+                "recommendation": "approve",
+                "risk": "高风险",
+                "options": [
+                    {"id": "approve", "label": "go", "action": "approve"},
+                    {"id": "reject", "label": "stop", "action": "reject"},
+                ],
+            })
 
         assert state.pending_checkpoint is not None
         assert state.pending_checkpoint["checkpoint_id"] == ckpt["checkpoint_id"]
@@ -60,7 +130,7 @@ class TestCheckpointHelpers:
         assert state.pending_checkpoint["risk"] == "高风险"
 
         emitted = [
-            e for e in state.live_decision_events
+            e for e in cap.events
             if e.get("action") == "checkpoint_request"
         ]
         assert len(emitted) == 1
@@ -70,16 +140,16 @@ class TestCheckpointHelpers:
 
     def test_resolve_checkpoint_archives_and_persists_user_prompt(self):
         state = _build_state()
-        ckpt = state.open_checkpoint({
-            "checkpoint_type": "exploit_gate",
-            "summary": "approve",
-        })
-
-        archived = state.resolve_checkpoint({
-            "action": "modify",
-            "selected_option": "modify",
-            "user_prompt": "先验证 LFI 再尝试 RCE",
-        })
+        with _DecisionCapture(state) as cap:
+            ckpt = cap.call_sync(state.open_checkpoint, {
+                "checkpoint_type": "exploit_gate",
+                "summary": "approve",
+            })
+            archived = cap.call_sync(state.resolve_checkpoint, {
+                "action": "modify",
+                "selected_option": "modify",
+                "user_prompt": "先验证 LFI 再尝试 RCE",
+            })
 
         assert archived is not None
         assert archived["status"] == "resolved"
@@ -93,7 +163,7 @@ class TestCheckpointHelpers:
         assert state.user_messages[-1]["text"] == "先验证 LFI 再尝试 RCE"
 
         emitted = [
-            e for e in state.live_decision_events
+            e for e in cap.events
             if e.get("action") == "checkpoint_resolved"
         ]
         assert len(emitted) == 1
@@ -107,10 +177,11 @@ class TestCheckpointHelpers:
 
     def test_resolve_appends_prompts_when_called_back_to_back(self):
         state = _build_state()
-        state.open_checkpoint({"checkpoint_type": "exploit_gate"})
-        state.resolve_checkpoint({"action": "modify", "user_prompt": "first"})
-        state.open_checkpoint({"checkpoint_type": "post_foothold_gate"})
-        state.resolve_checkpoint({"action": "modify", "user_prompt": "second"})
+        with _DecisionCapture(state) as cap:
+            cap.call_sync(state.open_checkpoint, {"checkpoint_type": "exploit_gate"})
+            cap.call_sync(state.resolve_checkpoint, {"action": "modify", "user_prompt": "first"})
+            cap.call_sync(state.open_checkpoint, {"checkpoint_type": "post_foothold_gate"})
+            cap.call_sync(state.resolve_checkpoint, {"action": "modify", "user_prompt": "second"})
 
         assert "first" in state.pending_user_prompt
         assert "second" in state.pending_user_prompt

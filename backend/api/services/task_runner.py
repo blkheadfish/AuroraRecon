@@ -15,12 +15,11 @@ import time
 from backend.agents.models import PentestState, TaskStatus
 from backend.agents.orchestrator import Orchestrator
 from backend.api.state import get_state_manager
+from backend.api import event_stream
 from backend.api.event_bus import (
-    get_event_bus,
     set_task_sink, clear_task_sink,
     set_log_sink, clear_log_sink,
     set_task_loop, clear_task_loop,
-    get_dropped_count, reset_dropped_count,
 )
 
 logger = logging.getLogger(__name__)
@@ -106,7 +105,6 @@ async def run_task(
     会传入 ``f"{task_id}:{branch_id}"`` 让 LangGraph checkpoint 落到独立 thread。
     """
     sm = get_state_manager()
-    bus = get_event_bus()
     sm.mark_running(task_id)
     orchestrator = get_orchestrator()
     # Ownership token: BranchManager.fork_from_active swaps in a new
@@ -118,25 +116,28 @@ async def run_task(
     # forked, no further logs".
     my_task = asyncio.current_task()
 
-    # Register decision event sink so push_decision() inside agent nodes
-    # can fire events to WS clients in real-time (not waiting for node yield).
+    # 协议 v2: sink 直接把事件写进 Stream。前端不再依赖 phase_log 派生事件,
+    # 因此 ``state.log()`` 触发的也走 ``type=log`` 单独 envelope, 而不是
+    # 依附在 phase_update 里。
     async def _decision_sink(ev: dict):
-        await bus.publish(task_id, {"type": "decision_event", "data": ev})
+        cur = sm.get(task_id)
+        bid = (
+            ev.get("branch_id")
+            or (cur.active_branch_id if cur else "")
+            or ""
+        )
+        await event_stream.publish(
+            task_id, type="decision_event", payload=ev, branch_id=bid,
+        )
 
     async def _log_sink(line: str, seq: int):
-        # ``seq`` 是 task 级单调 counter (TaskStateManager.next_log_seq),
-        # 前端用它推进 ``lastLogSeq`` 走 ``after_log_seq=K`` 增量重连。
-        # ``branch_id`` 由 sink 侧从 sm 当前 active 拿一次, 让前端按
-        # ``activeBranchId`` 过滤聊天流时, 任何路径的 phase_log 都能落到
-        # 正确的分支视图里。
         cur = sm.get(task_id)
         bid = (cur.active_branch_id if cur else "") or ""
-        await bus.publish(task_id, {
-            "type": "log",
-            "data": line,
-            "seq": seq,
-            "branch_id": bid,
-        })
+        await event_stream.publish(
+            task_id, type="log",
+            payload={"line": line, "seq": seq},
+            branch_id=bid,
+        )
 
     set_task_sink(task_id, _decision_sink)
     set_log_sink(task_id, _log_sink)
@@ -181,11 +182,13 @@ async def run_task(
             # 异步 DB（节流）
             await _maybe_save_db(task_id, state)
 
-            # 即时事件推送
-            await bus.publish(task_id, {
-                "type": "phase_update",
-                **sm.ws_phase_payload(state, log_tail=5),
-            })
+            # 即时事件推送 (协议 v2: phase_update envelope)
+            payload = sm.ws_phase_payload(state, log_tail=5)
+            await event_stream.publish(
+                task_id, type="phase_update",
+                payload=payload,
+                branch_id=payload.get("branch_id", ""),
+            )
 
     except asyncio.CancelledError:
         logger.info(f"[API] 任务 {task_id} 被取消(CancelledError)")
@@ -221,20 +224,19 @@ async def run_task(
         state.current_phase = "awaiting_approval"
         state.log("⏸ 等待人工审批,请在前端点击「授权并继续」")
         sm.set(task_id, state)
-        # ``server_iso`` 是给前端做时间戳排序对齐用的 — phase_log 派生事件
-        # 是 ISO, 这里也得给 ISO, 否则前端 ``_compareDecisionEvents`` 会把
-        # 短格式时间戳排到字典序最前 (字符 '1' < '2'), 直接让审批气泡掉出
-        # MAX_DECISION_EVENTS 窗口, 用户连按钮都看不到。
         from datetime import datetime as _dt
-        await bus.publish(task_id, {
-            "type": "approval_required",
-            "phase": "awaiting_approval",
-            "status": "running",
-            "server_iso": _dt.utcnow().isoformat(),
-            "logs": state.phase_log[-3:],
-            "findings_count": len(state.findings),
-            "got_shell": state.got_shell,
-        })
+        await event_stream.publish(
+            task_id, type="approval_required",
+            payload={
+                "phase": "awaiting_approval",
+                "status": "running",
+                "server_iso": _dt.utcnow().isoformat(),
+                "logs": state.phase_log[-3:],
+                "findings_count": len(state.findings),
+                "got_shell": state.got_shell,
+            },
+            branch_id=state.active_branch_id or "",
+        )
         await _maybe_save_db(task_id, state, force=True)
         logger.info(f"[API] 任务 {task_id} 等待人工审批")
         # 待审批期间不关容器:恢复后继续利用还要用同一个工具环境
@@ -249,24 +251,21 @@ async def run_task(
 
     if state:
         await _maybe_save_db(task_id, state, force=True)
-        await bus.publish(task_id, {
-            "type": "done",
-            "status": state.status.value,
-            "findings_count": len(state.findings),
-            "got_shell": state.got_shell,
-        })
+        await event_stream.publish(
+            task_id, type="done",
+            payload={
+                "status": state.status.value,
+                "findings_count": len(state.findings),
+                "got_shell": state.got_shell,
+            },
+            branch_id=state.active_branch_id or "",
+        )
 
     _last_db_save.pop(task_id, None)
     _redis_log_cursor.pop(task_id, None)
     clear_task_sink(task_id)
     clear_log_sink(task_id)
     clear_task_loop(task_id)
-    dropped = get_dropped_count(task_id)
-    if dropped:
-        logger.warning(
-            f"[API] 任务 {task_id} 生命周期内累计丢弃 {dropped} 条事件"
-        )
-    reset_dropped_count(task_id)
     logger.info(f"[API] 任务 {task_id} 完成")
 
 
@@ -279,7 +278,6 @@ async def resume_task(
     thread_id: str | None = None,
 ):
     sm = get_state_manager()
-    bus = get_event_bus()
     sm.mark_running(task_id)
     orchestrator = get_orchestrator()
     # See ``run_task`` for why we capture ownership: when a chat message
@@ -288,17 +286,24 @@ async def resume_task(
     my_task = asyncio.current_task()
 
     async def _decision_sink(ev: dict):
-        await bus.publish(task_id, {"type": "decision_event", "data": ev})
+        cur = sm.get(task_id)
+        bid = (
+            ev.get("branch_id")
+            or (cur.active_branch_id if cur else "")
+            or ""
+        )
+        await event_stream.publish(
+            task_id, type="decision_event", payload=ev, branch_id=bid,
+        )
 
     async def _log_sink(line: str, seq: int):
         cur = sm.get(task_id)
         bid = (cur.active_branch_id if cur else "") or ""
-        await bus.publish(task_id, {
-            "type": "log",
-            "data": line,
-            "seq": seq,
-            "branch_id": bid,
-        })
+        await event_stream.publish(
+            task_id, type="log",
+            payload={"line": line, "seq": seq},
+            branch_id=bid,
+        )
 
     set_task_sink(task_id, _decision_sink)
     set_log_sink(task_id, _log_sink)
@@ -326,10 +331,12 @@ async def resume_task(
             await _maybe_save_db(task_id, state)
             asyncio.create_task(_cache_redis_incremental(task_id, state))
 
-            await bus.publish(task_id, {
-                "type": "phase_update",
-                **sm.ws_phase_payload(state, log_tail=5),
-            })
+            payload = sm.ws_phase_payload(state, log_tail=5)
+            await event_stream.publish(
+                task_id, type="phase_update",
+                payload=payload,
+                branch_id=payload.get("branch_id", ""),
+            )
 
     except asyncio.CancelledError:
         logger.info(f"[API] Resume 任务 {task_id} 被取消(CancelledError)")
@@ -368,24 +375,21 @@ async def resume_task(
     state = sm.get(task_id)
     if state:
         await _maybe_save_db(task_id, state, force=True)
-        await bus.publish(task_id, {
-            "type": "done",
-            "status": state.status.value,
-            "findings_count": len(state.findings),
-            "got_shell": state.got_shell,
-        })
+        await event_stream.publish(
+            task_id, type="done",
+            payload={
+                "status": state.status.value,
+                "findings_count": len(state.findings),
+                "got_shell": state.got_shell,
+            },
+            branch_id=state.active_branch_id or "",
+        )
 
     _last_db_save.pop(task_id, None)
     _redis_log_cursor.pop(task_id, None)
     clear_task_sink(task_id)
     clear_log_sink(task_id)
     clear_task_loop(task_id)
-    dropped = get_dropped_count(task_id)
-    if dropped:
-        logger.warning(
-            f"[API] 任务 {task_id} resume 期间累计丢弃 {dropped} 条事件"
-        )
-    reset_dropped_count(task_id)
     logger.info(f"[API] 任务 {task_id} resume 完成")
 
 

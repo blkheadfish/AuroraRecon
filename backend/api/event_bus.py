@@ -1,89 +1,36 @@
-"""
-event_bus.py —— 事件总线
+"""event_bus.py —— Sink 注册表 + 主 event loop 注册表
 
-基于 asyncio.Queue 的发布/订阅，替代 WebSocket 150ms 轮询。
-生产者（task_runner）push 事件，消费者（ws.py）await queue.get()，延迟接近 0。
+历史上这里维护一套 ``asyncio.Queue`` 的 fan-out 总线; v2 协议把"事件存储 +
+分发"职责交给了 :mod:`backend.api.event_stream` (Redis Stream), 本模块只
+保留两件事:
+
+    1. **Task-level sinks**: 让 ``PentestState.log()`` / ``PentestState.push_decision()``
+       这些 *业务节点内部* 的 fire-and-forget 调用能够把事件投递出去。WS 路由层
+       不再消费 sink, 而是订阅 Stream; sink 只负责把事件写进 Stream。
+    2. **Task-level main loop registry**: ``state.log() / push_decision()`` 在
+       worker 线程命中时, ``asyncio.get_running_loop()`` 会抛 RuntimeError;
+       这时退到主协程注册的 loop, 配合 ``run_coroutine_threadsafe`` 跨线程投递。
+
+这套抽象保留, 是因为 LangGraph 节点 / 工具执行器 / dir_scan_orchestrator 等
+都已经按 sink 在写代码; 替换协议时尽量不影响它们的调用面。
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
-
-class TaskEventBus:
-    """
-    每个 task_id 可以有多个订阅者（多个 WS 连接）。
-    publish 是 fire-and-forget，消费者太慢则丢弃。
-    """
-
-    def __init__(self):
-        self._channels: dict[str, list[asyncio.Queue]] = {}
-
-    def subscribe(self, task_id: str, maxsize: int = 1000) -> asyncio.Queue:
-        q: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
-        self._channels.setdefault(task_id, []).append(q)
-        return q
-
-    def unsubscribe(self, task_id: str, q: asyncio.Queue):
-        if task_id in self._channels:
-            self._channels[task_id] = [x for x in self._channels[task_id] if x is not q]
-            if not self._channels[task_id]:
-                del self._channels[task_id]
-
-    async def publish(self, task_id: str, event: dict):
-        for q in self._channels.get(task_id, []):
-            try:
-                q.put_nowait(event)
-            except asyncio.QueueFull:
-                # 消费者太慢, 丢弃最旧的事件腾出空间。同时累加
-                # 丢弃计数 + 限频 warning, 便于运维和前端 history_meta
-                # 感知"已经丢了 N 条历史事件"。
-                try:
-                    q.get_nowait()
-                    q.put_nowait(event)
-                except (asyncio.QueueEmpty, asyncio.QueueFull):
-                    pass
-                _DROPPED_TOTAL[task_id] = _DROPPED_TOTAL.get(task_id, 0) + 1
-                import time as _t
-                now = _t.monotonic()
-                last = _DROPPED_LAST_WARN.get(task_id, 0.0)
-                if now - last >= _DROPPED_WARN_INTERVAL:
-                    _DROPPED_LAST_WARN[task_id] = now
-                    logger.warning(
-                        "[EventBus] task=%s 队列满, 已累计丢弃 %d 条事件 "
-                        "(消费者过慢 / WS 客户端卡顿)",
-                        task_id,
-                        _DROPPED_TOTAL[task_id],
-                    )
-
-    def has_subscribers(self, task_id: str) -> bool:
-        return bool(self._channels.get(task_id))
-
-    def subscriber_count(self, task_id: str) -> int:
-        return len(self._channels.get(task_id, []))
+# ── Task-level decision event sink ────────────────────────────
+# Sink 签名: ``async def(event_dict) -> None``。``event_dict`` 是
+# 业务层的 decision payload (含 action / message / tool / phase 等), 由
+# 注册方决定要怎么把它转成 Stream envelope 并 publish。
+DecisionSink = Callable[[dict], Awaitable[None]]
+_TASK_EVENT_SINK: dict[str, DecisionSink] = {}
 
 
-# ── 模块级单例 ────────────────────────────────────────────
-_event_bus = TaskEventBus()
-
-
-def get_event_bus() -> TaskEventBus:
-    return _event_bus
-
-
-# ── Task-level decision event sink ────────────────────────
-# Allows push_decision() inside PentestState to fire-and-forget
-# events into the EventBus without importing task_runner or bus.
-
-from typing import Callable, Awaitable
-
-_TASK_EVENT_SINK: dict[str, Callable[[dict], Awaitable[None]]] = {}
-
-
-def set_task_sink(task_id: str, sink: Callable[[dict], Awaitable[None]]) -> None:
+def set_task_sink(task_id: str, sink: DecisionSink) -> None:
     _TASK_EVENT_SINK[task_id] = sink
 
 
@@ -91,15 +38,12 @@ def clear_task_sink(task_id: str) -> None:
     _TASK_EVENT_SINK.pop(task_id, None)
 
 
-def get_task_sink(task_id: str) -> Callable[[dict], Awaitable[None]] | None:
+def get_task_sink(task_id: str) -> Optional[DecisionSink]:
     return _TASK_EVENT_SINK.get(task_id)
 
 
-# ── Task-level phase_log sink ──────────────────────────────
-# 让 PentestState.log() 也能 fire-and-forget 把每条 phase_log 实时推到 WS,
-# 而不是等到节点 yield 后随 phase_update 批量下发。两套 sink 分开注册,
-# 避免 decision_event 的包装格式被复用到普通日志上(前端需要 type='log').
-
+# ── Task-level phase_log sink ─────────────────────────────────
+# Sink 签名: ``async def(line, seq) -> None``。
 LogSink = Callable[[str, int], Awaitable[None]]
 _TASK_LOG_SINK: dict[str, LogSink] = {}
 
@@ -112,17 +56,14 @@ def clear_log_sink(task_id: str) -> None:
     _TASK_LOG_SINK.pop(task_id, None)
 
 
-def get_log_sink(task_id: str) -> LogSink | None:
+def get_log_sink(task_id: str) -> Optional[LogSink]:
     return _TASK_LOG_SINK.get(task_id)
 
 
-# ── Task-level event loop registry ─────────────────────────
-# 主协程(run_task / resume_task / _resume_branch_bg)在入口
-# 把自己运行的 event loop 登记进来。``PentestState.log /
-# push_decision`` 在 worker 线程(LLM 同步调用、阻塞 IO 线程池)
-# 命中时, ``asyncio.get_running_loop()`` 会抛 RuntimeError, 这时
-# 退回到注册表里的 loop, 配合 ``run_coroutine_threadsafe`` 把
-# 事件投递回主 loop, 避免事件被 try/except 静默吞掉。
+# ── Task-level event loop registry ────────────────────────────
+# 主协程 (run_task / resume_task / _resume_branch_bg) 在入口把自己运行的 loop
+# 登记进来, 让 worker 线程命中 sink 调用时能 ``run_coroutine_threadsafe`` 把
+# 事件投递回主 loop。
 _TASK_LOOP: dict[str, asyncio.AbstractEventLoop] = {}
 
 
@@ -134,25 +75,70 @@ def clear_task_loop(task_id: str) -> None:
     _TASK_LOOP.pop(task_id, None)
 
 
-def get_task_loop(task_id: str) -> asyncio.AbstractEventLoop | None:
+def get_task_loop(task_id: str) -> Optional[asyncio.AbstractEventLoop]:
     return _TASK_LOOP.get(task_id)
 
 
-# ── 队列丢弃计数 ──────────────────────────────────────────
-# subscriber 队列满时, ``publish`` 会丢掉最旧的事件腾位置。
-# 频繁丢弃通常意味着前端消费者卡住或吞吐瓶颈, 需要限频
-# warning 让运维感知; 同时把累计计数透出, 便于 ws 重连时
-# 给前端发 ``history_meta`` 提示"刚刚丢了 N 条历史事件,
-# 请刷新看完整记录"。
-_DROPPED_TOTAL: dict[str, int] = {}
-_DROPPED_LAST_WARN: dict[str, float] = {}
-_DROPPED_WARN_INTERVAL = 5.0  # 秒
+# ── 兼容: 老调用方仍然 ``from backend.api.event_bus import get_event_bus`` ──
+# v1 协议里这里返回一个 ``TaskEventBus``; v2 协议下没有真正的 bus 单例了, 但
+# ``get_event_bus().publish(task_id, frame)`` 这种调用面遍布在 task_runner /
+# branch_manager / tasks router / dir_scan_orchestrator。为了让迁移期内老代码
+# 不至于一次性全爆, 我们提供一个**适配层**: ``publish(task_id, frame)`` 解析
+# v1 帧 (``{type:..., data:...}`` 或 flat ``{type:..., **kwargs}``) 把它写进
+# v2 Stream。这条路径不应当作长期 API, 内部代码会逐步切到 ``event_stream``。
+class _LegacyBusAdapter:
+    """v1 -> v2 适配层。优先把帧拆成 ``(type, payload, branch_id)``。"""
+
+    async def publish(self, task_id: str, frame: dict) -> None:
+        if not isinstance(frame, dict):
+            return
+        from backend.api import event_stream
+        ftype = str(frame.get("type") or "")
+        if not ftype:
+            return
+        branch_id = str(frame.get("branch_id") or "")
+        # v1 帧: ``decision_event`` 用 ``data`` 装载; 其它类型直接平铺 (例如
+        # ``{type:"phase_update", phase:..., logs:[...], ...}``)。我们统一把
+        # 业务字段塞进 ``payload``, type 不变。
+        if "data" in frame and isinstance(frame["data"], dict):
+            payload = dict(frame["data"])
+        else:
+            payload = {k: v for k, v in frame.items() if k not in ("type", "branch_id")}
+        if not branch_id and isinstance(payload.get("branch_id"), str):
+            branch_id = payload["branch_id"]
+        try:
+            await event_stream.publish(
+                task_id, type=ftype, payload=payload, branch_id=branch_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[event_bus] legacy adapter publish 失败 task=%s type=%s err=%s",
+                task_id, ftype, exc,
+            )
+
+    # 老接口里有些调用还引用了这些 helper, 留空兜底。
+    def has_subscribers(self, task_id: str) -> bool:  # pragma: no cover
+        return True
+
+    def subscriber_count(self, task_id: str) -> int:  # pragma: no cover
+        return 0
 
 
+_legacy_bus = _LegacyBusAdapter()
+
+
+def get_event_bus() -> _LegacyBusAdapter:
+    return _legacy_bus
+
+
+# ``TaskEventBus`` 类型在老代码里用作 Type Hint, 保留一个 alias 让 import 不爆
+TaskEventBus = _LegacyBusAdapter
+
+
+# ── 队列丢弃计数 (v2 不需要, 但老代码可能 import) ────────────
 def get_dropped_count(task_id: str) -> int:
-    return _DROPPED_TOTAL.get(task_id, 0)
+    return 0
 
 
 def reset_dropped_count(task_id: str) -> None:
-    _DROPPED_TOTAL.pop(task_id, None)
-    _DROPPED_LAST_WARN.pop(task_id, None)
+    return None

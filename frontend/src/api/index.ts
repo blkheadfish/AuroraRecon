@@ -141,6 +141,17 @@ export const api = {
     params?: { offset?: number; limit?: number; tail?: number; after_seq?: number },
   ): Promise<TaskLogsPage> =>
     http.get(`/tasks/${id}/logs`, { params: params || {} }),
+  // 协议 v2: 历史事件分页 (后端 XRANGE 包装), 用于 IndexedDB 翻页 / 主动补差量
+  getEvents: (
+    id: string,
+    params?: { after_id?: string; count?: number },
+  ): Promise<{
+    events: Array<Record<string, unknown>>
+    count: number
+    first_id: string
+    last_id: string
+    has_more: boolean
+  }> => http.get(`/tasks/${id}/events`, { params: params || {} }),
   getReport: (id: string): Promise<ReportData> => http.get(`/tasks/${id}/report`),
   cancelTask: (id: string): Promise<{ ok: boolean }> => http.post(`/tasks/${id}/cancel`),
   deleteTask: (id: string): Promise<{ ok: boolean }> => http.delete(`/tasks/${id}`),
@@ -437,9 +448,14 @@ export interface WsConnection {
 }
 
 export interface WsConnectOptions {
-  /** Replay only entries with phase_log index > afterLogSeq (incremental reconnect). */
-  afterLogSeq?: number
-  /** First-connect history replay tail size (server caps to 5000). */
+  /**
+   * 协议 v2: Redis Stream id (string), 用于增量重连。
+   * 服务端对 ``after_id`` 之后的事件做 XRANGE / XREAD 回放。
+   */
+  afterId?: string
+  /**
+   * 首次连接希望回放的最近 N 条 (服务端上限 5000)。
+   */
   logTail?: number
 }
 
@@ -450,25 +466,35 @@ export function createWsConnection(
   options?: WsConnectOptions,
 ): WsConnection {
   const wsBase = getWsBase()
-  const token = localStorage.getItem(TOKEN_KEY) ?? ''
-  const queryParts: string[] = []
-  if (token) queryParts.push(`token=${encodeURIComponent(token)}`)
-  if (typeof options?.afterLogSeq === 'number' && options.afterLogSeq >= 0) {
-    queryParts.push(`after_log_seq=${options.afterLogSeq}`)
-  }
-  if (typeof options?.logTail === 'number' && options.logTail >= 0) {
-    queryParts.push(`log_tail=${options.logTail}`)
-  }
-  const url = `${wsBase}/ws/${taskId}${queryParts.length ? `?${queryParts.join('&')}` : ''}`
 
-  const PING_INTERVAL = 15000
-  const PONG_TIMEOUT = 5000
+  function _buildUrl(): string {
+    const token = localStorage.getItem(TOKEN_KEY) ?? ''
+    const queryParts: string[] = []
+    if (token) queryParts.push(`token=${encodeURIComponent(token)}`)
+    if (options?.afterId) {
+      queryParts.push(`after_id=${encodeURIComponent(options.afterId)}`)
+    }
+    if (typeof options?.logTail === 'number' && options.logTail >= 0) {
+      queryParts.push(`log_tail=${options.logTail}`)
+    }
+    return `${wsBase}/ws/${taskId}${queryParts.length ? `?${queryParts.join('&')}` : ''}`
+  }
+
+  // 协议 v2 推荐节奏: 服务端每 25s 没业务事件时主动发 ``heartbeat``,
+  // 客户端 ping 间隔与之对齐 (略宽), pong 等待到 8s 容忍弱网抖动。
+  const PING_INTERVAL = 25000
+  const PONG_TIMEOUT = 8000
 
   let ws: WebSocket | null = null
   let heartbeatTimer: number | undefined
   let pongTimer: number | undefined
   let awaitingPong = false
   let destroyed = false
+  // 1008 鉴权失败 + 自动 token refresh + 立即重连一次的状态机
+  let authRetryAttempted = false
+  // onclose 后的"温和首次重试" (覆盖 NAT 抖动 / 服务重启间隙) — 命中过一次后
+  // 后续重连交给上层 wsManager 的指数退避来管。
+  let softRetryUsed = false
 
   function clearTimers() {
     if (heartbeatTimer) window.clearInterval(heartbeatTimer)
@@ -478,8 +504,23 @@ export function createWsConnection(
     awaitingPong = false
   }
 
+  // 协议 v2 鉴权失败时尝试刷新 token 一次
+  async function _tryRefreshToken(): Promise<boolean> {
+    try {
+      // /auth/me 是最轻量的鉴权探测; 后端会在 token 即将过期时颁发新的。
+      // 没有 refresh 接口的部署里, 至少能感知到 "token 过期" 触发用户重登。
+      const res = await api.authMe()
+      // authMe 返回的 user 不带新 token, 这里仅确认 token 仍可用; 真正的
+      // refresh 在后端将来加了 /auth/refresh 后再补。
+      return Boolean(res)
+    } catch {
+      return false
+    }
+  }
+
   function connect() {
     if (destroyed) return
+    const url = _buildUrl()
     ws = new WebSocket(url)
 
     ws.onopen = () => {
@@ -505,9 +546,11 @@ export function createWsConnection(
           if (pongTimer) { window.clearTimeout(pongTimer); pongTimer = undefined }
           return
         }
+        // 收到任何业务帧, 都视为对端活着 -> 清掉 pong 等待
+        awaitingPong = false
+        if (pongTimer) { window.clearTimeout(pongTimer); pongTimer = undefined }
         onMessage?.(data)
       } catch {
-        // Ignore non-JSON frames; treat raw text as possible pong
         if (typeof e.data === 'string' && e.data.trim() === 'pong') {
           awaitingPong = false
           if (pongTimer) { window.clearTimeout(pongTimer); pongTimer = undefined }
@@ -515,11 +558,34 @@ export function createWsConnection(
       }
     }
 
-    ws.onclose = () => {
+    ws.onclose = (ev: CloseEvent) => {
       clearTimers()
-      if (!destroyed) {
-        onClose?.()
+      if (destroyed) return
+      // 1008 = policy violation, 后端在 token 过期 / 鉴权失败时使用
+      if (ev.code === 1008 && !authRetryAttempted) {
+        authRetryAttempted = true
+        _tryRefreshToken().then((ok) => {
+          if (destroyed) return
+          if (ok) {
+            // token 仍可用 → 立即重连
+            connect()
+          } else {
+            // token 真的过期 → 交给 axios 401 拦截器处理 (会跳登录页)
+            onClose?.()
+          }
+        })
+        return
       }
+      // 第一次掉线快速温和重试一次 (覆盖 NAT 抖动 / load balancer 漂移),
+      // 之后的重连节奏交给 wsManager 的退避策略。
+      if (!softRetryUsed) {
+        softRetryUsed = true
+        window.setTimeout(() => {
+          if (!destroyed) connect()
+        }, 500)
+        return
+      }
+      onClose?.()
     }
 
     ws.onerror = () => {

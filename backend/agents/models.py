@@ -12,7 +12,7 @@ from enum import Enum
 from typing import Any, Literal, Optional
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator
 
 
 # ───────────────────────────────────────────────────────
@@ -678,8 +678,8 @@ class PentestState(BaseModel):
 	# 历史计划(末尾追加, 限长 20), 用于审计 / 调试 / 回放。
 	operator_plan_history: list[OperatorPlan] = Field(default_factory=list)
 
-	# 结构化决策事件队列（ReAct thinking / Skill reasoning），供 WS 增量推送
-	live_decision_events: list[dict] = Field(default_factory=list)
+	# guard_stats 记录每类拦截 (preflight reject / repeat failed / reprobe) 的累计次数,
+	# 走 ``health.metrics_overview`` 透出, 并不依赖事件流。
 	guard_stats: dict[str, int] = Field(default_factory=dict)
 	trace_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:16])
 
@@ -762,7 +762,8 @@ class PentestState(BaseModel):
 		self.phase_log.append(entry)
 		self.phase_log_seqs.append(int(seq))
 		# 滚动淘汰: 反馈/监督模式下 phase_log 会随循环爆炸增长,
-		# 同 live_decision_events 一致, 超过 5000 行截留最近 2500 行.
+		# 超过 5000 行截留最近 2500 行 (phase_log 主要供 DB 持久化与 logs 接口
+		# 翻页回看, 实时推送已经走 Redis Stream, 不依赖这块内存)。
 		# phase_log_seqs 必须与 phase_log 等长一起裁。
 		if len(self.phase_log) > 5000:
 			self.phase_log = self.phase_log[-2500:]
@@ -805,30 +806,29 @@ class PentestState(BaseModel):
 		except Exception:
 			pass
 
+	# 进程级单调计数器, 用于给 push_decision 生成 client 级业务 id;
+	# 真正的 transport id 由 Redis Stream 在 XADD 时分配, 这里只是兜底
+	# 让 WS 不可用 / sink 未注册时事件结构里仍然有可读的 id 字段。
+	_push_decision_idx: int = PrivateAttr(default=0)
+
 	def push_decision(self, event: dict) -> None:
-		"""Append a structured decision event and fire-and-forget to EventBus.
+		"""Fire-and-forget 把结构化决策事件投递到事件流 (Redis Stream)。
+
+		协议 v2 之后, ``live_decision_events`` 不再保留在 state 内; 历史事件
+		由 Redis Stream 持久化, 前端用 last_event_id 增量重连即可补差量。
 
 		``timestamp`` 采用 ISO-8601 完整格式(``YYYY-MM-DDTHH:MM:SS.ffffff``),
-		确保前端按字典序排序时跨午夜、同秒抖动、Vue3 reactive sort 路径下
-		都能严格还原事件先后。前端 ``formatTime`` 会把 ISO 串转成本地时:分:秒
-		展示,渲染层无感升级。
+		业务 id 仅作为兼容字段保留 (前端去重已切换到 envelope.id), sink 不
+		注册时这里直接 fallthrough, 不会让 LangGraph 节点崩溃。
 		"""
 		now = datetime.utcnow()
+		self._push_decision_idx += 1
 		if "id" not in event:
-			event["id"] = f"de-{len(self.live_decision_events)}-{now.strftime('%H%M%S%f')}"
+			event["id"] = f"de-{self._push_decision_idx}-{now.strftime('%H%M%S%f')}"
 		if "timestamp" not in event:
 			event["timestamp"] = now.isoformat(timespec="microseconds")
-		# 自动注入 branch_id: 让前端按 ``activeBranchId`` 过滤事件流时
-		# 不必依赖外部上下文。``active_branch_id`` 在分支切换 / fork 时
-		# 已经写到 state, 所以直接复用。空字符串视为"未启用分支系统",
-		# 前端会按"全局视角"展示。
 		if "branch_id" not in event:
 			event["branch_id"] = self.active_branch_id or ""
-		self.live_decision_events.append(event)
-		# Prevent unbounded growth in LangGraph checkpoint payload
-		if len(self.live_decision_events) > 5000:
-			self.live_decision_events = self.live_decision_events[-2500:]
-		# Fire-and-forget to EventBus so WS clients see it immediately.
 		# 跨线程 fallback 同 ``log()``: worker 线程拿不到 running loop 时,
 		# 退到 BranchManager / task_runner 入口 ``set_task_loop`` 注册的主 loop。
 		try:

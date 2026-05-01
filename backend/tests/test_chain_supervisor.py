@@ -264,9 +264,33 @@ def test_node_supervisor_increments_round_and_history():
 
 
 def test_node_supervisor_emits_decision_event():
-    state = PentestState(target="x")
-    state2 = asyncio.run(node_supervisor(state))
-    actions = [e.get("action") for e in state2.live_decision_events]
+    """协议 v2: push_decision 不再 append 到 state, 通过 sink 投递。"""
+    from backend.api.event_bus import (
+        set_task_sink, clear_task_sink,
+        set_task_loop, clear_task_loop,
+    )
+
+    captured: list[dict] = []
+
+    async def _sink(ev: dict) -> None:
+        captured.append(dict(ev))
+
+    async def _drive() -> None:
+        loop = asyncio.get_running_loop()
+        state = PentestState(task_id="t-supervisor-1", target="x")
+        set_task_loop(state.task_id, loop)
+        set_task_sink(state.task_id, _sink)
+        try:
+            await node_supervisor(state)
+            # 给 ``loop.create_task(sink(...))`` 一次回到 loop 的机会
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+        finally:
+            clear_task_sink(state.task_id)
+            clear_task_loop(state.task_id)
+
+    asyncio.run(_drive())
+    actions = [e.get("action") for e in captured]
     assert "supervisor_route" in actions
 
 
