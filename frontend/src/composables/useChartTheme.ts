@@ -32,15 +32,15 @@ export function useChartTheme() {
 
     const isDark = theme.value === 'dark'
     return {
-      cyan:   getCssVar('--accent-blue')   || (isDark ? '#58b8c9' : '#3984bf'),
-      teal:   getCssVar('--accent-green')  || (isDark ? '#4a9ea8' : '#2e9472'),
-      mint:   getCssVar('--accent-green')  || (isDark ? '#5cbda3' : '#2e9472'),
-      slate:  getCssVar('--text-muted')    || (isDark ? '#6889a0' : '#8b949e'),
-      indigo: getCssVar('--accent-purple') || (isDark ? '#7680b8' : '#7773ad'),
-      mauve:  getCssVar('--accent-purple') || (isDark ? '#8878a8' : '#7773ad'),
-      ember:  getCssVar('--accent-red')    || (isDark ? '#a86070' : '#c36672'),
-      amber:  getCssVar('--accent-yellow') || (isDark ? '#9c8a62' : '#a68753'),
-      dim:    getCssVar('--text-muted')    || (isDark ? '#4e5c68' : '#8b949e'),
+      cyan:   getCssVar('--accent-blue')   || (isDark ? '#58b8e0' : '#3d8fd4'),
+      teal:   getCssVar('--accent-green')  || (isDark ? '#4ec9b0' : '#2d9d76'),
+      mint:   getCssVar('--accent-green')  || (isDark ? '#56c9a4' : '#2d9d76'),
+      slate:  getCssVar('--text-secondary')|| (isDark ? '#9198a9' : '#656d76'),
+      indigo: getCssVar('--accent-purple') || (isDark ? '#7b8fd4' : '#7e78ba'),
+      mauve:  getCssVar('--accent-purple') || (isDark ? '#aea0d6' : '#7e78ba'),
+      ember:  getCssVar('--accent-red')    || (isDark ? '#e06979' : '#cf5a6a'),
+      amber:  getCssVar('--accent-yellow') || (isDark ? '#d9a84e' : '#b89244'),
+      dim:    getCssVar('--text-muted')    || (isDark ? '#6e7681' : '#8b949e'),
     }
   }
 
@@ -52,12 +52,13 @@ export function useChartTheme() {
   function tooltipStyle() {
     const isDark = theme.value === 'dark'
     return {
-      backgroundColor: isDark ? 'rgba(10,16,22,0.94)' : 'rgba(255,255,255,0.96)',
-      borderColor: isDark ? 'rgba(88,184,201,0.18)' : 'rgba(0,0,0,0.08)',
+      backgroundColor: isDark ? 'rgba(13,17,23,0.96)' : 'rgba(255,255,255,0.96)',
+      borderColor: isDark ? 'rgba(88,184,224,0.22)' : 'rgba(0,0,0,0.10)',
       textStyle: {
-        color: isDark ? '#9ab4c0' : '#333',
+        color: isDark ? '#c9d1d9' : '#24292f',
         fontSize: 12,
       },
+      extraCssText: 'border-radius:8px;box-shadow:0 4px 20px rgba(0,0,0,0.25);padding:10px 14px;',
     }
   }
 

@@ -303,7 +303,7 @@ const option = computed(() => {
           `<div style="font-size:11px">事件数: ${v.eventCount ?? 0}</div>`,
         ]
         if (v.isCurrent) {
-          parts.push(`<div style="font-size:11px;color:#5cbda3;margin-top:4px">● 当前阶段</div>`)
+          parts.push(`<div style="font-size:11px;color:#56c9a4;margin-top:4px">● 当前阶段</div>`)
         }
         return parts.join('')
       },

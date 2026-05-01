@@ -124,22 +124,22 @@ const nodes = computed(() => props.graph?.nodes || [])
 const edges = computed(() => props.graph?.edges || [])
 
 const NODE_TYPE_META = {
-  host:        { color: '#58b8c9', symbol: 'circle',     size: 56, label: '主机' },
-  service:     { color: '#4a9ea8', symbol: 'roundRect',  size: 46, label: '服务' },
-  finding:     { color: '#c36672', symbol: 'diamond',    size: 50, label: '漏洞' },
-  credential:  { color: '#a68753', symbol: 'triangle',   size: 42, label: '凭据' },
-  foothold:    { color: '#7773ad', symbol: 'pin',        size: 50, label: '立足点' },
-  loot:        { color: '#8878a8', symbol: 'rect',       size: 38, label: '战利品' },
-  objective:   { color: '#2e9472', symbol: 'star',       size: 56, label: '目标' },
-  path:        { color: '#6889a0', symbol: 'circle',     size: 32, label: '路径' },
+  host:        { color: '#58b8e0', symbol: 'circle',     size: 56, label: '主机' },
+  service:     { color: '#4ec9b0', symbol: 'roundRect',  size: 46, label: '服务' },
+  finding:     { color: '#e06979', symbol: 'diamond',    size: 50, label: '漏洞' },
+  credential:  { color: '#d9a84e', symbol: 'triangle',   size: 42, label: '凭据' },
+  foothold:    { color: '#aea0d6', symbol: 'pin',        size: 50, label: '立足点' },
+  loot:        { color: '#7b8fd4', symbol: 'rect',       size: 38, label: '战利品' },
+  objective:   { color: '#2d9d76', symbol: 'star',       size: 56, label: '目标' },
+  path:        { color: '#9198a9', symbol: 'circle',     size: 32, label: '路径' },
 }
 
 const RELATION_META = {
-  enables:    { color: '#c36672', dashed: false, label: '使能' },
-  leads_to:   { color: '#58b8c9', dashed: false, label: '导致' },
-  exposes:    { color: '#4a9ea8', dashed: true,  label: '暴露' },
-  consumes:   { color: '#a68753', dashed: false, label: '消费' },
-  discovers:  { color: '#7773ad', dashed: true,  label: '发现' },
+  enables:    { color: '#e06979', dashed: false, label: '使能' },
+  leads_to:   { color: '#58b8e0', dashed: false, label: '导致' },
+  exposes:    { color: '#4ec9b0', dashed: true,  label: '暴露' },
+  consumes:   { color: '#d9a84e', dashed: false, label: '消费' },
+  discovers:  { color: '#aea0d6', dashed: true,  label: '发现' },
 }
 
 function typeLabel(t) {

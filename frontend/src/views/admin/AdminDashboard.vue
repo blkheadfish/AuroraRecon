@@ -373,6 +373,7 @@ const topToolsBarOption = computed(() => {
     return { title: { text: '暂无调用数据', left: 'center', top: 'center', textStyle: { color: mutedColor, fontSize: 12 } } }
   }
   return {
+    title: { show: false },
     tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' }, ...tip,
       formatter: (params) => {
         const p = params[0]; const tool = tools[p.dataIndex]

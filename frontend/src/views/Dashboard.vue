@@ -137,18 +137,20 @@
 
         <div class="backend-row">
           <span class="label backend-row-title">执行后端分布</span>
-          <el-tooltip
-            v-for="item in backendRows"
-            :key="item.name"
-            :content="backendTip(item.name)"
-            placement="top"
-          >
-            <el-tag size="small" type="info" effect="plain" class="backend-tag">
-              <span class="backend-name">{{ item.name }}</span>
-              <span class="backend-count mono">{{ item.count }} 次</span>
-            </el-tag>
-          </el-tooltip>
-          <span v-if="!backendRows.length" class="empty-tip">暂无数据</span>
+          <template v-if="backendRows.length">
+            <el-tooltip
+              v-for="item in backendRows"
+              :key="item.name"
+              :content="backendTip(item.name)"
+              placement="top"
+            >
+              <el-tag size="small" type="info" effect="plain" class="backend-tag">
+                <span class="backend-name">{{ item.name }}</span>
+                <span class="backend-count mono">{{ item.count }} 次</span>
+              </el-tag>
+            </el-tooltip>
+          </template>
+          <span v-else class="empty-tip">暂无数据</span>
         </div>
 
         <div class="chart-container-md">
@@ -339,6 +341,7 @@ const topToolsBarOption = computed(() => {
     return { title: { text: '暂无调用数据', left: 'center', top: 'center', textStyle: { color: mutedColor, fontSize: 12, fontWeight: 400 } } }
   }
   return {
+    title: { show: false },
     tooltip: {
       trigger: 'axis',
       axisPointer: { type: 'shadow' },
@@ -388,6 +391,7 @@ const categoryPieOption = computed(() => {
     return { title: { text: '暂无工具数据', left: 'center', top: 'center', textStyle: { color: mutedColor, fontSize: 12, fontWeight: 400 } } }
   }
   return {
+    title: { show: false },
     tooltip: { trigger: 'item', ...tip },
     legend: {
       orient: 'vertical',
@@ -565,11 +569,11 @@ onUnmounted(() => {
 .label { color: var(--text-secondary); font-size: 12px; }
 .value { margin-top: 4px; color: var(--text-primary); font-weight: 700; font-size: 20px; }
 .mono { font-family: var(--font-mono); }
-.running { color: #58b8c9; }
-.success { color: #5cbda3; }
-.danger { color: #a86070; }
-.shell-color { color: #7680b8; }
-.root-color { color: #9c8a62; }
+.running { color: var(--accent-blue); }
+.success { color: var(--accent-green); }
+.danger { color: var(--accent-red); }
+.shell-color { color: var(--accent-purple); }
+.root-color { color: var(--accent-yellow); }
 
 /* ── Main Grid ── */
 .main-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
