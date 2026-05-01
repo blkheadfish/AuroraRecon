@@ -604,12 +604,10 @@ async function submit() {
   if (!canSubmit.value) {
     if (!form.value.userPrompt.trim()) {
       ElMessage.warning('请先输入任务描述')
-    } else if (!detectedTarget.value) {
-      pushAgent('我没有从描述里识别到目标(IP / 域名 / URL),请在句子里写清楚要测试的对象。', 'warning')
     }
     return
   }
-  const target = detectedTarget.value as string
+  const target = detectedTarget.value || ''
   creating.value = true
   const userText = form.value.userPrompt.trim()
   messages.value.push({
@@ -623,6 +621,7 @@ async function submit() {
   try {
     const task = await listStore.createTask({
       target,
+      rawPrompt: userText,
       scopeNote: form.value.scopeNote,
       extraHint: form.value.extraHint,
       userPrompt: userText,
@@ -862,7 +861,7 @@ async function submit() {
   font-size: 11px;
 }
 .hint-target-missing {
-  color: var(--accent-yellow);
+  color: var(--text-muted);
 }
 .hint-target-loading {
   color: var(--accent-blue);

@@ -515,6 +515,7 @@ function phaseText(phase) {
     surface_enum: '表面枚举',
     exploit_decision: '利用决策',
     awaiting_approval: '等待审批',
+    waiting_user: '等待用户指令',
     foothold_attempt: '立足点尝试',
     exploit: '漏洞利用',
     secondary_attack: '二次利用',

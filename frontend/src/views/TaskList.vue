@@ -32,7 +32,7 @@
         <span class="stat-num cancelled">{{ listStore.stats.cancelled }}</span>
         <span class="stat-label">已取消</span>
       </div>
-      <div class="stat-item" @click="filterPhase = filterPhase === 'awaiting_approval' ? '' : 'awaiting_approval'">
+      <div class="stat-item" :class="{ active: filterPhase === 'awaiting_approval' }" @click="toggleApproval">
         <span class="stat-num warn">{{ awaitingApprovalCount }}</span>
         <span class="stat-label">待审批</span>
       </div>
@@ -85,15 +85,21 @@
 
       <el-table
         v-else
-        :data="pagedTasks"
+        :data="sortedPagedTasks"
         v-loading="listStore.loading"
         @selection-change="onSelectionChange"
         @row-click="(row) => goDetail(row.task_id)"
+        @sort-change="onSortChange"
       >
         <el-table-column type="selection" width="44" />
-        <el-table-column label="目标" min-width="220">
+        <el-table-column label="目标" min-width="200" sortable="custom" prop="target">
           <template #default="{ row }">
             <code class="target">{{ row.target }}</code>
+          </template>
+        </el-table-column>
+        <el-table-column label="创建时间" width="100" sortable="custom" prop="created_at">
+          <template #default="{ row }">
+            <span class="text-muted" style="font-size:11px">{{ relativeTime(row.created_at) }}</span>
           </template>
         </el-table-column>
         <el-table-column label="状态" width="120">
@@ -106,7 +112,7 @@
             <PhaseBadge :phase="row.current_phase" />
           </template>
         </el-table-column>
-        <el-table-column label="漏洞" width="90" align="center">
+        <el-table-column label="漏洞" width="90" align="center" sortable prop="findings_count">
           <template #default="{ row }">
             <span class="mono">{{ row.findings_count || 0 }}</span>
           </template>
@@ -123,117 +129,49 @@
             <span v-else class="text-muted">-</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="280" align="center">
+        <el-table-column label="操作" width="130" align="center" fixed="right">
           <template #default="{ row }">
             <div class="actions" @click.stop>
-              <el-button class="action-detail" size="small" type="primary" @click="goDetail(row.task_id)">详情</el-button>
-              <el-button
-                v-if="row.report_path"
-                class="action-report"
-                size="small"
-                text
-                type="success"
-                @click="goReport(row.task_id)"
-              >报告</el-button>
-              <el-button
-                v-if="row.status === 'running' || row.status === 'pending'"
-                size="small"
-                type="warning"
-                plain
-                @click="handleCancel(row)"
-              >取消</el-button>
-              <el-popconfirm title="确认删除该任务？" @confirm="handleDelete(row)">
-                <template #reference>
-                  <el-button class="action-delete" size="small" type="danger">删除</el-button>
+              <el-button size="small" type="primary" @click="goDetail(row.task_id)">详情</el-button>
+              <el-dropdown trigger="click" @command="(cmd) => handleRowCommand(cmd, row)">
+                <el-button size="small" circle class="action-more">
+                  <el-icon><MoreFilled /></el-icon>
+                </el-button>
+                <template #dropdown>
+                  <el-dropdown-menu>
+                    <el-dropdown-item v-if="row.report_path" command="report">
+                      <el-icon><Document /></el-icon> 查看报告
+                    </el-dropdown-item>
+                    <el-dropdown-item command="copy">
+                      <el-icon><CopyDocument /></el-icon> 复制目标
+                    </el-dropdown-item>
+                    <el-dropdown-item v-if="row.status === 'running' || row.status === 'pending'" command="cancel" divided>
+                      <el-icon><VideoPause /></el-icon> 取消任务
+                    </el-dropdown-item>
+                    <el-dropdown-item command="delete" divided>
+                      <el-icon><Delete /></el-icon>
+                      <span style="color:var(--accent-red)">删除任务</span>
+                    </el-dropdown-item>
+                  </el-dropdown-menu>
                 </template>
-              </el-popconfirm>
+              </el-dropdown>
             </div>
           </template>
         </el-table-column>
       </el-table>
 
-      <div class="pagination-wrap" v-if="filteredTasks.length > pageSize">
+      <div class="pagination-wrap" v-if="filteredTasks.length > 10">
         <el-pagination
           v-model:current-page="currentPage"
-          :page-size="pageSize"
+          v-model:page-size="pageSize"
+          :page-sizes="[10, 20, 50, 100]"
           :total="filteredTasks.length"
-          layout="total, prev, pager, next"
+          layout="total, sizes, prev, pager, next, jumper"
           background
           small
         />
       </div>
     </el-card>
-
-    <el-dialog v-model="showCreate" title="创建渗透测试任务" width="700px" :close-on-click-modal="false">
-      <el-form :model="form" :rules="rules" ref="formRef" label-position="top">
-        <el-form-item label="目标地址" prop="target">
-          <el-input v-model="form.target" placeholder="IP / 域名 / IP:端口 / URL" clearable />
-          <div class="form-tip">仅在合法授权范围内使用。</div>
-        </el-form-item>
-        <el-form-item label="工作流模式（workflow_mode）">
-          <el-radio-group v-model="form.workflowMode" @change="onWorkflowModeChange">
-            <el-radio-button label="pentest_engineer">渗透工程师</el-radio-button>
-            <el-radio-button label="ctf_expert">CTF 选手</el-radio-button>
-          </el-radio-group>
-          <div class="form-tip">
-            决定审批策略 / 证据门槛 / 轮次上限等默认值。下方选项可单项覆盖,只对本任务生效。
-          </div>
-        </el-form-item>
-        <el-form-item label="审批模式">
-          <el-radio-group v-model="form.autoApprove">
-            <el-radio-button :label="false">手动审批</el-radio-button>
-            <el-radio-button :label="true">全自动（跳过人工审批）</el-radio-button>
-          </el-radio-group>
-          <div class="form-tip">
-            渗透工程师默认手动、CTF 选手默认全自动;此处显式选择会覆盖 mode 默认值。
-          </div>
-        </el-form-item>
-        <el-collapse>
-          <el-collapse-item title="高级参数（覆盖 workflow_mode 默认值）" name="advanced">
-            <el-form-item label="证据门槛 success_gate_level">
-              <el-radio-group v-model="form.successGateLevel">
-                <el-radio-button label="">沿用默认</el-radio-button>
-                <el-radio-button label="strict">严格</el-radio-button>
-                <el-radio-button label="medium">中等</el-radio-button>
-                <el-radio-button label="lenient">宽松</el-radio-button>
-              </el-radio-group>
-            </el-form-item>
-            <el-form-item label="风险预算 risk_budget">
-              <el-input-number v-model="form.riskBudget" :min="0" :max="50" controls-position="right" />
-            </el-form-item>
-            <el-form-item label="ReAct 最大轮次 max_react_rounds">
-              <el-input-number v-model="form.maxReactRounds" :min="1" :max="200" controls-position="right" />
-            </el-form-item>
-            <el-form-item label="探索最大轮次 max_explore_rounds">
-              <el-input-number v-model="form.maxExploreRounds" :min="1" :max="200" controls-position="right" />
-            </el-form-item>
-          </el-collapse-item>
-        </el-collapse>
-        <el-form-item label="授权说明">
-          <el-input v-model="form.scopeNote" type="textarea" :rows="3" />
-        </el-form-item>
-        <el-form-item label="附加提示（Extra Hint）">
-          <el-input
-            v-model="form.extraHint"
-            type="textarea"
-            :rows="2"
-            placeholder="例如：优先验证 Web RCE，避免长时间暴力破解"
-          />
-        </el-form-item>
-        <el-form-item label="用户 Prompt 偏好（User Prompt）">
-          <el-input
-            v-model="form.userPrompt"
-            type="textarea"
-            :rows="4"
-            placeholder="告诉系统你的偏好策略，例如先验证 PoC 再尝试利用、优先低噪声命令等"
-          />
-        </el-form-item>
-      </el-form>
-      <template #footer>
-        <el-button @click="showCreate = false">取消</el-button>
-        <el-button type="primary" :loading="creating" @click="handleCreate">创建并开始</el-button>
-      </template>
-    </el-dialog>
   </div>
 </template>
 
@@ -241,7 +179,9 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Search } from '@element-plus/icons-vue'
+import {
+  Search, MoreFilled, Document, CopyDocument, VideoPause, Delete,
+} from '@element-plus/icons-vue'
 import { useTaskListStore } from '@/stores/taskList'
 import { trackEvent } from '@/metrics/tracker'
 import StatusBadge from '@/components/StatusBadge.vue'
@@ -250,106 +190,39 @@ import PhaseBadge from '@/components/PhaseBadge.vue'
 const router = useRouter()
 const listStore = useTaskListStore()
 
-const showCreate = ref(false)
-const creating = ref(false)
-const formRef = ref()
 const selectedRows = ref([])
-
-// workflow_mode 默认值矩阵,必须与后端 models._MODE_DEFAULTS 保持一致
-const MODE_DEFAULTS = {
-  pentest_engineer: { autoApprove: false },
-  ctf_expert:       { autoApprove: true },
-}
-
-const form = ref({
-  target: '',
-  scopeNote: 'CTF/授权靶场测试',
-  extraHint: '',
-  userPrompt: '',
-  workflowMode: 'pentest_engineer',
-  autoApprove: MODE_DEFAULTS.pentest_engineer.autoApprove,
-  successGateLevel: '',
-  riskBudget: null,
-  maxReactRounds: null,
-  maxExploreRounds: null,
-})
-
-function onWorkflowModeChange(mode) {
-  const defaults = MODE_DEFAULTS[mode] || MODE_DEFAULTS.pentest_engineer
-  form.value.autoApprove = defaults.autoApprove
-}
-
-function isValidIPv4(host) {
-  const parts = host.split('.')
-  if (parts.length !== 4) return false
-  return parts.every((item) => {
-    if (!/^\d{1,3}$/.test(item)) return false
-    const n = Number(item)
-    return n >= 0 && n <= 255
-  })
-}
-
-function parseHostPort(raw) {
-  const match = raw.match(/:(\d{1,5})$/)
-  if (!match) return { host: raw, port: '' }
-  return {
-    host: raw.slice(0, -match[0].length),
-    port: match[1],
-  }
-}
-
-function isValidHost(host) {
-  if (!host) return false
-  if (host === 'localhost') return true
-  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return isValidIPv4(host)
-  const label = '[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?'
-  const hostnamePattern = new RegExp(`^${label}(\\.${label})*$`)
-  return hostnamePattern.test(host)
-}
-
-function isValidTarget(value) {
-  const raw = String(value || '').trim()
-  if (!raw) return false
-  try {
-    const u = new URL(raw)
-    if (!['http:', 'https:'].includes(u.protocol)) return false
-    if (!isValidHost(u.hostname)) return false
-    if (u.port) {
-      const p = Number(u.port)
-      if (!Number.isFinite(p) || p < 1 || p > 65535) return false
-    }
-    return true
-  } catch {
-    // fall through to host / host:port validation
-  }
-
-  const { host, port } = parseHostPort(raw)
-  if (!isValidHost(host) || host.includes(':')) return false
-  if (port) {
-    const p = Number(port)
-    if (!Number.isFinite(p) || p < 1 || p > 65535) return false
-  }
-  return true
-}
-
-function validateTarget(_rule, value, callback) {
-  if (!isValidTarget(value)) {
-    callback(new Error('请输入有效目标：IP / 域名 / IP:端口 / URL'))
-    return
-  }
-  callback()
-}
-
-const rules = {
-  target: [{ validator: validateTarget, trigger: 'blur' }],
-}
 
 const filterStatus = ref('')
 const filterPhase = ref('')
 const onlyShell = ref(false)
 const searchKeyword = ref('')
 const currentPage = ref(1)
-const pageSize = 20
+const pageSize = ref(20)
+const sortProp = ref('')
+const sortOrder = ref('')
+
+// ── 筛选持久化 ──
+const FILTER_KEY = 'taskList_filters'
+function saveFilters() {
+  try { sessionStorage.setItem(FILTER_KEY, JSON.stringify({
+    filterStatus: filterStatus.value, filterPhase: filterPhase.value,
+    onlyShell: onlyShell.value, searchKeyword: searchKeyword.value,
+    pageSize: pageSize.value,
+  })) } catch { /* ignore */ }
+}
+function restoreFilters() {
+  try {
+    const raw = sessionStorage.getItem(FILTER_KEY)
+    if (!raw) return
+    const saved = JSON.parse(raw)
+    if (saved.filterStatus) filterStatus.value = saved.filterStatus
+    if (saved.filterPhase) filterPhase.value = saved.filterPhase
+    if (saved.onlyShell) onlyShell.value = saved.onlyShell
+    if (saved.searchKeyword) searchKeyword.value = saved.searchKeyword
+    if (saved.pageSize) pageSize.value = saved.pageSize
+  } catch { /* ignore */ }
+}
+watch([filterStatus, filterPhase, onlyShell, searchKeyword, pageSize], saveFilters)
 
 const filteredTasks = computed(() => {
   const keyword = searchKeyword.value.trim().toLowerCase()
@@ -363,8 +236,22 @@ const filteredTasks = computed(() => {
 })
 
 const pagedTasks = computed(() => {
-  const start = (currentPage.value - 1) * pageSize
-  return filteredTasks.value.slice(start, start + pageSize)
+  const start = (currentPage.value - 1) * pageSize.value
+  return filteredTasks.value.slice(start, start + pageSize.value)
+})
+
+const sortedPagedTasks = computed(() => {
+  if (!sortProp.value) return pagedTasks.value
+  const arr = [...pagedTasks.value]
+  const key = sortProp.value
+  const asc = sortOrder.value === 'ascending'
+  arr.sort((a, b) => {
+    const va = a[key] ?? ''
+    const vb = b[key] ?? ''
+    if (typeof va === 'number' && typeof vb === 'number') return asc ? va - vb : vb - va
+    return asc ? String(va).localeCompare(String(vb)) : String(vb).localeCompare(String(va))
+  })
+  return arr
 })
 
 watch([filterStatus, filterPhase, onlyShell, searchKeyword], () => {
@@ -399,48 +286,43 @@ function goCreate() {
   router.push('/tasks/new')
 }
 
-async function handleCreate() {
-  await formRef.value.validate()
-  creating.value = true
-  try {
-    const task = await listStore.createTask({
-      target:           form.value.target,
-      scopeNote:        form.value.scopeNote,
-      extraHint:        form.value.extraHint,
-      userPrompt:       form.value.userPrompt,
-      workflowMode:     form.value.workflowMode,
-      autoApprove:      form.value.autoApprove,
-      successGateLevel: form.value.successGateLevel || null,
-      riskBudget:       form.value.riskBudget,
-      maxReactRounds:   form.value.maxReactRounds,
-      maxExploreRounds: form.value.maxExploreRounds,
-    })
-    trackEvent('task.create', {
-      target: form.value.target,
-      workflowMode: form.value.workflowMode,
-      autoApprove: form.value.autoApprove,
-      taskId: task.task_id,
-    })
-    ElMessage.success(`任务已创建：${task.target}`)
-    showCreate.value = false
-    form.value = {
-      target: '',
-      scopeNote: 'CTF/授权靶场测试',
-      extraHint: '',
-      userPrompt: '',
-      workflowMode: 'pentest_engineer',
-      autoApprove: MODE_DEFAULTS.pentest_engineer.autoApprove,
-      successGateLevel: '',
-      riskBudget: null,
-      maxReactRounds: null,
-      maxExploreRounds: null,
-    }
-    router.push(`/tasks/${task.task_id}`)
-  } catch (e) {
-    ElMessage.error(e?.response?.data?.detail || e.message || '创建失败')
-  } finally {
-    creating.value = false
+// ── 统计栏快捷筛选 ──
+function toggleApproval() {
+  if (filterPhase.value === 'awaiting_approval') {
+    filterPhase.value = ''
+    filterStatus.value = ''
+  } else {
+    filterPhase.value = 'awaiting_approval'
+    filterStatus.value = 'running'
   }
+}
+
+// ── 相对时间 ──
+function relativeTime(dateStr) {
+  if (!dateStr) return '-'
+  const diff = Date.now() - new Date(dateStr).getTime()
+  const mins = Math.floor(diff / 60000)
+  if (mins < 1) return '刚刚'
+  if (mins < 60) return `${mins}分钟前`
+  const hours = Math.floor(mins / 60)
+  if (hours < 24) return `${hours}小时前`
+  const days = Math.floor(hours / 24)
+  return `${days}天前`
+}
+
+// ── 排序 ──
+function onSortChange({ prop, order }) {
+  sortProp.value = prop || ''
+  sortOrder.value = order || ''
+}
+
+// ── 行操作（下拉菜单） ──
+function handleRowCommand(cmd, row) {
+  if (cmd === 'report') goReport(row.task_id)
+  else if (cmd === 'copy') {
+    navigator.clipboard.writeText(row.target || '').then(() => ElMessage.success('已复制'))
+  } else if (cmd === 'cancel') handleCancel(row)
+  else if (cmd === 'delete') handleDelete(row)
 }
 
 async function handleCancel(row) {
@@ -460,10 +342,21 @@ async function handleCancel(row) {
   }
 }
 
-function handleDelete(row) {
-  listStore.removeTask(row.task_id)
-  trackEvent('task.delete', { taskId: row.task_id })
-  ElMessage.success('任务已删除')
+async function handleDelete(row) {
+  try {
+    await ElMessageBox.confirm(
+      `确认删除任务 ${row.target}？此操作不可撤销。`,
+      '删除任务',
+      { type: 'warning', confirmButtonText: '确认删除' },
+    )
+  } catch { return }
+  try {
+    await listStore.deleteTask(row.task_id)
+    trackEvent('task.delete', { taskId: row.task_id })
+    ElMessage.success('任务已删除')
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || e.message || '删除失败')
+  }
 }
 
 async function batchDelete() {
@@ -475,9 +368,16 @@ async function batchDelete() {
       type: 'warning',
     })
   } catch { return }
-  selectedRows.value.forEach((item) => listStore.removeTask(item.task_id))
+  const results = await Promise.allSettled(
+    selectedRows.value.map((item) => listStore.deleteTask(item.task_id)),
+  )
+  const failed = results.filter((r) => r.status === 'rejected').length
   trackEvent('task.batch_delete', { count })
-  ElMessage.success(`已删除 ${count} 个任务`)
+  if (failed) {
+    ElMessage.warning(`已删除 ${count - failed} 个任务，${failed} 个失败`)
+  } else {
+    ElMessage.success(`已删除 ${count} 个任务`)
+  }
   selectedRows.value = []
 }
 
@@ -491,6 +391,7 @@ function openBatchReport() {
 }
 
 onMounted(() => {
+  restoreFilters()
   listStore.fetchTasks()
 })
 </script>
@@ -528,35 +429,15 @@ onMounted(() => {
 .shell.yes { color: var(--accent-green); }
 .shell.no { color: var(--text-muted); }
 .text-muted { color: var(--text-muted); }
-.actions { display: flex; justify-content: center; align-items: center; flex-wrap: wrap; gap: 8px; }
-:deep(.action-detail.el-button) {
-  font-weight: 600;
-  color: #f0f7ff !important;
-  box-shadow: 0 2px 10px color-mix(in srgb, var(--accent-blue) 28%, transparent);
+.actions { display: flex; justify-content: center; align-items: center; gap: 6px; }
+.action-more {
+  border-color: var(--border) !important;
+  background: var(--bg-elevated) !important;
+  color: var(--text-secondary) !important;
 }
-:deep(.action-delete.el-button--danger) {
-  font-weight: 600;
-  color: #fff5f5 !important;
-  border-color: color-mix(in srgb, var(--accent-red) 72%, #8b2d2d) !important;
-  background: linear-gradient(
-    155deg,
-    color-mix(in srgb, var(--accent-red) 58%, #3a1218),
-    color-mix(in srgb, var(--accent-red) 42%, #240c10)
-  ) !important;
-  box-shadow:
-    0 3px 12px color-mix(in srgb, var(--accent-red) 35%, transparent),
-    inset 0 0 0 1px color-mix(in srgb, #ffffff 12%, transparent);
+.action-more:hover {
+  border-color: var(--accent-blue) !important;
+  color: var(--accent-blue) !important;
 }
-:deep(.action-delete.el-button--danger:hover),
-:deep(.action-delete.el-button--danger:focus-visible) {
-  color: #ffffff !important;
-  border-color: color-mix(in srgb, var(--accent-red) 85%, #c44) !important;
-  background: linear-gradient(
-    155deg,
-    color-mix(in srgb, var(--accent-red) 68%, #4a1820),
-    color-mix(in srgb, var(--accent-red) 50%, #2a0c12)
-  ) !important;
-}
-.form-tip { margin-top: 4px; color: var(--text-muted); font-size: 12px; }
 .pagination-wrap { display: flex; justify-content: flex-end; padding: 12px 0 4px; }
 </style>

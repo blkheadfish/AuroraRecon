@@ -5,6 +5,7 @@ import type { TaskSummary, WorkflowMode } from '@/types/task'
 
 export interface CreateTaskParams {
   target: string
+  rawPrompt?: string
   scopeNote?: string
   extraHint?: string
   userPrompt?: string
@@ -42,6 +43,7 @@ export const useTaskListStore = defineStore('taskList', () => {
   async function createTask(params: CreateTaskParams) {
     const task = await api.createTask({
       target:             params.target,
+      rawPrompt:          params.rawPrompt ?? '',
       note:               params.scopeNote,
       extraHint:          params.extraHint,
       userPrompt:         params.userPrompt,
@@ -71,6 +73,11 @@ export const useTaskListStore = defineStore('taskList', () => {
     tasks.value = tasks.value.filter((task) => task.task_id !== taskId)
   }
 
+  async function deleteTask(taskId: string) {
+    await api.deleteTask(taskId)
+    tasks.value = tasks.value.filter((task) => task.task_id !== taskId)
+  }
+
   function getTaskById(taskId: string) {
     return tasks.value.find((task) => task.task_id === taskId) || null
   }
@@ -89,6 +96,7 @@ export const useTaskListStore = defineStore('taskList', () => {
     createTask,
     upsertTask,
     removeTask,
+    deleteTask,
     getTaskById,
     cancelTask,
   }
