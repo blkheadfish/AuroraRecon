@@ -197,6 +197,46 @@ class TaskBranch(BaseModel):
 	is_root: bool = False                   # 兼容老任务: 第一个 branch 标 is_root=True
 
 
+# ── 意图解析与安全卡口 ──────────────────────────────────
+
+TargetType = Literal["ip", "cidr", "domain", "hostname_pattern", "unknown"]
+AmbiguityLevel = Literal["clear", "partial", "vague"]
+RiskLevel = Literal["safe", "warning", "blocked"]
+
+
+class ParsedIntent(BaseModel):
+	"""任务意图解析结果——正则优先提取，LLM 辅助语义补充。
+
+	仅在 LLM 可用时才填充 scope_hint / task_focus / pentest_phase 等语义字段；
+	基础正则（IP/CIDR/域名）是确定性逻辑，不依赖 LLM。
+	"""
+	target_type: TargetType = "unknown"
+	targets: list[str] = Field(default_factory=list)
+	scope_hint: Optional[str] = None       # "intranet", "dmz", "specific_host"
+	task_focus: list[str] = Field(default_factory=list)    # ["web", "database"]
+	pentest_phase: list[str] = Field(default_factory=list)  # ["recon", "exploit"]
+	priority_vulns: list[str] = Field(default_factory=list) # ["shiro", "fastjson"]
+	requires_discovery: bool = False  # 是否需要先做主机发现（masscan 存活扫描）
+	ambiguity_level: AmbiguityLevel = "vague"
+	clarification_needed: list[str] = Field(default_factory=list)
+	raw_prompt: str = ""
+
+
+class SafetyCheckResult(BaseModel):
+	"""确定性安全校验结果——不依赖 LLM，所有规则来自 YAML 配置。
+
+	三层模型：
+	  - 有 authorization_token → 放行（仅记录审计日志）
+	  - 命中黑名单（云服务商/政府IP段 + 无授权）→ blocked
+	  - 命中灰名单（公网IP无授权 / CIDR过大 / exploit阶段无明确目标）→ warning
+	"""
+	passed: bool
+	risk_level: RiskLevel = "safe"
+	block_reason: Optional[str] = None
+	warnings: list[str] = Field(default_factory=list)
+	required_confirmations: list[str] = Field(default_factory=list)
+
+
 class PortInfo(BaseModel):
 	port: int
 	protocol: str = "tcp"
@@ -515,6 +555,15 @@ class PentestState(BaseModel):
 	scope_note: str = ""
 	extra_hint: str = ""
 	user_prompt: str = ""
+	# ── 意图解析 + 安全卡口（新增）─────────────────
+	# raw_prompt: 用户自然语言描述（兼容旧 target 字段）
+	raw_prompt: str = ""
+	# parsed_intent: 意图解析器产出的结构化结果
+	parsed_intent: Optional[dict[str, Any]] = None
+	# safety_check_result: 安全卡口的校验结果
+	safety_check_result: Optional[dict[str, Any]] = None
+	# authorization_token: 用户提供的授权证明
+	authorization_token: Optional[str] = None
 	# ── 工作流模式 + per-task 运行时策略 ───────────────
 	# workflow_mode 决定一组默认值(见 _MODE_DEFAULTS),
 	# 其余字段允许在创建任务时显式覆盖,不再依赖全局环境变量。

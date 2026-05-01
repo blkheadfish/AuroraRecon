@@ -1,0 +1,71 @@
+# ══════════════════════════════════════════════════════════════
+# SafetyGate 确定性安全校验规则
+# ══════════════════════════════════════════════════════════════
+# 注意：此文件不依赖 LLM，所有规则均为确定性规则。
+# 修改后重启服务即生效，运维无需重训练模型。
+# ══════════════════════════════════════════════════════════════
+
+safety:
+
+  # ── 黑名单：直接 BLOCK，创建任务前必须拒绝 ──────────────
+  # 注意：带 authorization_token 的任务始终放行（仅记录审计日志）
+  block_list:
+
+    # 主流云服务商已知 IP 段（不含客户自有 VPC 地址）
+    # 这些是 IaaS 平台的公共服务 / metadata 端点 / 默认网段
+    cloud_provider_cidrs:
+      # AWS
+      - "169.254.169.254/32"  # AWS EC2 metadata endpoint
+      - "169.254.170.2/32"    # AWS ECS task metadata
+      # 腾讯云
+      - "169.254.0.0/16"      # 腾讯云 metadata 服务段
+      - "100.64.0.0/10"       # 阿里云经典网络 metadata 段（与 CGNAT 共享）
+      # 其他可在此扩展
+
+    # 政府/关基已知 IP 段
+    # 留空，由运维按需填充
+    government_cidrs: []
+
+    # 恶意意图关键词（中文）—— 匹配到即 BLOCK
+    unauthorized_keywords:
+      - "攻击某公司"
+      - "黑掉"
+      - "入侵"
+      - "非法获取"
+      - "未授权渗透"
+      - "破解某网站"
+      - "盗取数据"
+
+    # 不允许的 CIDR 阈值（超过此值的 CIDR 在无授权时 BLOCK）
+    # /8 → 完全拒绝（除非有 authorization_token）
+    max_cidr_prefix: 8
+
+  # ── 灰名单：WARNING，需要用户显式确认后继续 ──────────
+  warn_list:
+
+    # CIDR 范围超过 /N 时警告（大规模扫描风险）
+    cidr_warn_threshold: 16
+
+    # 公网 IP 无授权 → 要求用户附上授权说明
+    public_ip_no_auth: true
+
+    # exploit 阶段但目标不明确 → 警告
+    exploit_without_clear_target: true
+
+    # 无明确目标时需要先做主机发现的网段最大范围
+    # discovery_max_cidr: 24 表示没有具体目标时最多允许扫 /24
+    discovery_max_cidr: 24
+
+  # ── 白名单：已知合法靶场/授权网段，直接放行 ──────────
+  allow_list:
+
+    # 常见 CTF/靶场地址段
+    authorized_cidrs:
+      # 空，由运维按需填充，例如：
+      # - "172.16.0.0/12"   # 某授权靶场网段
+      # - "10.99.0.0/16"    # 内部测试环境
+
+    # 按主机名白名单
+    authorized_hosts:
+      - "localhost"
+      - "127.0.0.1"

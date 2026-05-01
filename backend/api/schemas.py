@@ -16,6 +16,12 @@ class CreateTaskRequest(BaseModel):
     """
     创建任务请求。
 
+    支持两种模式：
+    1. 传统模式：直接传 target (IP/域名/CIDR)，兼容旧接口
+    2. 自然语言模式：传 raw_prompt，系统自动解析意图
+       - target 可选（raw_prompt 提供时可为空）
+       - authorization_token 提供后跳过安全卡口
+
     workflow_mode 决定一组默认值(审批策略 / 证据门槛 / 风险预算 / 轮次
     上限 / Skill 匹配阈值);用户可以同时在 `auto_approve` / `success_gate_level`
     / `risk_budget` / `max_react_rounds` / `max_explore_rounds` 等字段上
@@ -23,11 +29,15 @@ class CreateTaskRequest(BaseModel):
     不会写回全局环境变量。
     """
 
-    target: str
+    target: str = ""              # 兼容旧接口，raw_prompt 提供时可为空
+    raw_prompt: str = ""          # 自然语言任务描述（新增）
     scope_note: str = "CTF/授权靶场测试"
     extra_hint: str = ""
     user_prompt: str = ""
     workflow_mode: WorkflowMode = "pentest_engineer"
+    # 安全卡口相关字段（新增）
+    authorization_token: Optional[str] = None    # 授权证明
+    user_confirmed_risks: list[str] = []          # 用户已确认的风险项 ID
 
     # 以下字段为可选覆盖项,不传则沿用 workflow_mode 的默认值
     auto_approve: Optional[bool] = None
@@ -41,9 +51,14 @@ class CreateTaskRequest(BaseModel):
     @field_validator("target")
     @classmethod
     def validate_target(cls, v: str) -> str:
+        """校验 target 字段。
+
+        注意：target 可以为空（当 raw_prompt 提供时），此时不做校验。
+        空 target 的完整校验在路由层完成（与 raw_prompt 联动）。
+        """
         raw = v.strip()
         if not raw:
-            raise ValueError("目标地址不能为空")
+            return raw  # 空 target 允许通过，路由层与 raw_prompt 联动校验
 
         if re.search(r'[;\|`$&<>(){}\[\]!]', raw):
             raise ValueError("目标地址包含非法字符")

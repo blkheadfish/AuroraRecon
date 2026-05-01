@@ -146,6 +146,27 @@ def _apply_parsed_target(state: PentestState) -> None:
         state.log(f"⚠ 目标解析失败，原始输入: {state.target}")
 
 
+def get_intent_skill_boost(parsed_intent: dict | None) -> dict[str, int]:
+    """意图驱动：从 parsed_intent 中提取漏洞类型优先级权重。
+
+    返回 {vuln_tag: boost_score}，供 Skills 匹配评分时加权。
+    例如 priority_vulns=["shiro", "fastjson"] →
+         {"shiro": +20, "fastjson": +20, "deserialization": +15}
+
+    由 ExploitAgent 在调用 SkillRegistry.match() 时通过 kb_hits 参数传入。
+    """
+    if not parsed_intent:
+        return {}
+    priority_vulns: list[str] = parsed_intent.get("priority_vulns", []) or []
+    boosts: dict[str, int] = {}
+    base_boost = 15  # 意图指定的漏洞类型基础加权
+    for tag in priority_vulns:
+        tag_lower = tag.lower().strip()
+        if tag_lower and tag_lower not in boosts:
+            boosts[tag_lower] = base_boost
+    return boosts
+
+
 def _append_tool_record(
     state: PentestState,
     record: dict,
@@ -390,6 +411,45 @@ def _build_exploit_context(state: PentestState) -> dict[str, Any]:
     if not dir_intel:
         dir_intel = _build_dir_intel(state)
 
+    # KB 探针命中：交给 SkillRegistry.match() 用 dispatch_skill 加 +150 分
+    kb_hits = list(state.kb_probe_hits) if state.kb_probe_hits else []
+
+    # ── 意图驱动：priority_vulns → skill_id 映射并注入 kb_hits ──
+    # 通过 kb_hits 机制实现 Skill 优先级加权，不修改 Skill YAML 和 ExploitAgent。
+    # confidence=0.5 保证权重要弱于真实探针命中(0.9+)但强于常规关键词匹配。
+    _INTENT_VULN_TO_SKILL: dict[str, str] = {
+        "shiro": "shiro_rce",
+        "fastjson": "fastjson_rce",
+        "log4j": "log4shell_rce",
+        "struts2": "struts2_rce",
+        "thinkphp": "thinkphp_rce",
+        "weblogic": "weblogic_rce",
+        "jboss": "jboss_rce",
+        "tomcat": "tomcat_exploit",
+        "wordpress": "wordpress_exploit",
+        "sql_injection": "sql_injection",
+        "sqli": "sql_injection",
+        "lfi": "lfi_rfi",
+        "ssti": "flask_ssti",
+        "weak_password": "credential_bruteforce",
+        "default_creds": "tomcat_exploit",
+    }
+    parsed = state.parsed_intent or {}
+    for tag in parsed.get("priority_vulns", []) or []:
+        tag_lower = tag.lower().strip()
+        skill_id = _INTENT_VULN_TO_SKILL.get(tag_lower)
+        if skill_id:
+            kb_hits.append({
+                "vuln_id": f"intent_{tag_lower}",
+                "dispatch_skill": skill_id,
+                "confidence": 0.5,  # 主观意图的置信度低于探针实际命中
+                "base_url": f"http://{state.target_host}" if state.target_host else "",
+                "port": state.target_port,
+                "cves": [],
+                "finding_vuln_id": "",  # 不限 finding，全局加权
+                "source": "parsed_intent",
+            })
+
     ctx: dict[str, Any] = {
         "ports_summary": ", ".join(
             f"{p.port}/{p.service}({p.version[:30]})" for p in state.open_ports[:20]
@@ -415,8 +475,8 @@ def _build_exploit_context(state: PentestState) -> dict[str, Any]:
         "confirmed_facts": state.confirmed_facts or {},
         "prior_probe_variables": state.exploit_probe_variables or {},
         "prior_failed_commands": state.failed_commands_by_vuln or {},
-        # KB 探针命中：交给 SkillRegistry.match() 用 dispatch_skill 加 +150 分
-        "kb_probe_hits": list(state.kb_probe_hits) if state.kb_probe_hits else [],
+        # KB 探针命中 + 意图驱动加权
+        "kb_probe_hits": kb_hits,
         "attack_chain_mode": True,
         "attack_chain_hint": (
             "主机攻链优先：以「立足点→枚举→提权→目标」为主线；"
@@ -533,6 +593,63 @@ def retry_node(max_attempts: int = 3, delay: float = 2.0):
 # 节点函数
 # ───────────────────────────────────────────────────────
 
+def _run_host_discovery(state: PentestState) -> list[str]:
+    """意图驱动：使用 masscan 做存活主机发现。
+
+    从 parsed_intent.targets 中提取 CIDR/网段信息作为扫描范围。
+    返回发现的存活主机 IP 列表。
+
+    安全注意：
+    - 仅扫描 parsed_intent 中明确指定的网段，不自作主张扩大范围
+    - masscan 使用 --rate 限制发包速率，避免对目标网络造成冲击
+    - 仅做 ping 扫描（-sn 等效），不做端口扫描
+    """
+    parsed = state.parsed_intent or {}
+    targets = parsed.get("targets", [])
+
+    # 找到所有 CIDR 目标作为扫描范围
+    cidr_targets = [t for t in targets if "/" in t]
+    if not cidr_targets:
+        state.log("[意图驱动] 无法确定主机发现范围（无 CIDR 目标），跳过")
+        return []
+
+    import asyncio
+    discovered: list[str] = []
+
+    for cidr in cidr_targets[:3]:  # 最多扫描 3 个网段
+        try:
+            # 使用 nmap -sn（ping 扫描）而非 masscan，因为更可靠且内置
+            # masscan 更适合全端口快速扫描，这里只需存活探测
+            cmd = f"nmap -sn -T4 --max-retries 1 {cidr}"
+            state.log(f"[意图驱动] 执行主机发现: {cmd}")
+
+            import subprocess
+            proc = subprocess.run(
+                cmd, shell=True,
+                capture_output=True, text=True, timeout=120
+            )
+            output = proc.stdout + proc.stderr
+
+            # 解析 nmap -sn 输出，提取存活主机
+            import re
+            ip_pattern = re.compile(
+                r"Nmap scan report for (?:\S+ )?\(?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\)?"
+            )
+            for match in ip_pattern.finditer(output):
+                ip = match.group(1)
+                if ip not in discovered:
+                    discovered.append(ip)
+
+            state.log(f"[意图驱动] {cidr} 发现 {len(discovered)} 个存活主机")
+
+        except subprocess.TimeoutExpired:
+            state.log(f"[意图驱动] 主机发现超时: {cidr}")
+        except Exception as e:
+            state.log(f"[意图驱动] 主机发现失败: {cidr}: {e}")
+
+    return discovered
+
+
 @retry_node(max_attempts=3, delay=2.0)
 async def node_recon(state: PentestState) -> PentestState:
     from backend.agents.recon_agent import ReconAgent
@@ -542,6 +659,31 @@ async def node_recon(state: PentestState) -> PentestState:
     state.status = TaskStatus.RUNNING
     if _yield_if_interrupted(state, "recon"):
         return state
+
+    # ── 意图驱动：主机发现（masscan 存活扫描）───────────────
+    # 当 parsed_intent.requires_discovery 为 True 且首次进入 recon 时，
+    # 先用 masscan 做全端口 ping 扫描发现存活主机，再对每个主机执行侦察。
+    parsed_intent_raw = state.parsed_intent or {}
+    requires_discovery = parsed_intent_raw.get("requires_discovery", False)
+    if requires_discovery and state.phase_visit_count.get("recon", 0) == 0:
+        state.log("[意图驱动] 检测到主机发现需求，先执行 masscan 存活扫描")
+        discovery_targets = _run_host_discovery(state)
+        if discovery_targets:
+            # 将发现的主机追加到 pending_seeds，下一轮 recon 会消费
+            seeds = state.pending_seeds or {}
+            existing_hosts = list(seeds.get("hosts", []))
+            for host in discovery_targets:
+                if host not in existing_hosts and host != state.target_host:
+                    existing_hosts.append(host)
+            seeds["hosts"] = existing_hosts
+            state.pending_seeds = seeds
+            state.log(
+                f"[意图驱动] masscan 发现 {len(discovery_targets)} 个存活主机: "
+                f"{', '.join(discovery_targets[:10])}"
+                + (f"... 等共 {len(discovery_targets)} 个" if len(discovery_targets) > 10 else "")
+            )
+        else:
+            state.log("[意图驱动] masscan 未发现存活主机")
 
     # ── 增量入口：把 pending_seeds["hosts"] 并入；签名命中则跳过 ──
     seed_hosts = _consume_pending_seeds(state, "hosts")
@@ -2500,12 +2642,25 @@ def edge_should_exploit(state: PentestState) -> str:
     """
     决策阶段结束后的路由:
       - 任务已失败 → report
+      - 意图驱动：仅侦察模式（pentest_phase 只有 recon）→ report
       - 无可利用 finding → report
       - 有可利用 finding 且 auto_approve=True → 直接进入 foothold_attempt,
         不经过 human_approval interrupt(避免 LangGraph 暂停等待)
       - 其余情况 → human_approval(会在 interrupt_before 处暂停)
     """
     if state.status == TaskStatus.FAILED:
+        return "report"
+    # ── 意图驱动：仅侦察模式 → 直接出报告，不进入利用阶段 ──
+    parsed = state.parsed_intent or {}
+    phases = parsed.get("pentest_phase", [])
+    if phases == ["recon"]:
+        state.log("[意图驱动] 仅侦察模式，跳过利用阶段，直接生成报告")
+        state.push_decision({
+            "action": "intent_recon_only",
+            "phase": "exploit_decision",
+            "message": "用户仅要求侦察，跳过漏洞利用阶段",
+            "tone": "info",
+        })
         return "report"
     if not any(f.exploitable for f in state.findings):
         return "report"

@@ -280,31 +280,150 @@ async def create_task(req: CreateTaskRequest, request: Request):
     """
     创建一个新任务。
 
-    参数来源优先级:
-      1. 请求体里显式非 None 字段(per-task 覆盖)
-      2. workflow_mode 对应的默认值(见 models._MODE_DEFAULTS)
-    router 不再从 os.environ 读取工作流策略,settings 里不再下发这些变量。
+    支持两种模式:
+      1. 传统模式: 直接传 target (IP/域名/CIDR)，兼容旧接口
+      2. 自然语言模式: 传 raw_prompt，系统自动解析意图 + 安全卡口
 
-    BackgroundTasks 不能承载长耗时任务(FastAPI 会在 response 发出前 awaited
-    完,导致任务被延迟触发),因此统一改用 asyncio.create_task 并通过
-    TaskStateManager 注册后台 handle,方便 cancel/delete 时精确终止。
+    状态机:
+      POST /tasks →
+        if SafetyGate.blocked → 400 + reason
+        if SafetyGate.warnings 且 user_confirmed_risks 未覆盖 → 202 pending_confirmation
+        if ambiguity partial/vague 且缺关键信息 → 202 pending_clarification
+        else → 创建任务 201 + task_id
+
+    二次 POST 附带 user_confirmed_risks 完成确认，避免意外执行。
     """
     sm = _get_sm()
-    task_id = str(uuid.uuid4())
-
     owner_id = getattr(request.state, "user_id", "") or ""
     tenant_id = getattr(request.state, "tenant_id", "") or "default"
-    
+
+    # ── 第一步：意图解析 + 目标推导 ───────────────────────
+    raw_prompt = req.raw_prompt.strip() or req.user_prompt.strip()
+    raw_target = req.target.strip()
+
+    parsed_intent_dict: dict | None = None
+    effective_target = raw_target
+
+    if raw_prompt:
+        from backend.agents.intent_parser import parse_intent_deterministic
+
+        parsed_intent = parse_intent_deterministic(raw_prompt)
+        parsed_intent_dict = parsed_intent.model_dump()
+
+        # 如果 target 为空，从 raw_prompt 提取
+        if not effective_target and parsed_intent.targets:
+            effective_target = parsed_intent.targets[0]
+            logger.info(
+                f"[create_task] 从 raw_prompt 提取目标: {effective_target} "
+                f"(type={parsed_intent.target_type})"
+            )
+
+        # 如果 target 和 raw_prompt 都为空 → 400
+        if not effective_target:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "status": "pending_clarification",
+                    "message": "无法从描述中提取目标地址",
+                    "clarification_needed": parsed_intent.clarification_needed,
+                    "parsed_intent": parsed_intent_dict,
+                }
+            )
+    elif not effective_target:
+        raise HTTPException(
+            status_code=400,
+            detail="target 和 raw_prompt 至少需要提供一个"
+        )
+
+    # ── 第二步：安全卡口检查（确定性规则，不依赖 LLM）────
+    from backend.agents.safety_gate import get_safety_gate
+    from backend.agents.intent_parser import parse_intent_deterministic
+
+    # 复用已解析的 intent 或重新解析
+    if parsed_intent_dict is None:
+        safety_intent = parse_intent_deterministic(
+            raw_prompt or f"对 {effective_target} 进行渗透测试"
+        )
+    else:
+        from backend.agents.models import ParsedIntent
+        safety_intent = ParsedIntent(**parsed_intent_dict)
+
+    gate = get_safety_gate()
+    safety_result = gate.check(
+        safety_intent,
+        authorization_token=req.authorization_token,
+        user_id=owner_id,
+    )
+
+    # ── BLOCK：直接拒绝 ──────────────────────────────────
+    if safety_result.risk_level == "blocked":
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "status": "blocked",
+                "message": safety_result.block_reason or "安全卡口拦截",
+                "parsed_intent": parsed_intent_dict or safety_intent.model_dump(),
+            }
+        )
+
+    # ── WARNING：检查用户是否已确认 ──────────────────────
+    if safety_result.risk_level == "warning":
+        pending_confirmations = [
+            c for c in safety_result.required_confirmations
+            if c not in req.user_confirmed_risks
+        ]
+        if pending_confirmations:
+            return {
+                "status": "pending_confirmation",
+                "task_id": "",
+                "target": effective_target,
+                "warnings": safety_result.warnings,
+                "required_confirmations": pending_confirmations,
+                "parsed_intent": parsed_intent_dict or safety_intent.model_dump(),
+                "message": "需要确认以下风险项后再提交",
+            }
+
+    # ── PENDING_CLARIFICATION：目标不明确 ────────────────
+    if safety_intent.ambiguity_level in ("partial", "vague") and \
+       safety_intent.clarification_needed:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "status": "pending_clarification",
+                "message": "目标信息不完整，需要补充",
+                "questions": safety_intent.clarification_needed,
+                "parsed_intent": safety_intent.model_dump(),
+            }
+        )
+
+    # ── 第三步：通过所有检查，创建任务 ─────────────────────
+    task_id = str(uuid.uuid4())
+
+    # 验证最终 target 的合法性
+    try:
+        from backend.agents.models import parse_target
+        parsed = parse_target(effective_target)
+        if not parsed.host:
+            raise HTTPException(status_code=400, detail=f"无法解析目标: {effective_target}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"目标格式错误: {e}")
+
     state = PentestState(
         task_id=task_id,
-        target=req.target,
+        target=effective_target,
+        raw_prompt=raw_prompt,
         scope_note=req.scope_note,
         extra_hint=req.extra_hint,
-        user_prompt=req.user_prompt,
+        user_prompt=req.user_prompt or raw_prompt,
         workflow_mode=req.workflow_mode,
         owner_id=owner_id,
         tenant_id=tenant_id,
         trace_id=getattr(request.state, "trace_id", "") or "",
+        authorization_token=req.authorization_token,
+        parsed_intent=parsed_intent_dict or safety_intent.model_dump(),
+        safety_check_result=safety_result.model_dump(),
     )
     # 填入 workflow_mode 默认值,并用请求里显式传入的覆盖项替换
     apply_mode_defaults(
