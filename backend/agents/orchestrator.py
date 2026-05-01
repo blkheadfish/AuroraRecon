@@ -187,7 +187,7 @@ def _append_tool_record(
     *,
     default_phase: str,
 ) -> None:
-    """将执行器结构化记录写入 state.tool_records（去重）。"""
+    """将执行器结构化记录写入 state.tool_records（去重）并推送 command_exec 事件。"""
     payload = dict(record or {})
     payload.setdefault("phase", default_phase)
     payload.setdefault("timestamp", datetime.utcnow().isoformat())
@@ -203,6 +203,30 @@ def _append_tool_record(
     # 截留最近 1000 条，避免 LangGraph checkpoint payload 失控。
     if len(state.tool_records) > 2000:
         state.tool_records = state.tool_records[-1000:]
+
+    # 推送 command_exec 事件到前端，让用户看到 KB 探针、表面枚举等工具执行的 stdout/stderr
+    exit_code = payload.get("exit_code", -1)
+    stdout = payload.get("stdout", "") or ""
+    stderr = payload.get("stderr", "") or ""
+    tool = payload.get("tool", "") or payload.get("display_tool", "") or "script"
+    command = payload.get("command", "") or payload.get("runtime_command", "") or ""
+    purpose = payload.get("purpose", "") or ""
+    state.push_decision({
+        "action": "command_exec",
+        "phase": payload.get("phase", default_phase),
+        "tool": tool,
+        "display_tool": tool,
+        "command": command[:2000],
+        "runtime_command": payload.get("runtime_command", ""),
+        "purpose": purpose,
+        "stdout": stdout[:8000],
+        "stderr": stderr[:4000],
+        "exit_code": exit_code,
+        "elapsed_ms": int(round((payload.get("elapsed") or 0) * 1000)),
+        "truncated": payload.get("truncated", False),
+        "total_len": payload.get("total_len", 0),
+        "tone": "success" if exit_code == 0 else "danger",
+    })
 
 
 def _operator_chat_block(state: PentestState) -> str:
@@ -1418,15 +1442,21 @@ async def node_surface_enum(state: PentestState) -> PentestState:
             "console", "upload", "api", "debug", "phpinfo",
         ))
     ]
+    # 全量路径列表(截断到150条,避免事件体过大)
+    all_paths_truncated = state.web_paths[:150]
+    path_list_text = "\n".join(f"  • {p}" for p in all_paths_truncated)
+    path_overflow = "" if len(state.web_paths) <= 150 else f"\n  … 共 {len(state.web_paths)} 条, 仅展示前 150 条"
+    thinking_text = (
+        f"表面枚举完成: 共发现 {inv['total_paths']} 条路径, "
+        f"其中高价值 {inv['high_value']} 条.\n"
+        f"来源工具: {', '.join(inv['source_tools'])}.\n"
+        + (f"高价值路径: {', '.join(high_value_paths[:10])}\n" if high_value_paths else "")
+        + f"完整路径列表:\n{path_list_text}{path_overflow}"
+    )
     state.push_decision({
         "action": "thought",
         "phase": "surface_enum",
-        "thinking": (
-            f"表面枚举完成: 共发现 {inv['total_paths']} 条路径, "
-            f"其中高价值 {inv['high_value']} 条. "
-            f"来源工具: {', '.join(inv['source_tools'])}. "
-            + (f"高价值路径: {', '.join(high_value_paths[:10])}" if high_value_paths else "未发现明显高价值路径.")
-        ),
+        "thinking": thinking_text,
         "purpose": "表面枚举总结",
         "plan": [
             f"总路径: {inv['total_paths']}",
@@ -1434,6 +1464,8 @@ async def node_surface_enum(state: PentestState) -> PentestState:
             f"下一步: 利用决策分析",
         ],
         "message": f"表面枚举完成: {inv['total_paths']} 路径, {inv['high_value']} 高价值",
+        "discovered_paths": all_paths_truncated,
+        "total_path_count": len(state.web_paths),
     })
     _consume_replan_signal(state, "re_surface_enum_for_paths")
     _mark_phase_visited(state, "surface_enum", sig)
@@ -2048,20 +2080,75 @@ async def node_intel_harvest(state: PentestState) -> PentestState:
         f"(已验证 {verified_count})"
         + (f", KB 探针命中 {len(state.kb_probe_hits)} 个" if state.kb_probe_hits else "")
     )
+    # Build KB probe hit details
+    kb_probe_lines: list[str] = []
+    if state.kb_probe_hits:
+        for h in state.kb_probe_hits[:20]:
+            name = h.get("vuln_id", "")
+            skill = h.get("dispatch_skill", "")
+            conf = h.get("confidence", 0)
+            evidence = (h.get("evidence", "") or "")[:120]
+            kb_probe_lines.append(
+                f"  • {name} (confidence={conf:.2f}"
+                + (f", skill={skill}" if skill else "")
+                + (f", evidence={evidence}" if evidence else "")
+                + ")"
+            )
+    kb_probe_detail = (
+        f"\nKB 探针命中 ({len(state.kb_probe_hits)} 个):\n" + "\n".join(kb_probe_lines)
+        if kb_probe_lines else ""
+    )
+
+    # Build file intelligence details
+    intel_file_lines: list[str] = []
+    for f in state.intel_files[:15]:
+        path = f.get("path", "")
+        intel = f.get("intel", {})
+        risk = intel.get("risk_level", "")
+        summary = (intel.get("summary", "") or "")[:80]
+        intel_file_lines.append(
+            f"  • {path}" + (f" [{risk}] {summary}" if risk or summary else "")
+        )
+    intel_file_detail = (
+        f"\n文件情报 ({len(state.intel_files)} 份):\n" + "\n".join(intel_file_lines)
+        if intel_file_lines else ""
+    )
+
+    # Build page param details
+    param_lines: list[str] = []
+    for p in state.page_params[:15]:
+        verified_mark = "✓" if p.get("verified") else "?"
+        param_lines.append(
+            f"  • {p.get('url', '')} [{p.get('vuln_type', '')}] param={p.get('param_name', '')} ({verified_mark})"
+        )
+    param_detail = (
+        f"\n发现参数 ({len(state.page_params)} 个, {verified_count} 已验证):\n" + "\n".join(param_lines)
+        if param_lines else ""
+    )
+
+    thinking_text = (
+        f"情报采集完成: 分析了 {len(file_entries)} 个文件和 {len(page_entries)} 个页面. "
+        f"提取文件情报 {len(state.intel_files)} 份, "
+        f"发现注入参数 {len(state.page_params)} 个, "
+        f"其中已验证 {verified_count} 个."
+        + kb_probe_detail
+        + intel_file_detail
+        + param_detail
+    )
+
     state.push_decision({
         "action": "thought",
         "phase": "intel_harvest",
-        "thinking": (
-            f"情报采集完成: 分析了 {len(file_entries)} 个文件和 {len(page_entries)} 个页面. "
-            f"提取文件情报 {len(state.intel_files)} 份, "
-            f"发现注入参数 {len(state.page_params)} 个, "
-            f"其中已验证 {verified_count} 个."
-        ),
+        "thinking": thinking_text,
         "purpose": "情报采集总结",
         "message": (
             f"情报采集: {len(state.intel_files)} 文件情报, "
             f"{len(state.page_params)} 参数 ({verified_count} 已验证)"
+            + (f", KB 探针命中 {len(state.kb_probe_hits)} 个" if state.kb_probe_hits else "")
         ),
+        "kb_probe_hits_count": len(state.kb_probe_hits),
+        "intel_files_count": len(state.intel_files),
+        "page_params_count": len(state.page_params),
     })
     _consume_replan_signal(state, "re_intel_harvest_for_paths")
     _mark_phase_visited(state, "intel_harvest", sig)

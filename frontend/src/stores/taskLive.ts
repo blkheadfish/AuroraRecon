@@ -573,6 +573,9 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
           attack_next_steps: patch.attack_next_steps ?? state.task.attack_next_steps,
           privesc_attempt_count: patch.privesc_attempt_count ?? state.task.privesc_attempt_count,
         }
+        if (prevPhase !== 'awaiting_approval' && patch.phase === 'awaiting_approval') {
+          state.approvalState = 'idle'
+        }
         if (prevPhase === 'awaiting_approval' && patch.phase !== 'awaiting_approval') {
           state.approvalState = 'idle'
         }
@@ -592,12 +595,16 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
         state.task = { ...state.task, current_phase: 'awaiting_approval' }
       }
 
-      const withinProtection = Date.now() - state.approvalSubmittedAt < APPROVAL_PROTECTION_MS
-      if (state.approvalState === 'submitted' && !withinProtection) {
+      const withinProtection = state.approvalNonce && incomingNonce === state.approvalNonce
+        && Date.now() - state.approvalSubmittedAt < APPROVAL_PROTECTION_MS
+      if (state.approvalState === 'submitted' && withinProtection) {
+        // same nonce still in protection window, ignore duplicate
+      } else if (state.approvalState === 'submitted' && !withinProtection) {
         state.approvalNonce = incomingNonce
         state.approvalState = 'idle'
-      } else if (state.approvalState === 'idle') {
+      } else {
         state.approvalNonce = incomingNonce
+        state.approvalState = 'idle'
       }
 
       const p = (raw.payload || {}) as Record<string, unknown>

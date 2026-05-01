@@ -541,7 +541,7 @@ const messages = computed(() => {
     })
   }
 
-  const events = decisionEvents.value.slice(-160)
+  const events = decisionEvents.value.slice(-200)
   // 找到最新一个审批气泡的 id, 用于决定哪条审批 bubble 可交互。
   // 同时认 'approval_required' (后端 WS bus 推) 和 'approval'
   // (phase_log 文本"等待审批"派生) 两种 action: 任何一种事件存在都能让
@@ -761,6 +761,30 @@ const messages = computed(() => {
         text: `调用结果 · ${toolLabel}\nexit=${exitText} ｜ elapsed=${elapsedText}${entry.message ? '\n' + entry.message : ''}`.trim(),
         timestamp: time,
         payloads,
+      })
+      return
+    }
+
+    if (entry.action === 'tool_executed') {
+      const toolLabel = resolveToolDisplay({
+        display_tool: entry.display_tool,
+        tool: entry.tool,
+        command: entry.command,
+        purpose: entry.purpose,
+      })
+      const statusText = entry.status || entry.message || ''
+      const cleanMsg = entry.message
+        ? entry.message.replace(/^\s*\w+:\s*/, '').trim()
+        : ''
+      out.push({
+        id: baseId,
+        role: 'agent',
+        tone: entry.tone === 'warn' ? 'warning' : 'info',
+        text: `工具完成 · ${toolLabel}${cleanMsg ? '\n' + cleanMsg : ''}${statusText ? '\n' + statusText : ''}`.trim(),
+        timestamp: time,
+        payloads: entry.command
+          ? [{ title: 'Command', language: 'bash', code: entry.command }]
+          : null,
       })
       return
     }
@@ -1027,7 +1051,12 @@ const activeRailId = ref('')
 function handleRailJump(id) {
   if (!id || !streamRef.value) return
   const target = streamRef.value.querySelector(`[data-bubble-id="${CSS.escape(id)}"]`)
-  if (!target) return
+  if (!target) {
+    // 工具链节点对应的气泡不在当前视图(可能在更早的事件中已被裁剪)
+    // 尝试滚动到顶部,让用户看到最早的可见气泡
+    streamRef.value.scrollTo({ top: 0, behavior: 'smooth' })
+    return
+  }
   activeRailId.value = id
   target.scrollIntoView({ behavior: 'smooth', block: 'center' })
   target.classList.add('bubble-flash')
