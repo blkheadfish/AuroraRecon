@@ -25,6 +25,7 @@
     </div>
     <div v-else class="tree-canvas-wrap">
       <VChart
+        ref="chartRef"
         :option="option"
         :update-options="{ notMerge: true }"
         autoresize
@@ -48,7 +49,7 @@
 </template>
 
 <script setup>
-import { computed } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { Share } from '@element-plus/icons-vue'
 import VChart from 'vue-echarts'
 import { use } from 'echarts/core'
@@ -58,6 +59,8 @@ import { TitleComponent, TooltipComponent, LegendComponent } from 'echarts/compo
 import { useChartTheme } from '@/composables/useChartTheme'
 
 use([CanvasRenderer, TreeChart, TitleComponent, TooltipComponent, LegendComponent])
+
+const chartRef = ref(null)
 
 const props = defineProps({
   events: { type: Array, default: () => [] },
@@ -345,6 +348,24 @@ function escapeHtml(s) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
 }
+
+function resizeChart() {
+  nextTick(() => {
+    const instance = chartRef.value
+    if (instance && typeof instance.resize === 'function') {
+      instance.resize()
+    }
+  })
+}
+
+// 数据到位后强制 resize，确保 ECharts 在容器尺寸已确定的场景下正确渲染节点与边
+watch(styledTree, () => {
+  if (styledTree.value) resizeChart()
+})
+
+onMounted(() => {
+  resizeChart()
+})
 </script>
 
 <style scoped>

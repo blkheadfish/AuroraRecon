@@ -95,7 +95,7 @@
  *
  * 数据由 TaskDetail.vue 通过 props 注入（来自 GET /tasks/{id} 的 attack_graph 字段）。
  */
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import VChart from 'vue-echarts'
 import { use } from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
@@ -351,6 +351,24 @@ watch(() => props.graph, () => {
     drawerOpen.value = false
     selected.value = null
   }
+})
+
+function resizeChart() {
+  nextTick(() => {
+    const instance = chartRef.value
+    if (instance && typeof instance.resize === 'function') {
+      instance.resize()
+    }
+  })
+}
+
+// 节点数据就绪后强制 resize，解决 lazy tab 内 ECharts 首次挂载不自动布局的问题
+watch(nodes, (val) => {
+  if (val && val.length > 0) resizeChart()
+})
+
+onMounted(() => {
+  resizeChart()
 })
 </script>
 
