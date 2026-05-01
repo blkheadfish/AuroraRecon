@@ -233,8 +233,8 @@
                 <span v-else class="hint-source hint-source-fallback">via 正则</span>
               </span>
               <span v-else class="hint-target hint-target-missing">
-                <el-icon><Warning /></el-icon>
-                请在描述中包含目标 IP / 域名 / URL
+                <el-icon><Aim /></el-icon>
+                可以直接描述测试意图，无明确目标时 AI 会向你确认
               </span>
             </span>
             <el-button
@@ -375,7 +375,7 @@ const targetSource = computed<'llm' | 'regex' | 'idle'>(() => {
 })
 
 const canSubmit = computed(
-  () => !creating.value && form.value.userPrompt.trim().length > 0 && !!detectedTarget.value,
+  () => !creating.value && form.value.userPrompt.trim().length > 0,
 )
 
 let intentDebounceTimer: ReturnType<typeof setTimeout> | null = null
@@ -647,11 +647,29 @@ async function submit() {
     ElMessage.success(`任务已创建: ${task.target}`)
     setTimeout(() => router.push(`/tasks/${task.task_id}/chat`), 600)
   } catch (e: unknown) {
-    const detail =
-      (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail ||
-      (e as Error)?.message ||
-      '创建失败'
-    pushAgent(`创建失败: ${detail}`, 'warning')
+    const responseData = (e as { response?: { data?: { detail?: unknown } } })?.response?.data
+    const rawDetail = responseData?.detail
+
+    // 后端可能返回结构化对象 detail={status, message, questions, ...}
+    // 或者普通字符串 detail="xxx"
+    let detail: string
+    if (typeof rawDetail === 'object' && rawDetail !== null) {
+      const structured = rawDetail as Record<string, unknown>
+      detail = (structured.message as string) || (structured.detail as string) || JSON.stringify(rawDetail)
+      // 如果有补充问题，在聊天流中展示出来，引导用户补充
+      if (structured.status === 'pending_clarification' && Array.isArray(structured.questions) && structured.questions.length) {
+        pushAgent(
+          `${detail}\n\n${(structured.questions as string[]).map((q) => `• ${q}`).join('\n')}`,
+          'warning',
+        )
+        ElMessage.warning(detail)
+        creating.value = false
+        return
+      }
+    } else {
+      detail = String(rawDetail || (e as Error)?.message || '创建失败')
+    }
+    pushAgent(`${detail}`, 'warning')
     ElMessage.error(detail)
   } finally {
     creating.value = false

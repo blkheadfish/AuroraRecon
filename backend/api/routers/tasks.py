@@ -384,7 +384,11 @@ async def create_task(req: CreateTaskRequest, request: Request):
             }
 
     # ── PENDING_CLARIFICATION：目标不明确 ────────────────
-    if safety_intent.ambiguity_level in ("partial", "vague") and \
+    # 仅当 effective_target 为空时才需要从自然语言中反推目标；
+    # 若用户已显式提供了 target（通过 target 字段或前端识别），
+    # 即使 raw_prompt 中提取不到，也视为用户已有明确意图，不应拦截。
+    if not effective_target and \
+       safety_intent.ambiguity_level in ("partial", "vague") and \
        safety_intent.clarification_needed:
         raise HTTPException(
             status_code=400,
