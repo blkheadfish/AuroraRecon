@@ -320,7 +320,7 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
   }
 
   // ── 协议 v2: 按 event.id 字典序排序 (Stream ID 天然时序单调) ──
-  function mergeDecisionEvents(state: TaskLiveState, incoming: DecisionEvent[] = []) {
+  function mergeDecisionEvents(state: TaskLiveState, incoming: DecisionEvent[] = [], preSorted = false) {
     if (!Array.isArray(incoming) || !incoming.length) return
     for (const event of incoming) {
       const id = String(event?.id || '')
@@ -328,11 +328,14 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
       state.decisionEventIds.add(id)
       state.decisionEvents.push(event)
     }
-    // 协议 v2: 按 event.id 字典序排序 (Stream ID 形如 "1735689600123-0" 天然时序递增)
-    const sorted = state.decisionEvents.slice().sort((a, b) =>
-      String(a?.id || '').localeCompare(String(b?.id || '')),
-    )
-    state.decisionEvents.splice(0, state.decisionEvents.length, ...sorted)
+    if (!preSorted) {
+      const sorted = state.decisionEvents.slice().sort((a, b) => {
+        const aid = String(a?.id || '')
+        const bid = String(b?.id || '')
+        return aid < bid ? -1 : aid > bid ? 1 : 0
+      })
+      state.decisionEvents.splice(0, state.decisionEvents.length, ...sorted)
+    }
     if (state.decisionEvents.length > MAX_DECISION_EVENTS) {
       const drop = state.decisionEvents.length - MAX_DECISION_EVENTS
       const evicted = state.decisionEvents.splice(0, drop)
@@ -677,7 +680,7 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
             } as DecisionEvent)
           }
         }
-        if (dEvents.length) mergeDecisionEvents(state, dEvents)
+        if (dEvents.length) mergeDecisionEvents(state, dEvents, true)
       }
     } catch {
       // IndexedDB 不可用, 跳过预热

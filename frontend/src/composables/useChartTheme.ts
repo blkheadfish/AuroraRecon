@@ -1,4 +1,4 @@
-import { ref, watchEffect } from 'vue'
+import { ref, watchEffect, watch } from 'vue'
 import { useTheme } from '@/composables/useTheme'
 
 function getCssVar(name: string): string {
@@ -6,6 +6,10 @@ function getCssVar(name: string): string {
 }
 
 const revision = ref(0)
+
+// 缓存 getComputedStyle 结果，避免每次 computed 重算都触发强制回流
+let _colorsCache: ChartColors | null = null
+let _cacheRevision = -1
 
 export interface ChartColors {
   cyan: string
@@ -29,9 +33,11 @@ export function useChartTheme() {
 
   function colors(): ChartColors {
     void revision.value
+    if (_colorsCache && _cacheRevision === revision.value) return _colorsCache
 
+    _cacheRevision = revision.value
     const isDark = theme.value === 'dark'
-    return {
+    _colorsCache = {
       cyan:   getCssVar('--accent-blue')   || (isDark ? '#58b8e0' : '#3d8fd4'),
       teal:   getCssVar('--accent-green')  || (isDark ? '#4ec9b0' : '#2d9d76'),
       mint:   getCssVar('--accent-green')  || (isDark ? '#56c9a4' : '#2d9d76'),
@@ -42,6 +48,7 @@ export function useChartTheme() {
       amber:  getCssVar('--accent-yellow') || (isDark ? '#d9a84e' : '#b89244'),
       dim:    getCssVar('--text-muted')    || (isDark ? '#6e7681' : '#8b949e'),
     }
+    return _colorsCache
   }
 
   function palette(): string[] {

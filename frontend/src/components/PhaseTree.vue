@@ -215,27 +215,22 @@ const treeData = computed(() => {
     children: [],
   }))
 
-  // first-visit-of-phase index 缓存
-  const firstVisitIdx = {}
-  // (phase, visitNo) -> parent idx
   const parentOf = new Array(vs.length).fill(-1)
+  // phase -> Map<visitNo, index> for O(1) parent lookup
+  const phaseVisitMap = new Map()
 
   for (let i = 0; i < vs.length; i++) {
     const v = vs[i]
     if (v.visitNo === 1) {
-      firstVisitIdx[v.phase] = i
       parentOf[i] = i === 0 ? -1 : i - 1
     } else {
-      // 找到 visitNo - 1 的同 phase 的 visit
-      let prevIdx = -1
-      let count = 0
-      for (let j = 0; j < i; j++) {
-        if (vs[j].phase === v.phase) {
-          count += 1
-          if (count === v.visitNo - 1) { prevIdx = j; break }
-        }
-      }
+      const pm = phaseVisitMap.get(v.phase)
+      const prevIdx = pm?.get(v.visitNo - 1) ?? -1
       parentOf[i] = prevIdx >= 0 ? parentOf[prevIdx] : (i - 1)
+    }
+    if (v.phase) {
+      if (!phaseVisitMap.has(v.phase)) phaseVisitMap.set(v.phase, new Map())
+      phaseVisitMap.get(v.phase).set(v.visitNo, i)
     }
   }
 

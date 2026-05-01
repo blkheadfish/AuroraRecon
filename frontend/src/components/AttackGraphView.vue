@@ -351,7 +351,7 @@ watch(() => props.graph, () => {
     drawerOpen.value = false
     selected.value = null
   }
-}, { deep: true })
+})
 </script>
 
 <style scoped>
