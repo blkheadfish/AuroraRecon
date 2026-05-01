@@ -156,7 +156,11 @@ const filteredFindings = computed(() => {
   if (minConfidence.value > 0) {
     list = list.filter(f => (f.confidence ?? 50) >= minConfidence.value)
   }
-  list.sort((a, b) => severityOrder.indexOf(a.severity) - severityOrder.indexOf(b.severity))
+  list.sort((a, b) => {
+    const dc = (b.confidence ?? 50) - (a.confidence ?? 50)
+    if (dc !== 0) return dc
+    return severityOrder.indexOf(a.severity) - severityOrder.indexOf(b.severity)
+  })
   if (filterSev.value) {
     list = list.filter(f => f.severity === filterSev.value)
   }
