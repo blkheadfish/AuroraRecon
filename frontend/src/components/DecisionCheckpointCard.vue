@@ -100,6 +100,17 @@
       </div>
       <div class="footer-actions">
         <el-button
+          v-if="isPhaseCompleted"
+          type="danger"
+          plain
+          :loading="loading"
+          @click="onSubmitFinish"
+        >
+          <el-icon><CircleClose /></el-icon>
+          结束任务，生成报告
+        </el-button>
+        <el-button
+          v-else
           plain
           :loading="loading"
           @click="onSubmit('reject')"
@@ -108,7 +119,7 @@
           拒绝并跳过
         </el-button>
         <el-button
-          v-if="hasModifyOption"
+          v-if="hasModifyOption && !isPhaseCompleted"
           type="warning"
           plain
           :loading="loading"
@@ -123,7 +134,7 @@
           @click="onSubmit('approve')"
         >
           <el-icon><Check /></el-icon>
-          批准并继续
+          {{ isPhaseCompleted ? '继续下一阶段' : '批准并继续' }}
         </el-button>
       </div>
     </div>
@@ -162,6 +173,7 @@ const emit = defineEmits<{
     selected_option: string
     user_prompt: string
     note: string
+    next_action: string
   }): void
 }>()
 
@@ -276,14 +288,23 @@ watch(
   { immediate: true },
 )
 
+// phase_completed 类型的 checkpoint —— 交互式流程暂停点
+const isPhaseCompleted = computed(() => checkpointType.value === 'phase_completed')
+
 function onSubmit(action: 'approve' | 'reject' | 'modify' | 'skip') {
   if (props.loading) return
   let resolved = action
+  let nextAction = ''
   let selectedOption = selectedId.value || ''
   // 如果用户选了一个具体选项,以选项里声明的 action 为准
   const opt = visibleOptions.value.find((o) => o.id === selectedOption)
   if (opt?.action) {
     resolved = opt.action as typeof action
+    // 如果选项的 action 是 continue/skip/finish，将其作为 next_action
+    if (['continue', 'skip', 'finish'].includes(opt.action)) {
+      nextAction = opt.action
+      resolved = 'approve'  // 对后端来说，phase_checkpoint 的 continue=approve
+    }
   }
   if (resolved === 'modify' && !userPrompt.value.trim()) {
     ElMessage.warning('请输入你想要补充的意见,再点击「采纳意见后继续」')
@@ -294,7 +315,13 @@ function onSubmit(action: 'approve' | 'reject' | 'modify' | 'skip') {
     selected_option: selectedOption,
     user_prompt: userPrompt.value.trim(),
     note: '',
+    next_action: nextAction,
   })
+}
+
+function onSubmitFinish() {
+  selectedId.value = 'finish'
+  onSubmit('approve')
 }
 </script>
 

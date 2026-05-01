@@ -198,6 +198,7 @@ class CheckpointDecisionRequest(BaseModel):
     selected_option: str = ""
     user_prompt: str = ""
     note: str = ""
+    next_action: str = ""  # "continue" | "skip" | "finish" — 交互式流程用
 
 
 # ── 设置相关 ──────────────────────────────────────────────

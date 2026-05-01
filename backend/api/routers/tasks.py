@@ -924,6 +924,7 @@ async def respond_checkpoint(
         "selected_option": req.selected_option,
         "user_prompt": req.user_prompt,
         "note": req.note,
+        "next_action": req.next_action,
     })
 
     approved = req.action != "reject"

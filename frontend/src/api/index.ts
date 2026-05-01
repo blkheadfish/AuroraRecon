@@ -103,6 +103,7 @@ export const api = {
 
   createTask: (payload: {
     target: string
+    rawPrompt?: string
     note?: string
     extraHint?: string
     userPrompt?: string
@@ -117,6 +118,7 @@ export const api = {
   }): Promise<TaskSummary> =>
     http.post('/tasks', {
       target:              payload.target,
+      raw_prompt:          payload.rawPrompt ?? '',
       scope_note:          payload.note ?? 'CTF/授权靶场测试',
       extra_hint:          payload.extraHint ?? '',
       user_prompt:         payload.userPrompt ?? '',
@@ -164,6 +166,7 @@ export const api = {
       selected_option?: string
       user_prompt?: string
       note?: string
+      next_action?: string
     },
   ): Promise<{ status: string; approved: boolean; action: string }> =>
     http.post(`/tasks/${id}/checkpoint/respond`, {
@@ -171,6 +174,7 @@ export const api = {
       selected_option: payload.selected_option ?? '',
       user_prompt: payload.user_prompt ?? '',
       note: payload.note ?? '',
+      next_action: payload.next_action ?? '',
     }),
 
   getSettings: (): Promise<SettingsPayload> => http.get('/settings'),

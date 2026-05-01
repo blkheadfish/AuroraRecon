@@ -744,6 +744,7 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
       selected_option?: string
       user_prompt?: string
       note?: string
+      next_action?: string
     },
   ) {
     const s = ensureState(taskId)

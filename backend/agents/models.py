@@ -79,6 +79,7 @@ class TaskStatus(str, Enum):
 	PENDING = "pending"
 	RUNNING = "running"
 	AWAITING_APPROVAL = "awaiting_approval"
+	WAITING_USER = "waiting_user"
 	COMPLETED = "completed"
 	FAILED = "failed"
 
@@ -978,6 +979,7 @@ class PentestState(BaseModel):
 				"selected_option": response.get("selected_option", ""),
 				"user_prompt": response.get("user_prompt", ""),
 				"note": response.get("note", ""),
+				"next_action": response.get("next_action", ""),
 			},
 		})
 		self.checkpoint_history.append(archived)

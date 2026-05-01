@@ -93,6 +93,20 @@ _CHAIN_PHASE_ORDER: list[str] = [
     "report",
 ]
 
+# 交互式模式下，每个阶段结束后暂停等待用户指令
+# interrupt_before 的含义：在进入该节点前暂停，让用户审查上一阶段的结果
+_INTERACTIVE_INTERRUPT_NODES: list[str] = [
+    "surface_enum",
+    "intel_harvest",
+    "vuln_scan",
+    "exploit_decision",
+    "foothold_attempt",
+    "secondary_attack",
+    "post_foothold_enum",
+    "privesc_attempt",
+    "objective_collect",
+]
+
 
 def _record_chain_visit(state: PentestState, phase_name: str) -> None:
     if phase_name not in state.chain_visited:
@@ -245,6 +259,93 @@ def _yield_if_interrupted(state: PentestState, node_name: str) -> bool:
         f"[{node_name}] 让步给操作员指令(reason={entry.get('reason','')})"
     )
     return True
+
+
+def _read_last_user_action(state: PentestState) -> str:
+    """从最近一次 checkpoint 响应中读取用户的下步动作。
+
+    返回: "continue" | "skip" | "finish" | "continue"
+    默认返回 "continue"（安全默认值，不阻塞流程）。
+    """
+    history = state.checkpoint_history or []
+    if not history:
+        return "continue"
+    last = history[-1]
+    resp = last.get("response", {}) if isinstance(last, dict) else {}
+    action = str(resp.get("action") or "").strip().lower()
+    # 支持通过 next_action 显式指定（优先级高于 action）
+    next_action = str(resp.get("next_action") or "").strip().lower()
+    if next_action in ("continue", "skip", "finish"):
+        return next_action
+    # 兼容旧 action 字段
+    if action == "reject":
+        return "skip"
+    return "continue"
+
+
+def _push_phase_checkpoint(state: PentestState, phase_name: str,
+                            summary: str, findings_count: int = 0) -> None:
+    """在阶段完成后推送 phase_completed checkpoint，触发前端交互。
+
+    这个 checkpoint 不阻塞 LangGraph 执行——阻塞由 interrupt_before 负责。
+    它的作用是将阶段结果摘要推送到前端，让用户看到并决策。
+    """
+    state.open_checkpoint({
+        "checkpoint_type": "phase_completed",
+        "phase": phase_name,
+        "summary": summary,
+        "thinking": f"阶段 {phase_name} 已完成，等待你的指令",
+        "recommendation": (
+            f"{phase_name} 阶段已完成"
+            + (f"，发现 {findings_count} 个漏洞" if findings_count else "")
+            + "。请选择: 继续 / 跳过下一阶段 / 结束任务"
+        ),
+        "options": [
+            {"value": "continue", "label": "继续下一阶段", "action": "continue"},
+            {"value": "skip", "label": "跳过下一阶段", "action": "skip"},
+            {"value": "finish", "label": "结束任务，生成报告", "action": "finish"},
+        ],
+        "risk": "info",
+        "requires_input": True,
+        "default_action": "continue",
+    })
+    state.status = TaskStatus.WAITING_USER
+    logger.info(
+        f"[phase_checkpoint] {phase_name} 完成, 等待用户指令 "
+        f"(task={state.task_id})"
+    )
+
+
+def _maybe_skip_or_finish(state: PentestState, phase_name: str) -> bool:
+    """在阶段节点开头调用，检查用户是否要求跳过或结束。
+
+    返回 True 表示本节点应该直接 return（跳过/结束），False 表示正常执行。
+    """
+    action = _read_last_user_action(state)
+    if action == "finish":
+        state.log(f"[交互] 用户要求结束任务，跳过 {phase_name}，直接进入报告")
+        state.push_decision({
+            "action": "user_requested_finish",
+            "phase": phase_name,
+            "message": f"用户要求结束任务，跳过 {phase_name}",
+            "tone": "info",
+        })
+        return True
+    if action == "skip":
+        state.log(f"[交互] 用户跳过阶段: {phase_name}")
+        state.push_decision({
+            "action": "user_skipped_phase",
+            "phase": phase_name,
+            "message": f"用户跳过阶段: {phase_name}",
+            "tone": "info",
+        })
+        return True
+    return False
+
+
+def _should_finish(state: PentestState) -> bool:
+    """判断用户是否要求结束任务（finish 动作）。"""
+    return _read_last_user_action(state) == "finish"
 
 
 def _consume_operator_plan_for_phase(
@@ -856,6 +957,8 @@ async def node_vuln_scan(state: PentestState) -> PentestState:
     _record_chain_visit(state, "vuln_scan")
     if _yield_if_interrupted(state, "vuln_scan"):
         return state
+    if _maybe_skip_or_finish(state, "vuln_scan"):
+        return state
 
     # Consume paths discovered by intel_harvest and merge into attack surface
     if state.intel_discovered_paths:
@@ -1074,6 +1177,8 @@ async def node_surface_enum(state: PentestState) -> PentestState:
     state.current_phase = "surface_enum"
     _record_chain_visit(state, "surface_enum")
     if _yield_if_interrupted(state, "surface_enum"):
+        return state
+    if _maybe_skip_or_finish(state, "surface_enum"):
         return state
 
     # ── 增量入口：消费 pending_seeds["ports"]/["web_paths"] ──
@@ -1667,6 +1772,8 @@ async def node_intel_harvest(state: PentestState) -> PentestState:
     _record_chain_visit(state, "intel_harvest")
     if _yield_if_interrupted(state, "intel_harvest"):
         return state
+    if _maybe_skip_or_finish(state, "intel_harvest"):
+        return state
 
     file_targets, page_targets = _classify_harvest_targets(state)
     # 增量幂等：基于本轮目标集合签名
@@ -1967,6 +2074,8 @@ async def node_exploit_decision(state: PentestState) -> PentestState:
     _record_chain_visit(state, "exploit_decision")
     if _yield_if_interrupted(state, "exploit_decision"):
         return state
+    if _maybe_skip_or_finish(state, "exploit_decision"):
+        return state
     exploitable = [f for f in state.findings if f.exploitable]
     if not exploitable:
         state.log("无可利用漏洞，跳过利用阶段")
@@ -2140,6 +2249,8 @@ async def node_foothold_attempt(state: PentestState) -> PentestState:
     _record_chain_visit(state, "foothold_attempt")
     if _yield_if_interrupted(state, "foothold_attempt"):
         return state
+    if _maybe_skip_or_finish(state, "foothold_attempt"):
+        return state
     exploitable = [f for f in state.findings if f.exploitable]
     before_snapshot = _snapshot_facts(state)
     _normalize_and_dedupe_state_facts(state, source_node="foothold_attempt_pre")
@@ -2259,6 +2370,8 @@ async def node_secondary_attack(state: PentestState) -> PentestState:
     _record_chain_visit(state, "secondary_attack")
     if _yield_if_interrupted(state, "secondary_attack"):
         return state
+    if _maybe_skip_or_finish(state, "secondary_attack"):
+        return state
     # linear 模式保持兼容：done 标志仍然写为 True；feedback / supervisor 模式
     # 通过 secondary_attack_count + max_secondary_attacks 控制重入次数。
     state.secondary_attack_done = True
@@ -2375,6 +2488,8 @@ async def node_post_foothold_enum(state: PentestState) -> PentestState:
     state.current_phase = "post_foothold_enum"
     _record_chain_visit(state, "post_foothold_enum")
     if _yield_if_interrupted(state, "post_foothold_enum"):
+        return state
+    if _maybe_skip_or_finish(state, "post_foothold_enum"):
         return state
     before_snapshot = _snapshot_facts(state)
     state.log("攻链: 立足后枚举")
@@ -2519,6 +2634,8 @@ async def node_privesc_attempt(state: PentestState) -> PentestState:
     _record_chain_visit(state, "privesc_attempt")
     if _yield_if_interrupted(state, "privesc_attempt"):
         return state
+    if _maybe_skip_or_finish(state, "privesc_attempt"):
+        return state
     state.privesc_attempt_count += 1
     before_snapshot = _snapshot_facts(state)
     if not _consume_risk_budget(state, cost=1):
@@ -2568,6 +2685,8 @@ async def node_objective_collect(state: PentestState) -> PentestState:
     state.current_phase = "objective_collect"
     _record_chain_visit(state, "objective_collect")
     if _yield_if_interrupted(state, "objective_collect"):
+        return state
+    if _maybe_skip_or_finish(state, "objective_collect"):
         return state
     state.log("攻链: 目标收集（flag / proof 线索）")
     try:
@@ -2967,7 +3086,7 @@ def _build_graph_linear(checkpointer=None):
 
     return graph.compile(
         checkpointer=checkpointer,
-        interrupt_before=["human_approval", "post_foothold_approval"],
+        interrupt_before=["human_approval", "post_foothold_approval"] + _INTERACTIVE_INTERRUPT_NODES,
     )
 
 
@@ -3075,7 +3194,7 @@ def _build_graph_feedback(checkpointer=None):
 
     return graph.compile(
         checkpointer=checkpointer,
-        interrupt_before=["human_approval", "post_foothold_approval"],
+        interrupt_before=["human_approval", "post_foothold_approval"] + _INTERACTIVE_INTERRUPT_NODES,
     )
 
 
@@ -3126,7 +3245,7 @@ def _build_graph_supervisor(checkpointer=None):
 
     return graph.compile(
         checkpointer=checkpointer,
-        interrupt_before=["human_approval", "post_foothold_approval"],
+        interrupt_before=["human_approval", "post_foothold_approval"] + _INTERACTIVE_INTERRUPT_NODES,
     )
 
 
