@@ -28,8 +28,9 @@
     <div v-if="!nodes.length" class="graph-empty">
       <el-empty description="尚未捕获攻击图节点（运行中节点出现新事实后会自动绘制）" />
     </div>
-    <div v-else class="graph-canvas-wrap">
+    <div v-else ref="canvasWrapRef" class="graph-canvas-wrap">
       <VChart
+        v-if="chartReady"
         ref="chartRef"
         :option="option"
         :update-options="{ notMerge: false }"
@@ -95,7 +96,7 @@
  *
  * 数据由 TaskDetail.vue 通过 props 注入（来自 GET /tasks/{id} 的 attack_graph 字段）。
  */
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import VChart from 'vue-echarts'
 import { use } from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
@@ -353,22 +354,48 @@ watch(() => props.graph, () => {
   }
 })
 
-function resizeChart() {
+// 延迟 ECharts 初始化: lazy tab 激活前容器 display:none, 尺寸为 0;
+// 激活后容器可能已有尺寸, ResizeObserver 不会触发回调, 所以先用
+// getBoundingClientRect 主动检测, 有尺寸直接挂载, 没有才等 Observer。
+const canvasWrapRef = ref(null)
+const chartReady = ref(false)
+let _ro = null
+
+function _tryMountChart() {
   nextTick(() => {
-    const instance = chartRef.value
-    if (instance && typeof instance.resize === 'function') {
-      instance.resize()
+    const el = canvasWrapRef.value
+    if (!el) return
+    // 已经有确定尺寸，直接挂载
+    const rect = el.getBoundingClientRect()
+    if (rect.width > 0 && rect.height > 0) {
+      chartReady.value = true
+      return
     }
+    // 还没有尺寸，等 ResizeObserver 回调
+    if (_ro) _ro.disconnect()
+    _ro = new ResizeObserver(entries => {
+      const { width, height } = entries[0].contentRect
+      if (width > 0 && height > 0) {
+        chartReady.value = true
+        _ro.disconnect()
+      }
+    })
+    _ro.observe(el)
   })
 }
 
-// 节点数据就绪后强制 resize，解决 lazy tab 内 ECharts 首次挂载不自动布局的问题
-watch(nodes, (val) => {
-  if (val && val.length > 0) resizeChart()
+// graph-canvas-wrap 由 v-else 控制，当 nodes 从空变为非空时 DOM 才出现，
+// ResizeObserver 需要重新绑定到新元素上
+watch([() => nodes.value.length, canvasWrapRef], ([len]) => {
+  if (len > 0) _tryMountChart()
 })
 
 onMounted(() => {
-  resizeChart()
+  if (nodes.value.length > 0) _tryMountChart()
+})
+
+onUnmounted(() => {
+  if (_ro) _ro.disconnect()
 })
 </script>
 

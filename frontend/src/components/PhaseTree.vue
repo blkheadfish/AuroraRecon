@@ -23,8 +23,9 @@
     <div v-if="!visits.length" class="tree-empty">
       <el-empty description="尚未产生阶段决策事件" :image-size="64" />
     </div>
-    <div v-else class="tree-canvas-wrap">
+    <div v-else ref="canvasWrapRef" class="tree-canvas-wrap">
       <VChart
+        v-if="chartReady && styledTree"
         ref="chartRef"
         :option="option"
         :update-options="{ notMerge: true }"
@@ -49,7 +50,7 @@
 </template>
 
 <script setup>
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { Share } from '@element-plus/icons-vue'
 import VChart from 'vue-echarts'
 import { use } from 'echarts/core'
@@ -229,7 +230,13 @@ const treeData = computed(() => {
     } else {
       const pm = phaseVisitMap.get(v.phase)
       const prevIdx = pm?.get(v.visitNo - 1) ?? -1
-      parentOf[i] = prevIdx >= 0 ? parentOf[prevIdx] : (i - 1)
+      if (prevIdx < 0) {
+        parentOf[i] = i - 1
+      } else {
+        const gp = parentOf[prevIdx]
+        // gp < 0 说明 prevIdx 本身是根节点，重访时挂在根下而非覆盖 root
+        parentOf[i] = gp >= 0 ? gp : prevIdx
+      }
     }
     if (v.phase) {
       if (!phaseVisitMap.has(v.phase)) phaseVisitMap.set(v.phase, new Map())
@@ -349,22 +356,43 @@ function escapeHtml(s) {
     .replace(/"/g, '&quot;')
 }
 
-function resizeChart() {
+// 延迟 ECharts 初始化：容器尺寸未确定时 canvas 渲染会缺边缺节点。
+// 先用 getBoundingClientRect 主动检测 — 元素已有尺寸时 observer 不会回调。
+const canvasWrapRef = ref(null)
+const chartReady = ref(false)
+let _ro = null
+
+function _tryMountChart() {
   nextTick(() => {
-    const instance = chartRef.value
-    if (instance && typeof instance.resize === 'function') {
-      instance.resize()
+    const el = canvasWrapRef.value
+    if (!el) return
+    const rect = el.getBoundingClientRect()
+    if (rect.width > 0 && rect.height > 0) {
+      chartReady.value = true
+      return
     }
+    if (_ro) _ro.disconnect()
+    _ro = new ResizeObserver(entries => {
+      const { width, height } = entries[0].contentRect
+      if (width > 0 && height > 0) {
+        chartReady.value = true
+        _ro.disconnect()
+      }
+    })
+    _ro.observe(el)
   })
 }
 
-// 数据到位后强制 resize，确保 ECharts 在容器尺寸已确定的场景下正确渲染节点与边
-watch(styledTree, () => {
-  if (styledTree.value) resizeChart()
+watch(visits, (v) => {
+  if (v.length > 0) _tryMountChart()
 })
 
 onMounted(() => {
-  resizeChart()
+  if (visits.value.length > 0) _tryMountChart()
+})
+
+onUnmounted(() => {
+  if (_ro) _ro.disconnect()
 })
 </script>
 
