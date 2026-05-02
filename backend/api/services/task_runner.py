@@ -225,6 +225,22 @@ async def run_task(
         state.log("⏸ 等待人工审批,请在前端点击「授权并继续」")
         sm.set(task_id, state)
         from datetime import datetime as _dt
+        exploitable = [f for f in state.findings if f.exploitable]
+        risk_note = (
+            "高风险" if any(f.severity in ("critical", "high") for f in exploitable)
+            else "中等风险" if exploitable else "低风险"
+        )
+        top_targets = [
+            {
+                "name": f.name,
+                "severity": f.severity,
+                "vuln_id": f.vuln_id,
+                "cve": f.cve or "",
+                "port": getattr(f, "port", None),
+                "description": (f.description or "")[:120],
+            }
+            for f in exploitable[:5]
+        ]
         await event_stream.publish(
             task_id, type="approval_required",
             payload={
@@ -234,6 +250,9 @@ async def run_task(
                 "logs": state.phase_log[-3:],
                 "findings_count": len(state.findings),
                 "got_shell": state.got_shell,
+                "exploitable_count": len(exploitable),
+                "top_targets": top_targets,
+                "risk": risk_note,
             },
             branch_id=state.active_branch_id or "",
         )

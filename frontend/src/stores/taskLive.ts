@@ -6,6 +6,7 @@ import { subscribeTaskEvents } from '@/services/wsManager'
 import { loadEvents } from '@/services/eventStore'
 import { useTaskListStore } from '@/stores/taskList'
 import type {
+  ApprovalTarget,
   BranchTreeItem,
   CheckpointPayload,
   DecisionEvent,
@@ -614,13 +615,26 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
 
       const p = (raw.payload || {}) as Record<string, unknown>
       const serverIso = String(p.server_iso || '')
+      const exploitableCount = Number(p.exploitable_count ?? 0)
+      const topTargets = (p.top_targets as ApprovalTarget[]) || []
+      const risk = String(p.risk || '')
+      // Build richer message: surface the actual context to approval card
+      const targetsSummary = topTargets.slice(0, 3)
+        .map((t) => `${t.severity?.toUpperCase?.() || '?'} | ${t.name}${t.cve ? ` (${t.cve})` : ''}`)
+        .join('\n')
+      const message = exploitableCount > 0
+        ? `系统已识别 ${exploitableCount} 个可利用漏洞，等待你的授权再开始利用。` + (targetsSummary ? `\n\n待利用目标:\n${targetsSummary}` : '')
+        : '系统检测到可利用路径，等待人工审批。'
       const approvalEvent: DecisionEvent = {
         id: String(raw.id || `approval-req-${taskId}-${incomingNonce}`),
         timestamp: serverIso || String(raw.ts || new Date().toISOString()),
         phase: 'awaiting_approval',
         action: 'approval_required',
-        message: '系统检测到可利用路径，等待人工审批。',
+        message,
         tone: 'warning',
+        exploitable_count: exploitableCount,
+        top_targets: topTargets,
+        risk,
       } as DecisionEvent
       mergeDecisionEvents(state, [approvalEvent])
       if (state.task) {
