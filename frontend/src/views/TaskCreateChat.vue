@@ -331,25 +331,7 @@
               @click="submit"
             >
               <el-icon><Promotion /></el-icon>
-              {{ planGenerating ? '生成策略中...' : planPreview ? '确认并创建' : '生成策略并创建' }}
-            </el-button>
-            <el-button
-              v-if="planPreview"
-              plain
-              size="small"
-              :disabled="creating"
-              @click="regeneratePlan"
-            >
-              重新生成
-            </el-button>
-            <el-button
-              v-if="!planPreview && !planGenerating"
-              text
-              size="small"
-              :disabled="!canSubmit"
-              @click="skipPlanAndSubmit"
-            >
-              跳过预览
+              {{ planGenerating ? '生成策略中...' : planPreview ? '确认并创建' : '创建并开始' }}
             </el-button>
           </div>
         </div>
@@ -730,6 +712,16 @@ function goBack() {
 async function generatePlanPreview() {
   const userPrompt = form.value.userPrompt.trim()
   if (!userPrompt) return
+  // 添加用户消息（仅首次生成时）
+  if (!planPreview.value) {
+    messages.value.push({
+      id: `user-${Date.now()}`,
+      role: 'user',
+      text: userPrompt,
+      timestamp: nowTime(),
+    })
+    scrollToBottom()
+  }
   planGenerating.value = true
   planError.value = ''
   try {
@@ -746,29 +738,14 @@ async function generatePlanPreview() {
     const msg = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
       || (e as Error)?.message || '策略生成失败'
     planError.value = String(msg)
-    pushAgent(`策略生成失败: ${planError.value}，可直接创建任务`, 'warning')
+    pushAgent(`策略生成失败: ${planError.value}`, 'warning')
+    // 失败后允许直接创建
+    planPreview.value = null
+    doCreateTask()
+    return
   } finally {
     planGenerating.value = false
   }
-}
-
-/** 跳过策略预览，直接创建任务 */
-function skipPlanAndSubmit() {
-  planPreview.value = null
-  planError.value = ''
-  doCreateTask()
-}
-
-/** 重新生成策略预览 */
-function regeneratePlan() {
-  planPreview.value = null
-  planError.value = ''
-  // 移除上一条策略预览消息
-  const lastIdx = messages.value.length - 1
-  if (lastIdx >= 0 && messages.value[lastIdx].role === 'agent') {
-    messages.value.splice(lastIdx, 1)
-  }
-  generatePlanPreview()
 }
 
 async function submit() {
@@ -778,23 +755,14 @@ async function submit() {
     }
     return
   }
-  const target = detectedTarget.value || ''
-  const userText = form.value.userPrompt.trim()
 
-  // ── Step 1: 尚未生成策略预览 → 先生成 ──
+  // 未生成策略 → 先生成
   if (!planPreview.value && !planGenerating.value) {
-    messages.value.push({
-      id: `user-${Date.now()}`,
-      role: 'user',
-      text: userText,
-      timestamp: nowTime(),
-    })
-    scrollToBottom()
     await generatePlanPreview()
     return
   }
 
-  // ── Step 2: 已生成预览 → 确认创建任务 ──
+  // 策略已生成 → 确认创建
   doCreateTask()
 }
 
@@ -1345,24 +1313,15 @@ function cancelConfirmation() {
 /* ── Plan Mode: 策略预览卡片 ─────────────────────── */
 .plan-preview-card {
   margin: 12px 0;
-  padding: 16px 20px;
+  padding: 20px 24px;
   background: color-mix(in srgb, var(--accent-blue) 6%, var(--bg-surface));
   border: 1px solid color-mix(in srgb, var(--accent-blue) 30%, var(--border));
   border-left: 3px solid var(--accent-blue);
   border-radius: 10px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 14px;
   animation: planIn 0.25s ease-out;
-  max-height: 420px;
-  overflow-y: auto;
-  scrollbar-width: thin;
-  scrollbar-color: color-mix(in srgb, var(--text-primary) 22%, transparent) transparent;
-}
-.plan-preview-card::-webkit-scrollbar { width: 8px; }
-.plan-preview-card::-webkit-scrollbar-thumb {
-  background: color-mix(in srgb, var(--text-primary) 18%, transparent);
-  border-radius: 4px;
 }
 @keyframes planIn {
   from { opacity: 0; transform: translateY(-6px); }
@@ -1393,70 +1352,70 @@ function cancelConfirmation() {
 }
 .plan-preview-section p {
   margin: 0;
-  font-size: 13px;
-  line-height: 1.55;
+  font-size: 14px;
+  line-height: 1.6;
   color: var(--text-primary);
 }
 .plan-preview-label {
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
   color: var(--text-muted);
   text-transform: uppercase;
   letter-spacing: 0.05em;
 }
 .plan-preview-phase {
-  padding: 8px 0;
+  padding: 14px 0;
   border-top: 1px dashed color-mix(in srgb, var(--text-primary) 10%, transparent);
 }
 .plan-preview-phase-head {
   display: flex;
   align-items: baseline;
-  gap: 8px;
-  margin-bottom: 6px;
+  gap: 10px;
+  margin-bottom: 8px;
 }
 .plan-preview-phase-name {
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 600;
   font-family: var(--font-mono);
   color: var(--accent-blue);
-  padding: 2px 8px;
+  padding: 2px 10px;
   border-radius: var(--radius-sm);
   background: color-mix(in srgb, var(--accent-blue) 12%, transparent);
 }
 .plan-preview-phase-desc {
-  font-size: 12px;
+  font-size: 13px;
   color: var(--text-secondary);
 }
 .plan-preview-steps {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 8px;
   padding-left: 4px;
 }
 .plan-preview-step {
   display: flex;
   align-items: baseline;
-  gap: 6px;
-  font-size: 12px;
-  line-height: 1.5;
+  gap: 8px;
+  font-size: 13px;
+  line-height: 1.6;
 }
 .plan-preview-step-idx {
   flex-shrink: 0;
-  width: 18px;
-  height: 18px;
+  width: 22px;
+  height: 22px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   border-radius: 50%;
   background: color-mix(in srgb, var(--text-primary) 8%, transparent);
-  font-size: 10px;
+  font-size: 11px;
   color: var(--text-muted);
   font-weight: 600;
 }
 .plan-preview-step-tool {
   font-family: var(--font-mono);
-  font-size: 11px;
-  padding: 1px 6px;
+  font-size: 12px;
+  padding: 2px 8px;
   border-radius: var(--radius-sm);
   background: color-mix(in srgb, #2ea043 15%, transparent);
   color: color-mix(in srgb, #2ea043 85%, var(--text-primary));
@@ -1464,8 +1423,8 @@ function cancelConfirmation() {
 }
 .plan-preview-step-skill {
   font-family: var(--font-mono);
-  font-size: 11px;
-  padding: 1px 6px;
+  font-size: 12px;
+  padding: 2px 8px;
   border-radius: var(--radius-sm);
   background: color-mix(in srgb, var(--accent-purple) 15%, transparent);
   color: var(--accent-purple);
