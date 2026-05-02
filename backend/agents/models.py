@@ -686,6 +686,11 @@ class PentestState(BaseModel):
 	credential_store: list[dict[str, Any]] = Field(default_factory=list)
 	loot_store: list[dict[str, Any]] = Field(default_factory=list)
 
+	# ── 横向移动 / 持久化 / 内网扫描 ────────────────────
+	lateral_results: dict[str, Any] = Field(default_factory=dict)
+	persistence_entries: list[dict[str, Any]] = Field(default_factory=list)
+	internal_network: dict[str, Any] = Field(default_factory=dict)
+
 	privesc_hypotheses: list[dict[str, Any]] = Field(default_factory=list)
 	# user_proof / root_proof / report_ready 等
 	objective_status: dict[str, Any] = Field(default_factory=dict)
@@ -736,6 +741,8 @@ class PentestState(BaseModel):
 	# 统一从这里取数, 避免每个节点各自再去解读 pending_user_prompt 字符串。
 	# 计划是 sticky 的, 直到下一次新指令产生新的 OperatorPlan 才被覆盖。
 	operator_plan: Optional[OperatorPlan] = None
+	# 用户确认的渗透策略（Plan Mode，类似 Cursor Plan 模式）
+	pentest_plan: Optional[dict[str, Any]] = None
 	# 历史计划(末尾追加, 限长 20), 用于审计 / 调试 / 回放。
 	operator_plan_history: list[OperatorPlan] = Field(default_factory=list)
 

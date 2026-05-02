@@ -48,6 +48,9 @@ class CreateTaskRequest(BaseModel):
     skill_min_score: Optional[int] = None
     skill_weak_boost: Optional[int] = None
 
+    # ── Plan Mode: 用户确认的策略 ───────────────────────
+    confirmed_plan: Optional[dict] = None  # PentestPlan 的 dict 形式
+
     @field_validator("target")
     @classmethod
     def validate_target(cls, v: str) -> str:
@@ -353,3 +356,64 @@ class ParseIntentResponse(BaseModel):
     confidence: float = 0.0
     fallback: bool = False
     error: str = ""
+
+
+# ── 策略规划（Plan Mode — 类似 Cursor Plan 模式）─────────
+
+class PlanStep(BaseModel):
+    """单个策略步骤"""
+    tool: str = ""               # 工具名（仅 recon/vuln_scan 阶段）
+    skill: str = ""              # Skill 名（仅 exploit/post_exploit 阶段）
+    purpose: str = ""            # 为什么用这个工具/Skill
+    command_hint: str = ""       # 大致的命令参数方向
+    expected_output: str = ""    # 预期能得到什么信息
+    trigger_condition: str = ""  # Skill 触发条件
+    expected_impact: str = ""    # 预期影响
+    fallback: str = ""           # 失败后的兜底策略
+    depends_on: str = ""         # 依赖的前序产出
+    enabled: bool = True         # 用户可禁用该步骤
+
+
+class PlanPhase(BaseModel):
+    """策略中的单个阶段"""
+    phase: str = ""              # recon / vuln_scan / exploit / post_exploit
+    description: str = ""
+    steps: list[PlanStep] = []
+
+
+class PentestPlan(BaseModel):
+    """完整的渗透策略"""
+    target_understanding: str = ""
+    phases: list[PlanPhase] = []
+    unsupported_hints: list[str] = []
+    risk_notes: list[str] = []
+
+
+class PlanRequest(BaseModel):
+    """策略生成请求"""
+    user_prompt: str
+
+    @field_validator("user_prompt")
+    @classmethod
+    def validate_user_prompt(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("user_prompt 不能为空")
+        return v[:2000]
+
+
+class PlanResponse(BaseModel):
+    """策略生成响应"""
+    plan_id: str = ""
+    plan: PentestPlan = Field(default_factory=PentestPlan)
+    available_tools_count: int = 0
+    available_skills_count: int = 0
+
+
+class ConfirmPlanRequest(BaseModel):
+    """用户确认/修改后的策略提交"""
+    plan_id: str
+    plan: PentestPlan
+    user_note: str = ""          # 用户补充备注
+    target: str = ""             # 目标地址
+    workflow_mode: WorkflowMode = "pentest_engineer"

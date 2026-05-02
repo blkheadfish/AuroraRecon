@@ -12,7 +12,8 @@ orchestrator.py  ── 改进版
   START → recon → surface_enum → intel_harvest → vuln_scan → exploit_decision
         → human_approval（interrupt_before 暂停等待审批）
         → foothold_attempt → secondary_attack（可选）→ post_foothold_enum
-        → privesc_attempt（可循环）→ objective_collect → report → END
+        → internal_scan → privesc_attempt（可循环）→ lateral_movement
+        → persistence → objective_collect → report → END
         ↓（无可利用漏洞）
         report → END
 """
@@ -88,7 +89,10 @@ _CHAIN_PHASE_ORDER: list[str] = [
     "secondary_attack",
     "post_foothold_enum",
     "post_foothold_approval",
+    "internal_scan",
     "privesc_attempt",
+    "lateral_movement",
+    "persistence",
     "objective_collect",
     "report",
 ]
@@ -452,6 +456,80 @@ def _consume_operator_plan_for_phase(
     })
 
 
+def _plan_get_phase_steps(state: PentestState, phase_name: str) -> list[dict]:
+    """从 ``state.pentest_plan`` 中提取指定阶段已启用的步骤列表。
+
+    返回每个步骤的 dict（含 tool/skill/purpose 等字段），
+    只返回 enabled=True 的步骤。没有 plan 或该阶段无步骤时返回空列表。
+    """
+    plan = state.pentest_plan or {}
+    if not plan:
+        return []
+    phases = plan.get("phases", [])
+    for phase in phases:
+        if phase.get("phase") != phase_name:
+            continue
+        steps = phase.get("steps", [])
+        return [s for s in steps if s.get("enabled", True)]
+    return []
+
+
+def _plan_should_skip_phase(state: PentestState, phase_name: str) -> tuple[bool, str]:
+    """检查 pentest_plan 是否指示跳过该阶段。
+
+    如果 plan 中该阶段无 enabled 步骤，则跳过。
+    如果 plan 中根本没有该阶段，则不跳过（走正常逻辑）。
+    """
+    plan = state.pentest_plan or {}
+    if not plan:
+        return False, ""
+    phases = plan.get("phases", [])
+    phase_exists = any(p.get("phase") == phase_name for p in phases)
+    if not phase_exists:
+        # Plan doesn't mention this phase at all → let normal logic decide
+        return False, ""
+    steps = _plan_get_phase_steps(state, phase_name)
+    if not steps:
+        return True, f"策略中 {phase_name} 阶段无启用步骤，跳过"
+    return False, ""
+
+
+def _plan_get_step_tools(state: PentestState, phase_name: str) -> list[str]:
+    """获取策略中某个阶段启用的步骤中指定的工具名列表（用于 recon/vuln 阶段）。"""
+    steps = _plan_get_phase_steps(state, phase_name)
+    tools = []
+    for s in steps:
+        t = (s.get("tool") or "").strip()
+        if t and t not in tools:
+            tools.append(t)
+    return tools
+
+
+def _plan_get_step_skills(state: PentestState, phase_name: str) -> list[str]:
+    """获取策略中某个阶段启用的步骤中指定的 Skill 名列表（用于 exploit/post 阶段）。"""
+    steps = _plan_get_phase_steps(state, phase_name)
+    skills = []
+    for s in steps:
+        sid = (s.get("skill") or "").strip()
+        if sid and sid not in skills:
+            skills.append(sid)
+    return skills
+
+
+def _plan_log_phase_steps(state: PentestState, phase_name: str) -> None:
+    """记录 Plan 模式下当前阶段将执行的步骤。"""
+    steps = _plan_get_phase_steps(state, phase_name)
+    if not steps:
+        return
+    state.log(f"[Plan] {phase_name} 阶段将执行以下步骤:")
+    for i, s in enumerate(steps, 1):
+        tool = s.get("tool", "")
+        skill = s.get("skill", "")
+        label = tool or skill or "?"
+        purpose = s.get("purpose", "")[:80]
+        state.log(f"  [{i}] {label}: {purpose}")
+
+
 def _build_dir_intel(state: PentestState) -> dict[str, Any]:
     """Build structured directory intelligence from web_paths_inventory and related state."""
     intel: dict[str, Any] = {
@@ -782,6 +860,14 @@ async def node_recon(state: PentestState) -> PentestState:
     state.current_phase = "recon"
     _record_chain_visit(state, "recon")
     state.status = TaskStatus.RUNNING
+
+    # ── Plan Mode: 检查策略是否要求跳过该阶段 ─────────────────
+    skip_plan, skip_plan_reason = _plan_should_skip_phase(state, "recon")
+    if skip_plan:
+        state.log(f"[Plan] {skip_plan_reason}")
+        return state
+    _plan_log_phase_steps(state, "recon")
+
     if _yield_if_interrupted(state, "recon"):
         return state
 
@@ -979,6 +1065,14 @@ async def node_vuln_scan(state: PentestState) -> PentestState:
     from backend.agents.vuln_agent import VulnAgent
     state.current_phase = "vuln_scan"
     _record_chain_visit(state, "vuln_scan")
+
+    # ── Plan Mode: 检查策略是否要求跳过该阶段 ─────────────────
+    skip_plan, skip_plan_reason = _plan_should_skip_phase(state, "vuln_scan")
+    if skip_plan:
+        state.log(f"[Plan] {skip_plan_reason}")
+        return state
+    _plan_log_phase_steps(state, "vuln_scan")
+
     if _yield_if_interrupted(state, "vuln_scan"):
         return state
     if _maybe_skip_or_finish(state, "vuln_scan"):
@@ -2159,6 +2253,14 @@ async def node_exploit_decision(state: PentestState) -> PentestState:
     from backend.llm.router import LLMRouter
     state.current_phase = "exploit_decision"
     _record_chain_visit(state, "exploit_decision")
+
+    # ── Plan Mode: 检查策略是否要求跳过该阶段 ─────────────────
+    skip_plan, skip_plan_reason = _plan_should_skip_phase(state, "exploit")
+    if skip_plan:
+        state.log(f"[Plan] {skip_plan_reason}")
+        return state
+    _plan_log_phase_steps(state, "exploit")
+
     if _yield_if_interrupted(state, "exploit_decision"):
         return state
     if _maybe_skip_or_finish(state, "exploit_decision"):
@@ -2574,6 +2676,14 @@ async def node_post_foothold_enum(state: PentestState) -> PentestState:
     from backend.agents.post_agent import PostExploitAgent
     state.current_phase = "post_foothold_enum"
     _record_chain_visit(state, "post_foothold_enum")
+
+    # ── Plan Mode: 检查策略是否要求跳过该阶段 ─────────────────
+    skip_plan, skip_plan_reason = _plan_should_skip_phase(state, "post_exploit")
+    if skip_plan:
+        state.log(f"[Plan] {skip_plan_reason}")
+        return state
+    _plan_log_phase_steps(state, "post_exploit")
+
     if _yield_if_interrupted(state, "post_foothold_enum"):
         return state
     if _maybe_skip_or_finish(state, "post_foothold_enum"):
@@ -2711,7 +2821,7 @@ async def node_post_foothold_approval(state: PentestState) -> PentestState:
 
 def edge_after_post_foothold_approval(state: PentestState) -> str:
     if state.post_approved:
-        return "privesc_attempt"
+        return "internal_scan"
     return "objective_collect"
 
 
@@ -2764,6 +2874,130 @@ async def node_privesc_attempt(state: PentestState) -> PentestState:
     except Exception as e:
         state.error_msg = str(e)
         state.log(f"提权阶段异常: {e}")
+    return state
+
+
+async def node_internal_scan(state: PentestState) -> PentestState:
+    """Discover internal subnets and hosts from the compromised target."""
+    from backend.agents.post_agent import PostExploitAgent
+    state.current_phase = "internal_scan"
+    _record_chain_visit(state, "internal_scan")
+    if _yield_if_interrupted(state, "internal_scan"):
+        return state
+    if _maybe_skip_or_finish(state, "internal_scan"):
+        return state
+    if not state.got_shell:
+        state.log("攻链: 无立足点, 跳过内网扫描")
+        return state
+    state.log("攻链: 内网扫描 (发现内部网络 & 主机)")
+    try:
+        agent = PostExploitAgent()
+
+        async def _on_tool_log(line: str):
+            state.log(line)
+
+        async def _on_exec_record(record: dict):
+            _append_tool_record(state, record, default_phase="internal_scan")
+
+        res = await agent.run_internal_scan(
+            exploit_results=state.exploit_results,
+            target_os=state.target_os,
+            task_id=state.task_id,
+            log_callback=_on_tool_log,
+            record_callback=_on_exec_record,
+        )
+        state.internal_network = res
+        subnets = res.get("subnets", [])
+        hosts = res.get("hosts", [])
+        state.log(f"内网扫描完成: {len(subnets)} 子网, {len(hosts)} 主机")
+    except Exception as e:
+        state.error_msg = str(e)
+        state.log(f"内网扫描异常: {e}")
+    return state
+
+
+async def node_lateral_movement(state: PentestState) -> PentestState:
+    """Attempt lateral movement using discovered credentials."""
+    from backend.agents.post_agent import PostExploitAgent
+    state.current_phase = "lateral_movement"
+    _record_chain_visit(state, "lateral_movement")
+    if _yield_if_interrupted(state, "lateral_movement"):
+        return state
+    if _maybe_skip_or_finish(state, "lateral_movement"):
+        return state
+    if not state.credential_store and not state.got_shell:
+        state.log("攻链: 无凭据且无立足点, 跳过横向移动")
+        return state
+    state.log("攻链: 横向移动")
+    try:
+        agent = PostExploitAgent()
+
+        async def _on_tool_log(line: str):
+            state.log(line)
+
+        async def _on_exec_record(record: dict):
+            _append_tool_record(state, record, default_phase="lateral_movement")
+
+        res = await agent.run_lateral_movement(
+            exploit_results=state.exploit_results,
+            credential_store=state.credential_store,
+            target_os=state.target_os,
+            task_id=state.task_id,
+            log_callback=_on_tool_log,
+            record_callback=_on_exec_record,
+        )
+        state.lateral_results = res
+        findings = res.get("findings", {})
+        lateral_successes = findings.get("lateral_successes", [])
+        if lateral_successes:
+            state.log(f"横向移动成功: {len(lateral_successes)} 台主机")
+        else:
+            state.log("横向移动: 未发现可利用路径")
+    except Exception as e:
+        state.error_msg = str(e)
+        state.log(f"横向移动异常: {e}")
+    return state
+
+
+async def node_persistence(state: PentestState) -> PentestState:
+    """Establish persistence on the compromised host."""
+    from backend.agents.post_agent import PostExploitAgent
+    state.current_phase = "persistence"
+    _record_chain_visit(state, "persistence")
+    if _yield_if_interrupted(state, "persistence"):
+        return state
+    if _maybe_skip_or_finish(state, "persistence"):
+        return state
+    if not state.got_shell:
+        state.log("攻链: 无立足点, 跳过持久化")
+        return state
+    state.log("攻链: 持久化安装")
+    try:
+        agent = PostExploitAgent()
+
+        async def _on_tool_log(line: str):
+            state.log(line)
+
+        async def _on_exec_record(record: dict):
+            _append_tool_record(state, record, default_phase="persistence")
+
+        res = await agent.run_persistence(
+            exploit_results=state.exploit_results,
+            target_os=state.target_os,
+            task_id=state.task_id,
+            log_callback=_on_tool_log,
+            record_callback=_on_exec_record,
+        )
+        methods = res.get("methods", [])
+        state.persistence_entries = methods
+        if methods:
+            names = ", ".join(m.get("type", "?") for m in methods)
+            state.log(f"持久化成功: {names}")
+        else:
+            state.log("持久化: 未成功安装任何方法")
+    except Exception as e:
+        state.error_msg = str(e)
+        state.log(f"持久化异常: {e}")
     return state
 
 
@@ -3005,12 +3239,12 @@ def edge_after_secondary(state: PentestState) -> str:
 
 def edge_after_privesc(state: PentestState) -> str:
     if state.status == TaskStatus.FAILED:
-        return "objective_collect"
+        return "lateral_movement"
     pl = (state.privilege_level or "").lower()
     if pl == "root":
-        return "objective_collect"
+        return "lateral_movement"
     if state.privesc_attempt_count >= state.max_privesc_rounds:
-        return "objective_collect"
+        return "lateral_movement"
     return "privesc_again"
 
 
@@ -3098,17 +3332,17 @@ def edge_after_post_foothold_enum_v2(state: PentestState) -> str:
 
 
 def edge_after_privesc_v2(state: PentestState) -> str:
-    """提权出口：到 root → objective；产生新凭据 → vuln_scan；否则按老规则。"""
+    """提权出口：到 root → lateral；产生新凭据 → vuln_scan；否则按老规则。"""
     if state.status == TaskStatus.FAILED:
-        return "objective_collect"
+        return "lateral_movement"
     pl = (state.privilege_level or "").lower()
     if pl == "root":
-        return "objective_collect"
+        return "lateral_movement"
     sig = state.replan_signals or {}
     if sig.get("re_vuln_scan_for_creds") and _can_replan(state, "vuln_scan"):
         return _do_replan(state, "vuln_scan", "re_vuln_scan_for_creds")
     if state.privesc_attempt_count >= state.max_privesc_rounds:
-        return "objective_collect"
+        return "lateral_movement"
     return "privesc_again"
 
 
@@ -3123,7 +3357,8 @@ def edge_after_privesc_v2(state: PentestState) -> str:
 _LINEAR_ENTRY_PHASES: set[str] = {
     "recon", "surface_enum", "intel_harvest", "vuln_scan",
     "exploit_decision", "foothold_attempt", "secondary_attack",
-    "post_foothold_enum", "privesc_attempt", "objective_collect",
+    "post_foothold_enum", "internal_scan", "privesc_attempt",
+    "lateral_movement", "persistence", "objective_collect",
 }
 
 
@@ -3205,7 +3440,10 @@ def _build_graph_linear(checkpointer=None):
     graph.add_node("foothold_attempt",    node_foothold_attempt)
     graph.add_node("secondary_attack",    node_secondary_attack)
     graph.add_node("post_foothold_enum",  node_post_foothold_enum)
+    graph.add_node("internal_scan",       node_internal_scan)
     graph.add_node("privesc_attempt",     node_privesc_attempt)
+    graph.add_node("lateral_movement",    node_lateral_movement)
+    graph.add_node("persistence",         node_persistence)
     graph.add_node("objective_collect",   node_objective_collect)
     graph.add_node("report",              node_report)
 
@@ -3222,7 +3460,10 @@ def _build_graph_linear(checkpointer=None):
             "foothold_attempt":   "foothold_attempt",
             "secondary_attack":   "secondary_attack",
             "post_foothold_enum": "post_foothold_enum",
+            "internal_scan":      "internal_scan",
             "privesc_attempt":    "privesc_attempt",
+            "lateral_movement":   "lateral_movement",
+            "persistence":        "persistence",
             "objective_collect":  "objective_collect",
         },
     )
@@ -3258,15 +3499,18 @@ def _build_graph_linear(checkpointer=None):
     graph.add_edge("post_foothold_enum", "post_foothold_approval")
     graph.add_conditional_edges(
         "post_foothold_approval", edge_after_post_foothold_approval,
-        {"privesc_attempt": "privesc_attempt", "objective_collect": "objective_collect"},
+        {"privesc_attempt": "privesc_attempt", "internal_scan": "internal_scan"},
     )
+    graph.add_edge("internal_scan", "privesc_attempt")
     graph.add_conditional_edges(
         "privesc_attempt", edge_after_privesc,
         {
-            "objective_collect": "objective_collect",
+            "lateral_movement": "lateral_movement",
             "privesc_again": "privesc_attempt",
         },
     )
+    graph.add_edge("lateral_movement", "persistence")
+    graph.add_edge("persistence", "objective_collect")
     graph.add_edge("objective_collect", "report")
     graph.add_edge("report", END)
 
@@ -3296,7 +3540,10 @@ def _build_graph_feedback(checkpointer=None):
     graph.add_node("secondary_attack",    node_secondary_attack)
     graph.add_node("post_foothold_enum",  node_post_foothold_enum)
     graph.add_node("post_foothold_approval", node_post_foothold_approval)
+    graph.add_node("internal_scan",       node_internal_scan)
     graph.add_node("privesc_attempt",     node_privesc_attempt)
+    graph.add_node("lateral_movement",    node_lateral_movement)
+    graph.add_node("persistence",         node_persistence)
     graph.add_node("objective_collect",   node_objective_collect)
     graph.add_node("report",              node_report)
 
@@ -3312,7 +3559,10 @@ def _build_graph_feedback(checkpointer=None):
             "foothold_attempt":   "foothold_attempt",
             "secondary_attack":   "secondary_attack",
             "post_foothold_enum": "post_foothold_enum",
+            "internal_scan":      "internal_scan",
             "privesc_attempt":    "privesc_attempt",
+            "lateral_movement":   "lateral_movement",
+            "persistence":        "persistence",
             "objective_collect":  "objective_collect",
         },
     )
@@ -3365,16 +3615,19 @@ def _build_graph_feedback(checkpointer=None):
     )
     graph.add_conditional_edges(
         "post_foothold_approval", edge_after_post_foothold_approval,
-        {"privesc_attempt": "privesc_attempt", "objective_collect": "objective_collect"},
+        {"internal_scan": "internal_scan", "objective_collect": "objective_collect"},
     )
+    graph.add_edge("internal_scan", "privesc_attempt")
     graph.add_conditional_edges(
         "privesc_attempt", edge_after_privesc_v2,
         {
-            "objective_collect": "objective_collect",
+            "lateral_movement": "lateral_movement",
             "privesc_again": "privesc_attempt",
             "vuln_scan": "vuln_scan",
         },
     )
+    graph.add_edge("lateral_movement", "persistence")
+    graph.add_edge("persistence", "objective_collect")
     graph.add_edge("objective_collect", "report")
     graph.add_edge("report", END)
 
@@ -3409,7 +3662,10 @@ def _build_graph_supervisor(checkpointer=None):
     graph.add_node("secondary_attack",    node_secondary_attack)
     graph.add_node("post_foothold_enum",  node_post_foothold_enum)
     graph.add_node("post_foothold_approval", node_post_foothold_approval)
+    graph.add_node("internal_scan",       node_internal_scan)
     graph.add_node("privesc_attempt",     node_privesc_attempt)
+    graph.add_node("lateral_movement",    node_lateral_movement)
+    graph.add_node("persistence",         node_persistence)
     graph.add_node("objective_collect",   node_objective_collect)
     graph.add_node("report",              node_report)
 
@@ -3419,7 +3675,8 @@ def _build_graph_supervisor(checkpointer=None):
         "recon", "surface_enum", "intel_harvest", "vuln_scan",
         "exploit_decision", "human_approval", "foothold_attempt",
         "secondary_attack", "post_foothold_enum", "post_foothold_approval",
-        "privesc_attempt", "objective_collect",
+        "internal_scan", "privesc_attempt", "lateral_movement",
+        "persistence", "objective_collect",
     ]
     for p in PHASE_NODES:
         graph.add_edge(p, "supervisor")
