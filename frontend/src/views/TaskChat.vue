@@ -356,7 +356,6 @@
       </div>
     </main>
 
-    <footer class="chat-footer">
       <section class="composer" :class="{ 'composer-flash': composerFlashing }">
         <div v-if="branches.length || activeBranch" class="branch-status-band">
           <span class="band-icon">
@@ -471,7 +470,6 @@
           </div>
         </div>
       </section>
-    </footer>
   </div>
 </template>
 
@@ -2357,15 +2355,12 @@ onUnmounted(() => {
   transform: translateX(-50%) translateY(8px);
 }
 
-.chat-footer {
-  flex-shrink: 0;
-  padding: 14px 28px 18px;
-  border-top: 1px solid var(--border);
-  background: var(--bg-elevated);
-}
 .composer {
+  flex-shrink: 0;
   max-width: 1080px;
+  width: 100%;
   margin: 0 auto;
+  margin-bottom: 18px;
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   background: var(--bg-surface);

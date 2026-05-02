@@ -449,6 +449,8 @@ const intent = ref<IntentState>({
 })
 
 const intentVisible = computed(() => {
+  if (creating.value) return false
+  if (planPreview.value) return false
   if (intent.value.loading) return true
   if (!intent.value.loaded) return false
   return Boolean(
