@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time as _time
 import uuid
@@ -19,6 +20,8 @@ from backend.api.schemas import (
     CheckpointDecisionRequest, ChatMessageRequest,
     ParseIntentRequest, ParseIntentResponse,
     PendingConfirmationResponse, TaskCreateResponse,
+    PlanRequest, PlanResponse, PentestPlan, PlanPhase, PlanStep,
+    ConfirmPlanRequest,
 )
 from backend.api.state import get_state_manager, TaskStateManager
 from backend.api import event_stream
@@ -274,6 +277,353 @@ async def parse_task_intent(req: ParseIntentRequest, request: Request):
     return ParseIntentResponse(**payload, fallback=False)
 
 
+# ── 策略规划辅助函数 ──────────────────────────────────────
+
+def _load_available_tools() -> list[dict[str, str]]:
+    """遍历 tools/definitions/ 目录，提取所有已注册工具的名称与描述。
+    返回列表，每个元素为 {"name": "...", "category": "...", "description": "..."}
+    """
+    import glob as _glob
+    import yaml as _yaml
+
+    tools_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+        "tools", "definitions",
+    )
+    tools: list[dict[str, str]] = []
+    if not os.path.isdir(tools_dir):
+        return tools
+    for yaml_path in sorted(_glob.glob(os.path.join(tools_dir, "*.yaml"))):
+        try:
+            with open(yaml_path, "r", encoding="utf-8") as fh:
+                docs = list(_yaml.safe_load_all(fh))
+            for doc in docs:
+                if not isinstance(doc, list):
+                    continue
+                for item in doc:
+                    if not isinstance(item, dict):
+                        continue
+                    name = str(item.get("name") or "").strip()
+                    if not name:
+                        continue
+                    tools.append({
+                        "name": name,
+                        "category": str(item.get("category") or "").strip(),
+                        "description": str(item.get("description") or "").strip(),
+                    })
+        except Exception as e:
+            logger.warning(f"[plan] skip tool file {yaml_path}: {e}")
+    return tools
+
+
+def _load_available_skills() -> list[dict[str, str]]:
+    """遍历 skills/ 目录，提取所有已注册 Skill 名称与触发条件。
+    返回列表，每个元素为 {"skill_id": "...", "name": "...", "category": "...", "match_rules": "..."}
+    """
+    import glob as _glob
+    import yaml as _yaml
+
+    skills_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+        "skills",
+    )
+    skills: list[dict[str, str]] = []
+    if not os.path.isdir(skills_dir):
+        return skills
+    for yaml_path in sorted(_glob.glob(os.path.join(skills_dir, "**/*.yaml"), recursive=True)):
+        try:
+            with open(yaml_path, "r", encoding="utf-8") as fh:
+                doc = _yaml.safe_load(fh)
+            if not isinstance(doc, dict):
+                continue
+            skill_id = str(doc.get("skill_id") or "").strip()
+            if not skill_id:
+                continue
+            match_rules = ""
+            match_block = doc.get("match")
+            if isinstance(match_block, dict):
+                rules = match_block.get("rules", [])
+                rule_parts: list[str] = []
+                for rule in rules if isinstance(rules, list) else []:
+                    if isinstance(rule, dict):
+                        for k, v in rule.items():
+                            rule_parts.append(f"{k}: {json.dumps(v)}")
+                    elif isinstance(rule, str):
+                        rule_parts.append(rule)
+                match_rules = "; ".join(rule_parts[:3])
+            skills.append({
+                "skill_id": skill_id,
+                "name": str(doc.get("name") or "").strip(),
+                "category": str(doc.get("category") or "").strip(),
+                "match_rules": match_rules,
+            })
+        except Exception as e:
+            logger.warning(f"[plan] skip skill file {yaml_path}: {e}")
+    return skills
+
+
+def _build_available_tools_text(tools: list[dict[str, str]]) -> str:
+    """将工具列表格式化为 prompt 可读文本。"""
+    if not tools:
+        return "（暂无已注册工具）"
+    categories: dict[str, list[str]] = {}
+    for t in tools:
+        cat = t.get("category", "other")
+        categories.setdefault(cat, []).append(
+            f"  - {t['name']}: {t.get('description', '无描述')}"
+        )
+    lines: list[str] = []
+    for cat in sorted(categories):
+        lines.append(f"### {cat}")
+        lines.extend(categories[cat])
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _build_available_skills_text(skills: list[dict[str, str]]) -> str:
+    """将 Skill 列表格式化为 prompt 可读文本。"""
+    if not skills:
+        return "（暂无已注册 Skill）"
+    categories: dict[str, list[str]] = {}
+    for s in skills:
+        cat = s.get("category", "other")
+        match = s.get("match_rules", "")
+        entry = f"  - {s['skill_id']}: {s.get('name', '')}"
+        if match:
+            entry += f" [触发条件: {match}]"
+        categories.setdefault(cat, []).append(entry)
+    lines: list[str] = []
+    for cat in sorted(categories):
+        lines.append(f"### {cat}")
+        lines.extend(categories[cat])
+        lines.append("")
+    return "\n".join(lines)
+
+
+# ── 策略规划接口（Plan Mode）──────────────────────────────
+
+@router.post("/tasks/plan", response_model=PlanResponse)
+async def generate_pentest_plan(req: PlanRequest, request: Request):
+    """
+    生成渗透策略（不创建任务，不执行任何工具）。
+
+    流程:
+      1. 动态读取已注册工具列表和 Skill 列表
+      2. 将列表注入 PLAN_GENERATION_PROMPT
+      3. 调用 LLM 在可用能力范围内生成完整渗透策略
+      4. 返回策略供前端展示，用户可审查/修改/确认
+
+    注意:
+      - 该接口**只读**，不创建任务，不执行任何工具
+      - 生成的策略中的每个工具名/Skill 名都保证来自已注册列表
+    """
+    user_id = getattr(request.state, "user_id", "") or ""
+    if not user_id:
+        raise HTTPException(status_code=401, detail="未登录")
+
+    user_prompt = req.user_prompt
+    if not user_prompt.strip():
+        raise HTTPException(status_code=400, detail="user_prompt 不能为空")
+
+    # Step 1: 动态加载可用工具和 Skill
+    available_tools = _load_available_tools()
+    available_skills = _load_available_skills()
+
+    tools_text = _build_available_tools_text(available_tools)
+    skills_text = _build_available_skills_text(available_skills)
+
+    logger.info(
+        f"[plan] 加载了 {len(available_tools)} 个工具, "
+        f"{len(available_skills)} 个 Skill"
+    )
+
+    # Step 2: 调用 LLM 生成策略
+    from backend.llm.router import LLMRouter
+    from backend.llm.prompts.templates import PLAN_GENERATION_PROMPT
+
+    prompt = PLAN_GENERATION_PROMPT.format(
+        user_prompt=user_prompt,
+        available_tools=tools_text,
+        available_skills=skills_text,
+    )
+
+    llm = LLMRouter()
+    try:
+        raw = await asyncio.wait_for(
+            llm.chat(
+                prompt,
+                response_format="json",
+                temperature=0.2,
+                max_tokens=4096,
+            ),
+            timeout=60.0,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="LLM 策略生成超时，请重试")
+    except Exception as e:
+        logger.error(f"[plan] LLM 调用失败: {e}")
+        raise HTTPException(status_code=502, detail=f"LLM 调用失败: {e}")
+
+    # Step 3: 解析 LLM 返回的 JSON
+    try:
+        data = json.loads(raw if isinstance(raw, str) else str(raw))
+        if not isinstance(data, dict):
+            raise ValueError("LLM 返回不是 JSON 对象")
+    except Exception as e:
+        logger.error(f"[plan] JSON 解析失败: {e}, raw={raw[:500]}")
+        raise HTTPException(status_code=502, detail=f"策略解析失败: {e}")
+
+    # Step 4: 校验生成的工具名/Skill 名是否都在已注册列表中
+    valid_tool_names = {t["name"] for t in available_tools}
+    valid_skill_ids = {s["skill_id"] for s in available_skills}
+
+    unknown_tools: list[str] = []
+    unknown_skills: list[str] = []
+    for phase in data.get("phases", []):
+        for step in phase.get("steps", []):
+            tool_name = (step.get("tool") or "").strip()
+            skill_name = (step.get("skill") or "").strip()
+            if tool_name and tool_name not in valid_tool_names:
+                unknown_tools.append(f"{tool_name} (phase={phase.get('phase', '?')})")
+            if skill_name and skill_name not in valid_skill_ids:
+                unknown_skills.append(f"{skill_name} (phase={phase.get('phase', '?')})")
+
+    if unknown_tools or unknown_skills:
+        warning_parts = []
+        if unknown_tools:
+            warning_parts.append(f"未知工具: {', '.join(unknown_tools)}")
+        if unknown_skills:
+            warning_parts.append(f"未知 Skill: {', '.join(unknown_skills)}")
+        logger.warning(f"[plan] LLM 生成了未注册的能力: {'; '.join(warning_parts)}")
+        # 不直接拒绝，但记录警告；前端可根据 unsupported_hints 判断
+
+    # Step 5: 构建响应
+    plan_id = str(uuid.uuid4())
+    plan_obj = PentestPlan(
+        target_understanding=str(data.get("target_understanding") or ""),
+        phases=[
+            PlanPhase(
+                phase=str(p.get("phase", "")),
+                description=str(p.get("description", "")),
+                steps=[
+                    PlanStep(
+                        tool=str(s.get("tool") or ""),
+                        skill=str(s.get("skill") or ""),
+                        purpose=str(s.get("purpose") or ""),
+                        command_hint=str(s.get("command_hint") or ""),
+                        expected_output=str(s.get("expected_output") or ""),
+                        trigger_condition=str(s.get("trigger_condition") or ""),
+                        expected_impact=str(s.get("expected_impact") or ""),
+                        fallback=str(s.get("fallback") or ""),
+                        depends_on=str(s.get("depends_on") or ""),
+                        enabled=True,
+                    )
+                    for s in (p.get("steps") or []) if isinstance(s, dict)
+                ],
+            )
+            for p in (data.get("phases") or []) if isinstance(p, dict)
+        ],
+        unsupported_hints=[
+            str(h) for h in (data.get("unsupported_hints") or []) if h
+        ],
+        risk_notes=[
+            str(r) for r in (data.get("risk_notes") or []) if r
+        ],
+    )
+    return PlanResponse(
+        plan_id=plan_id,
+        plan=plan_obj,
+        available_tools_count=len(available_tools),
+        available_skills_count=len(available_skills),
+    )
+
+
+# ── 初始策略推送 ──────────────────────────────────────────
+
+async def _push_initial_plan_event(
+    task_id: str,
+    state: "PentestState",
+    req: CreateTaskRequest,
+    parsed_intent_dict: dict | None,
+    effective_target: str,
+) -> None:
+    """任务创建后立即推送一条初始策略事件到前端, 让用户在任务开始执行前
+    就能看到 Agent 对目标的理解和即将遵循的路径。
+
+    这条事件会被 ``TaskChat.vue`` 的 ``action='initial_plan'`` 分支渲染成
+    高亮策略卡片, 与后续 ``operator_replan`` 卡片保持一致的视觉语言。
+    """
+    try:
+        from backend.agents.models import WorkflowMode
+
+        # ── 构建策略卡片内容 ─────────────────────────────
+        mode_label = {
+            "pentest_engineer": "渗透工程师",
+            "ctf_expert": "CTF 选手",
+        }.get(req.workflow_mode, req.workflow_mode)
+
+        plan_steps: list[str] = []
+        # 核心阶段序列
+        core_phases = ["recon", "surface_enum", "vuln_scan", "exploit_decision"]
+        if req.auto_approve:
+            core_phases.append("foothold_attempt")
+        else:
+            core_phases.append("human_approval")
+            core_phases.append("foothold_attempt")
+        plan_steps.append("阶段序列: " + " → ".join(core_phases) + " → ...")
+
+        # 工作模式
+        plan_steps.append(f"工作模式: {mode_label}")
+        if req.auto_approve:
+            plan_steps.append("自动审批: 已启用 (关键节点不暂停)")
+        else:
+            plan_steps.append("人工审批: 关键节点将暂停等待确认")
+
+        if req.scope_note:
+            plan_steps.append(f"授权说明: {req.scope_note[:120]}")
+        if req.extra_hint:
+            plan_steps.append(f"额外提示: {req.extra_hint[:200]}")
+
+        # 从 parsed_intent 提取攻击偏好
+        if parsed_intent_dict:
+            intents = parsed_intent_dict.get("intents", []) or []
+            if intents:
+                plan_steps.append(f"攻击倾向: {', '.join(intents[:6])}")
+            priority_vulns = parsed_intent_dict.get("priority_vulns", []) or []
+            if priority_vulns:
+                plan_steps.append(f"重点关注: {', '.join(priority_vulns[:6])}")
+            summary = parsed_intent_dict.get("summary", "")
+        else:
+            summary = ""
+
+        # 目标理解文本
+        target_understanding = summary or (
+            f"目标: {effective_target}, "
+            f"授权范围: {req.scope_note or 'CTF/靶场测试'}"
+        )
+
+        await event_stream.publish(
+            task_id,
+            type="decision_event",
+            payload={
+                "action": "initial_plan",
+                "phase": "init",
+                "thinking": target_understanding,
+                "purpose": "初始渗透策略",
+                "plan": plan_steps,
+                "message": (
+                    f"已生成初始策略: 目标={effective_target}, "
+                    f"模式={mode_label}"
+                ),
+                "tone": "primary",
+                "workflow_mode": req.workflow_mode,
+                "auto_approve": req.auto_approve,
+            },
+        )
+    except Exception as exc:
+        logger.warning(f"[create_task] 推送初始策略事件失败: {exc}")
+
+
 # ── CRUD ──────────────────────────────────────────────────
 
 @router.post("/tasks", response_model=TaskCreateResponse)
@@ -429,6 +779,7 @@ async def create_task(req: CreateTaskRequest, request: Request):
         authorization_token=req.authorization_token,
         parsed_intent=parsed_intent_dict or safety_intent.model_dump(),
         safety_check_result=safety_result.model_dump(),
+        pentest_plan=req.confirmed_plan,  # Plan Mode: 用户确认的策略
     )
     # 填入 workflow_mode 默认值,并用请求里显式传入的覆盖项替换
     apply_mode_defaults(
@@ -451,6 +802,9 @@ async def create_task(req: CreateTaskRequest, request: Request):
             await save_task(state)
         except Exception as e:
             logger.warning(f"[DB] 保存失败: {e}")
+
+    # ── 推送初始策略到前端 ─────────────────────────────────
+    _push_initial_plan_event(task_id, state, req, parsed_intent_dict, effective_target)
 
     from backend.api.services.task_runner import run_task
     from backend.api.services.branch_manager import get_branch_manager

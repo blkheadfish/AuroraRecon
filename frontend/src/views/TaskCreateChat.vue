@@ -72,6 +72,57 @@
           </div>
         </div>
 
+        <!-- Plan Mode: 策略预览卡片 -->
+        <div v-if="planPreview" class="plan-preview-card">
+          <div class="plan-preview-head">
+            <el-icon class="plan-preview-icon"><MagicStick /></el-icon>
+            <span>渗透策略预览</span>
+            <span class="plan-preview-id">#{{ planPreview.planId }}</span>
+          </div>
+
+          <div v-if="planPreview.plan.target_understanding" class="plan-preview-section">
+            <span class="plan-preview-label">目标理解</span>
+            <p>{{ planPreview.plan.target_understanding }}</p>
+          </div>
+
+          <div
+            v-for="(phase, pi) in planPreview.plan.phases"
+            :key="pi"
+            class="plan-preview-phase"
+          >
+            <div class="plan-preview-phase-head">
+              <code class="plan-preview-phase-name">{{ phase.phase }}</code>
+              <span v-if="phase.description" class="plan-preview-phase-desc">{{ phase.description }}</span>
+            </div>
+            <div class="plan-preview-steps">
+              <div
+                v-for="(step, si) in phase.steps.filter(s => s.enabled)"
+                :key="si"
+                class="plan-preview-step"
+              >
+                <span class="plan-preview-step-idx">{{ si + 1 }}</span>
+                <span v-if="step.tool" class="plan-preview-step-tool">{{ step.tool }}</span>
+                <span v-if="step.skill" class="plan-preview-step-skill">{{ step.skill }}</span>
+                <span class="plan-preview-step-purpose">{{ step.purpose }}</span>
+              </div>
+            </div>
+          </div>
+
+          <div v-if="planPreview.plan.risk_notes?.length" class="plan-preview-risks">
+            <span class="plan-preview-label">风险提示</span>
+            <ul>
+              <li v-for="(r, ri) in planPreview.plan.risk_notes" :key="ri">{{ r }}</li>
+            </ul>
+          </div>
+
+          <div v-if="planPreview.plan.unsupported_hints?.length" class="plan-preview-hints">
+            <span class="plan-preview-label">能力限制</span>
+            <ul>
+              <li v-for="(h, hi) in planPreview.plan.unsupported_hints" :key="hi">{{ h }}</li>
+            </ul>
+          </div>
+        </div>
+
         <div v-if="advancedDirty" class="advanced-summary">
           <span class="muted">已生效的高级配置:</span>
           <el-tag
@@ -275,12 +326,30 @@
             </span>
             <el-button
               type="primary"
-              :loading="creating"
-              :disabled="!canSubmit"
+              :loading="creating || planGenerating"
+              :disabled="!canSubmit || planGenerating"
               @click="submit"
             >
               <el-icon><Promotion /></el-icon>
-              创建并开始
+              {{ planGenerating ? '生成策略中...' : planPreview ? '确认并创建' : '生成策略并创建' }}
+            </el-button>
+            <el-button
+              v-if="planPreview"
+              plain
+              size="small"
+              :disabled="creating"
+              @click="regeneratePlan"
+            >
+              重新生成
+            </el-button>
+            <el-button
+              v-if="!planPreview && !planGenerating"
+              text
+              size="small"
+              :disabled="!canSubmit"
+              @click="skipPlanAndSubmit"
+            >
+              跳过预览
             </el-button>
           </div>
         </div>
@@ -307,7 +376,7 @@ import {
 import { api } from '@/api'
 import { useTaskListStore } from '@/stores/taskList'
 import { trackEvent } from '@/metrics/tracker'
-import type { PendingConfirmationResponse, WorkflowMode } from '@/types/task'
+import type { PendingConfirmationResponse, WorkflowMode, PentestPlan } from '@/types/task'
 
 const ChatBubble = defineAsyncComponent(() => import('@/components/ChatBubble.vue'))
 
@@ -345,6 +414,11 @@ const streamRef = ref<HTMLElement | null>(null)
 // pending_confirmation 流程状态
 const pendingConfirmationState = ref<PendingConfirmationResponse | null>(null)
 const confirmedRisks = ref<string[]>([])
+
+// Plan Mode: 策略预览状态
+const planGenerating = ref(false)
+const planPreview = ref<{ planId: string; plan: PentestPlan } | null>(null)
+const planError = ref('')
 
 const messages = ref<ChatMessage[]>([
   {
@@ -653,6 +727,50 @@ function goBack() {
   router.push('/tasks')
 }
 
+async function generatePlanPreview() {
+  const userPrompt = form.value.userPrompt.trim()
+  if (!userPrompt) return
+  planGenerating.value = true
+  planError.value = ''
+  try {
+    const resp = await api.generatePlan({ userPrompt })
+    planPreview.value = {
+      planId: resp.plan_id,
+      plan: resp.plan,
+    }
+    pushAgent(
+      `策略预览已生成 (工具 ${resp.available_tools_count} 个, Skill ${resp.available_skills_count} 个)`,
+      'primary',
+    )
+  } catch (e: unknown) {
+    const msg = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+      || (e as Error)?.message || '策略生成失败'
+    planError.value = String(msg)
+    pushAgent(`策略生成失败: ${planError.value}，可直接创建任务`, 'warning')
+  } finally {
+    planGenerating.value = false
+  }
+}
+
+/** 跳过策略预览，直接创建任务 */
+function skipPlanAndSubmit() {
+  planPreview.value = null
+  planError.value = ''
+  doCreateTask()
+}
+
+/** 重新生成策略预览 */
+function regeneratePlan() {
+  planPreview.value = null
+  planError.value = ''
+  // 移除上一条策略预览消息
+  const lastIdx = messages.value.length - 1
+  if (lastIdx >= 0 && messages.value[lastIdx].role === 'agent') {
+    messages.value.splice(lastIdx, 1)
+  }
+  generatePlanPreview()
+}
+
 async function submit() {
   if (!canSubmit.value) {
     if (!form.value.userPrompt.trim()) {
@@ -661,14 +779,29 @@ async function submit() {
     return
   }
   const target = detectedTarget.value || ''
-  creating.value = true
   const userText = form.value.userPrompt.trim()
-  messages.value.push({
-    id: `user-${Date.now()}`,
-    role: 'user',
-    text: userText,
-    timestamp: nowTime(),
-  })
+
+  // ── Step 1: 尚未生成策略预览 → 先生成 ──
+  if (!planPreview.value && !planGenerating.value) {
+    messages.value.push({
+      id: `user-${Date.now()}`,
+      role: 'user',
+      text: userText,
+      timestamp: nowTime(),
+    })
+    scrollToBottom()
+    await generatePlanPreview()
+    return
+  }
+
+  // ── Step 2: 已生成预览 → 确认创建任务 ──
+  doCreateTask()
+}
+
+async function doCreateTask() {
+  const target = detectedTarget.value || ''
+  const userText = form.value.userPrompt.trim()
+  creating.value = true
   scrollToBottom()
 
   try {
@@ -685,6 +818,7 @@ async function submit() {
       riskBudget: form.value.riskBudget,
       maxReactRounds: form.value.maxReactRounds,
       maxExploreRounds: form.value.maxExploreRounds,
+      confirmedPlan: planPreview.value?.plan ? (planPreview.value.plan as unknown as Record<string, unknown>) : null,
     })
 
     // ── 安全卡口待确认 ──
@@ -701,6 +835,7 @@ async function submit() {
     }
 
     // ── 正常创建成功 ──
+    planPreview.value = null
     trackEvent('task.create', {
       target,
       workflowMode: form.value.workflowMode,
@@ -1205,5 +1340,155 @@ function cancelConfirmation() {
   display: flex;
   justify-content: flex-end;
   gap: 10px;
+}
+
+/* ── Plan Mode: 策略预览卡片 ─────────────────────── */
+.plan-preview-card {
+  margin: 12px 0;
+  padding: 16px 20px;
+  background: color-mix(in srgb, var(--accent-blue) 6%, var(--bg-surface));
+  border: 1px solid color-mix(in srgb, var(--accent-blue) 30%, var(--border));
+  border-left: 3px solid var(--accent-blue);
+  border-radius: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  animation: planIn 0.25s ease-out;
+  max-height: 420px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--text-primary) 22%, transparent) transparent;
+}
+.plan-preview-card::-webkit-scrollbar { width: 8px; }
+.plan-preview-card::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--text-primary) 18%, transparent);
+  border-radius: 4px;
+}
+@keyframes planIn {
+  from { opacity: 0; transform: translateY(-6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.plan-preview-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--accent-blue);
+  padding-bottom: 8px;
+  border-bottom: 1px solid color-mix(in srgb, var(--accent-blue) 20%, transparent);
+}
+.plan-preview-icon { font-size: 18px; }
+.plan-preview-id {
+  margin-left: auto;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+  font-weight: 400;
+}
+.plan-preview-section {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.plan-preview-section p {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--text-primary);
+}
+.plan-preview-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.plan-preview-phase {
+  padding: 8px 0;
+  border-top: 1px dashed color-mix(in srgb, var(--text-primary) 10%, transparent);
+}
+.plan-preview-phase-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.plan-preview-phase-name {
+  font-size: 12px;
+  font-weight: 600;
+  font-family: var(--font-mono);
+  color: var(--accent-blue);
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--accent-blue) 12%, transparent);
+}
+.plan-preview-phase-desc {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.plan-preview-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-left: 4px;
+}
+.plan-preview-step {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.plan-preview-step-idx {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--text-primary) 8%, transparent);
+  font-size: 10px;
+  color: var(--text-muted);
+  font-weight: 600;
+}
+.plan-preview-step-tool {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, #2ea043 15%, transparent);
+  color: color-mix(in srgb, #2ea043 85%, var(--text-primary));
+  font-weight: 500;
+}
+.plan-preview-step-skill {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--accent-purple) 15%, transparent);
+  color: var(--accent-purple);
+  font-weight: 500;
+}
+.plan-preview-step-purpose {
+  color: var(--text-secondary);
+}
+.plan-preview-risks,
+.plan-preview-hints {
+  padding: 8px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--accent-yellow) 6%, transparent);
+}
+.plan-preview-risks ul,
+.plan-preview-hints ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
+}
+.plan-preview-risks li,
+.plan-preview-hints li {
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.5;
 }
 </style>

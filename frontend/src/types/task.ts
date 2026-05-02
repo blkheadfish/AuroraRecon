@@ -239,6 +239,10 @@ export interface DecisionEvent {
   vuln_name?: string
   // 节点 yield-to-operator 事件(action === 'node_yielded_to_operator')附带的 phase
   branch_id?: string
+  // 审批卡片附带的利用目标上下文
+  exploitable_count?: number
+  top_targets?: ApprovalTarget[]
+  risk?: string
 }
 
 export interface OperatorPlanFocusTarget {
@@ -265,6 +269,40 @@ export interface OperatorPlanPayload {
   needs_human_approval?: boolean
   consumed_by?: string[]
   derived_replan_signals?: Record<string, number>
+}
+
+// Plan Mode: 策略预览相关类型
+export interface PlanStep {
+  tool: string
+  skill: string
+  purpose: string
+  command_hint: string
+  expected_output: string
+  trigger_condition: string
+  expected_impact: string
+  fallback: string
+  depends_on: string
+  enabled: boolean
+}
+
+export interface PlanPhase {
+  phase: string
+  description: string
+  steps: PlanStep[]
+}
+
+export interface PentestPlan {
+  target_understanding: string
+  phases: PlanPhase[]
+  unsupported_hints: string[]
+  risk_notes: string[]
+}
+
+export interface PlanResponse {
+  plan_id: string
+  plan: PentestPlan
+  available_tools_count: number
+  available_skills_count: number
 }
 
 export interface TaskStats {
@@ -509,6 +547,16 @@ export interface WsPhaseUpdateV2 {
   }
 }
 
+/** 审批卡片中展示的单个漏洞目标 */
+export interface ApprovalTarget {
+  name: string
+  severity: string
+  vuln_id: string
+  cve?: string
+  port?: number
+  description?: string
+}
+
 /** 等待审批 */
 export interface WsApprovalRequiredV2 {
   type: 'approval_required'
@@ -524,6 +572,9 @@ export interface WsApprovalRequiredV2 {
     logs: string[]
     findings_count: number
     got_shell: boolean
+    exploitable_count?: number
+    top_targets?: ApprovalTarget[]
+    risk?: string
   }
 }
 

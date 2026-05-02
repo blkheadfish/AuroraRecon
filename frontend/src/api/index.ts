@@ -5,6 +5,8 @@ import type {
   HealthInfo,
   MetricsOverview,
   PendingConfirmationResponse,
+  PentestPlan,
+  PlanResponse,
   ReportData,
   TaskBranch,
   TaskCreateResponse,
@@ -103,6 +105,12 @@ export const api = {
       { timeout: 12000 },
     ),
 
+  // Plan Mode: 在创建任务前生成渗透策略预览，不执行任何工具
+  generatePlan: (payload: {
+    userPrompt: string
+  }): Promise<PlanResponse> =>
+    http.post('/tasks/plan', { user_prompt: payload.userPrompt }, { timeout: 90000 }),
+
   createTask: (payload: {
     target: string
     rawPrompt?: string
@@ -118,6 +126,7 @@ export const api = {
     skillMinScore?: number | null
     skillWeakBoost?: number | null
     userConfirmedRisks?: string[]
+    confirmedPlan?: Record<string, unknown> | null
   }): Promise<TaskCreateResponse> =>
     http.post('/tasks', {
       target:                payload.target,
@@ -134,6 +143,7 @@ export const api = {
       skill_min_score:       payload.skillMinScore ?? null,
       skill_weak_boost:      payload.skillWeakBoost ?? null,
       user_confirmed_risks:  payload.userConfirmedRisks ?? [],
+      confirmed_plan:        payload.confirmedPlan ?? null,
     }),
   // 默认走轻量快照(phase_log_tail/decision_events_tail),完整 state 用 getTaskFull
   getTask: (id: string): Promise<TaskDetail> => http.get(`/tasks/${id}`),

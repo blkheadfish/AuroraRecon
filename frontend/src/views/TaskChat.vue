@@ -139,7 +139,7 @@
               <span class="meta-label">预期</span> {{ msg.expected }}
             </div>
             <div v-if="Array.isArray(msg.plan) && msg.plan.length" class="thought-plan">
-              <span class="meta-label">{{ msg.action === 'operator_replan' ? '执行要点' : '攻击计划' }}</span>
+              <span class="meta-label">{{ msg.action === 'operator_replan' ? '执行要点' : msg.action === 'initial_plan' ? '初始策略' : '攻击计划' }}</span>
               <ol>
                 <li v-for="(step, si) in msg.plan" :key="si">{{ step }}</li>
               </ol>
@@ -178,15 +178,76 @@
               v-if="msg.action === 'approval_required' || msg.action === 'approval'"
               class="approval-slot"
             >
-              <div v-if="showApprovalActions && msg.isLastApproval" class="inline-approval">
-                <span class="inline-approval-text">是否继续执行?</span>
-                <div class="inline-approval-actions">
-                  <el-button type="primary" size="small" :loading="approving" @click="doApprove(true)">
+              <div v-if="showApprovalActions && msg.isLastApproval" class="approval-card">
+                <!-- Header -->
+                <div class="approval-card-header">
+                  <div class="approval-card-header-left">
+                    <el-icon class="approval-card-icon"><WarningFilled /></el-icon>
+                    <div>
+                      <div class="approval-card-title">
+                        <span>人工审批确认</span>
+                        <el-tag v-if="approvalCardContext?.phaseLabel" size="small" type="warning" class="approval-card-phase-tag">
+                          {{ approvalCardContext.phaseLabel }}
+                        </el-tag>
+                      </div>
+                      <div class="approval-card-subtitle">
+                        {{ approvalCardContext?.summary || 'Agent 已暂停, 等待你审批后续操作。' }}
+                      </div>
+                    </div>
+                  </div>
+                  <div class="approval-card-header-right">
+                    <el-tag v-if="approvalCardContext?.risk" :type="approvalCardContext.riskType" effect="dark" size="small">
+                      风险 · {{ approvalCardContext.risk }}
+                    </el-tag>
+                  </div>
+                </div>
+
+                <!-- Targets list -->
+                <div v-if="approvalCardContext?.targets?.length" class="approval-card-targets">
+                  <div class="approval-card-section-head">
+                    <el-icon><Aim /></el-icon>
+                    <span>待利用漏洞 ({{ approvalCardContext.targets.length }})</span>
+                  </div>
+                  <div class="approval-card-target-list">
+                    <div v-for="(t, i) in approvalCardContext.targets.slice(0, 6)" :key="i" class="approval-card-target-item">
+                      <span class="approval-card-sev" :class="`sev-${t.severity}`">{{ (t.severity || '?').toUpperCase() }}</span>
+                      <span class="approval-card-target-name">{{ t.name }}</span>
+                      <code v-if="t.cve" class="approval-card-target-cve">{{ t.cve }}</code>
+                      <span v-if="t.port" class="approval-card-target-port">:{{ t.port }}</span>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Recommendation -->
+                <div v-if="approvalCardContext?.recommendation" class="approval-card-recommendation">
+                  <div class="approval-card-section-head">
+                    <el-icon><Promotion /></el-icon>
+                    <span>Agent 建议</span>
+                  </div>
+                  <p class="approval-card-recommendation-text">{{ approvalCardContext.recommendation }}</p>
+                </div>
+
+                <!-- What happens -->
+                <div class="approval-card-consequences">
+                  <div class="approval-card-consequence approve-consequence">
+                    <el-icon><CircleCheck /></el-icon>
+                    <span>批准后将进入利用阶段, 尝试对上述漏洞发起攻击获取立足点</span>
+                  </div>
+                  <div class="approval-card-consequence reject-consequence">
+                    <el-icon><CircleCloseFilled /></el-icon>
+                    <span>拒绝将跳过利用阶段, 直接生成报告</span>
+                  </div>
+                </div>
+
+                <!-- Actions -->
+                <div class="approval-card-actions">
+                  <el-button type="primary" :loading="approving" @click="doApprove(true)">
                     <el-icon><Check /></el-icon>
-                    批准并继续
+                    批准并开始利用
                   </el-button>
-                  <el-button size="small" plain :loading="approving" @click="doApprove(false)">
-                    拒绝
+                  <el-button type="danger" plain :loading="approving" @click="doApprove(false)">
+                    <el-icon><Close /></el-icon>
+                    拒绝, 直接生成报告
                   </el-button>
                 </div>
               </div>
@@ -395,17 +456,21 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import {
+  Aim,
   ArrowDown,
   ArrowLeft,
   ChatLineRound,
   Check,
   CircleCheck,
+  CircleCloseFilled,
+  Close,
   Document,
   Loading,
   Memo,
   Promotion,
   Share,
   Warning,
+  WarningFilled,
 } from '@element-plus/icons-vue'
 import { api } from '@/api'
 import { useTaskListStore } from '@/stores/taskList'
@@ -483,6 +548,64 @@ const approving = computed(() => approvalState.value === 'submitting')
 const showApprovalActions = computed(() => needsApproval.value && approvalState.value === 'idle')
 const pendingCheckpoint = computed(() => state.value?.pendingCheckpoint || null)
 const checkpointSubmitting = computed(() => state.value?.checkpointState === 'submitting')
+
+// ── 审批卡片上下文: 优先从 pendingCheckpoint 取(最丰富),
+//    再回退到 approval_required 事件里的轻量字段 ─────────
+interface ApprovalCardContext {
+  phase: string
+  phaseLabel: string
+  risk: string
+  riskType: 'danger' | 'warning' | 'info' | ''
+  summary: string
+  targets: { name: string; severity: string; vuln_id: string; cve?: string; port?: number }[]
+  recommendation: string
+  exploitableCount: number
+}
+
+const approvalCardContext = computed<ApprovalCardContext | null>(() => {
+  // Priority 1: pending checkpoint (from node_human_approval)
+  const ckpt = pendingCheckpoint.value
+  if (ckpt && (ckpt.checkpoint_type === 'exploit_gate' || ckpt.checkpoint_type === 'post_foothold_gate')) {
+    const ctx = (ckpt.context || {}) as Record<string, unknown>
+    const topTargets = (ctx.top_targets || []) as { name: string; severity: string; vuln_id: string; cve?: string; port?: number }[]
+    const count = Number(ctx.exploitable_count ?? topTargets.length)
+    return {
+      phase: ckpt.phase || 'awaiting_approval',
+      phaseLabel: ckpt.phase === 'post_foothold_approval' ? '立足后确认' : '利用前确认',
+      risk: ckpt.risk || '',
+      riskType: (ckpt.risk === '高风险' ? 'danger' : ckpt.risk === '中等风险' ? 'warning' : 'info') as ApprovalCardContext['riskType'],
+      summary: ckpt.summary || `系统已识别 ${count} 个可利用漏洞，等待你的授权再开始利用。`,
+      targets: topTargets,
+      recommendation: ckpt.recommendation || '批准后将进入利用阶段;拒绝则跳过利用并直接生成报告。',
+      exploitableCount: count,
+    }
+  }
+
+  // Priority 2: last approval message with inline context
+  const msgs = messages.value
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i]
+    if ((m.action === 'approval_required' || m.action === 'approval') && m.isLastApproval) {
+      const targets = (m.topTargets || []) as ApprovalCardContext['targets']
+      const count = Number(m.exploitableCount ?? targets.length)
+      if (count > 0 || targets.length > 0) {
+        return {
+          phase: 'awaiting_approval',
+          phaseLabel: '利用前确认',
+          risk: m.risk || '',
+          riskType: (m.risk === '高风险' ? 'danger' : m.risk === '中等风险' ? 'warning' : 'info') as ApprovalCardContext['riskType'],
+          summary: m.text?.split('\n').slice(1).join('\n') || `系统已识别 ${count} 个可利用漏洞，等待你的授权。`,
+          targets,
+          recommendation: '批准后将进入利用阶段;拒绝则跳过利用并直接生成报告。',
+          exploitableCount: count,
+        }
+      }
+    }
+  }
+
+  // No context available — still show a card, but minimal
+  return null
+})
 
 function inferPayloadLang(text) {
   if (/^\s*\{[\s\S]*\}\s*$/.test(text)) return 'json'
@@ -588,6 +711,30 @@ const messages = computed(() => {
         thinkingFullLen: 0,
         reasoning: '',
         operatorPlan: entry.operator_plan || null,
+      })
+      return
+    }
+
+    // 初始策略: 由后端 create_task 在任务创建后立即推送,
+    // 让用户在执行开始前就能看到 Agent 对目标的理解和即将遵循的路径。
+    if (entry.action === 'initial_plan') {
+      const headBits = ['初始策略']
+      if (entry.phase) headBits.push(entry.phase)
+      const summary = entry.message || '已生成初始渗透策略'
+      out.push({
+        id: baseId,
+        role: 'agent',
+        tone: 'primary',
+        action: 'initial_plan',
+        text: `${headBits.join(' · ')}\n${summary}`,
+        timestamp: time,
+        purpose: entry.purpose || '',
+        plan: entry.plan || [],
+        thinking: entry.thinking || '',
+        thinkingPreview: (entry.thinking || '').slice(0, 320),
+        thinkingHasMore: (entry.thinking || '').length > 320,
+        thinkingFullLen: (entry.thinking || '').length,
+        reasoning: '',
       })
       return
     }
@@ -831,16 +978,14 @@ const messages = computed(() => {
         timestamp: time,
         action: 'approval_required',
         isLastApproval: baseId === lastApprovalId,
+        exploitableCount: entry.exploitable_count ?? 0,
+        topTargets: entry.top_targets ?? [],
+        risk: entry.risk ?? '',
       })
       return
     }
 
     if (entry.action === 'approval') {
-      // 由 phase_log 文本 "⏸ 等待人工审批,请在前端点击「授权并继续」" 派生。
-      // 之前这条只渲染纯文本, WS 那条 approval_required 又因为时间戳格式
-      // 不一致被排到历史最早处看不到 → 用户屏幕上"审批节点"卡片有, 但
-      // 按钮没有。现在让本卡片本身也具备"我是最新一条审批 → 渲染按钮"
-      // 的能力, 保证 phase_log 落地任意一条都能让用户点。
       out.push({
         id: baseId,
         role: 'agent',
@@ -965,6 +1110,16 @@ const railItems = computed(() => {
         round: ev.round || 0,
         purpose: ev.purpose || '',
         thinking: ev.thinking || ev.message || '',
+        time: formatTime(ev.timestamp),
+      })
+    } else if (action === 'initial_plan') {
+      items.push({
+        id,
+        action,
+        tone: 'primary',
+        title: '初始策略',
+        purpose: ev.purpose || '',
+        summary: ev.message || '',
         time: formatTime(ev.timestamp),
       })
     } else if (action === 'command_exec') {
@@ -1706,22 +1861,221 @@ onUnmounted(() => {
 }
 
 .approval-slot { margin-top: 8px; }
-.inline-approval {
+
+/* ── 审批卡片 (取代原来的 inline-approval "是否继续执行?") ── */
+.approval-card {
+  margin: 6px 0 0;
+  border: 1px solid color-mix(in srgb, var(--accent-yellow) 35%, transparent);
+  border-left: 4px solid var(--accent-yellow);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--accent-yellow) 5%, var(--bg-elevated));
+  overflow: hidden;
+}
+
+.approval-card-header {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
-  padding: 8px 10px;
-  border-radius: var(--radius-sm);
-  border-left: 3px solid color-mix(in srgb, var(--accent-yellow) 80%, var(--text-primary));
-  background: color-mix(in srgb, var(--accent-yellow) 6%, var(--bg-elevated));
+  padding: 12px 14px 10px;
+  border-bottom: 1px solid color-mix(in srgb, var(--accent-yellow) 15%, transparent);
 }
-.inline-approval-text {
-  font-size: 13px;
+
+.approval-card-header-left {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  flex: 1;
+  min-width: 0;
+}
+
+.approval-card-icon {
+  margin-top: 2px;
+  font-size: 18px;
+  color: var(--accent-yellow);
+  flex-shrink: 0;
+}
+
+.approval-card-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text-primary);
+  margin-bottom: 4px;
+}
+
+.approval-card-phase-tag {
+  font-size: 11px;
+}
+
+.approval-card-subtitle {
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.approval-card-header-right {
+  flex-shrink: 0;
+}
+
+/* targets */
+.approval-card-targets {
+  padding: 10px 14px;
+  border-bottom: 1px solid color-mix(in srgb, var(--accent-yellow) 10%, transparent);
+}
+
+.approval-card-section-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+  font-size: 12px;
   font-weight: 600;
   color: var(--text-primary);
 }
-.inline-approval-actions { display: flex; gap: 8px; }
+
+.approval-card-target-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.approval-card-target-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--bg-base) 80%, var(--accent-yellow) 5%);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.approval-card-sev {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 48px;
+  padding: 1px 6px;
+  font-size: 10px;
+  font-weight: 700;
+  border-radius: 3px;
+  letter-spacing: 0.3px;
+  font-family: var(--font-mono);
+  flex-shrink: 0;
+}
+
+.approval-card-sev.sev-critical {
+  background: color-mix(in srgb, #f85149 25%, transparent);
+  color: #f85149;
+  border: 1px solid color-mix(in srgb, #f85149 45%, transparent);
+}
+
+.approval-card-sev.sev-high {
+  background: color-mix(in srgb, #d29922 22%, transparent);
+  color: #d29922;
+  border: 1px solid color-mix(in srgb, #d29922 40%, transparent);
+}
+
+.approval-card-sev.sev-medium {
+  background: color-mix(in srgb, var(--accent-blue) 18%, transparent);
+  color: var(--accent-blue);
+  border: 1px solid color-mix(in srgb, var(--accent-blue) 35%, transparent);
+}
+
+.approval-card-sev.sev-low,
+.approval-card-sev.sev-info {
+  background: color-mix(in srgb, var(--text-secondary) 12%, transparent);
+  color: var(--text-secondary);
+  border: 1px solid color-mix(in srgb, var(--text-secondary) 20%, transparent);
+}
+
+.approval-card-target-name {
+  color: var(--text-primary);
+  font-weight: 500;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.approval-card-target-cve {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--accent-blue);
+  background: color-mix(in srgb, var(--accent-blue) 8%, transparent);
+  padding: 1px 6px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+
+.approval-card-target-port {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+/* recommendation */
+.approval-card-recommendation {
+  padding: 10px 14px;
+  border-bottom: 1px solid color-mix(in srgb, var(--accent-yellow) 10%, transparent);
+}
+
+.approval-card-recommendation-text {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* consequences */
+.approval-card-consequences {
+  padding: 8px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border-bottom: 1px solid color-mix(in srgb, var(--accent-yellow) 10%, transparent);
+}
+
+.approval-card-consequence {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+}
+
+.approve-consequence .el-icon {
+  color: var(--accent-green, #3fb950);
+  flex-shrink: 0;
+}
+
+.reject-consequence .el-icon {
+  color: var(--accent-red, #f85149);
+  flex-shrink: 0;
+}
+
+/* actions */
+.approval-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  background: color-mix(in srgb, var(--bg-base) 60%, transparent);
+}
+
+.approval-card-actions .el-button {
+  font-size: 13px;
+}
 
 .payload-slot { margin-top: 8px; }
 
