@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 from typing import Any, Optional
 
@@ -37,6 +38,29 @@ BRUTE_SERVICES = {
     445:   ("smb",      ["administrator", "admin", "guest"]),
     3389:  ("rdp",      ["administrator", "admin"]),
 }
+
+_NUCLEI_TAG_BLACKLIST: set[str] = {
+    # Credential testing — handled by ExploitAgent Skill engine
+    "default-login", "default-credentials", "brute-force",
+    # Pure detection / informational noise
+    "tech-detect", "exposure", "info",
+    # HTTP header / TLS noise (not exploitable)
+    "http-missing-security-headers", "ssl", "tls",
+    "cookie", "csp", "xss-protection", "hsts",
+    # DNS infrastructure noise
+    "dns", "cname", "nameserver", "mx",
+    # CMS detection (not vulns)
+    "wordpress-plugin-detect", "joomla-detect", "cms-detect",
+    # Network service detection
+    "tcp", "udp", "network-service-detect",
+}
+
+def _get_nuclei_tag_blacklist() -> set[str]:
+    """Return the Nuclei tag blacklist, extended by env var if set."""
+    extra = os.environ.get("NUCLEI_TAG_BLACKLIST", "")
+    if extra:
+        return _NUCLEI_TAG_BLACKLIST | {t.strip().lower() for t in extra.split(",") if t.strip()}
+    return _NUCLEI_TAG_BLACKLIST
 
 
 class VulnAgent:
@@ -247,8 +271,8 @@ class VulnAgent:
             llm_tags = scan_strategy.get("nuclei_tags", [])
             # 过滤掉会触发 LockOutRealm 的凭据测试标签
             # 凭据爆破留给 ExploitAgent 的 Skill 统一处理
-            BLACKLISTED_TAGS = {"default-login", "default-credentials", "brute-force"}
-            llm_tags = [t for t in llm_tags if t.lower() not in BLACKLISTED_TAGS]
+            blacklist = _get_nuclei_tag_blacklist()
+            llm_tags = [t for t in llm_tags if t.lower() not in blacklist]
             if llm_tags:
                 r = await self._nuclei_tag_scan(web_url, target, llm_tags)
                 port_findings.extend(r.get("findings", []))
@@ -265,6 +289,10 @@ class VulnAgent:
             # 3d: Nikto 补充
             r = await self._nikto_scan(web_url)
             port_findings.extend(r.get("findings", []))
+
+            # 3d-2: sqlmap SQL injection scan (if injectable URLs found)
+            sqli_r = await self._sql_injection_scan(web_url, target, web_paths)
+            port_findings.extend(sqli_r.get("findings", []))
 
             # 3e: 命中 PHP/PHP-FPM 信号时，主动触发 phuip 探针
             phuip_finding = await self._phuip_probe_if_php_signal(
@@ -956,7 +984,7 @@ $PHUIP "{web_url}/index.php" 2>&1
                 "-t", "http/vulnerabilities/",
                 "-t", "http/misconfiguration/",
                 "-severity", "critical,high,medium",
-                "-etags", "default-login",
+                "-etags", ",".join(_get_nuclei_tag_blacklist()),
                 "-jsonl",
                 "-silent",
                 "-rate-limit", sp["nuclei_rate_limit"],
@@ -987,7 +1015,7 @@ $PHUIP "{web_url}/index.php" 2>&1
             args=[
                 "-u", web_url,
                 "-tags", tag_str,
-                "-etags", "default-login",
+                "-etags", ",".join(_get_nuclei_tag_blacklist()),
                 "-jsonl",
                 "-silent",
                 "-timeout", sp["nuclei_timeout"],
@@ -1026,7 +1054,7 @@ $PHUIP "{web_url}/index.php" 2>&1
                 "-t", "http/misconfiguration/",
                 "-t", "http/exposures/",
                 "-severity", "critical,high,medium",
-                "-etags", "default-login",
+                "-etags", ",".join(_get_nuclei_tag_blacklist()),
                 "-jsonl",
                 "-silent",
                 "-timeout", sp["nuclei_timeout"],
@@ -1040,6 +1068,82 @@ $PHUIP "{web_url}/index.php" 2>&1
         findings: list[VulnFinding] = []
         if result.success and result.stdout:
             findings = self.nuclei_parser.parse(result.stdout, target)
+
+        return {"findings": findings}
+
+    async def _sql_injection_scan(
+        self, web_url: str, target: str, web_paths: list[str],
+    ) -> dict:
+        """Run sqlmap against URLs with query parameters or SQL-injectable path
+        patterns discovered by gobuster / dirbuster."""
+        injectable_urls: list[str] = []
+        _PARAM_RE = re.compile(r'\?[^#\s]*=')
+        # Path patterns that commonly accept SQL-injectable parameters
+        _SQLI_PATH_PATTERNS = re.compile(
+            r'\.(?:php|asp|aspx|jsp)(?:\?|$)|'
+            r'/(?:search|login|product|item|user|profile|article|page|cat|'
+            r'detail|view|show|get|fetch|query|download|upload|admin|api)(?:/|\.|\?|$)',
+            re.IGNORECASE,
+        )
+
+        for path in web_paths[:30]:
+            full = f"{web_url}{path}" if path.startswith("/") else f"{web_url}/{path}"
+            if _PARAM_RE.search(full) or _SQLI_PATH_PATTERNS.search(full):
+                injectable_urls.append(full)
+
+        # If no injectable paths found in web_paths, also check the base URL
+        if not injectable_urls and _PARAM_RE.search(web_url):
+            injectable_urls.append(web_url)
+
+        if not injectable_urls:
+            return {"findings": []}
+
+        logger.info(
+            f"[VulnAgent] sqlmap: {len(injectable_urls)} injectable URL candidates"
+        )
+
+        findings: list[VulnFinding] = []
+        for url in injectable_urls[:5]:
+            try:
+                result: ExecuteResult = await self.executor.run(
+                    tool="sqlmap",
+                    args=[
+                        "-u", url,
+                        "--batch",
+                        "--level", "1",
+                        "--risk", "1",
+                        "--threads", "4",
+                        "--timeout", "15",
+                        "--retries", "1",
+                        "--output-dir", "/tmp/sqlmap_out",
+                        "--flush-session",
+                    ],
+                    timeout=180,
+                )
+                stdout = result.stdout or ""
+                if any(sig in stdout for sig in (
+                    "is vulnerable",
+                    "sqlmap identified the following injection point",
+                    "Type: ",
+                )):
+                    sqli_type = "unknown"
+                    for line in stdout.splitlines():
+                        if line.strip().startswith("Type:"):
+                            sqli_type = line.split(":", 1)[1].strip()[:80]
+                            break
+                    findings.append(VulnFinding(
+                        name=f"SQL Injection ({sqli_type})",
+                        severity="critical",
+                        target=url,
+                        port=int(url.split(":")[2].split("/")[0]) if ":" in url.split("//")[1] else 80,
+                        description=f"sqlmap confirmed SQL injection: {sqli_type}",
+                        evidence=stdout[:3000],
+                        exploitable=True,
+                        tool="sqlmap",
+                    ))
+                    logger.info(f"[VulnAgent] ✅ sqlmap SQLi confirmed: {url}")
+            except Exception as e:
+                logger.warning(f"[VulnAgent] sqlmap failed for {url}: {e}")
 
         return {"findings": findings}
 

@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 class EvidenceLevel(str, Enum):
     CONFIRMED_RCE = "confirmed_rce"
+    LFI_ESCALATED_TO_RCE = "lfi_escalated_to_rce"
     PROBABLE_RCE = "probable_rce"
     FILE_READ_ONLY = "file_read_only"
     FAILED = "failed"
@@ -40,10 +41,11 @@ class GatePolicy(str, Enum):
 
 
 _GATE_PASS: dict[GatePolicy, set[EvidenceLevel]] = {
-    GatePolicy.STRICT: {EvidenceLevel.CONFIRMED_RCE},
-    GatePolicy.MEDIUM: {EvidenceLevel.CONFIRMED_RCE, EvidenceLevel.PROBABLE_RCE},
+    GatePolicy.STRICT: {EvidenceLevel.CONFIRMED_RCE, EvidenceLevel.LFI_ESCALATED_TO_RCE},
+    GatePolicy.MEDIUM: {EvidenceLevel.CONFIRMED_RCE, EvidenceLevel.LFI_ESCALATED_TO_RCE, EvidenceLevel.PROBABLE_RCE},
     GatePolicy.LENIENT: {
         EvidenceLevel.CONFIRMED_RCE,
+        EvidenceLevel.LFI_ESCALATED_TO_RCE,
         EvidenceLevel.PROBABLE_RCE,
         EvidenceLevel.FILE_READ_ONLY,
     },
@@ -112,6 +114,18 @@ _RCE_NEGATIVE_KEYWORDS = [
     "NoClassDefFoundError",
 ]
 
+_LFI_ESCALATION_PATTERNS = [
+    re.compile(r"(?:auth\.log|access\.log|error\.log|syslog|secure).*uid=\d+\(", re.IGNORECASE | re.DOTALL),
+    re.compile(r"php://(?:filter|input|expect).*uid=\d+\(", re.IGNORECASE | re.DOTALL),
+    re.compile(r"/proc/self/environ.*uid=\d+\(", re.IGNORECASE | re.DOTALL),
+]
+
+_LFI_ESCALATION_CMD_PATTERNS = [
+    re.compile(r"(?:auth\.log|access\.log|syslog|secure)", re.IGNORECASE),
+    re.compile(r"php://(?:filter|input|expect)", re.IGNORECASE),
+    re.compile(r"/proc/self/environ", re.IGNORECASE),
+]
+
 
 @dataclass
 class VerifyResult:
@@ -119,6 +133,7 @@ class VerifyResult:
     reason: str
     passed: bool
     evidence_snippets: list[str]
+    escalation_path: str = ""
 
 
 class EvidenceVerifier:
@@ -157,11 +172,18 @@ class EvidenceVerifier:
                 f"policy={self.policy.value}, reason={reason}"
             )
 
+        escalation = ""
+        if level == EvidenceLevel.LFI_ESCALATED_TO_RCE:
+            escalation = self._build_escalation_path(all_records)
+        elif level == EvidenceLevel.FILE_READ_ONLY:
+            escalation = "file_read"
+
         return VerifyResult(
             level=level,
             reason=reason,
             passed=passed,
             evidence_snippets=snippets,
+            escalation_path=escalation,
         )
 
     def _classify(
@@ -173,6 +195,15 @@ class EvidenceVerifier:
     ) -> tuple[EvidenceLevel, str, list[str]]:
         combined = f"{stdout}\n{stderr}"
         snippets: list[str] = []
+
+        # ── Check LFI → RCE escalation ───────────────────
+        lfi_escalation = self._detect_lfi_escalation(combined, all_records)
+        if lfi_escalation:
+            snippets.append(lfi_escalation)
+            m = _UID_RE.search(combined)
+            if m:
+                snippets.append(m.group(0))
+                return EvidenceLevel.LFI_ESCALATED_TO_RCE, f"LFI escalated to RCE: {lfi_escalation}", snippets
 
         # ── Check confirmed RCE ──────────────────────────
         m = _UID_RE.search(combined)
@@ -231,6 +262,64 @@ class EvidenceVerifier:
             return EvidenceLevel.FILE_READ_ONLY, f"shell_type={shell_type}", snippets
 
         return EvidenceLevel.FAILED, "no hard evidence found", snippets
+
+    @staticmethod
+    def _detect_lfi_escalation(combined: str, all_records: list[dict] | None) -> str:
+        """Detect if the current output shows LFI-to-RCE escalation."""
+        had_file_read = False
+        if all_records:
+            for rec in all_records:
+                rec_out = str(rec.get("stdout", ""))
+                rec_cmd = str(rec.get("command", ""))
+                if _passwd_content_detected(rec_out):
+                    had_file_read = True
+                if _SSH_KEY_RE.search(rec_out):
+                    had_file_read = True
+
+        if not had_file_read:
+            return ""
+
+        for pat in _LFI_ESCALATION_PATTERNS:
+            if pat.search(combined):
+                return "lfi→log_poisoning→rce"
+
+        if all_records:
+            for rec in all_records:
+                cmd = str(rec.get("command", ""))
+                out = str(rec.get("stdout", ""))
+                for cmd_pat in _LFI_ESCALATION_CMD_PATTERNS:
+                    if cmd_pat.search(cmd) and _UID_RE.search(out):
+                        if "auth.log" in cmd or "syslog" in cmd or "secure" in cmd:
+                            return "lfi→log_poisoning→rce"
+                        if "php://" in cmd:
+                            return "lfi→php_wrapper→rce"
+                        if "/proc/self/environ" in cmd:
+                            return "lfi→proc_environ→rce"
+                        return "lfi→escalation→rce"
+        return ""
+
+    @staticmethod
+    def _build_escalation_path(all_records: list[dict] | None) -> str:
+        """Build a human-readable escalation path from command history."""
+        if not all_records:
+            return "lfi→rce"
+        stages: list[str] = []
+        for rec in all_records:
+            out = str(rec.get("stdout", ""))
+            cmd = str(rec.get("command", ""))
+            if _passwd_content_detected(out):
+                if "file_read" not in stages:
+                    stages.append("file_read")
+            if any(log in cmd for log in ("auth.log", "access.log", "syslog", "secure")):
+                if "log_poisoning" not in stages:
+                    stages.append("log_poisoning")
+            if "php://" in cmd:
+                if "php_wrapper" not in stages:
+                    stages.append("php_wrapper")
+            if _UID_RE.search(out):
+                if "rce" not in stages:
+                    stages.append("rce")
+        return "→".join(stages) if stages else "lfi→rce"
 
 
 # ── Module-level default instance ─────────────────────────
