@@ -228,7 +228,7 @@ def _intent_to_operator_plan(state: PentestState) -> None:
       OperatorPlan.avoided_tools   → ToolCoveragePlanner.build_plan() → 直接剔除
       OperatorPlan.keyword_hints   → VulnAgent / ReconAgent LLM prompt 注入
     """
-    from backend.agents.models import OperatorPlan, OperatorFocusTarget
+    from backend.agents.models import OperatorPlan, OperatorFocusTarget, VulnFinding
 
     # 已有用户实时计划，不覆盖
     if state.operator_plan is not None:
@@ -280,14 +280,18 @@ def _intent_to_operator_plan(state: PentestState) -> None:
                 # Skill 名不转为 tool，由 ExploitAgent 通过 kb_hits 机制消费
 
     # ── 4. skip_phases → operator plan 中的 next_phase 锚点 ───────────
-    # 仅当用户明确指定了阶段列表但不含 exploit 时，辅助路由决策
+    # LLM 已通过 parsed_intent 确定了 pentest_phases 和 priority_vulns，
+    # 这里根据 LLM 的判断决定路由，不做额外的硬编码规则匹配。
     next_phase: str | None = None
-    if pentest_phases and "exploit" not in pentest_phases and "full_chain" not in pentest_phases:
-        # 最后一个显式阶段作为终止锚
+    exploit_with_known_vuln = bool(priority_vulns) and "exploit" in pentest_phases
+
+    if exploit_with_known_vuln:
+        next_phase = "vuln_scan"
+    elif pentest_phases and "exploit" not in pentest_phases and "full_chain" not in pentest_phases:
         last_phase = pentest_phases[-1] if pentest_phases else ""
         phase_sequence = ["recon", "surface_enum", "intel_harvest", "vuln_scan"]
         if last_phase in phase_sequence:
-            next_phase = last_phase  # supervisor/linear 模式下辅助提早终止
+            next_phase = last_phase
 
     # 没有任何有效约束，不创建空计划
     has_constraints = preferred or avoided or keyword_hints or next_phase or extra_hint
@@ -318,6 +322,34 @@ def _intent_to_operator_plan(state: PentestState) -> None:
         f"preferred={preferred[:6]}, avoided={avoided[:4]}, "
         f"keyword_hints={keyword_hints[:4]}"
     )
+
+    # ── 6. LLM 意图快通：当 LLM 识别出具体漏洞且用户意图为利用时，
+    #    注入 synthetic finding 使 _has_exploitable() 为 True，
+    #    避免因 findings 为空而无法进入利用阶段。
+    if exploit_with_known_vuln:
+        existing_names = {(f.name or "").lower() for f in (state.findings or [])}
+        injected: list[str] = []
+        for vuln_tag in priority_vulns:
+            tag_lower = vuln_tag.strip().lower()
+            if tag_lower and tag_lower not in existing_names:
+                state.findings = list(state.findings or []) + [VulnFinding(
+                    name=f"用户指定: {vuln_tag}",
+                    severity="high",
+                    cve=vuln_tag.upper() if vuln_tag.upper().startswith("CVE-") else None,
+                    target=state.target or "",
+                    port=state.target_port or None,
+                    description=f"LLM 意图解析: 用户断言目标存在 {vuln_tag}，待工具验证",
+                    exploitable=True,
+                    tool="llm_intent",
+                    confidence=70,
+                    verification_status="suspected",
+                    verification_reasons=["LLM 意图解析识别，待工具验证确认"],
+                )]
+                injected.append(vuln_tag)
+        if injected:
+            state.log(
+                f"[意图快通] 注入 LLM 识别的漏洞为 synthetic finding: {injected}"
+            )
 
 
 def get_intent_skill_boost(parsed_intent: dict | None) -> dict[str, int]:

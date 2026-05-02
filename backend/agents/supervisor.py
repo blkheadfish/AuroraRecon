@@ -19,6 +19,7 @@ from typing import Any, Optional
 
 from backend.agents.fact_hooks import (
     compute_phase_signature,
+    consume_replan_signal as _consume_replan_signal,
     snapshot_facts,
 )
 from backend.agents.models import PentestState, TaskStatus
@@ -153,6 +154,21 @@ def _rule_decide(state: PentestState) -> Optional[dict[str, Any]]:
     # _llm_decide 会读取 user_messages / pending_user_prompt 决定下一阶段。
     if int(sig.get("operator_intent", 0)) > 0:
         return None
+
+    # 1.1 当已有可利用 finding 且尚未尝试 foothold 时，不允许 replan
+    #     信号把流程拉回前置侦察阶段，优先推进利用链路。
+    _exploit_pending = (
+        _has_exploitable(state) and not _has_visited(state, "foothold_attempt")
+    )
+    if _exploit_pending:
+        for _drain_key in (
+            "re_surface_enum_for_paths",
+            "re_intel_harvest_for_paths",
+        ):
+            if sig.get(_drain_key):
+                _consume_replan_signal(state, _drain_key)
+        sig = state.replan_signals or {}
+
     if sig.get("re_recon_for_hosts") and _under_cap(state, "recon"):
         return {"next": "recon", "reason": "new hosts discovered", "rule": "replan.re_recon_for_hosts"}
     if sig.get("re_vuln_scan_for_creds") and _under_cap(state, "vuln_scan"):

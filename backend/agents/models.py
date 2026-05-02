@@ -769,12 +769,12 @@ class PentestState(BaseModel):
 	# 各阶段的访问次数上限（防止反馈循环里某阶段被无限拉起）
 	max_phase_visits: dict[str, int] = Field(default_factory=lambda: {
 		"recon": 3,
-		"surface_enum": 4,
-		"intel_harvest": 3,
-		"vuln_scan": 4,
+		"surface_enum": 2,
+		"intel_harvest": 2,
+		"vuln_scan": 3,
 		"foothold_attempt": 3,
 		"secondary_attack": 2,
-		"post_foothold_enum": 4,
+		"post_foothold_enum": 3,
 		"privesc_attempt": 3,
 	})
 	# 信号驱动的"重新规划"信号桶：见 fact_hooks.emit_replan_signals
