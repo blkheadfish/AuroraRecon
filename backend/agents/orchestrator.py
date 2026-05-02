@@ -164,6 +164,162 @@ def _apply_parsed_target(state: PentestState) -> None:
         state.log(f"⚠ 目标解析失败，原始输入: {state.target}")
 
 
+# ── 意图驱动 → OperatorPlan 转换 ─────────────────────────────────────────
+# 把 parsed_intent 中的策略字段转化为 OperatorPlan，让所有现有 agent 基础
+# 设施（ToolCoveragePlanner / VulnAgent / ReconAgent）自动感知用户意图。
+# 调用时机：_prepare_state() 内部，仅在 state.operator_plan 为 None 时执行。
+
+_INTENT_TAG_TO_AVOIDED_TOOLS: dict[str, list[str]] = {
+    "stealth":     ["masscan", "nuclei", "nikto"],     # 高噪声工具
+    "low_noise":   ["masscan", "nikto", "wpscan"],
+    "no_brute":    ["hydra", "medusa", "john", "hashcat"],
+    "web_only":    ["enum4linux", "smbclient"],
+    "prefer_msf":  [],   # 只影响 preferred_tools，见下方
+}
+
+_INTENT_TAG_TO_PREFERRED_TOOLS: dict[str, list[str]] = {
+    "prefer_msf":    ["metasploit"],
+    "ctf_fast":      ["gobuster", "ffuf"],
+    "web_only":      ["ffuf", "gobuster", "httpx", "whatweb"],
+    "get_flag":      ["gobuster", "ffuf", "nuclei"],
+}
+
+# priority_vulns → 在 recon/vuln 阶段推荐的针对性工具
+_VULN_TO_RECON_TOOLS: dict[str, list[str]] = {
+    "shiro":           ["whatweb", "httpx"],
+    "fastjson":        ["whatweb", "httpx"],
+    "log4j":           ["nuclei"],
+    "struts2":         ["nuclei", "httpx"],
+    "thinkphp":        ["whatweb", "gobuster"],
+    "weblogic":        ["httpx", "whatweb"],
+    "jboss":           ["httpx", "whatweb"],
+    "wordpress":       ["wpscan", "gobuster"],
+    "sqli":            ["sqlmap", "gobuster"],
+    "lfi":             ["ffuf", "gobuster"],
+    "weak_password":   ["hydra"],
+    "default_creds":   ["hydra"],
+}
+
+# priority_vulns → 在 vuln_scan 阶段推荐的 nuclei template tags
+_VULN_TO_NUCLEI_TAGS: dict[str, str] = {
+    "shiro":       "apache-shiro",
+    "fastjson":    "fastjson",
+    "log4j":       "log4j",
+    "struts2":     "apache-struts",
+    "thinkphp":    "thinkphp",
+    "weblogic":    "oracle-weblogic",
+    "jboss":       "jboss",
+    "wordpress":   "wordpress",
+    "sqli":        "sqli",
+    "lfi":         "lfi",
+}
+
+
+def _intent_to_operator_plan(state: PentestState) -> None:
+    """把 parsed_intent 策略字段转换成 OperatorPlan 写入 state.operator_plan。
+
+    设计原则：
+    - 仅当 state.operator_plan 为 None 时执行（不覆盖用户通过 /chat 下发的实时计划）
+    - 仅当 parsed_intent 包含有效策略约束时执行（避免无意义空计划）
+    - pentest_plan 中明确列出的工具优先级 > parsed_intent 推断的工具偏好
+
+    消费链路（已有，无需修改）：
+      OperatorPlan.preferred_tools → ToolCoveragePlanner.build_plan() → 置顶 must_run
+      OperatorPlan.avoided_tools   → ToolCoveragePlanner.build_plan() → 直接剔除
+      OperatorPlan.keyword_hints   → VulnAgent / ReconAgent LLM prompt 注入
+    """
+    from backend.agents.models import OperatorPlan, OperatorFocusTarget
+
+    # 已有用户实时计划，不覆盖
+    if state.operator_plan is not None:
+        return
+
+    parsed: dict = state.parsed_intent or {}
+    if not parsed:
+        return
+
+    intents: list[str] = parsed.get("intents", []) or []
+    priority_vulns: list[str] = parsed.get("priority_vulns", []) or []
+    pentest_phases: list[str] = parsed.get("pentest_phase", []) or []
+    extra_hint: str = (state.extra_hint or "").strip()
+    scope_note: str = (state.scope_note or "").strip()
+
+    # ── 1. intents → preferred / avoided tools ──────────────────────────
+    preferred: list[str] = []
+    avoided: list[str] = []
+    for tag in intents:
+        tag_lc = tag.lower().strip()
+        for tool in _INTENT_TAG_TO_AVOIDED_TOOLS.get(tag_lc, []):
+            if tool not in avoided:
+                avoided.append(tool)
+        for tool in _INTENT_TAG_TO_PREFERRED_TOOLS.get(tag_lc, []):
+            if tool not in preferred:
+                preferred.append(tool)
+
+    # ── 2. priority_vulns → preferred tools（recon/vuln 阶段定向扫描）──
+    keyword_hints: list[str] = []
+    for vuln_tag in priority_vulns:
+        tag_lc = vuln_tag.lower().strip()
+        for tool in _VULN_TO_RECON_TOOLS.get(tag_lc, []):
+            if tool not in preferred:
+                preferred.append(tool)
+        nuclei_tag = _VULN_TO_NUCLEI_TAGS.get(tag_lc)
+        if nuclei_tag and nuclei_tag not in keyword_hints:
+            keyword_hints.append(nuclei_tag)
+
+    # ── 3. pentest_plan 已启用步骤的工具名 → preferred_tools ─────────
+    plan: dict = state.pentest_plan or {}
+    if plan:
+        for phase in plan.get("phases", []):
+            for step in phase.get("steps", []):
+                if not step.get("enabled", True):
+                    continue
+                tool = (step.get("tool") or "").strip()
+                if tool and tool not in preferred:
+                    preferred.append(tool)
+                # Skill 名不转为 tool，由 ExploitAgent 通过 kb_hits 机制消费
+
+    # ── 4. skip_phases → operator plan 中的 next_phase 锚点 ───────────
+    # 仅当用户明确指定了阶段列表但不含 exploit 时，辅助路由决策
+    next_phase: str | None = None
+    if pentest_phases and "exploit" not in pentest_phases and "full_chain" not in pentest_phases:
+        # 最后一个显式阶段作为终止锚
+        last_phase = pentest_phases[-1] if pentest_phases else ""
+        phase_sequence = ["recon", "surface_enum", "intel_harvest", "vuln_scan"]
+        if last_phase in phase_sequence:
+            next_phase = last_phase  # supervisor/linear 模式下辅助提早终止
+
+    # 没有任何有效约束，不创建空计划
+    has_constraints = preferred or avoided or keyword_hints or next_phase or extra_hint
+    if not has_constraints:
+        return
+
+    # ── 5. 构建摘要 ──────────────────────────────────────────────────────
+    summary_parts: list[str] = []
+    if intents:
+        summary_parts.append(f"意图标签: {', '.join(intents[:6])}")
+    if priority_vulns:
+        summary_parts.append(f"重点漏洞: {', '.join(priority_vulns[:6])}")
+    if extra_hint:
+        summary_parts.append(f"附加提示: {extra_hint[:80]}")
+    if scope_note:
+        summary_parts.append(f"授权范围: {scope_note[:80]}")
+
+    state.operator_plan = OperatorPlan(
+        source_phase="init",
+        intent_summary=" | ".join(summary_parts) or "由 parsed_intent 自动推断",
+        next_phase=next_phase,
+        preferred_tools=preferred[:12],
+        avoided_tools=avoided[:8],
+        keyword_hints=keyword_hints[:8],
+    )
+    state.log(
+        f"[策略落实] parsed_intent → OperatorPlan: "
+        f"preferred={preferred[:6]}, avoided={avoided[:4]}, "
+        f"keyword_hints={keyword_hints[:4]}"
+    )
+
+
 def get_intent_skill_boost(parsed_intent: dict | None) -> dict[str, int]:
     """意图驱动：从 parsed_intent 中提取漏洞类型优先级权重。
 
@@ -3192,12 +3348,17 @@ def edge_should_exploit(state: PentestState) -> str:
     # ── 意图驱动：仅侦察模式 → 直接出报告，不进入利用阶段 ──
     parsed = state.parsed_intent or {}
     phases = parsed.get("pentest_phase", [])
-    if phases == ["recon"]:
-        state.log("[意图驱动] 仅侦察模式，跳过利用阶段，直接生成报告")
+    # ★ 修复：只要 phases 非空且不包含 exploit/full_chain，就跳过利用阶段
+    EXPLOIT_PHASES = {"exploit", "full_chain", "post_exploit"}
+    if phases and not any(p in EXPLOIT_PHASES for p in phases):
+        state.log(
+            f"[意图驱动] pentest_phase={phases!r} 不含利用阶段，"
+            f"跳过 exploit → 直接出报告"
+        )
         state.push_decision({
             "action": "intent_recon_only",
             "phase": "exploit_decision",
-            "message": "用户仅要求侦察，跳过漏洞利用阶段",
+            "message": f"策略指定阶段 {phases}，跳过漏洞利用",
             "tone": "info",
         })
         return "report"
@@ -3779,6 +3940,8 @@ class Orchestrator:
             f"react_rounds={initial_state.max_react_rounds}, "
             f"explore_rounds={initial_state.max_explore_rounds}"
         )
+        # ★ 新增：将 parsed_intent 策略字段转换为 OperatorPlan
+        _intent_to_operator_plan(initial_state)
         return initial_state
 
     async def run(

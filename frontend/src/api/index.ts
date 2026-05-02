@@ -127,6 +127,8 @@ export const api = {
     skillWeakBoost?: number | null
     userConfirmedRisks?: string[]
     confirmedPlan?: Record<string, unknown> | null
+    // ★ 新增：前端缓存 parse-intent 完整响应，回传给后端
+    parsedIntentExtra?: Record<string, unknown> | null
   }): Promise<TaskCreateResponse> =>
     http.post('/tasks', {
       target:                payload.target,
@@ -144,6 +146,8 @@ export const api = {
       skill_weak_boost:      payload.skillWeakBoost ?? null,
       user_confirmed_risks:  payload.userConfirmedRisks ?? [],
       confirmed_plan:        payload.confirmedPlan ?? null,
+      // ★ 新增：透传 parse-intent 完整表达式回后端
+      parsed_intent_extra:   payload.parsedIntentExtra ?? null,
     }),
   // 默认走轻量快照(phase_log_tail/decision_events_tail),完整 state 用 getTaskFull
   getTask: (id: string): Promise<TaskDetail> => http.get(`/tasks/${id}`),

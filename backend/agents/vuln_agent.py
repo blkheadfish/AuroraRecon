@@ -120,6 +120,12 @@ class VulnAgent:
         #      tools 对应的扫描类型。
         # 当前 P0 仅做存放与 prompt 注入, 工具级精挑由后续 PR 接入 _select_skills。
         self._operator_plan: Any = operator_plan
+        # ★ 新增：从 operator_plan.keyword_hints 提取 nuclei 模板 tag
+        # keyword_hints 由 _intent_to_operator_plan 从 priority_vulns 映射而来
+        self._nuclei_focus_tags: list[str] = []
+        if operator_plan is not None:
+            hints = getattr(operator_plan, "keyword_hints", None) or []
+            self._nuclei_focus_tags = [h for h in hints if h]
         self._seed_credentials: list[dict] = list((seeds or {}).get("credentials") or [])
         if self._seed_credentials:
             logger.info(
@@ -1003,6 +1009,13 @@ $PHUIP "{web_url}/index.php" 2>&1
 
     async def _nuclei_tag_scan(self, web_url: str, target: str, tags: list[str]) -> dict:
         """LLM 推荐标签的专项扫描"""
+        # ★ 新增：若 operator_plan 中有 keyword_hints（从 priority_vulns 映射而来），
+        # 追加到 tags 列表，实现 nuclei 定向扫描
+        focus_tags = getattr(self, "_nuclei_focus_tags", None) or []
+        if focus_tags:
+            for ft in focus_tags:
+                if ft not in tags:
+                    tags.insert(0, ft)  # 用户关注的标签插到最前面
         if not tags:
             return {"findings": []}
 

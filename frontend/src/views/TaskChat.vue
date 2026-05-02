@@ -48,6 +48,28 @@
 
       <div class="chat-stream-wrap" ref="streamRef" @scroll="onUserScroll">
         <div class="bubble-stream">
+          <!-- ★ 新增：策略执行状态条 -->
+          <div
+            v-if="strategyPlan.length > 0"
+            class="strategy-enforcement-bar"
+            style="margin: 8px 0; padding: 8px 12px; border-left: 3px solid var(--el-color-primary); background: var(--el-fill-color-lighter); border-radius: 0 4px 4px 0; font-size: 13px;"
+          >
+            <div style="font-weight: 500; margin-bottom: 4px; color: var(--el-text-color-primary)">
+              策略执行状态
+            </div>
+            <div
+              v-for="item in strategyPlan"
+              :key="item.key"
+              style="display: flex; align-items: center; gap: 6px; margin: 2px 0; color: var(--el-text-color-secondary)"
+            >
+              <span :style="{ color: item.enforced ? 'var(--el-color-success)' : 'var(--el-color-warning)' }">
+                {{ item.enforced ? '✓' : '△' }}
+              </span>
+              <span>{{ item.label }}</span>
+              <span v-if="item.detail" style="opacity: 0.7; font-size: 12px">— {{ item.detail }}</span>
+            </div>
+          </div>
+
           <template v-for="msg in messages" :key="msg.id">
             <div
               :data-bubble-id="msg.id"
@@ -548,6 +570,54 @@ const approving = computed(() => approvalState.value === 'submitting')
 const showApprovalActions = computed(() => needsApproval.value && approvalState.value === 'idle')
 const pendingCheckpoint = computed(() => state.value?.pendingCheckpoint || null)
 const checkpointSubmitting = computed(() => state.value?.checkpointState === 'submitting')
+
+// ★ 新增：从 parsed_intent 和 decisionEvents 计算策略执行状态
+const strategyPlan = computed(() => {
+  const t = task.value
+  if (!t) return []
+
+  const parsed = (t as any).parsed_intent || {}
+  const items: Array<{ key: string; label: string; detail: string; enforced: boolean }> = []
+
+  // 检查 operator_plan_applied 事件是否出现，作为"已落实"的信号
+  const enforcedPhases = new Set(
+    (decisionEvents.value || [])
+      .filter(e => e.action === 'operator_plan_applied' || e.action === 'intent_to_plan_converted')
+      .map(e => e.phase)
+  )
+
+  const priorityVulns: string[] = parsed.priority_vulns || []
+  if (priorityVulns.length) {
+    items.push({
+      key: 'priority_vulns',
+      label: `重点漏洞: ${priorityVulns.slice(0, 4).join(', ')}`,
+      detail: enforcedPhases.size ? '已注入扫描约束' : '等待执行',
+      enforced: enforcedPhases.size > 0,
+    })
+  }
+
+  const intents: string[] = parsed.intents || []
+  if (intents.length) {
+    items.push({
+      key: 'intents',
+      label: `意图标签: ${intents.slice(0, 4).join(', ')}`,
+      detail: enforcedPhases.size ? '已转换为工具约束' : '等待执行',
+      enforced: enforcedPhases.size > 0,
+    })
+  }
+
+  const phases: string[] = parsed.pentest_phase || []
+  if (phases.length) {
+    items.push({
+      key: 'phases',
+      label: `执行阶段: ${phases.join(' → ')}`,
+      detail: phases.includes('exploit') ? '含利用阶段' : '仅侦察/扫描',
+      enforced: true,  // 路由判断在创建时即确定，始终生效
+    })
+  }
+
+  return items
+})
 
 // ── 审批卡片上下文: 优先从 pendingCheckpoint 取(最丰富),
 //    再回退到 approval_required 事件里的轻量字段 ─────────

@@ -787,6 +787,12 @@ async function doCreateTask() {
       maxReactRounds: form.value.maxReactRounds,
       maxExploreRounds: form.value.maxExploreRounds,
       confirmedPlan: planPreview.value?.plan ? (planPreview.value.plan as unknown as Record<string, unknown>) : null,
+      // ★ 新增：把 parse-intent 完整响应回传给后端
+      parsedIntentExtra: intent.value.loaded ? {
+        intents: intent.value.intents,
+        extra_hint: intent.value.extraHint,
+        scope_note: intent.value.scopeNote,
+      } : null,
     })
 
     // ── 安全卡口待确认 ──
@@ -867,6 +873,12 @@ async function confirmAndResubmit() {
       maxReactRounds: form.value.maxReactRounds,
       maxExploreRounds: form.value.maxExploreRounds,
       userConfirmedRisks: confirmedRisks.value,
+      // ★ 新增：二次提交时也回传 parse-intent
+      parsedIntentExtra: intent.value.loaded ? {
+        intents: intent.value.intents,
+        extra_hint: intent.value.extraHint,
+        scope_note: intent.value.scopeNote,
+      } : null,
     })
 
     if (task.status === 'pending_confirmation') {

@@ -18,6 +18,9 @@ export interface CreateTaskParams {
   skillMinScore?: number | null
   skillWeakBoost?: number | null
   userConfirmedRisks?: string[]
+  confirmedPlan?: Record<string, unknown> | null
+  // ★ 新增：前端缓存 parse-intent 完整响应，回传给后端
+  parsedIntentExtra?: Record<string, unknown> | null
 }
 
 export const useTaskListStore = defineStore('taskList', () => {
@@ -57,6 +60,9 @@ export const useTaskListStore = defineStore('taskList', () => {
       skillMinScore:      params.skillMinScore ?? null,
       skillWeakBoost:     params.skillWeakBoost ?? null,
       userConfirmedRisks: params.userConfirmedRisks ?? [],
+      // ★ 新增：透传 plan 和 parse-intent 结果
+      confirmedPlan:      params.confirmedPlan ?? null,
+      parsedIntentExtra:  params.parsedIntentExtra ?? null,
     })
     // 只有成功创建的任务才加入列表（PendingConfirmationResponse 没有 task_id）
     if (result.status !== 'pending_confirmation' && result.task_id) {

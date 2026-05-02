@@ -51,6 +51,10 @@ class CreateTaskRequest(BaseModel):
     # ── Plan Mode: 用户确认的策略 ───────────────────────
     confirmed_plan: Optional[dict] = None  # PentestPlan 的 dict 形式
 
+    # ★ 新增：前端在 /tasks/parse-intent 后缓存的完整 LLM 解析结果，
+    # 用于把 intents / extra_hint / scope_note 传回后端
+    parsed_intent_extra: dict | None = None
+
     @field_validator("target")
     @classmethod
     def validate_target(cls, v: str) -> str:
@@ -144,6 +148,9 @@ class TaskDetail(TaskSummary):
     post_findings: dict = {}
     report_md: str = ""
     phase_log: list = []
+    # ★ 新增：意图解析结果 + 用户确认的策略计划
+    parsed_intent: dict = Field(default_factory=dict)
+    pentest_plan: dict = Field(default_factory=dict)
     # per-task 运行时参数(用于回显与调试,不允许中途修改)
     success_gate_level: str = "strict"
     risk_budget: int = 3

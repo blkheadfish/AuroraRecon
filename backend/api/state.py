@@ -204,6 +204,9 @@ class TaskStateManager:
             "scope_note": state.scope_note,
             "extra_hint": state.extra_hint,
             "user_prompt": state.user_prompt,
+            # ★ 新增：意图解析 + 策略计划数据，供前端策略执行状态条消费
+            "parsed_intent": state.parsed_intent,
+            "pentest_plan": state.pentest_plan,
             "error_msg": state.error_msg,
             "open_ports": [p.model_dump() for p in state.open_ports],
             "os_info": state.os_info,
@@ -356,6 +359,9 @@ class TaskStateManager:
             "scope_note": state.scope_note,
             "extra_hint": state.extra_hint,
             "user_prompt": state.user_prompt,
+            # ★ 新增：意图解析 + 策略计划数据，供前端策略执行状态条消费
+            "parsed_intent": state.parsed_intent,
+            "pentest_plan": state.pentest_plan,
             "error_msg": state.error_msg,
             "open_ports": [p.model_dump() for p in state.open_ports],
             "os_info": state.os_info,

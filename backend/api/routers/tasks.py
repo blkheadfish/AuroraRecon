@@ -661,6 +661,18 @@ async def create_task(req: CreateTaskRequest, request: Request):
         parsed_intent = parse_intent_deterministic(raw_prompt)
         parsed_intent_dict = parsed_intent.model_dump()
 
+        # ★ 新增：把 LLM parse-intent 解析出的 intents/extra_hint/scope_note
+        # 回填到 parsed_intent_dict，让 orchestrator 的转换函数能读到这些字段
+        # （这些字段来自前端 /tasks/parse-intent 调用后存在前端状态里，
+        #   用户提交 create_task 时通过 req 传入）
+        if req.parsed_intent_extra:
+            extra = req.parsed_intent_extra  # dict，来自前端存储的 parse-intent 响应
+            parsed_intent_dict.setdefault("intents", extra.get("intents", []))
+            if not parsed_intent_dict.get("extra_hint"):
+                parsed_intent_dict["extra_hint"] = extra.get("extra_hint", "")
+            if not parsed_intent_dict.get("scope_note"):
+                parsed_intent_dict["scope_note"] = extra.get("scope_note", "")
+
         # 如果 target 为空，从 raw_prompt 提取
         if not effective_target and parsed_intent.targets:
             effective_target = parsed_intent.targets[0]

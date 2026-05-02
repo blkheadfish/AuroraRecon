@@ -482,6 +482,13 @@ def _merge_llm_result(base: ParsedIntent,
             if isinstance(v, str) and v.strip().lower() not in base.priority_vulns:
                 base.priority_vulns.append(v.strip().lower())
 
+    # ★ 新增：intents 合并（LLM 语义标签，如 stealth / low_noise / prefer_msf）
+    llm_intents = llm_data.get("intents")
+    if isinstance(llm_intents, list):
+        for tag in llm_intents:
+            if isinstance(tag, str) and tag.strip().lower() not in base.intents:
+                base.intents.append(tag.strip().lower())
+
     return base
 
 

@@ -49,6 +49,35 @@ def operator_guidance_block(
     pending = (getattr(state, "pending_user_prompt", "") or "").strip()
     msgs = list(getattr(state, "user_messages", None) or [])
 
+    # ★ 新增：从任务创建时的静态策略字段补充 operator block
+    # 这让 recon / vuln_scan 阶段的 LLM 也能感知到用户在创建任务时的偏好
+    static_hints: list[str] = []
+
+    extra_hint = (getattr(state, "extra_hint", "") or "").strip()
+    if extra_hint:
+        static_hints.append(f"用户行动建议: {extra_hint}")
+
+    scope_note = (getattr(state, "scope_note", "") or "").strip()
+    if scope_note:
+        static_hints.append(f"授权范围/场景: {scope_note}")
+
+    parsed = getattr(state, "parsed_intent", None) or {}
+    if isinstance(parsed, dict):
+        priority_vulns = parsed.get("priority_vulns", []) or []
+        if priority_vulns:
+            static_hints.append(f"重点关注漏洞类型: {', '.join(priority_vulns[:6])}")
+        intents = parsed.get("intents", []) or []
+        if intents:
+            static_hints.append(f"任务意图标签: {', '.join(intents[:6])}")
+
+    # 将静态提示追加到 pending（不改变 pending 的优先级，只是补充）
+    if static_hints and not pending:
+        # 没有实时 pending 时，把静态提示作为「背景约束」注入
+        pending = "\n".join(static_hints)
+    elif static_hints and pending:
+        # 有实时 pending 时，静态提示追加在末尾（实时优先）
+        pending = pending + "\n\n【任务创建时的背景策略】\n" + "\n".join(static_hints)
+
     bullets: list[str] = []
     for m in msgs[-max_messages:]:
         text = (m.get("text") or "").strip()

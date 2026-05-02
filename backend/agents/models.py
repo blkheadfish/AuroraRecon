@@ -217,6 +217,8 @@ class ParsedIntent(BaseModel):
 	task_focus: list[str] = Field(default_factory=list)    # ["web", "database"]
 	pentest_phase: list[str] = Field(default_factory=list)  # ["recon", "exploit"]
 	priority_vulns: list[str] = Field(default_factory=list) # ["shiro", "fastjson"]
+	# ★ 新增：LLM 语义意图标签（来自 parse-intent 接口），如 stealth / low_noise / prefer_msf 等
+	intents: list[str] = Field(default_factory=list)
 	requires_discovery: bool = False  # 是否需要先做主机发现（masscan 存活扫描）
 	ambiguity_level: AmbiguityLevel = "vague"
 	clarification_needed: list[str] = Field(default_factory=list)
