@@ -192,7 +192,11 @@ services:
     image: redis:7-alpine
     container_name: pentest_redis
     restart: unless-stopped
-    command: redis-server --save 60 1 --loglevel warning --maxmemory 256mb --maxmemory-policy allkeys-lru
+    command: redis-server --save 60 1 --loglevel warning --maxmemory 256mb --maxmemory-policy allkeys-lru --maxclients 10000
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     volumes:
       - redis_data:/data
     networks:

@@ -20,18 +20,18 @@ logger = logging.getLogger(__name__)
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
+# ── 短操作池 (publish / cache / 工具结果读写) ──────────────
+# 短连接, 用完即还, 不需要太大。
 _pool: Optional[aioredis.Redis] = None
+
+# ── XREAD BLOCK 长连接池 (subscribe) ──────────────────────
+# 每个 WS 订阅者通过 XREAD BLOCK 25s 持有一条连接, 单独配池避免
+# 长连接饿死短操作。容量需要覆盖最大并发 WS Tab 数。
+_xread_pool: Optional[aioredis.Redis] = None
 
 
 async def get_redis() -> aioredis.Redis:
-    """获取 Redis 连接（懒初始化连接池）
-
-    ``max_connections`` 需要覆盖:
-      - 每个 WS 客户端 1 条 XREAD BLOCK 长连接 (25s 持有)
-      - task_runner 高频 publish (XADD + EXPIRE)
-      - redis_cache helpers (cache_state / append_log / is_cancelled)
-    20 个并发连接在多 Tab + 多任务场景下不够用, 提高到 100。
-    """
+    """获取 Redis 连接池 — 短操作 (publish / cache / 工具结果)。"""
     global _pool
     if _pool is None:
         _pool = aioredis.from_url(
@@ -42,12 +42,31 @@ async def get_redis() -> aioredis.Redis:
     return _pool
 
 
+async def get_redis_xread() -> aioredis.Redis:
+    """获取 Redis 连接池 — 专用于 XREAD BLOCK 长连接订阅。
+
+    默认 500 条连接, 覆盖 ~400 个并发 WS Tab + 余量。如果仍然不够,
+    通过环境变量 ``REDIS_XREAD_MAX_CONNECTIONS`` 调高。
+    """
+    global _xread_pool
+    if _xread_pool is None:
+        _xread_pool = aioredis.from_url(
+            REDIS_URL,
+            decode_responses=True,
+            max_connections=int(os.getenv("REDIS_XREAD_MAX_CONNECTIONS", "500")),
+        )
+    return _xread_pool
+
+
 async def close_redis():
-    """关闭连接池"""
-    global _pool
+    """关闭所有连接池"""
+    global _pool, _xread_pool
     if _pool:
         await _pool.close()
         _pool = None
+    if _xread_pool:
+        await _xread_pool.close()
+        _xread_pool = None
 
 
 # ── 任务状态缓存 ─────────────────────────────────────────

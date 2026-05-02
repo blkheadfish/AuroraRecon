@@ -71,9 +71,13 @@ def _ts_now_iso() -> str:
     return datetime.utcnow().isoformat(timespec="microseconds")
 
 
-# ── Redis 探测 ────────────────────────────────────────────────
+# ── Redis 探测 (短操作池) ────────────────────────────────────
 _redis_probe_done = False
 _redis_ok = False
+
+# ── Redis 探测 (XREAD 长连接池) ──────────────────────────────
+_xread_probe_done = False
+_xread_ok = False
 
 
 async def _get_redis_or_none():
@@ -105,6 +109,39 @@ async def _get_redis_or_none():
             )
             _redis_probe_done = True
             _redis_ok = False
+        return None
+
+
+async def _get_redis_xread_or_none():
+    """与 ``_get_redis_or_none`` 一样, 但使用 XREAD 专用连接池。
+
+    XREAD BLOCK 长连接占用时间远高于短操作, 分离后 publish / cache
+    不会被 WS 订阅者饿死。
+    """
+    global _xread_probe_done, _xread_ok
+    try:
+        from backend.db.redis_cache import get_redis_xread
+        r = await get_redis_xread()
+        if not _xread_probe_done:
+            try:
+                await r.ping()
+                _xread_ok = True
+                logger.info("[event_stream] XREAD 池 ping OK")
+            except Exception as exc:
+                _xread_ok = False
+                logger.warning(
+                    "[event_stream] XREAD 池 ping 失败, 走本地降级: %s", exc,
+                )
+            finally:
+                _xread_probe_done = True
+        return r if _xread_ok else None
+    except Exception as exc:
+        if not _xread_probe_done:
+            logger.warning(
+                "[event_stream] 加载 XREAD 池失败, 走本地降级: %s", exc,
+            )
+            _xread_probe_done = True
+            _xread_ok = False
         return None
 
 
@@ -165,10 +202,21 @@ async def publish(
             body["id"] = sid
             return sid
         except Exception as exc:
-            logger.warning(
-                "[event_stream] XADD 失败, 退到本地 ring task=%s err=%s",
-                task_id, exc,
-            )
+            msg = str(exc)
+            if "Too many connections" in msg:
+                # 连接池 / Redis 服务器已满, 短时间内不可能恢复,
+                # 标记降级, 避免后续 publish 每一条都尝试 Redis 都失败。
+                global _redis_ok
+                _redis_ok = False
+                logger.warning(
+                    "[event_stream] Redis 连接池耗尽, 降级到本地 ring, "
+                    "直到下一次 reset_redis_probe() 或服务重启才重试: %s", exc,
+                )
+            else:
+                logger.warning(
+                    "[event_stream] XADD 失败, 退到本地 ring task=%s err=%s",
+                    task_id, exc,
+                )
             # fallthrough 到本地降级
 
     return await _publish_local(task_id, body)
@@ -278,7 +326,7 @@ async def subscribe(
           抛 CancelledError 自动退出。
         * 降级模式: 监听本地 ``asyncio.Queue`` fanout, ``publish`` 时 put_nowait。
     """
-    r = await _get_redis_or_none()
+    r = await _get_redis_xread_or_none()
     if r is None:
         # 降级模式: 监听本地 queue
         queue: asyncio.Queue = asyncio.Queue(maxsize=2000)
