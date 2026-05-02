@@ -1,4 +1,4 @@
-export type TaskStatus = 'pending' | 'running' | 'completed' | 'failed'
+export type TaskStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled'
 
 export type WorkflowMode = 'pentest_engineer' | 'ctf_expert'
 
@@ -258,6 +258,7 @@ export interface TaskStats {
   running: number
   completed: number
   failed: number
+  cancelled: number
   total_findings: number
   shells_obtained: number
 }

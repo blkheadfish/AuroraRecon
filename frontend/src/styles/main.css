@@ -357,6 +357,32 @@ code, kbd, samp, pre {
     background: var(--bg-hover);
     border-color: var(--text-muted);
 }
+
+/* Default plain button (no type: "查看详情" / "对话视图" / "拒绝" etc.) */
+#app .el-button.is-plain:not(.el-button--primary):not(.el-button--success):not(.el-button--warning):not(.el-button--danger):not(.el-button--info) {
+    background: var(--bg-elevated);
+    border-color: var(--border);
+    color: var(--text-primary);
+}
+#app .el-button.is-plain:not(.el-button--primary):not(.el-button--success):not(.el-button--warning):not(.el-button--danger):not(.el-button--info):hover,
+#app .el-button.is-plain:not(.el-button--primary):not(.el-button--success):not(.el-button--warning):not(.el-button--danger):not(.el-button--info):focus-visible {
+    background: var(--bg-hover);
+    border-color: var(--text-muted);
+    color: var(--accent-blue);
+}
+#app .el-button.is-plain:not(.el-button--primary):not(.el-button--success):not(.el-button--warning):not(.el-button--danger):not(.el-button--info):active {
+    background: var(--bg-elevated);
+    border-color: var(--accent-blue);
+    color: var(--accent-blue);
+}
+#app .el-button.is-plain:not(.el-button--primary):not(.el-button--success):not(.el-button--warning):not(.el-button--danger):not(.el-button--info).is-disabled,
+#app .el-button.is-plain:not(.el-button--primary):not(.el-button--success):not(.el-button--warning):not(.el-button--danger):not(.el-button--info).is-loading {
+    background: var(--bg-elevated);
+    border-color: var(--border-muted);
+    color: var(--text-muted);
+    opacity: 0.7;
+}
+
 #app .approval-wrap .right .el-button.btn-approve {
     background: color-mix(in srgb, var(--accent-green) 18%, var(--bg-elevated));
     border-color: color-mix(in srgb, var(--accent-green) 52%, var(--border));
@@ -385,6 +411,17 @@ code, kbd, samp, pre {
     background: color-mix(in srgb, var(--accent-blue) 97%, var(--bg-surface));
     border-color: color-mix(in srgb, var(--accent-blue) 100%, var(--bg-surface));
     opacity: 1;
+}
+#app .el-button--primary.is-plain {
+    background: color-mix(in srgb, var(--accent-blue) 12%, var(--bg-elevated));
+    border-color: color-mix(in srgb, var(--accent-blue) 45%, var(--border));
+    color: color-mix(in srgb, var(--accent-blue) 85%, var(--text-primary));
+}
+#app .el-button--primary.is-plain:hover,
+#app .el-button--primary.is-plain:focus-visible {
+    background: color-mix(in srgb, var(--accent-blue) 22%, var(--bg-hover));
+    border-color: color-mix(in srgb, var(--accent-blue) 65%, var(--border));
+    color: var(--accent-blue);
 }
 #app .el-button--danger {
     background: transparent;
@@ -517,6 +554,84 @@ code, kbd, samp, pre {
 /* Switch override for dark/light */
 #app .el-switch {
     --el-switch-on-color: var(--accent-blue);
+}
+
+/* Pagination dark theme — covers both default and background mode */
+#app .el-pagination {
+    --el-pagination-bg-color: var(--bg-elevated);
+    --el-pagination-text-color: var(--text-secondary);
+    --el-pagination-hover-color: var(--accent-blue);
+}
+#app .el-pagination button {
+    background: var(--bg-elevated);
+    color: var(--text-secondary);
+    border-color: var(--border);
+}
+#app .el-pagination button:hover {
+    color: var(--accent-blue);
+}
+#app .el-pagination button.is-active {
+    background: color-mix(in srgb, var(--accent-blue) 18%, var(--bg-elevated));
+    color: var(--accent-blue);
+    border-color: color-mix(in srgb, var(--accent-blue) 40%, var(--border));
+}
+
+/* background mode (el-pagination background prop) */
+#app .el-pagination.is-background .btn-prev,
+#app .el-pagination.is-background .btn-next {
+    background: var(--bg-elevated);
+    color: var(--text-secondary);
+    border-color: var(--border);
+}
+#app .el-pagination.is-background .btn-prev:hover,
+#app .el-pagination.is-background .btn-next:hover {
+    color: var(--accent-blue);
+}
+#app .el-pagination.is-background .btn-prev:disabled,
+#app .el-pagination.is-background .btn-next:disabled {
+    background: var(--bg-elevated);
+    color: var(--text-muted);
+    border-color: var(--border-muted);
+}
+#app .el-pagination.is-background .el-pager li {
+    background: var(--bg-elevated);
+    color: var(--text-secondary);
+    border-color: var(--border);
+    margin: 0 2px;
+    border-radius: var(--radius-sm);
+}
+#app .el-pagination.is-background .el-pager li:hover {
+    color: var(--accent-blue);
+}
+#app .el-pagination.is-background .el-pager li:not(.is-disabled).is-active {
+    background: color-mix(in srgb, var(--accent-blue) 18%, var(--bg-elevated));
+    color: var(--accent-blue);
+    border-color: color-mix(in srgb, var(--accent-blue) 40%, var(--border));
+}
+#app .el-pagination.is-background .el-pager li:not(.is-disabled).is-active:hover {
+    color: var(--accent-blue);
+}
+#app .el-pagination.is-background .el-pager li.is-disabled {
+    background: var(--bg-elevated);
+    color: var(--text-muted);
+    border-color: var(--border-muted);
+}
+
+/* pagination text / select / jumper */
+#app .el-pagination .el-select .el-input__wrapper {
+    background: var(--bg-elevated);
+}
+#app .el-pagination__total,
+#app .el-pagination__sizes,
+#app .el-pagination__jump {
+    color: var(--text-secondary) !important;
+}
+#app .el-pagination__jump .el-input__wrapper {
+    background: var(--bg-elevated) !important;
+    box-shadow: 0 0 0 1px var(--border) !important;
+}
+#app .el-pagination__jump .el-input__inner {
+    color: var(--text-primary);
 }
 
 /* Popconfirm */
