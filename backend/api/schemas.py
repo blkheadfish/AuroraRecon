@@ -4,9 +4,9 @@ schemas.py —— 所有 API 请求/响应 Pydantic 模型
 from __future__ import annotations
 
 import re
-from typing import Literal, Optional
+from typing import Literal, Optional, Union
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 from backend.agents.models import WorkflowMode, parse_target
 
 
@@ -104,6 +104,27 @@ class TaskSummary(BaseModel):
     updated_at: str = ""
     workflow_mode: str = "pentest_engineer"
     auto_approve: bool = False
+
+
+class PendingConfirmationResponse(BaseModel):
+    """POST /tasks 返回的安全卡口待确认响应。
+
+    当目标为公网 IP、需进一步确认授权等场景时,后端不会立即创建任务,
+    而是返回此结构,要求前端展示风险警告并收集用户确认后二次提交。
+    二次提交时需在 CreateTaskRequest.user_confirmed_risks 中传入已勾选的
+    风险项 ID,后端校验通过后才会正式创建任务。
+    """
+    status: Literal["pending_confirmation"] = "pending_confirmation"
+    task_id: str = ""
+    target: str
+    warnings: list[str] = Field(default_factory=list)
+    required_confirmations: list[str] = Field(default_factory=list)
+    parsed_intent: dict = Field(default_factory=dict)
+    message: str = ""
+
+
+# POST /tasks 的联合响应：成功创建 → TaskSummary，待确认 → PendingConfirmationResponse
+TaskCreateResponse = Union[TaskSummary, PendingConfirmationResponse]
 
 
 class TaskDetail(TaskSummary):

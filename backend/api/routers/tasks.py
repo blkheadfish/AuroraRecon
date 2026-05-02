@@ -18,6 +18,7 @@ from backend.api.schemas import (
     CreateTaskRequest, TaskSummary, TaskStats, ApproveRequest,
     CheckpointDecisionRequest, ChatMessageRequest,
     ParseIntentRequest, ParseIntentResponse,
+    PendingConfirmationResponse, TaskCreateResponse,
 )
 from backend.api.state import get_state_manager, TaskStateManager
 from backend.api import event_stream
@@ -275,7 +276,7 @@ async def parse_task_intent(req: ParseIntentRequest, request: Request):
 
 # ── CRUD ──────────────────────────────────────────────────
 
-@router.post("/tasks", response_model=TaskSummary)
+@router.post("/tasks", response_model=TaskCreateResponse)
 async def create_task(req: CreateTaskRequest, request: Request):
     """
     创建一个新任务。
@@ -373,15 +374,15 @@ async def create_task(req: CreateTaskRequest, request: Request):
             if c not in req.user_confirmed_risks
         ]
         if pending_confirmations:
-            return {
-                "status": "pending_confirmation",
-                "task_id": "",
-                "target": effective_target,
-                "warnings": safety_result.warnings,
-                "required_confirmations": pending_confirmations,
-                "parsed_intent": parsed_intent_dict or safety_intent.model_dump(),
-                "message": "需要确认以下风险项后再提交",
-            }
+            return PendingConfirmationResponse(
+                status="pending_confirmation",
+                task_id="",
+                target=effective_target,
+                warnings=safety_result.warnings,
+                required_confirmations=pending_confirmations,
+                parsed_intent=parsed_intent_dict or safety_intent.model_dump(),
+                message="需要确认以下风险项后再提交",
+            )
 
     # ── PENDING_CLARIFICATION：目标不明确 ────────────────
     # 仅当 effective_target 为空时才需要从自然语言中反推目标；

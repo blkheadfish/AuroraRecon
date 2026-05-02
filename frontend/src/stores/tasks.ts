@@ -17,7 +17,7 @@ export const useTasksStore = defineStore('tasksCompat', () => {
   }
 
   async function createTask(target: string, scopeNote: string) {
-    return listStore.createTask(target, scopeNote)
+    return listStore.createTask({ target, scopeNote })
   }
 
   function updateTask(updated: { task_id: string } & Record<string, unknown>) {

@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { api } from '@/api'
-import type { TaskSummary, WorkflowMode } from '@/types/task'
+import type { TaskCreateResponse, TaskSummary, WorkflowMode } from '@/types/task'
 
 export interface CreateTaskParams {
   target: string
@@ -17,6 +17,7 @@ export interface CreateTaskParams {
   maxExploreRounds?: number | null
   skillMinScore?: number | null
   skillWeakBoost?: number | null
+  userConfirmedRisks?: string[]
 }
 
 export const useTaskListStore = defineStore('taskList', () => {
@@ -40,8 +41,8 @@ export const useTaskListStore = defineStore('taskList', () => {
     }
   }
 
-  async function createTask(params: CreateTaskParams) {
-    const task = await api.createTask({
+  async function createTask(params: CreateTaskParams): Promise<TaskCreateResponse> {
+    const result = await api.createTask({
       target:             params.target,
       rawPrompt:          params.rawPrompt ?? '',
       note:               params.scopeNote,
@@ -55,9 +56,13 @@ export const useTaskListStore = defineStore('taskList', () => {
       maxExploreRounds:   params.maxExploreRounds ?? null,
       skillMinScore:      params.skillMinScore ?? null,
       skillWeakBoost:     params.skillWeakBoost ?? null,
+      userConfirmedRisks: params.userConfirmedRisks ?? [],
     })
-    tasks.value.unshift(task)
-    return task
+    // 只有成功创建的任务才加入列表（PendingConfirmationResponse 没有 task_id）
+    if (result.status !== 'pending_confirmation' && result.task_id) {
+      tasks.value.unshift(result as TaskSummary)
+    }
+    return result
   }
 
   function upsertTask(updated: Partial<TaskSummary> & { task_id: string }) {

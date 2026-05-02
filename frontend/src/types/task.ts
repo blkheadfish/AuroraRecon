@@ -44,6 +44,20 @@ export interface TaskSummary {
   auto_approve?: boolean
 }
 
+/** POST /tasks 安全卡口待确认响应 */
+export interface PendingConfirmationResponse {
+  status: 'pending_confirmation'
+  task_id: string
+  target: string
+  warnings: string[]
+  required_confirmations: string[]
+  parsed_intent: Record<string, unknown>
+  message: string
+}
+
+/** POST /tasks 的联合响应类型 */
+export type TaskCreateResponse = TaskSummary | PendingConfirmationResponse
+
 export interface TaskDetail extends TaskSummary {
   findings?: Finding[]
   // 后端默认返回轻量快照: phase_log 留空, phase_log_tail 仅含最近 N 条,

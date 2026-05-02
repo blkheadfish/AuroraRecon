@@ -4,8 +4,10 @@ import type {
   BranchTreePayload,
   HealthInfo,
   MetricsOverview,
+  PendingConfirmationResponse,
   ReportData,
   TaskBranch,
+  TaskCreateResponse,
   TaskDetail,
   TaskLogsPage,
   TaskStats,
@@ -115,21 +117,23 @@ export const api = {
     maxExploreRounds?: number | null
     skillMinScore?: number | null
     skillWeakBoost?: number | null
-  }): Promise<TaskSummary> =>
+    userConfirmedRisks?: string[]
+  }): Promise<TaskCreateResponse> =>
     http.post('/tasks', {
-      target:              payload.target,
-      raw_prompt:          payload.rawPrompt ?? '',
-      scope_note:          payload.note ?? 'CTF/授权靶场测试',
-      extra_hint:          payload.extraHint ?? '',
-      user_prompt:         payload.userPrompt ?? '',
-      workflow_mode:       payload.workflowMode ?? 'pentest_engineer',
-      auto_approve:        payload.autoApprove ?? null,
-      success_gate_level:  payload.successGateLevel ?? null,
-      risk_budget:         payload.riskBudget ?? null,
-      max_react_rounds:    payload.maxReactRounds ?? null,
-      max_explore_rounds:  payload.maxExploreRounds ?? null,
-      skill_min_score:     payload.skillMinScore ?? null,
-      skill_weak_boost:    payload.skillWeakBoost ?? null,
+      target:                payload.target,
+      raw_prompt:            payload.rawPrompt ?? '',
+      scope_note:            payload.note ?? 'CTF/授权靶场测试',
+      extra_hint:            payload.extraHint ?? '',
+      user_prompt:           payload.userPrompt ?? '',
+      workflow_mode:         payload.workflowMode ?? 'pentest_engineer',
+      auto_approve:          payload.autoApprove ?? null,
+      success_gate_level:    payload.successGateLevel ?? null,
+      risk_budget:           payload.riskBudget ?? null,
+      max_react_rounds:      payload.maxReactRounds ?? null,
+      max_explore_rounds:    payload.maxExploreRounds ?? null,
+      skill_min_score:       payload.skillMinScore ?? null,
+      skill_weak_boost:      payload.skillWeakBoost ?? null,
+      user_confirmed_risks:  payload.userConfirmedRisks ?? [],
     }),
   // 默认走轻量快照(phase_log_tail/decision_events_tail),完整 state 用 getTaskFull
   getTask: (id: string): Promise<TaskDetail> => http.get(`/tasks/${id}`),

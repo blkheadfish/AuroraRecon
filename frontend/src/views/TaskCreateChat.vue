@@ -36,6 +36,42 @@
           </template>
         </ChatBubble>
 
+        <!-- 安全卡口确认卡片 -->
+        <div v-if="pendingConfirmationState" class="confirmation-card">
+          <div class="confirmation-header">
+            <el-icon class="confirmation-icon"><Warning /></el-icon>
+            <span>安全风险确认</span>
+          </div>
+          <p class="confirmation-message">{{ pendingConfirmationState.message }}</p>
+          <ul class="confirmation-warnings">
+            <li v-for="w in pendingConfirmationState.warnings" :key="w">
+              <el-icon><Warning /></el-icon>
+              {{ w }}
+            </li>
+          </ul>
+          <div class="confirmation-checks">
+            <el-checkbox
+              v-for="rid in pendingConfirmationState.required_confirmations"
+              :key="rid"
+              v-model="confirmedRisks"
+              :label="rid"
+            >
+              {{ confirmationLabel(rid) }}
+            </el-checkbox>
+          </div>
+          <div class="confirmation-actions">
+            <el-button @click="cancelConfirmation" :disabled="creating">取消</el-button>
+            <el-button
+              type="primary"
+              :loading="creating"
+              :disabled="confirmedRisks.length === 0"
+              @click="confirmAndResubmit"
+            >
+              确认并提交
+            </el-button>
+          </div>
+        </div>
+
         <div v-if="advancedDirty" class="advanced-summary">
           <span class="muted">已生效的高级配置:</span>
           <el-tag
@@ -271,7 +307,7 @@ import {
 import { api } from '@/api'
 import { useTaskListStore } from '@/stores/taskList'
 import { trackEvent } from '@/metrics/tracker'
-import type { WorkflowMode } from '@/types/task'
+import type { PendingConfirmationResponse, WorkflowMode } from '@/types/task'
 
 const ChatBubble = defineAsyncComponent(() => import('@/components/ChatBubble.vue'))
 
@@ -305,6 +341,10 @@ const form = ref({
 
 const creating = ref(false)
 const streamRef = ref<HTMLElement | null>(null)
+
+// pending_confirmation 流程状态
+const pendingConfirmationState = ref<PendingConfirmationResponse | null>(null)
+const confirmedRisks = ref<string[]>([])
 
 const messages = ref<ChatMessage[]>([
   {
@@ -511,6 +551,19 @@ function nowTime() {
   return new Date().toLocaleTimeString()
 }
 
+const CONFIRMATION_LABELS: Record<string, string> = {
+  confirm_public_ip_authorization: '我确认拥有对该公网 IP 目标的合法渗透测试授权',
+  confirm_third_party_target: '我确认拥有对该第三方目标的合法测试授权',
+  confirm_sensitive_port_scan: '我确认对该敏感端口的扫描已获授权',
+  confirm_aggressive_exploit: '我确认执行高影响利用操作已获授权',
+  confirm_lateral_movement: '我确认横向移动操作已获授权',
+  confirm_data_exfiltration: '我确认数据外传测试已获授权',
+}
+
+function confirmationLabel(riskId: string): string {
+  return CONFIRMATION_LABELS[riskId] || `确认风险项: ${riskId}`
+}
+
 function pushAgent(text: string, tone: ChatMessage['tone'] = 'info') {
   messages.value.push({
     id: `agent-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
@@ -633,6 +686,21 @@ async function submit() {
       maxReactRounds: form.value.maxReactRounds,
       maxExploreRounds: form.value.maxExploreRounds,
     })
+
+    // ── 安全卡口待确认 ──
+    if (task.status === 'pending_confirmation') {
+      pendingConfirmationState.value = task as PendingConfirmationResponse
+      confirmedRisks.value = []
+      pushAgent(
+        task.warnings.map((w) => `⚠️ ${w}`).join('\n') +
+          '\n\n请在下方勾选确认项后点击「确认并提交」。',
+        'warning',
+      )
+      creating.value = false
+      return
+    }
+
+    // ── 正常创建成功 ──
     trackEvent('task.create', {
       target,
       workflowMode: form.value.workflowMode,
@@ -673,6 +741,79 @@ async function submit() {
   } finally {
     creating.value = false
   }
+}
+
+async function confirmAndResubmit() {
+  const pending = pendingConfirmationState.value
+  if (!pending || confirmedRisks.value.length === 0) {
+    ElMessage.warning('请至少勾选一项确认')
+    return
+  }
+  creating.value = true
+  try {
+    const task = await listStore.createTask({
+      target: pending.target,
+      rawPrompt: form.value.userPrompt.trim(),
+      scopeNote: form.value.scopeNote,
+      extraHint: form.value.extraHint,
+      userPrompt: form.value.userPrompt.trim(),
+      workflowMode: form.value.workflowMode,
+      autoApprove: false,
+      successGateLevel: form.value.successGateLevel || null,
+      riskBudget: form.value.riskBudget,
+      maxReactRounds: form.value.maxReactRounds,
+      maxExploreRounds: form.value.maxExploreRounds,
+      userConfirmedRisks: confirmedRisks.value,
+    })
+
+    if (task.status === 'pending_confirmation') {
+      // 仍有关卡未通过，更新确认列表
+      pendingConfirmationState.value = task as PendingConfirmationResponse
+      confirmedRisks.value = []
+      pushAgent(
+        task.warnings.map((w) => `⚠️ ${w}`).join('\n') +
+          '\n\n还有风险项未确认，请继续勾选。',
+        'warning',
+      )
+      creating.value = false
+      return
+    }
+
+    // 创建成功
+    pendingConfirmationState.value = null
+    trackEvent('task.create', {
+      target: pending.target,
+      workflowMode: form.value.workflowMode,
+      autoApprove: false,
+      taskId: task.task_id,
+    })
+    pushAgent(
+      `✅ 确认通过，任务已创建: ${task.task_id}。即将跳转到任务详情页。`,
+      'primary',
+    )
+    ElMessage.success(`任务已创建: ${task.target}`)
+    setTimeout(() => router.push(`/tasks/${task.task_id}/chat`), 600)
+  } catch (e: unknown) {
+    const responseData = (e as { response?: { data?: { detail?: unknown } } })?.response?.data
+    const rawDetail = responseData?.detail
+    let detail: string
+    if (typeof rawDetail === 'object' && rawDetail !== null) {
+      const structured = rawDetail as Record<string, unknown>
+      detail = (structured.message as string) || (structured.detail as string) || JSON.stringify(rawDetail)
+    } else {
+      detail = String(rawDetail || (e as Error)?.message || '提交失败')
+    }
+    pushAgent(`${detail}`, 'warning')
+    ElMessage.error(detail)
+  } finally {
+    creating.value = false
+  }
+}
+
+function cancelConfirmation() {
+  pendingConfirmationState.value = null
+  confirmedRisks.value = []
+  pushAgent('已取消安全确认，你可以修改目标后重新提交。', 'info')
 }
 </script>
 
@@ -1001,4 +1142,68 @@ async function submit() {
 .adv-row.two-col > div { flex: 1; display: flex; flex-direction: column; gap: 4px; }
 
 .muted { color: var(--text-muted); }
+
+/* ── 安全卡口确认卡片 ─────────────────────────── */
+.confirmation-card {
+  margin: 12px 0;
+  padding: 16px 20px;
+  background: color-mix(in srgb, var(--accent-warning) 8%, var(--bg-surface));
+  border: 1px solid color-mix(in srgb, var(--accent-warning) 30%, var(--border));
+  border-radius: 10px;
+  animation: confirmationIn 0.25s ease-out;
+}
+@keyframes confirmationIn {
+  from { opacity: 0; transform: translateY(-6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.confirmation-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--accent-warning);
+  margin-bottom: 10px;
+}
+.confirmation-icon { font-size: 20px; }
+.confirmation-message {
+  margin: 0 0 12px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+.confirmation-warnings {
+  margin: 0 0 14px;
+  padding-left: 0;
+  list-style: none;
+}
+.confirmation-warnings li {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 6px 8px;
+  margin-bottom: 4px;
+  font-size: 13px;
+  color: var(--accent-warning);
+  background: color-mix(in srgb, var(--accent-warning) 12%, transparent);
+  border-radius: 6px;
+  line-height: 1.45;
+}
+.confirmation-checks {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+.confirmation-checks :deep(.el-checkbox__label) {
+  font-size: 13px;
+  color: var(--text-primary);
+  white-space: normal;
+  line-height: 1.45;
+}
+.confirmation-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
 </style>
