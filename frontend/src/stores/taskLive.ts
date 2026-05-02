@@ -31,6 +31,7 @@ interface LlmStreamBubble {
 
 interface TaskLiveState {
   task: TaskDetail | null
+  taskUpdatedAt: number
   logs: string[]
   logSet: Set<string>
   logTotal: number
@@ -51,6 +52,7 @@ interface TaskLiveState {
   maxBranchesPerTask: number
   branchFlashAt: number
   unsub?: () => void
+  _everAttached: boolean
 }
 
 export const useTaskLiveStore = defineStore('taskLive', () => {
@@ -63,6 +65,7 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
     if (!taskStateMap.value[taskId]) {
       taskStateMap.value[taskId] = {
         task: null,
+        taskUpdatedAt: 0,
         logs: [],
         logSet: new Set<string>(),
         logTotal: 0,
@@ -82,6 +85,7 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
         activeBranchId: '',
         maxBranchesPerTask: 12,
         branchFlashAt: 0,
+        _everAttached: false,
       }
     }
     return taskStateMap.value[taskId]
@@ -398,6 +402,7 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
         : minEarliest
     }
     taskListStore.upsertTask(full)
+    state.taskUpdatedAt = Date.now()
     return full
   }
 
@@ -667,41 +672,49 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
     const state = ensureState(taskId)
     if (state.unsub) return
 
-    // 协议 v2: 从 IndexedDB 预热历史事件, 避免 WS 首包到之前时间线空白
-    try {
-      const cached = await loadEvents(taskId, 2000)
-      if (cached.length) {
-        const dEvents: DecisionEvent[] = []
-        for (const ev of cached) {
-          const et = String(ev.type || '')
-          if (et === 'log') {
-            const p = (ev.payload || {}) as { line?: string; seq?: number }
-            if (p.line) pushLog(state, p.line)
-            if (typeof p.seq === 'number') state.logTotal = Math.max(state.logTotal, p.seq + 1)
-          } else if (et === 'decision_event') {
-            const p = (ev.payload || {}) as Record<string, unknown>
-            dEvents.push({
-              id: String(ev.id || ''),
-              timestamp: String(ev.ts || ''),
-              ...p,
-            } as DecisionEvent)
-          }
-        }
-        if (dEvents.length) mergeDecisionEvents(state, dEvents, true)
-      }
-    } catch {
-      // IndexedDB 不可用, 跳过预热
-    }
+    // 判断 state 是否已温热（之前 attach 过，从另一视图切换过来）
+    const isWarm = state._everAttached
 
-    // 先拉一份任务快照 (含 phase_log_tail / decision_events_tail / checkpoint)
-    refreshTask(taskId).catch(() => {})
+    if (!isWarm) {
+      // 冷启动：从 IndexedDB 预热历史事件，避免 WS 首包到之前时间线空白
+      try {
+        const cached = await loadEvents(taskId, 2000)
+        if (cached.length) {
+          const dEvents: DecisionEvent[] = []
+          for (const ev of cached) {
+            const et = String(ev.type || '')
+            if (et === 'log') {
+              const p = (ev.payload || {}) as { line?: string; seq?: number }
+              if (p.line) pushLog(state, p.line)
+              if (typeof p.seq === 'number') state.logTotal = Math.max(state.logTotal, p.seq + 1)
+            } else if (et === 'decision_event') {
+              const p = (ev.payload || {}) as Record<string, unknown>
+              dEvents.push({
+                id: String(ev.id || ''),
+                timestamp: String(ev.ts || ''),
+                ...p,
+              } as DecisionEvent)
+            }
+          }
+          if (dEvents.length) mergeDecisionEvents(state, dEvents, true)
+        }
+      } catch {
+        // IndexedDB 不可用，跳过预热
+      }
+      // 冷启动时拉任务快照；温热时由视图层 onMounted 的 refreshTask 负责
+      refreshTask(taskId).catch(() => {})
+    }
 
     state.unsub = subscribeTaskEvents(taskId, (event) => {
       applyEvent(state, taskId, event)
     })
 
-    // 拉完整 branch tree
-    refreshBranches(taskId).catch(() => {})
+    // 冷启动时拉完整 branch tree；温热时复用已有数据
+    if (!isWarm) {
+      refreshBranches(taskId).catch(() => {})
+    }
+
+    state._everAttached = true
   }
 
   function detach(taskId: string) {
