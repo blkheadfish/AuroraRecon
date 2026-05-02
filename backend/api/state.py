@@ -37,8 +37,6 @@ class TaskStateManager:
         self.redis_available = False
         self.msf_available = False
 
-        self._tool_registry_cache = None
-
         # 后台任务句柄注册表(run_task / resume_task 的 asyncio.Task)
         # cancel / delete 时可以精确取消对应协程,避免 zombie 残留。
         self._bg_tasks: dict[str, asyncio.Task] = {}
@@ -161,13 +159,12 @@ class TaskStateManager:
         task.cancel()
         return True
 
-    # ── 工具注册表缓存 ────────────────────────────────────
+    # ── 工具注册表 ──────────────────────────────────────
+    # 始终重新创建，确保 YAML 变更后无需重启即可生效
 
     def get_tool_registry(self):
-        if self._tool_registry_cache is None:
-            from backend.tools.tool_registry import ToolRegistry
-            self._tool_registry_cache = ToolRegistry()
-        return self._tool_registry_cache
+        from backend.tools.tool_registry import ToolRegistry
+        return ToolRegistry()
 
     # ── 辅助转换函数 ──────────────────────────────────────
 
