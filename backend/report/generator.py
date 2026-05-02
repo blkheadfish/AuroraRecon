@@ -19,13 +19,99 @@ REPORTS_DIR = os.getenv("REPORTS_DIR", "/tmp/pentest_reports")
 REPORT_BLOCK_MAX_CHARS = max(1200, int(os.getenv("REPORT_BLOCK_MAX_CHARS", "12000")))
 
 
+def _extract_phpinfo_fields(body: str) -> str:
+    """从 phpinfo() 输出中提取安全评估相关的关键字段，忽略冗余 HTML。"""
+    # 识别 phpinfo 页面特征头部
+    version_match = re.search(r'<h1 class="p">PHP Version ([\d.]+(?:[-\w.]*)?)</h1>', body)
+    if not version_match:
+        return body  # 不是 phpinfo 输出，原样返回
+
+    php_version = version_match.group(1)
+
+    # 提取 phpinfo 表格中的关键字段
+    # 匹配 <tr><td class="e">Key</td><td class="v">Value</td></tr>
+    tr_pattern = re.compile(
+        r'<tr>\s*<td class="e">\s*(.*?)\s*</td>\s*<td class="v">\s*(.*?)\s*</td>\s*</tr>',
+        re.DOTALL,
+    )
+
+    # 安全评估关键字段白名单
+    key_fields = {
+        "System", "Server API", "PHP Version", "Build Date",
+        "Virtual Directory Support",
+        "Configuration File (php.ini) Path",
+        "Loaded Configuration File",
+        "Scan this dir for additional .ini files",
+        "PHP API", "PHP Extension", "Zend Extension",
+        "Registered PHP Streams",
+        "Registered Stream Socket Transports",
+        "Registered Stream Filters",
+        "allow_url_fopen", "allow_url_include",
+        "disable_functions", "disable_classes",
+        "open_basedir",
+        "display_errors", "display_startup_errors",
+        "expose_php",
+        "file_uploads", "upload_max_filesize", "max_file_uploads",
+        "Loaded Extensions",
+        "Registered Stream Socket Transports",
+    }
+
+    extracted: list[str] = []
+    extracted.append(f"PHP Version: {php_version}")
+
+    for match in tr_pattern.finditer(body):
+        key = match.group(1).strip()
+        value_raw = match.group(2)
+
+        if key in key_fields:
+            # 清理值中的 HTML 标签和多余空白
+            value = re.sub(r'<[^>]+>', '', value_raw)
+            value = re.sub(r'\s+', ' ', value).strip()
+            # 将长文本截断
+            if len(value) > 200:
+                value = value[:200] + "..."
+            extracted.append(f"{key}: {value}")
+
+    # 如果没有提取到关键字段，回退到通用 HTML 清洗
+    if len(extracted) <= 1:
+        return _html_to_text(body)
+
+    return "\n".join(extracted)
+
+
+def _html_to_text(body: str) -> str:
+    """将通用 HTML 响应体转为可读的纯文本摘要。"""
+    # 移除 style/script 块
+    text = re.sub(r"<style[^>]*>.*?</style>", "", body, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<script[^>]*>.*?</script>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    # 移除 base64 内联图片
+    text = re.sub(r'src="data:image/[^"]{100,}"', '[image removed]', text)
+    # 将常见块级标签替换为换行
+    for tag in ("</?br[^>]*>", "</p>", "</div>", "</li>", "</tr>", "</h[1-6]>"):
+        text = re.sub(tag, "\n", text, flags=re.IGNORECASE)
+    # 移除其余 HTML 标签
+    text = re.sub(r"<[^>]+>", " ", text)
+    # 解码常见 HTML 实体
+    text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"').replace("&#39;", "'")
+    # 合并多余空白
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"^[ \t]+", "", text, flags=re.MULTILINE)
+    lines = [line.strip() for line in text.split("\n")]
+    lines = [line for line in lines if line]
+    return "\n".join(lines).strip()
+
+
+_PHPINFO_START = re.compile(r'<h1 class="p">PHP Version', re.IGNORECASE)
+
+
 def _clean_html_body(body: str) -> str:
-    """清理 HTML body：去除 style/script 内容块但保留结构与关键文本。"""
-    cleaned = re.sub(r"<style[^>]*>.*?</style>", "<!-- style removed -->", body, flags=re.DOTALL | re.IGNORECASE)
-    cleaned = re.sub(r"<script[^>]*>.*?</script>", "<!-- script removed -->", cleaned, flags=re.DOTALL | re.IGNORECASE)
-    cleaned = re.sub(r'src="data:image/[^"]{100,}"', 'src="[base64 image removed]"', cleaned)
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    return cleaned.strip()
+    """清理 HTML body：识别 phpinfo 输出做结构化提取，通用 HTML 转纯文本。"""
+    if not body or not body.strip():
+        return ""
+    if _PHPINFO_START.search(body):
+        return _extract_phpinfo_fields(body)
+    return _html_to_text(body)
 
 
 def _detect_text_lang(text: str) -> str:
@@ -249,6 +335,44 @@ def format_elapsed(value: Any) -> str:
         return "-"
 
 
+def _default_remediation(finding) -> str:
+    """当 finding.remediation 为空时的兜底修复建议（按严重等级分类）。"""
+    sev = getattr(finding, "severity", "medium") if not isinstance(finding, str) else finding
+    suggestions = {
+        "critical": "立即下线受影响服务，排查是否已被利用，部署 WAF 临时拦截，同时联系厂商获取安全补丁并尽快应用。",
+        "high": "优先安排修复窗口，升级到官方最新安全版本或应用安全补丁，修复后完成回归验证。",
+        "medium": "在维护窗口内修复并完成回归验证，同步审查相关配置是否存在同类风险。",
+        "low": "纳入下一迭代安全加固计划，持续跟踪厂商安全公告。",
+    }
+    return suggestions.get(sev, "根据安全基线持续监控并定期复查。")
+
+
+def _default_impact(finding) -> str:
+    """当 finding.impact 为空时的兜底危害描述。"""
+    sev = getattr(finding, "severity", "medium") if not isinstance(finding, str) else finding
+    impacts = {
+        "critical": "攻击者可远程利用此漏洞获取系统最高权限，导致服务器完全失陷、敏感数据泄露或业务中断。",
+        "high": "攻击者可能利用此漏洞获取敏感信息、执行未授权操作或进一步扩大攻击面。",
+        "medium": "此漏洞在特定条件下可能被利用，造成信息泄露或服务异常。",
+        "low": "此漏洞实际危害有限，但仍建议修复以消除潜在风险。",
+    }
+    return impacts.get(sev, "")
+
+
+def _filter_phase_log(phase_log: list) -> list:
+    """过滤掉 stdout/stderr 级别的原始输出行，只保留阶段摘要和关键事件。"""
+    if not phase_log:
+        return []
+    filtered: list = []
+    for entry in phase_log:
+        text = str(entry)
+        # 过滤掉 [stdout] 和 [stderr] 标签的纯输出行
+        if "[stdout]" in text or "[stderr]" in text:
+            continue
+        filtered.append(entry)
+    return filtered
+
+
 def normalize_markdown_whitespace(content: str) -> str:
     if not content:
         return ""
@@ -287,7 +411,21 @@ def normalize_markdown_whitespace(content: str) -> str:
     return "\n".join(output) + "\n"
 
 
-MD_TEMPLATE = """# 渗透测试报告
+# 模板路径（相对于本文件）
+_TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
+_TEMPLATE_FILE = os.environ.get("REPORT_TEMPLATE", os.path.join(_TEMPLATE_DIR, "report.md.j2"))
+
+
+def _load_template() -> str:
+    """从文件加载 Jinja2 模板，文件不存在时回退到内联模板。"""
+    if os.path.isfile(_TEMPLATE_FILE):
+        with open(_TEMPLATE_FILE, "r", encoding="utf-8") as f:
+            return f.read()
+    logger.warning(f"模板文件不存在 {_TEMPLATE_FILE}，使用内联回退模板")
+    return _FALLBACK_TEMPLATE
+
+
+_FALLBACK_TEMPLATE = """# 渗透测试报告
 
 | 项目 | 信息 |
 |------|------|
@@ -308,9 +446,9 @@ MD_TEMPLATE = """# 渗透测试报告
 
 | 严重程度 | 数量 |
 |----------|------|
-| 🔴 严重 | {{ critical_count }} |
-| 🟠 高危 | {{ high_count }} |
-| 🟡 中危 | {{ medium_count }} |
+| critical | {{ critical_count }} |
+| high | {{ high_count }} |
+| medium | {{ medium_count }} |
 
 {% if state.got_shell %}
 > ✅ 已获得目标访问能力，当前权限：**{{ safe_val(state.privilege_level, "unknown") }}**
@@ -392,17 +530,23 @@ MD_TEMPLATE = """# 渗透测试报告
 {% if real_vulns %}
 ### 可利用漏洞
 {% for f in real_vulns %}
-#### {{ loop.index }}. {{ sev_emoji(f.severity) }} {{ f.name }}
+#### {{ loop.index }}. {{ f.name }}
 
 | 属性 | 值 |
 |------|-----|
 | **严重程度** | {{ sev_emoji(f.severity) }} {{ sev_label(f.severity) }} |
+| **CVSS** | {% if f.cvss_score %}{{ f.cvss_score }}{% endif %} |
+| **CWE** | {{ f.cwe or "N/A" }} |
 | **CVE** | {{ f.cve or "N/A" }} |
 | **目标** | `{{ safe_val(f.target, "-") }}` |
 | **端口** | {{ safe_val(f.port, "N/A") }} |
 | **发现工具** | {{ safe_val(f.tool, "unknown") }} |
 
 **描述：** {{ safe_val(f.description, "无") }}
+
+{% if f.impact %}
+**危害说明：** {{ f.impact }}
+{% endif %}
 
 {% set sections = split_evidence(f.evidence) %}
 {% if sections %}
@@ -424,8 +568,9 @@ MD_TEMPLATE = """# 渗透测试报告
 ### 信息类发现
 <details>
 <summary>共 {{ info_items | length }} 项信息类发现（点击展开）</summary>
+
 {% for f in info_items %}
-- **{{ table_text(f.name, 80) }}** — {{ safe_val(f.tool, "unknown") }}{% if f.cve %} ({{ f.cve }}){% endif %}
+- **{{ table_text(f.name, 80) }}** — `{{ safe_val(f.tool, "unknown") }}`{% if f.cve %} ({{ f.cve }}){% endif %}
 {% endfor %}
 </details>
 {% endif %}
@@ -452,8 +597,11 @@ MD_TEMPLATE = """# 渗透测试报告
 {% set rec_list = r.command_records if r.command_records else r.command_results %}
 {% if rec_list %}
 #### 命令执行过程（{{ rec_list | length }} 条）
+{% set prev_stdout = namespace(value='') %}
 {% for rec in rec_list %}
-##### 第 {{ normalize_round(rec.round, loop.index) }} 轮迭代{% if rec.purpose %} — {{ rec.purpose }}{% endif %}
+{% set current_stdout = rec.stdout if rec.stdout else '' %}
+{% set is_duplicate = (current_stdout == prev_stdout.value and current_stdout and current_stdout | length > 500) %}
+##### 第 {{ normalize_round(rec.round, loop.index) }} 轮迭代{% if rec.purpose %} — {{ rec.purpose }}{% endif %}{% if is_duplicate %} *(同上){% endif %}
 
 | 属性 | 值 |
 |------|-----|
@@ -475,11 +623,16 @@ MD_TEMPLATE = """# 渗透测试报告
 ```
 {% endif %}
 
+{% if is_duplicate %}
+**Output (stdout)：** *与上一轮相同，已省略。*
+{% else %}
 **Output (stdout)：**
 
 ```{{ detect_lang(rec.stdout) }}
 {{ truncate_block(rec.stdout if rec.stdout else "(无输出)") }}
 ```
+{% set _ = prev_stdout.update(value=current_stdout) %}
+{% endif %}
 
 {% if rec.stderr %}
 **Error (stderr)：**
@@ -543,24 +696,50 @@ MD_TEMPLATE = """# 渗透测试报告
 {% endfor %}
 
 {% if remediation_items %}
-| 漏洞 | 优先级 | 立即行动 | 参考 | 临时缓解 |
-|------|--------|----------|------|----------|
 {% for f in remediation_items %}
-| {{ table_text(f.name, 44) }} | {{ sev_emoji(f.severity) }} {{ sev_label(f.severity) }} | {{ "立即升级并应用官方补丁" if f.severity in ('critical', 'high') else "维护窗口内修复并完成回归验证" }} | {{ f.cve or "厂商安全公告" }} | {{ "部署 WAF 规则并限制高风险入口暴露" if f.severity in ('critical', 'high') else "审查配置并加强访问控制策略" }} |
+### {{ loop.index }}. {{ f.name }}
+**优先级：** {{ sev_emoji(f.severity) }} {{ sev_label(f.severity) }}
+
+{% if f.remediation %}
+**修复方案：** {{ f.remediation }}
+{% else %}
+**修复方案：** {{ default_remediation(f) }}
+{% endif %}
+---
 {% endfor %}
 {% else %}
 当前未发现需要立即处置的高/中危漏洞，建议保持基线巡检与补丁更新节奏。
 {% endif %}
 
-## 七、测试过程日志（最近 200 行）
+## 七、测试过程日志（关键事件摘要）
 
 ```text
-{% for entry in (state.phase_log[-200:] if state.phase_log else []) %}
+{% for entry in (state.filtered_log[-200:] if state.filtered_log else (state.phase_log[-200:] if state.phase_log else [])) %}
 {{ entry }}
 {% endfor %}
 ```
 
-## 八、测试方法论
+## 八、风险评级标准
+
+本报告采用 CVSS v3.1 标准进行漏洞严重程度评级：
+
+| 严重等级 | CVSS 评分 | 说明 |
+|----------|-----------|------|
+| 严重 (Critical) | 9.0 - 10.0 | 可远程利用、无需认证、导致系统完全失陷 |
+| 高危 (High) | 7.0 - 8.9 | 可远程利用、可能导致敏感数据泄露或权限提升 |
+| 中危 (Medium) | 4.0 - 6.9 | 需特定条件利用、影响范围有限 |
+| 低危 (Low) | 0.1 - 3.9 | 几乎无实际危害、或利用条件极其苛刻 |
+| 信息 (Info) | 0 | 不构成直接安全风险 |
+
+## 九、测试限制与免责声明
+
+1. 本次测试在授权范围内进行，未对超出范围的系统进行任何探测。
+2. 测试期间未进行拒绝服务（DoS）攻击、社会工程学攻击等非授权方法。
+3. 测试结果仅反映测试时间点的安全状态，不代表系统在所有时间段的安全水平。
+4. 修复建议基于自动化分析生成，建议结合实际情况由安全工程师审阅后实施。
+5. 本报告仅供授权方内部使用，未经授权不得向第三方披露。
+
+## 十、测试方法论
 
 1. 信息收集：端口发现、服务识别、目录/路径枚举
 2. 漏洞扫描：模板/签名检测 + 证据回收
@@ -596,9 +775,12 @@ class ReportGenerator:
         self._env.globals["cmd_count"] = command_count
         self._env.globals["table_text"] = table_text
         self._env.globals["safe_val"] = safe_val
+        self._env.globals["default_remediation"] = _default_remediation
+        self._env.globals["default_impact"] = _default_impact
 
     async def generate(self, state) -> tuple[str, str]:
-        template = self._env.from_string(MD_TEMPLATE)
+        template_text = _load_template()
+        template = self._env.from_string(template_text)
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
         rendered = template.render(state=state, now=now)
         md_content = normalize_markdown_whitespace(rendered)

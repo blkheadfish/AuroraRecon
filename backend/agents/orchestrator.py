@@ -2810,10 +2810,20 @@ async def node_objective_collect(state: PentestState) -> PentestState:
 
 
 async def node_report(state: PentestState) -> PentestState:
-    from backend.report.generator import ReportGenerator
+    from backend.report.generator import ReportGenerator, _filter_phase_log
     state.current_phase = "report"
     _record_chain_visit(state, "report")
     state.log("开始生成报告...")
+
+    # 生成攻击时间线
+    _build_attack_timeline(state)
+
+    # 生成面向管理层的执行摘要
+    state.executive_summary = _build_executive_summary(state)
+
+    # 过滤日志，去除 stdout/stderr 原始输出
+    state.filtered_log = _filter_phase_log(state.phase_log)
+
     prior_status = state.status
     try:
         _flatten_post_findings_for_report(state)
@@ -2838,6 +2848,95 @@ async def node_report(state: PentestState) -> PentestState:
         except Exception:
             pass
     return state
+
+
+def _build_attack_timeline(state: PentestState) -> None:
+    """根据 chain_visited 和 findings/exploit_results 构建攻击时间线。"""
+    phase_descriptions = {
+        "recon": "侦察阶段：端口扫描与服务发现",
+        "surface_enum": "攻击面枚举：Web 路径探测与指纹识别",
+        "intel_harvest": "情报采集：解析响应体中的版本信息与敏感泄露",
+        "vuln_scan": "漏洞扫描：Nuclei/Nikto 模板检测 + 指纹匹配",
+        "exploit_decision": "攻链决策：评估可利用漏洞并制定利用计划",
+        "awaiting_approval": "等待人工审批：确认高影响利用操作",
+        "foothold_attempt": "立足点建立：执行漏洞利用 payload",
+        "secondary_attack": "二次攻击：对初始利用失败后执行补充攻击",
+        "post_foothold_enum": "后立足点枚举：收集系统信息与凭据",
+        "privesc_attempt": "权限提升尝试",
+        "objective_collect": "目标收集：提取 flag 与关键证据",
+        "report": "报告生成",
+    }
+
+    entries: list[dict[str, str]] = []
+    for phase in (state.chain_visited or []):
+        desc = phase_descriptions.get(phase, phase)
+        extra = ""
+
+        if phase == "foothold_attempt":
+            successes = [r for r in (state.exploit_results or []) if r.success]
+            failures = [r for r in (state.exploit_results or []) if not r.success]
+            if successes:
+                extra = f"，成功利用 {len(successes)} 个漏洞"
+            if failures:
+                extra += f"，{len(failures)} 个漏洞利用失败"
+        elif phase == "privesc_attempt":
+            extra = f"（第 {state.privesc_attempt_count}/{state.max_privesc_rounds} 轮）"
+        elif phase == "report":
+            vuln_count = len([f for f in (state.findings or []) if getattr(f, 'exploitable', False)])
+            total_count = len(state.findings or [])
+            extra = f"，共生成了 {vuln_count} 个可利用漏洞和 {total_count} 个信息项"
+
+        entries.append({"phase": phase, "summary": f"{desc}{extra}"})
+
+    state.attack_timeline = entries
+
+
+def _build_executive_summary(state: PentestState) -> str:
+    """基于测试数据生成面向管理层的非技术性执行摘要。"""
+    findings = state.findings or []
+    critical = sum(1 for f in findings if getattr(f, 'severity', '') == 'critical')
+    high = sum(1 for f in findings if getattr(f, 'severity', '') == 'high')
+    medium = sum(1 for f in findings if getattr(f, 'severity', '') == 'medium')
+    exploitable = [f for f in findings if getattr(f, 'exploitable', False)]
+
+    shell_status = "成功获取" if state.got_shell else "未能获取"
+    priv_level = state.privilege_level or "未获得"
+
+    # 确定整体风险评级
+    if critical > 0:
+        risk_level = "严重"
+    elif high > 0:
+        risk_level = "高风险"
+    elif medium > 0:
+        risk_level = "中等风险"
+    else:
+        risk_level = "低风险"
+
+    lines = [
+        f"本次对目标 `{state.target}` 进行了自动化渗透测试，整体风险评级为**{risk_level}**。",
+        "",
+        f"测试共发现 **{len(findings)}** 个安全问题，其中严重 {critical} 个、高危 {high} 个、中危 {medium} 个，",
+        f"含 **{len(exploitable)}** 个具有实际可利用性的漏洞。",
+    ]
+
+    if exploitable:
+        top_vulns = sorted(exploitable, key=lambda f: {'critical': 4, 'high': 3, 'medium': 2, 'low': 1}.get(getattr(f, 'severity', 'low'), 0), reverse=True)
+        lines.append("")
+        lines.append("**关键漏洞包括：**")
+        for v in top_vulns[:3]:
+            name = getattr(v, 'name', '未命名')
+            sev = getattr(v, 'severity', 'unknown')
+            sev_cn = {'critical': '严重', 'high': '高危', 'medium': '中危', 'low': '低危'}.get(sev, sev)
+            target = getattr(v, 'target', '')
+            lines.append(f"- [{sev_cn}] {name} ({target})")
+
+    lines.append("")
+    lines.append(f"测试期间{shell_status}目标系统的交互式访问权限（当前权限级别：{priv_level}）。")
+    lines.append("")
+    lines.append("**建议：** 请安全团队优先处置严重和高危漏洞，参照报告中的修复建议在 7 个工作日内完成修复，")
+    lines.append("并安排回归验证测试。同时建议将安全扫描纳入 CI/CD 流水线，实现常态化漏洞管理。")
+
+    return "\n".join(lines)
 
 
 # ───────────────────────────────────────────────────────

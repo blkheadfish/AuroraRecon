@@ -269,6 +269,12 @@ class VulnFinding(BaseModel):
 	verification_status: VerificationStatus = "unverified"
 	verification_reasons: list[str] = Field(default_factory=list)
 	evidence_snippets: list[dict[str, str]] = Field(default_factory=list)
+	# 报告增强字段
+	remediation: str = ""          # LLM 生成的具体修复建议
+	impact: str = ""               # 实际业务危害描述
+	cvss_score: Optional[float] = None  # CVSS 3.1 评分
+	cvss_vector: str = ""          # CVSS 向量字符串，如 AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H
+	cwe: str = ""                  # CWE 编号，如 CWE-98
 
 
 class CommandExecutionRecord(BaseModel):
@@ -692,6 +698,11 @@ class PentestState(BaseModel):
 	chain_summary: str = ""
 	# 实际执行过的攻链阶段（有序），供前端进度条精确展示
 	chain_visited: list[str] = Field(default_factory=list)
+
+	# 报告增强字段
+	executive_summary: str = ""       # 面向管理层的非技术性总结
+	attack_timeline: list[dict[str, str]] = Field(default_factory=list)  # 攻击时间线 [{phase, summary}]
+	filtered_log: list[str] = Field(default_factory=list)  # 过滤后的关键事件日志
 
 	post_findings: dict = Field(default_factory=dict)
 

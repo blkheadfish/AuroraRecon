@@ -1,0 +1,353 @@
+# 渗透测试报告
+
+| 项目 | 信息 |
+|------|------|
+| **任务 ID** | `{{ state.task_id }}` |
+| **目标** | `{{ state.target }}` |
+| **测试时间** | {{ safe_val(state.created_at, "未知") }} |
+| **操作系统** | {{ safe_val(state.target_os, "未知") }} |
+| **最终权限** | {{ safe_val(state.privilege_level, "未获得") }} |
+
+{% if state.scope_note and state.scope_note != "未填写" %}
+### 测试范围与授权
+{{ state.scope_note }}
+{% endif %}
+
+## 一、执行摘要
+
+{% if state.executive_summary %}
+{{ state.executive_summary }}
+{% endif %}
+
+{% set critical_count = state.findings | selectattr('severity','eq','critical') | list | length %}
+{% set high_count = state.findings | selectattr('severity','eq','high') | list | length %}
+{% set medium_count = state.findings | selectattr('severity','eq','medium') | list | length %}
+
+本次测试共发现 **{{ state.findings | length }}** 个漏洞/信息项，其中严重/高危/中危共 **{{ critical_count + high_count + medium_count }}** 个。
+
+| 严重程度 | 数量 |
+|----------|------|
+| critical | {{ critical_count }} |
+| high | {{ high_count }} |
+| medium | {{ medium_count }} |
+
+{% if state.got_shell %}
+> ✅ 已获得目标访问能力，当前权限：**{{ safe_val(state.privilege_level, "unknown") }}**
+{% else %}
+> ❌ 本次测试未获得目标交互式访问权限。
+{% endif %}
+
+### 攻链状态
+
+| 字段 | 值 |
+|------|-----|
+| **foothold_status** | {{ safe_val(state.foothold_status, "none") }} |
+| **privesc_attempt_count** | {{ state.privesc_attempt_count if state.privesc_attempt_count is not none else 0 }} / {{ state.max_privesc_rounds if state.max_privesc_rounds is not none else "-" }} |
+| **chain_visited** | {{ (state.chain_visited | join(" -> ")) if state.chain_visited else "无" }} |
+
+{% if state.chain_summary %}
+**攻链总结：** {{ state.chain_summary }}
+{% endif %}
+
+{% if state.objective_status %}
+**目标完成度（objective_status）：**
+```json
+{{ pretty_json(state.objective_status) }}
+```
+{% endif %}
+
+{% if state.credential_store %}
+**凭据资产（credential_store）：**
+```json
+{{ pretty_json(state.credential_store) }}
+```
+{% endif %}
+
+{% if state.loot_store %}
+**战利品（loot_store）：**
+```json
+{{ pretty_json(state.loot_store) }}
+```
+{% endif %}
+
+## 二、侦察结果
+
+### 开放端口
+
+| 端口 | 协议 | 服务 | 版本 |
+|------|------|------|------|
+{% for p in state.open_ports %}
+| {{ p.port }} | {{ safe_val(p.protocol, "tcp") }} | {{ safe_val(p.service, "-") }} | {{ table_text(p.version, 60) }} |
+{% else %}
+| - | - | - | 未发现开放端口 |
+{% endfor %}
+
+{% if state.web_paths %}
+### Web 路径发现
+{% for path in state.web_paths %}
+- `{{ path }}`
+{% endfor %}
+{% endif %}
+
+{% if state.subdomains %}
+### 子域名发现
+{% for sub in state.subdomains %}
+- `{{ sub }}`
+{% endfor %}
+{% endif %}
+
+{% if state.attack_timeline %}
+## 三、攻击时间线
+{% for entry in state.attack_timeline %}
+- **[{{ entry.phase }}]** {{ entry.summary }}
+{% endfor %}
+{% endif %}
+
+## 四、漏洞发现
+
+{% set real_vulns = [] %}
+{% set info_items = [] %}
+{% for f in state.findings %}
+{% if f.severity in ('critical', 'high', 'medium', 'low') and f.exploitable %}
+{% set _ = real_vulns.append(f) %}
+{% else %}
+{% set _ = info_items.append(f) %}
+{% endif %}
+{% endfor %}
+
+{% if real_vulns %}
+### 可利用漏洞
+{% for f in real_vulns %}
+#### {{ loop.index }}. {{ f.name }}
+
+| 属性 | 值 |
+|------|-----|
+| **严重程度** | {{ sev_emoji(f.severity) }} {{ sev_label(f.severity) }} |
+| **CVSS** | {% if f.cvss_score %}{{ f.cvss_score }}{% if f.cvss_vector %} ({{ f.cvss_vector }}){% endif %}{% else %}N/A{% endif %} |
+| **CWE** | {{ f.cwe or "N/A" }} |
+| **CVE** | {{ f.cve or "N/A" }} |
+| **目标** | `{{ safe_val(f.target, "-") }}` |
+| **端口** | {{ safe_val(f.port, "N/A") }} |
+| **发现工具** | {{ safe_val(f.tool, "unknown") }} |
+
+**描述：** {{ safe_val(f.description, "无") }}
+
+{% if f.impact %}
+**危害说明：** {{ f.impact }}
+{% endif %}
+
+{% set sections = split_evidence(f.evidence) %}
+{% if sections %}
+**证据：**
+
+{% for sec in sections %}
+**{{ sec.title }}：**
+
+```{{ sec.lang }}
+{{ truncate_block(sec.content) }}
+```
+
+{% endfor %}
+{% endif %}
+{% endfor %}
+{% endif %}
+
+{% if info_items %}
+### 信息类发现
+<details>
+<summary>共 {{ info_items | length }} 项信息类发现（点击展开）</summary>
+
+{% for f in info_items %}
+- **{{ table_text(f.name, 80) }}** — `{{ safe_val(f.tool, "unknown") }}`{% if f.cve %} ({{ f.cve }}){% endif %}
+{% endfor %}
+</details>
+{% endif %}
+
+## 五、漏洞利用结果
+
+{% if state.exploit_results %}
+### 利用结果摘要
+
+| 漏洞 ID | 状态 | Shell 类型 | 命令数 | 结论摘要 |
+|---------|------|------------|--------|----------|
+{% for r in state.exploit_results %}
+| `{{ r.vuln_id }}` | {{ "✅ 成功" if r.success else "❌ 失败" }} | {{ safe_val(r.shell_type, "N/A") }} | {{ cmd_count(r) }} | {{ table_text(r.evidence, 78) }} |
+{% endfor %}
+
+{% for r in state.exploit_results %}
+### {{ loop.index }}. 漏洞 `{{ r.vuln_id }}`
+
+| 属性 | 值 |
+|------|-----|
+| **状态** | {{ "✅ 利用成功" if r.success else "❌ 利用失败" }} |
+| **Shell 类型** | {{ safe_val(r.shell_type, "N/A") }} |
+
+{% set rec_list = r.command_records if r.command_records else r.command_results %}
+{% if rec_list %}
+#### 命令执行过程（{{ rec_list | length }} 条）
+{% set prev_stdout = namespace(value='') %}
+{% for rec in rec_list %}
+{% set current_stdout = rec.stdout if rec.stdout else '' %}
+{% set is_duplicate = (current_stdout == prev_stdout.value and current_stdout and current_stdout | length > 500) %}
+##### 第 {{ normalize_round(rec.round, loop.index) }} 轮迭代{% if rec.purpose %} — {{ rec.purpose }}{% endif %}{% if is_duplicate %} *(输出同上){% endif %}
+
+| 属性 | 值 |
+|------|-----|
+| **退出码** | `{{ rec.exit_code if rec.exit_code is not none else "-" }}` |
+| **耗时** | {{ format_elapsed(rec.elapsed if rec.elapsed is not none else none) }} |
+| **工具** | {{ safe_val(rec.tool, "-") }} |
+
+**Payload：**
+
+```bash
+{{ rec.command if rec.command else "(empty command)" }}
+```
+
+{% if rec.runtime_command and rec.runtime_command != rec.command %}
+**Runtime Command：**
+
+```bash
+{{ rec.runtime_command }}
+```
+{% endif %}
+
+{% if is_duplicate %}
+**Output (stdout)：** *与上一轮相同，已省略。*
+{% else %}
+**Output (stdout)：**
+
+```{{ detect_lang(rec.stdout) }}
+{{ truncate_block(rec.stdout if rec.stdout else "(无输出)") }}
+```
+{% set _ = prev_stdout.update(value=current_stdout) %}
+{% endif %}
+
+{% if rec.stderr %}
+**Error (stderr)：**
+
+```text
+{{ truncate_block(rec.stderr) }}
+```
+{% endif %}
+
+---
+{% endfor %}
+{% elif r.commands_run %}
+#### 执行命令（{{ r.commands_run | length }} 条）
+{% for cmd in r.commands_run %}
+**第 {{ loop.index }} 条命令：**
+
+```bash
+{{ cmd }}
+```
+{% endfor %}
+{% endif %}
+
+{% if r.evidence %}
+#### 最终证据
+
+{% set sections = split_evidence(r.evidence) %}
+{% for sec in sections %}
+**{{ sec.title }}：**
+
+```{{ sec.lang }}
+{{ truncate_block(sec.content) }}
+```
+
+{% endfor %}
+{% endif %}
+{% endfor %}
+{% else %}
+无利用尝试或所有漏洞不满足利用条件。
+{% endif %}
+
+## 六、后渗透发现
+
+{% if state.post_findings and state.post_findings.get('findings') %}
+{% for k, v in state.post_findings.get('findings', {}).items() %}
+**{{ k }}：**
+```text
+{{ v if v else "无" }}
+```
+{% endfor %}
+{% else %}
+无后渗透数据。
+{% endif %}
+
+## 七、修复建议
+
+{% set remediation_items = [] %}
+{% for f in state.findings %}
+{% if f.severity in ('critical', 'high', 'medium') %}
+{% set _ = remediation_items.append(f) %}
+{% endif %}
+{% endfor %}
+
+{% if remediation_items %}
+{% for f in remediation_items %}
+### {{ loop.index }}. {{ f.name }}
+
+**优先级：** {{ sev_emoji(f.severity) }} {{ sev_label(f.severity) }}
+
+{% if f.remediation %}
+**修复方案：** {{ f.remediation }}
+{% else %}
+**修复方案：** {{ default_remediation(f) }}
+{% endif %}
+
+{% if f.cve %}
+| 项目 | 值 |
+|------|-----|
+| **CVE** | {{ f.cve }} |
+| **CVSS** | {{ f.cvss_score or "N/A" }} |
+| **CWE** | {{ f.cwe or "N/A" }} |
+| **受影响目标** | `{{ safe_val(f.target, "-") }}` |
+{% endif %}
+
+---
+{% endfor %}
+{% else %}
+当前未发现需要立即处置的高/中危漏洞，建议保持基线巡检与补丁更新节奏。
+{% endif %}
+
+## 八、测试过程日志（关键事件摘要）
+
+```text
+{% for entry in (state.filtered_log[-200:] if state.filtered_log else []) %}
+{{ entry }}
+{% endfor %}
+```
+
+## 九、风险评级标准
+
+本报告采用 CVSS v3.1 标准进行漏洞严重程度评级：
+
+| 严重等级 | CVSS 评分 | 说明 |
+|----------|-----------|------|
+| 严重 (Critical) | 9.0 - 10.0 | 可远程利用、无需认证、导致系统完全失陷 |
+| 高危 (High) | 7.0 - 8.9 | 可远程利用、可能导致敏感数据泄露或权限提升 |
+| 中危 (Medium) | 4.0 - 6.9 | 需特定条件利用、影响范围有限 |
+| 低危 (Low) | 0.1 - 3.9 | 几乎无实际危害、或利用条件极其苛刻 |
+| 信息 (Info) | 0 | 不构成直接安全风险、仅供安全意识参考 |
+
+## 十、测试限制与免责声明
+
+1. 本次测试在授权范围内进行，未对超出范围的系统进行任何探测。
+2. 测试期间未进行拒绝服务（DoS）攻击、社会工程学攻击等非授权方法。
+3. 测试结果仅反映测试时间点的安全状态，不代表系统在所有时间段的安全水平。
+4. 修复建议基于自动化分析生成，建议结合实际情况由安全工程师审阅后实施。
+5. 本报告仅供授权方内部使用，未经授权不得向第三方披露。
+
+## 十一、测试方法论
+
+1. 信息收集：端口发现、服务识别、目录/路径枚举
+2. 漏洞扫描：模板/签名检测 + 指纹识别 + 证据回收
+3. 攻链决策：基于环境信息动态编排利用路径
+4. 漏洞利用：执行 payload 并验证命令执行证据
+5. 后渗透：权限提升、凭据与资产收集
+6. 报告生成：汇总证据与修复建议
+
+---
+
+*本报告由 PentestAI v2.0 自动生成，仅供授权安全测试使用。*
+*生成时间：{{ now }}*
