@@ -38,6 +38,7 @@ class TaskStateManager:
         self.msf_available = False
 
         self._tool_registry_cache = None
+        self._tool_registry_mtime = 0.0
 
         # 后台任务句柄注册表(run_task / resume_task 的 asyncio.Task)
         # cancel / delete 时可以精确取消对应协程,避免 zombie 残留。
@@ -161,12 +162,20 @@ class TaskStateManager:
         task.cancel()
         return True
 
-    # ── 工具注册表缓存 ────────────────────────────────────
+    # ── 工具注册表（基于文件 mtime 的惰性缓存）──────
+    # YAML 变更后自动检测，无需重启；未变更时走缓存，零额外开销
 
     def get_tool_registry(self):
-        if self._tool_registry_cache is None:
-            from backend.tools.tool_registry import ToolRegistry
+        from pathlib import Path as _Path
+        from backend.tools.tool_registry import ToolRegistry, DEFINITIONS_DIR
+
+        latest_mtime = max(
+            (f.stat().st_mtime for f in _Path(DEFINITIONS_DIR).glob("*.yaml")),
+            default=0,
+        )
+        if self._tool_registry_cache is None or latest_mtime > self._tool_registry_mtime:
             self._tool_registry_cache = ToolRegistry()
+            self._tool_registry_mtime = latest_mtime
         return self._tool_registry_cache
 
     # ── 辅助转换函数 ──────────────────────────────────────

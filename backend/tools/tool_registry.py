@@ -7,6 +7,7 @@ tools/tool_registry.py
   - 运行时可通过 register() 动态注册
   - 未在注册表中的工具自动 fallback 到 container 执行
   - 多人扩展时只需改 executor 字段（local/container/remote）
+  - YAML 变更后需重启或 trigger uvicorn reload 才能生效
 
 Function Calling:
   - to_openai_tools(category, include_meta) → 生成 OpenAI function calling

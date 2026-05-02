@@ -451,7 +451,7 @@
   </div>
 </template>
 
-<script setup>
+<script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
@@ -710,7 +710,18 @@ const messages = computed(() => {
         thinkingHasMore: false,
         thinkingFullLen: 0,
         reasoning: '',
-        operatorPlan: entry.operator_plan || null,
+        operatorPlan: entry.operator_plan ? (() => {
+          const raw = entry.operator_plan
+          const normalize = (arr) => {
+            if (!Array.isArray(arr)) return []
+            return arr.map(x => {
+              if (typeof x === 'string') return x
+              if (x && typeof x === 'object') return x.name || x.tool || x.value || String(x)
+              return String(x)
+            }).filter(Boolean)
+          }
+          return { ...raw, preferred_tools: normalize(raw.preferred_tools), avoided_tools: normalize(raw.avoided_tools), keyword_hints: normalize(raw.keyword_hints) }
+        })() : null,
       })
       return
     }
