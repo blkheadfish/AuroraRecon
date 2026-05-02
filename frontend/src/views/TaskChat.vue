@@ -48,28 +48,6 @@
 
       <div class="chat-stream-wrap" ref="streamRef" @scroll="onUserScroll">
         <div class="bubble-stream">
-          <!-- ★ 新增：策略执行状态条 -->
-          <div
-            v-if="strategyPlan.length > 0"
-            class="strategy-enforcement-bar"
-            style="margin: 8px 0; padding: 8px 12px; border-left: 3px solid var(--el-color-primary); background: var(--el-fill-color-lighter); border-radius: 0 4px 4px 0; font-size: 13px;"
-          >
-            <div style="font-weight: 500; margin-bottom: 4px; color: var(--el-text-color-primary)">
-              策略执行状态
-            </div>
-            <div
-              v-for="item in strategyPlan"
-              :key="item.key"
-              style="display: flex; align-items: center; gap: 6px; margin: 2px 0; color: var(--el-text-color-secondary)"
-            >
-              <span :style="{ color: item.enforced ? 'var(--el-color-success)' : 'var(--el-color-warning)' }">
-                {{ item.enforced ? '✓' : '△' }}
-              </span>
-              <span>{{ item.label }}</span>
-              <span v-if="item.detail" style="opacity: 0.7; font-size: 12px">— {{ item.detail }}</span>
-            </div>
-          </div>
-
           <template v-for="msg in messages" :key="msg.id">
             <div
               :data-bubble-id="msg.id"
@@ -352,6 +330,30 @@
           </button>
         </transition>
       </div>
+
+      <!-- 右侧策略面板，与左侧工具链对称 -->
+      <div v-if="strategyPlan.length > 0" class="strategy-side">
+        <div class="strategy-rail">
+          <div class="strategy-rail-header">
+            <span class="strategy-rail-title">策略状态</span>
+            <span class="strategy-rail-count">{{ strategyPlan.length }}</span>
+          </div>
+          <div class="strategy-rail-list">
+            <div
+              v-for="(item, i) in strategyPlan"
+              :key="item.key"
+              class="strategy-node"
+            >
+              <div class="strategy-connector" v-if="i > 0" />
+              <div class="strategy-dot" :class="item.enforced ? 'dot-success' : 'dot-warning'" />
+              <div class="strategy-body">
+                <div class="strategy-label">{{ item.label }}</div>
+                <div class="strategy-detail" v-if="item.detail">{{ item.detail }}</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
     </main>
 
     <footer class="chat-footer">
@@ -571,49 +573,71 @@ const showApprovalActions = computed(() => needsApproval.value && approvalState.
 const pendingCheckpoint = computed(() => state.value?.pendingCheckpoint || null)
 const checkpointSubmitting = computed(() => state.value?.checkpointState === 'submitting')
 
-// ★ 新增：从 parsed_intent 和 decisionEvents 计算策略执行状态
 const strategyPlan = computed(() => {
   const t = task.value
   if (!t) return []
 
-  const parsed = (t as any).parsed_intent || {}
+  const parsed: Record<string, unknown> = t.parsed_intent || {}
+  if (!parsed || !Object.keys(parsed).length) return []
+
   const items: Array<{ key: string; label: string; detail: string; enforced: boolean }> = []
 
-  // 检查 operator_plan_applied 事件是否出现，作为"已落实"的信号
-  const enforcedPhases = new Set(
+  const enforcedActions = new Set(
     (decisionEvents.value || [])
-      .filter(e => e.action === 'operator_plan_applied' || e.action === 'intent_to_plan_converted')
-      .map(e => e.phase)
+      .filter(e => e.action === 'operator_plan_applied'
+                || e.action === 'intent_to_plan_converted'
+                || e.action === 'intent_recon_only')
+      .map(e => String(e.action))
   )
+  const hasEnforcement = enforcedActions.size > 0
 
-  const priorityVulns: string[] = parsed.priority_vulns || []
+  const phases = Array.isArray(parsed.pentest_phase) ? parsed.pentest_phase as string[] : []
+  if (phases.length) {
+    const EXPLOIT_PHASES = new Set(['exploit', 'full_chain', 'post_exploit'])
+    const hasExploit = phases.some(p => EXPLOIT_PHASES.has(p))
+    const phaseLabels: Record<string, string> = {
+      recon: '侦察', exploit: '利用', post_exploit: '后渗透', full_chain: '完整链',
+    }
+    const display = phases.map(p => phaseLabels[p] || p).join(' → ')
+    items.push({
+      key: 'phases',
+      label: `执行阶段: ${display}`,
+      detail: hasExploit ? '含利用阶段' : '仅侦察/扫描',
+      enforced: true,
+    })
+  }
+
+  const priorityVulns = Array.isArray(parsed.priority_vulns) ? parsed.priority_vulns as string[] : []
   if (priorityVulns.length) {
     items.push({
       key: 'priority_vulns',
-      label: `重点漏洞: ${priorityVulns.slice(0, 4).join(', ')}`,
-      detail: enforcedPhases.size ? '已注入扫描约束' : '等待执行',
-      enforced: enforcedPhases.size > 0,
+      label: `重点漏洞: ${priorityVulns.slice(0, 5).join(', ')}`,
+      detail: hasEnforcement ? '已注入扫描约束' : '等待执行',
+      enforced: hasEnforcement,
     })
   }
 
-  const intents: string[] = parsed.intents || []
+  const intents = Array.isArray(parsed.intents) ? parsed.intents as string[] : []
   if (intents.length) {
     items.push({
       key: 'intents',
-      label: `意图标签: ${intents.slice(0, 4).join(', ')}`,
-      detail: enforcedPhases.size ? '已转换为工具约束' : '等待执行',
-      enforced: enforcedPhases.size > 0,
+      label: `意图标签: ${intents.slice(0, 5).join(', ')}`,
+      detail: hasEnforcement ? '已转换为工具约束' : '等待执行',
+      enforced: hasEnforcement,
     })
   }
 
-  const phases: string[] = parsed.pentest_phase || []
-  if (phases.length) {
-    items.push({
-      key: 'phases',
-      label: `执行阶段: ${phases.join(' → ')}`,
-      detail: phases.includes('exploit') ? '含利用阶段' : '仅侦察/扫描',
-      enforced: true,  // 路由判断在创建时即确定，始终生效
-    })
+  // 兜底：parsed_intent 存在但没有具体策略项时，至少展示目标信息
+  if (!items.length) {
+    const targets = Array.isArray(parsed.targets) ? parsed.targets as string[] : []
+    if (targets.length) {
+      items.push({
+        key: 'target_fallback',
+        label: `目标: ${targets.slice(0, 3).join(', ')}`,
+        detail: '默认策略',
+        enforced: true,
+      })
+    }
   }
 
   return items
@@ -1679,6 +1703,93 @@ onUnmounted(() => {
 .chat-stream-wrap::-webkit-scrollbar-corner {
   background: transparent;
 }
+/* ── 右侧策略面板 ── */
+.strategy-side {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+}
+.strategy-rail {
+  width: 170px;
+  min-width: 170px;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--border);
+  background: var(--bg-elevated);
+  overflow: hidden;
+  height: 100%;
+}
+.strategy-rail-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.strategy-rail-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.strategy-rail-count {
+  font-size: 10px;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+  background: var(--bg-hover);
+  padding: 1px 6px;
+  border-radius: 8px;
+}
+.strategy-rail-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 0;
+}
+.strategy-node {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 12px;
+  position: relative;
+}
+.strategy-connector {
+  position: absolute;
+  left: 17px;
+  top: -4px;
+  width: 1px;
+  height: 10px;
+  background: var(--border);
+}
+.strategy-dot {
+  width: 8px;
+  height: 8px;
+  min-width: 8px;
+  border-radius: 50%;
+  margin-top: 3px;
+  border: 1.5px solid var(--border);
+  background: var(--bg-base);
+  transition: all 0.15s;
+}
+.strategy-body {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+  gap: 2px;
+}
+.strategy-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  line-height: 1.35;
+  word-break: break-word;
+}
+.strategy-detail {
+  font-size: 10px;
+  color: var(--text-muted);
+  line-height: 1.3;
+}
+
 .bubble-stream {
   max-width: 1080px;
   margin: 0 auto;

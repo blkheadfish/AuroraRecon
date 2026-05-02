@@ -666,12 +666,21 @@ async def create_task(req: CreateTaskRequest, request: Request):
         # （这些字段来自前端 /tasks/parse-intent 调用后存在前端状态里，
         #   用户提交 create_task 时通过 req 传入）
         if req.parsed_intent_extra:
-            extra = req.parsed_intent_extra  # dict，来自前端存储的 parse-intent 响应
-            parsed_intent_dict.setdefault("intents", extra.get("intents", []))
+            extra = req.parsed_intent_extra
+            if not parsed_intent_dict.get("intents"):
+                parsed_intent_dict["intents"] = extra.get("intents", [])
             if not parsed_intent_dict.get("extra_hint"):
                 parsed_intent_dict["extra_hint"] = extra.get("extra_hint", "")
             if not parsed_intent_dict.get("scope_note"):
                 parsed_intent_dict["scope_note"] = extra.get("scope_note", "")
+            # LLM 可能发现确定性解析遗漏的漏洞类型，合并去重
+            llm_vulns = extra.get("priority_vulns") or []
+            if isinstance(llm_vulns, list):
+                existing = set(parsed_intent_dict.get("priority_vulns") or [])
+                for v in llm_vulns:
+                    if isinstance(v, str) and v.strip() and v.strip() not in existing:
+                        parsed_intent_dict.setdefault("priority_vulns", []).append(v.strip())
+                        existing.add(v.strip())
 
         # 如果 target 为空，从 raw_prompt 提取
         if not effective_target and parsed_intent.targets:

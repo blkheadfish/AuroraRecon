@@ -98,6 +98,8 @@ export interface TaskDetail extends TaskSummary {
   scope_note?: string
   extra_hint?: string
   user_prompt?: string
+  parsed_intent?: Record<string, unknown>
+  pentest_plan?: Record<string, unknown>
   privilege_level?: string
   // per-task 运行时参数(回显用,不允许中途改)
   success_gate_level?: 'strict' | 'medium' | 'lenient' | string
