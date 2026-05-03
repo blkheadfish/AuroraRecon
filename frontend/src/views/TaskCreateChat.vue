@@ -875,6 +875,7 @@ async function confirmAndResubmit() {
       maxReactRounds: form.value.maxReactRounds,
       maxExploreRounds: form.value.maxExploreRounds,
       userConfirmedRisks: confirmedRisks.value,
+      confirmedPlan: planPreview.value?.plan ? (planPreview.value.plan as unknown as Record<string, unknown>) : null,
       parsedIntentExtra: intent.value.loaded ? {
         intents: intent.value.intents,
         extra_hint: intent.value.extraHint,

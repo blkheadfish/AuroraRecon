@@ -385,6 +385,8 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
         pending_checkpoint: full.pending_checkpoint ?? state.task.pending_checkpoint,
         checkpoint_history: full.checkpoint_history ?? state.task.checkpoint_history,
         pending_user_prompt: full.pending_user_prompt ?? state.task.pending_user_prompt,
+        pentest_plan: full.pentest_plan ?? state.task.pentest_plan,
+        parsed_intent: full.parsed_intent ?? state.task.parsed_intent,
       }
     }
 

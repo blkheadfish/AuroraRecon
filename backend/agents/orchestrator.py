@@ -228,7 +228,7 @@ def _intent_to_operator_plan(state: PentestState) -> None:
       OperatorPlan.avoided_tools   → ToolCoveragePlanner.build_plan() → 直接剔除
       OperatorPlan.keyword_hints   → VulnAgent / ReconAgent LLM prompt 注入
     """
-    from backend.agents.models import OperatorPlan, OperatorFocusTarget, VulnFinding
+    from backend.agents.models import OperatorPlan, OperatorFocusTarget
 
     # 已有用户实时计划，不覆盖
     if state.operator_plan is not None:
@@ -327,33 +327,10 @@ def _intent_to_operator_plan(state: PentestState) -> None:
         f"keyword_hints={keyword_hints[:4]}"
     )
 
-    # ── 6. LLM 意图快通：当 LLM 识别出具体漏洞且用户意图为利用时，
-    #    注入 synthetic finding 使 _has_exploitable() 为 True，
-    #    避免因 findings 为空而无法进入利用阶段。
-    if exploit_with_known_vuln:
-        existing_names = {(f.name or "").lower() for f in (state.findings or [])}
-        injected: list[str] = []
-        for vuln_tag in priority_vulns:
-            tag_lower = vuln_tag.strip().lower()
-            if tag_lower and tag_lower not in existing_names:
-                state.findings = list(state.findings or []) + [VulnFinding(
-                    name=f"用户指定: {vuln_tag}",
-                    severity="high",
-                    cve=vuln_tag.upper() if vuln_tag.upper().startswith("CVE-") else None,
-                    target=state.target or "",
-                    port=state.target_port or None,
-                    description=f"LLM 意图解析: 用户断言目标存在 {vuln_tag}，待工具验证",
-                    exploitable=True,
-                    tool="llm_intent",
-                    confidence=70,
-                    verification_status="suspected",
-                    verification_reasons=["LLM 意图解析识别，待工具验证确认"],
-                )]
-                injected.append(vuln_tag)
-        if injected:
-            state.log(
-                f"[意图快通] 注入 LLM 识别的漏洞为 synthetic finding: {injected}"
-            )
+    # 注意: 不再注入 synthetic finding 到 state.findings。
+    # 用户指定的漏洞类型通过 operator_plan.keyword_hints 和 parsed_intent.priority_vulns
+    # 传递给各阶段消费，不污染真实漏洞发现列表。
+    # exploit_decision 和 edge_should_exploit 会检查策略 + parsed_intent 决定是否进入利用阶段。
 
 
 def get_intent_skill_boost(parsed_intent: dict | None) -> dict[str, int]:
@@ -2497,60 +2474,72 @@ async def node_exploit_decision(state: PentestState) -> PentestState:
         return state
     exploitable = [f for f in state.findings if f.exploitable]
     if not exploitable:
-        state.log("无可利用漏洞，跳过利用阶段")
-        return state
-
-    state.log(f"LLM 分析 {len(exploitable)} 个漏洞的利用优先级...")
-    try:
-        from backend.agents.prompt_utils import attach_operator_guidance
-        llm = LLMRouter()
-        prompt = _build_exploit_decision_prompt(state)
-        prompt = attach_operator_guidance(prompt, state)
-        decision = await llm.chat(prompt, response_format="json")
-        decision_data = json.loads(decision)
-
-        priority_map: dict[str, dict] = {
-            v["vuln_id"]: v for v in decision_data.get("targets", [])
-        }
-        for finding in state.findings:
-            if finding.vuln_id in priority_map:
-                rec = priority_map[finding.vuln_id]
-                if not rec.get("should_exploit", True):
-                    if finding.severity in ("low", "info"):
-                        finding.exploitable = False
-                        logger.info(
-                            f"[ExploitDecision] 禁用低优先级: {finding.name} ({finding.severity})"
-                        )
-                    else:
-                        logger.info(
-                            f"[ExploitDecision] 保留 {finding.severity} 级别: {finding.name}"
-                            f"（LLM 建议跳过但级别过高，强制保留）"
-                        )
-
-        remaining = sum(1 for f in state.findings if f.exploitable)
-        state.log(f"LLM 决策完成，保留 {remaining} 个可利用漏洞")
-
-        # Emit exploit decision thought event
-        analysis = decision_data.get("analysis", "")
-        targets_info = decision_data.get("targets", [])
-        plan_steps = []
-        for t in targets_info[:6]:
-            vuln_id = t.get("vuln_id", "?")
-            reason = t.get("reason", "")
-            should = t.get("should_exploit", True)
-            plan_steps.append(
-                f"{'[利用]' if should else '[跳过]'} {vuln_id}: {reason[:80]}"
+        # 策略明确要求利用 + 用户指定了漏洞类型 → 仍然进入利用阶段
+        plan = state.pentest_plan or {}
+        has_exploit_plan = any(
+            p.get("phase") == "exploit" for p in plan.get("phases", [])
+        )
+        priority_vulns = (state.parsed_intent or {}).get("priority_vulns", [])
+        if has_exploit_plan and priority_vulns:
+            state.log(
+                f"[策略驱动] 无工具确认的漏洞，但策略指定利用阶段"
+                f"且用户明确了漏洞类型 {priority_vulns}，继续执行"
             )
-        state.push_decision({
-            "action": "thought",
-            "phase": "exploit_decision",
-            "thinking": analysis or f"LLM 分析 {len(exploitable)} 个漏洞，保留 {remaining} 个可利用",
-            "purpose": "利用优先级决策",
-            "plan": plan_steps,
-            "message": f"LLM 决策: {remaining}/{len(exploitable)} 个漏洞将被利用",
-        })
-    except Exception as e:
-        state.log(f"LLM 决策异常（保留原始可利用标记）: {e}")
+        else:
+            state.log("无可利用漏洞，跳过利用阶段")
+            return state
+
+    if exploitable:
+        state.log(f"LLM 分析 {len(exploitable)} 个漏洞的利用优先级...")
+        try:
+            from backend.agents.prompt_utils import attach_operator_guidance
+            llm = LLMRouter()
+            prompt = _build_exploit_decision_prompt(state)
+            prompt = attach_operator_guidance(prompt, state)
+            decision = await llm.chat(prompt, response_format="json")
+            decision_data = json.loads(decision)
+
+            priority_map: dict[str, dict] = {
+                v["vuln_id"]: v for v in decision_data.get("targets", [])
+            }
+            for finding in state.findings:
+                if finding.vuln_id in priority_map:
+                    rec = priority_map[finding.vuln_id]
+                    if not rec.get("should_exploit", True):
+                        if finding.severity in ("low", "info"):
+                            finding.exploitable = False
+                            logger.info(
+                                f"[ExploitDecision] 禁用低优先级: {finding.name} ({finding.severity})"
+                            )
+                        else:
+                            logger.info(
+                                f"[ExploitDecision] 保留 {finding.severity} 级别: {finding.name}"
+                                f"（LLM 建议跳过但级别过高，强制保留）"
+                            )
+
+            remaining = sum(1 for f in state.findings if f.exploitable)
+            state.log(f"LLM 决策完成，保留 {remaining} 个可利用漏洞")
+
+            analysis = decision_data.get("analysis", "")
+            targets_info = decision_data.get("targets", [])
+            plan_steps = []
+            for t in targets_info[:6]:
+                vuln_id = t.get("vuln_id", "?")
+                reason = t.get("reason", "")
+                should = t.get("should_exploit", True)
+                plan_steps.append(
+                    f"{'[利用]' if should else '[跳过]'} {vuln_id}: {reason[:80]}"
+                )
+            state.push_decision({
+                "action": "thought",
+                "phase": "exploit_decision",
+                "thinking": analysis or f"LLM 分析 {len(exploitable)} 个漏洞，保留 {remaining} 个可利用",
+                "purpose": "利用优先级决策",
+                "plan": plan_steps,
+                "message": f"LLM 决策: {remaining}/{len(exploitable)} 个漏洞将被利用",
+            })
+        except Exception as e:
+            state.log(f"LLM 决策异常（保留原始可利用标记）: {e}")
     return state
 
 
@@ -3444,8 +3433,16 @@ def edge_should_exploit(state: PentestState) -> str:
             "tone": "info",
         })
         return "report"
-    if not any(f.exploitable for f in state.findings):
-        return "report"
+    has_exploitable = any(f.exploitable for f in state.findings)
+    if not has_exploitable:
+        # 策略明确要求利用 + 用户指定了漏洞类型 → 仍进入利用阶段
+        plan = state.pentest_plan or {}
+        has_exploit_plan = any(
+            p.get("phase") == "exploit" for p in plan.get("phases", [])
+        )
+        priority_vulns = (state.parsed_intent or {}).get("priority_vulns", [])
+        if not (has_exploit_plan and priority_vulns):
+            return "report"
     if state.auto_approve:
         return "foothold_attempt"
     return "human_approval"
