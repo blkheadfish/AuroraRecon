@@ -103,6 +103,7 @@ class ReconAgent:
 		decision_callback: Optional[Callable] = None,
 		operator_block: str = "",
 		operator_plan: Any = None,
+		plan_tools: list[str] | None = None,
 	) -> dict[str, Any]:
 		"""
 		执行侦察。
@@ -128,6 +129,14 @@ class ReconAgent:
 		self._decision_callback = decision_callback
 		self._operator_block = operator_block or ""
 		self._operator_plan = operator_plan
+
+		_DIR_SCAN_TOOLS = {"gobuster", "dirsearch", "feroxbuster", "ffuf", "dir-discovery", "dirb"}
+		_run_dir_scan = not plan_tools or bool(set(plan_tools) & _DIR_SCAN_TOOLS)
+		_run_nmap_vuln = not plan_tools or "nmap" in plan_tools
+		_run_subdomain = not plan_tools or any(t in plan_tools for t in ("subfinder", "amass", "subdomain"))
+		if plan_tools:
+			logger.info(f"[ReconAgent] plan_tools={plan_tools}, dir_scan={_run_dir_scan}, "
+			            f"nmap_vuln={_run_nmap_vuln}, subdomain={_run_subdomain}")
 
 		async def _tool_stream_cb(line: str) -> None:
 			"""Forward tool stdout/stderr lines as tool_stream decision events."""
@@ -192,30 +201,35 @@ class ReconAgent:
 			})
 
 		# 4th pass: targeted per-service nmap vuln scripts
-		if decision_callback:
-			await decision_callback({
-				"action": "tool_start",
-				"phase": "recon",
-				"tool": "nmap-vuln-scripts",
-				"message": f"Nmap 漏洞脚本扫描: {len(ports)} 个端口",
-			})
+		nmap_vuln_hints: list = []
+		llm_recon_hints: dict = {}
+		if _run_nmap_vuln:
+			if decision_callback:
+				await decision_callback({
+					"action": "tool_start",
+					"phase": "recon",
+					"tool": "nmap-vuln-scripts",
+					"message": f"Nmap 漏洞脚本扫描: {len(ports)} 个端口",
+				})
 
-		nmap_vuln_hints = await self._nmap_vuln_scan(
-			target, [p.port for p in ports], task_id, log_callback,
-			ports_info=ports,
-		)
+			nmap_vuln_hints = await self._nmap_vuln_scan(
+				target, [p.port for p in ports], task_id, log_callback,
+				ports_info=ports,
+			)
 
-		if decision_callback:
-			await decision_callback({
-				"action": "tool_result",
-				"phase": "recon",
-				"tool": "nmap-vuln-scripts",
-				"message": f"Nmap 漏洞脚本完成: {len(nmap_vuln_hints)} 条线索",
-			})
+			if decision_callback:
+				await decision_callback({
+					"action": "tool_result",
+					"phase": "recon",
+					"tool": "nmap-vuln-scripts",
+					"message": f"Nmap 漏洞脚本完成: {len(nmap_vuln_hints)} 条线索",
+				})
 
-		llm_recon_hints = await self._llm_analyze_nmap(
-			target, raw_nmap, ports, log_callback,
-		)
+			llm_recon_hints = await self._llm_analyze_nmap(
+				target, raw_nmap, ports, log_callback,
+			)
+		elif plan_tools and log_callback:
+			await log_callback(f"[ReconAgent] [Plan] 跳过 nmap 漏洞脚本/LLM 分析 (plan_tools={plan_tools})")
 
 		web_ports = [
 			p for p in ports
@@ -237,104 +251,110 @@ class ReconAgent:
 		dir_coverage: dict = {}
 
 		scan_strategy: dict = {}
+		tech_hints: list[str] = []
 		if web_ports:
 			primary_scheme = "https" if web_ports[0].port in (443, 8443) else "http"
 			primary_target = f"{primary_scheme}://{target}:{web_ports[0].port}"
 
-			if decision_callback:
-				await decision_callback({
-					"action": "tool_start",
-					"phase": "recon",
-					"tool": "dir-discovery",
-					"message": f"开始目录发现: {len(web_ports)} 个 Web 端口",
-				})
-
-			has_waf = await self._detect_waf(
-				primary_target, task_id, log_callback,
-			)
 			tech_hints = await self._quick_fingerprint(
 				target, web_ports, task_id, log_callback,
 			)
 
-			# ── Phase 1: LLM Pre-Scan Strategy ──
-			scan_strategy = await self._llm_plan_dir_strategy(
-				primary_target, tech_hints, ports, has_waf, log_callback,
-			)
+			if _run_dir_scan:
+				if decision_callback:
+					await decision_callback({
+						"action": "tool_start",
+						"phase": "recon",
+						"tool": "dir-discovery",
+						"message": f"开始目录发现: {len(web_ports)} 个 Web 端口",
+					})
 
-			aggregator = PathAggregator()
-			raw_outputs_all: list[str] = []
-			coverage_reports: list[dict] = []
+				has_waf = await self._detect_waf(
+					primary_target, task_id, log_callback,
+				)
 
-			# Shared deep-scan queue across all web ports + Phase 3 deep-dive.
-			# Allows newly discovered directories from _deep_recursive_scan to
-			# feed back into the common queue and be drained at the end.
-			from backend.tools.deep_scan_coordinator import DeepScanCoordinator
-			deep_coord = DeepScanCoordinator(
-				max_total_scans=30,
-				budget_seconds=900.0,
-			)
+				# ── Phase 1: LLM Pre-Scan Strategy ──
+				scan_strategy = await self._llm_plan_dir_strategy(
+					primary_target, tech_hints, ports, has_waf, log_callback,
+				)
 
-			for wp in web_ports[:4]:
-				scheme = "https" if wp.port in (443, 8443) else "http"
-				web_target = f"{scheme}://{target}:{wp.port}"
-				if log_callback:
-					await log_callback(
-						f"[ReconAgent] 目录发现: 扫描 Web 端口 {wp.port} ({scheme})"
+				aggregator = PathAggregator()
+				raw_outputs_all: list[str] = []
+				coverage_reports: list[dict] = []
+
+				from backend.tools.deep_scan_coordinator import DeepScanCoordinator
+				deep_coord = DeepScanCoordinator(
+					max_total_scans=30,
+					budget_seconds=900.0,
+				)
+
+				for wp in web_ports[:4]:
+					scheme = "https" if wp.port in (443, 8443) else "http"
+					web_target = f"{scheme}://{target}:{wp.port}"
+					if log_callback:
+						await log_callback(
+							f"[ReconAgent] 目录发现: 扫描 Web 端口 {wp.port} ({scheme})"
+						)
+					_, raw_out, coverage_rpt, port_aggregator = await self._dir_scan(
+						web_target, task_id, log_callback,
+						has_waf=has_waf, tech_hints=tech_hints,
+						scan_strategy=scan_strategy,
+						record_callback=record_callback,
+						deep_coord=deep_coord,
 					)
-				_, raw_out, coverage_rpt, port_aggregator = await self._dir_scan(
-					web_target, task_id, log_callback,
-					has_waf=has_waf, tech_hints=tech_hints,
+					raw_outputs_all.append(raw_out)
+					coverage_reports.append(coverage_rpt.to_log_dict())
+					for p_entry in port_aggregator._entries.values():
+						if p_entry.path in aggregator._entries:
+							aggregator._entries[p_entry.path].merge(p_entry)
+						else:
+							aggregator._entries[p_entry.path] = p_entry
+
+				# ── Phase 3: Post-Scan Deep Dive ──
+				await self._llm_deep_dive(
+					primary_target, tech_hints, aggregator,
+					task_id, log_callback, record_callback,
 					scan_strategy=scan_strategy,
-					record_callback=record_callback,
 					deep_coord=deep_coord,
 				)
-				raw_outputs_all.append(raw_out)
-				coverage_reports.append(coverage_rpt.to_log_dict())
-				for p_entry in port_aggregator._entries.values():
-					if p_entry.path in aggregator._entries:
-						aggregator._entries[p_entry.path].merge(p_entry)
-					else:
-						aggregator._entries[p_entry.path] = p_entry
 
-			# ── Phase 3: Post-Scan Deep Dive ──
-			await self._llm_deep_dive(
-				primary_target, tech_hints, aggregator,
-				task_id, log_callback, record_callback,
-				scan_strategy=scan_strategy,
-				deep_coord=deep_coord,
+				# ── Phase 3-drain: exhaust the shared deep-scan queue ──
+				await self._drain_deep_scan_queue(
+					base_url=primary_target,
+					aggregator=aggregator,
+					coord=deep_coord,
+					task_id=task_id,
+					log_callback=log_callback,
+					record_callback=record_callback,
+				)
+
+				path_contents = await self._probe_path_contents(
+					web_target=primary_target,
+					aggregator=aggregator,
+					task_id=task_id,
+					log_callback=log_callback,
+				)
+				web_paths = aggregator.get_actionable_paths()
+				raw_gobuster = "\n".join(raw_outputs_all)
+				dir_coverage = coverage_reports[0] if coverage_reports else {}
+
+				if decision_callback:
+					await decision_callback({
+						"action": "tool_result",
+						"phase": "recon",
+						"tool": "dir-discovery",
+						"message": f"目录发现完成: {len(web_paths)} 条路径",
+					})
+			elif log_callback:
+				await log_callback(f"[ReconAgent] [Plan] 跳过目录爆破 (plan_tools={plan_tools})")
+
+		subdomains: list = []
+		if _run_subdomain:
+			subdomains = await self._subdomain_enum(
+				target, task_id, log_callback,
 			)
-
-			# ── Phase 3-drain: exhaust the shared deep-scan queue ──
-			await self._drain_deep_scan_queue(
-				base_url=primary_target,
-				aggregator=aggregator,
-				coord=deep_coord,
-				task_id=task_id,
-				log_callback=log_callback,
-				record_callback=record_callback,
-			)
-
-			path_contents = await self._probe_path_contents(
-				web_target=primary_target,
-				aggregator=aggregator,
-				task_id=task_id,
-				log_callback=log_callback,
-			)
-			web_paths = aggregator.get_actionable_paths()
-			raw_gobuster = "\n".join(raw_outputs_all)
-			dir_coverage = coverage_reports[0] if coverage_reports else {}
-
-			if decision_callback:
-				await decision_callback({
-					"action": "tool_result",
-					"phase": "recon",
-					"tool": "dir-discovery",
-					"message": f"目录发现完成: {len(web_paths)} 条路径",
-				})
-
-		subdomains = await self._subdomain_enum(
-			target, task_id, log_callback,
-		)
+		elif plan_tools and log_callback:
+			await log_callback(f"[ReconAgent] [Plan] 跳过子域名枚举 (plan_tools={plan_tools})")
 
 		return {
 			"ports": ports,

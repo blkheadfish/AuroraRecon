@@ -1136,6 +1136,7 @@ async def node_recon(state: PentestState) -> PentestState:
     from backend.agents.prompt_utils import operator_guidance_block
     _op_block = operator_guidance_block(state)
     _op_plan = getattr(state, "operator_plan", None)
+    _recon_plan_tools = _plan_get_step_tools(state, "recon") or None
     result = await agent.run(
         target=state.target_host or state.target,
         target_port=state.target_port,
@@ -1145,6 +1146,7 @@ async def node_recon(state: PentestState) -> PentestState:
         decision_callback=_on_decision,
         operator_block=_op_block,
         operator_plan=_op_plan,
+        plan_tools=_recon_plan_tools,
     )
     if _op_plan is not None:
         # _dir_scan 内部对 plan 的消费已经发生 (plan 已注入 dir_discovery
@@ -3489,6 +3491,42 @@ def edge_after_privesc(state: PentestState) -> str:
 
 
 # ───────────────────────────────────────────────────────
+# Plan-aware 线性链路由
+#   当 pentest_plan 存在时，沿 recon → surface_enum → intel_harvest
+#   → vuln_scan → exploit_decision 链条向前走，跳过策略未覆盖的阶段，
+#   让执行流直达下一个策略内的阶段。
+# ───────────────────────────────────────────────────────
+
+_LINEAR_CHAIN_SUCCESSORS: dict[str, list[str]] = {
+    "recon":         ["surface_enum", "intel_harvest", "vuln_scan", "exploit_decision"],
+    "surface_enum":  ["intel_harvest", "vuln_scan", "exploit_decision"],
+    "intel_harvest": ["vuln_scan", "exploit_decision"],
+    "vuln_scan":     ["exploit_decision"],
+}
+
+
+def _edge_plan_forward(state: PentestState, current_phase: str) -> str:
+    """沿线性链向前走，跳过被策略排除的阶段。"""
+    for nxt in _LINEAR_CHAIN_SUCCESSORS.get(current_phase, ["exploit_decision"]):
+        skip, _ = _plan_should_skip_phase(state, nxt)
+        if not skip:
+            return nxt
+    return "exploit_decision"
+
+
+def _edge_after_recon(state: PentestState) -> str:
+    return _edge_plan_forward(state, "recon")
+
+
+def _edge_after_surface_enum(state: PentestState) -> str:
+    return _edge_plan_forward(state, "surface_enum")
+
+
+def _edge_after_intel_harvest(state: PentestState) -> str:
+    return _edge_plan_forward(state, "intel_harvest")
+
+
+# ───────────────────────────────────────────────────────
 # Feedback 模式专用条件边（v2）
 #   读取 state.replan_signals + state.replan_count + state.phase_visit_count
 #   决定是否回上游重跑。每跳一次 replan_count++，触达 max_replan 后回退。
@@ -3496,6 +3534,9 @@ def edge_after_privesc(state: PentestState) -> str:
 
 def _can_replan(state: PentestState, target_phase: str) -> bool:
     if state.replan_count >= state.max_replan:
+        return False
+    skip, _ = _plan_should_skip_phase(state, target_phase)
+    if skip:
         return False
     visits = state.phase_visit_count.get(target_phase, 0)
     cap = state.max_phase_visits.get(target_phase, 99)
@@ -3707,9 +3748,20 @@ def _build_graph_linear(checkpointer=None):
             "objective_collect":  "objective_collect",
         },
     )
-    graph.add_edge("recon", "surface_enum")
-    graph.add_edge("surface_enum", "intel_harvest")
-    graph.add_edge("intel_harvest", "vuln_scan")
+    _PLAN_FWD_TARGETS_RECON = {
+        "surface_enum": "surface_enum", "intel_harvest": "intel_harvest",
+        "vuln_scan": "vuln_scan", "exploit_decision": "exploit_decision",
+    }
+    _PLAN_FWD_TARGETS_SURF = {
+        "intel_harvest": "intel_harvest",
+        "vuln_scan": "vuln_scan", "exploit_decision": "exploit_decision",
+    }
+    _PLAN_FWD_TARGETS_INTEL = {
+        "vuln_scan": "vuln_scan", "exploit_decision": "exploit_decision",
+    }
+    graph.add_conditional_edges("recon", _edge_after_recon, _PLAN_FWD_TARGETS_RECON)
+    graph.add_conditional_edges("surface_enum", _edge_after_surface_enum, _PLAN_FWD_TARGETS_SURF)
+    graph.add_conditional_edges("intel_harvest", _edge_after_intel_harvest, _PLAN_FWD_TARGETS_INTEL)
     graph.add_edge("vuln_scan", "exploit_decision")
     graph.add_conditional_edges(
         "exploit_decision", edge_should_exploit,
@@ -3806,9 +3858,17 @@ def _build_graph_feedback(checkpointer=None):
             "objective_collect":  "objective_collect",
         },
     )
-    graph.add_edge("recon", "surface_enum")
-    graph.add_edge("surface_enum", "intel_harvest")
-    graph.add_edge("intel_harvest", "vuln_scan")
+    graph.add_conditional_edges("recon", _edge_after_recon, {
+        "surface_enum": "surface_enum", "intel_harvest": "intel_harvest",
+        "vuln_scan": "vuln_scan", "exploit_decision": "exploit_decision",
+    })
+    graph.add_conditional_edges("surface_enum", _edge_after_surface_enum, {
+        "intel_harvest": "intel_harvest",
+        "vuln_scan": "vuln_scan", "exploit_decision": "exploit_decision",
+    })
+    graph.add_conditional_edges("intel_harvest", _edge_after_intel_harvest, {
+        "vuln_scan": "vuln_scan", "exploit_decision": "exploit_decision",
+    })
     graph.add_edge("vuln_scan", "exploit_decision")
 
     graph.add_conditional_edges(
@@ -3825,6 +3885,7 @@ def _build_graph_feedback(checkpointer=None):
     )
 
     # foothold 出口：除老分支外，反馈到 vuln_scan / surface_enum
+    # _can_replan 已加 plan 检查，策略外阶段不会被循环回
     graph.add_conditional_edges(
         "foothold_attempt", edge_after_foothold_v2,
         {
