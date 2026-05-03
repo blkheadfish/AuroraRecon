@@ -331,11 +331,11 @@
         </transition>
       </div>
 
-      <!-- 右侧策略面板，展示完整攻击链 + 动态行进状态 -->
+      <!-- 右侧策略面板：优先按用户制定的策略展示，无策略时展示通用攻击链 -->
       <div v-if="strategyPlan.length > 0" class="strategy-side">
         <div class="strategy-rail">
           <div class="strategy-rail-header">
-            <span class="strategy-rail-title">攻击链</span>
+            <span class="strategy-rail-title">{{ hasPentestPlan ? '渗透策略' : '攻击链' }}</span>
             <span class="strategy-rail-count">{{ strategyPlan.filter(i => i.status === 'done').length }}/{{ strategyPlan.length }}</span>
           </div>
           <div class="strategy-rail-list">
@@ -354,6 +354,14 @@
               <div class="strategy-body">
                 <div class="strategy-label" :class="{ 'label-active': item.status === 'active' }">{{ item.label }}</div>
                 <div class="strategy-detail" v-if="item.detail">{{ item.detail }}</div>
+                <div v-if="item.steps && item.steps.length" class="strategy-steps">
+                  <div v-for="(step, si) in item.steps" :key="si" class="strategy-step">
+                    <span class="strategy-step-idx">{{ si + 1 }}</span>
+                    <code v-if="step.tool" class="strategy-step-tool">{{ step.tool }}</code>
+                    <code v-else-if="step.skill" class="strategy-step-skill">{{ step.skill }}</code>
+                    <span v-if="step.purpose" class="strategy-step-purpose">{{ step.purpose }}</span>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
@@ -576,11 +584,88 @@ const showApprovalActions = computed(() => needsApproval.value && approvalState.
 const pendingCheckpoint = computed(() => state.value?.pendingCheckpoint || null)
 const checkpointSubmitting = computed(() => state.value?.checkpointState === 'submitting')
 
-const strategyPlan = computed(() => {
+// 策略阶段名 → 对应的攻击链节点名（用于进度跟踪）
+const PLAN_PHASE_TO_CHAIN: Record<string, string[]> = {
+  recon: ['recon'],
+  surface_enum: ['surface_enum'],
+  intel_harvest: ['intel_harvest'],
+  vuln_scan: ['vuln_scan'],
+  exploit: ['exploit_decision', 'awaiting_approval', 'human_approval', 'foothold_attempt', 'secondary_attack'],
+  post_exploit: ['post_foothold_enum', 'post_foothold_approval', 'internal_scan', 'privesc_attempt', 'lateral_movement', 'persistence', 'objective_collect'],
+  report: ['report'],
+}
+
+const PLAN_PHASE_LABELS: Record<string, string> = {
+  recon: '侦察',
+  surface_enum: '攻击面枚举',
+  intel_harvest: '情报收集',
+  vuln_scan: '漏洞扫描',
+  exploit: '漏洞利用',
+  post_exploit: '后渗透',
+  report: '报告',
+}
+
+interface StrategyStep {
+  tool?: string
+  skill?: string
+  purpose?: string
+}
+
+interface StrategyItem {
+  key: string
+  label: string
+  detail: string
+  status: 'done' | 'active' | 'pending'
+  steps?: StrategyStep[]
+}
+
+const hasPentestPlan = computed(() => {
+  const plan = task.value?.pentest_plan as Record<string, unknown> | undefined
+  return plan && Array.isArray(plan.phases) && plan.phases.length > 0
+})
+
+const strategyPlan = computed<StrategyItem[]>(() => {
   const t = task.value
   if (!t) return []
 
-  // 完整攻击链阶段顺序 (与后端 _CHAIN_PHASE_ORDER 对齐)
+  const visited = (t.chain_visited || []) as string[]
+  const visitedSet = new Set(visited)
+  const curPhase = t.current_phase || ''
+
+  // ── 有策略时：严格按策略阶段展示 ──
+  const plan = t.pentest_plan as Record<string, unknown> | undefined
+  if (plan && Array.isArray(plan.phases) && plan.phases.length > 0) {
+    const phases = plan.phases as Array<{ phase: string; description: string; steps?: Array<{ tool?: string; skill?: string; purpose?: string; enabled?: boolean }> }>
+    const items: StrategyItem[] = []
+    for (let i = 0; i < phases.length; i++) {
+      const p = phases[i]
+      const chainNodes = PLAN_PHASE_TO_CHAIN[p.phase] || [p.phase]
+      const isActive = chainNodes.includes(curPhase) || curPhase === p.phase
+      const isDone = !isActive && chainNodes.some(n => visitedSet.has(n))
+      let status: 'done' | 'active' | 'pending' = 'pending'
+      let detail = ''
+      if (isActive) {
+        status = 'active'
+        detail = '进行中'
+      } else if (isDone) {
+        status = 'done'
+        detail = '已完成'
+      }
+      const steps: StrategyStep[] = (p.steps || [])
+        .filter(s => s.enabled !== false)
+        .map(s => ({ tool: s.tool, skill: s.skill, purpose: s.purpose }))
+      items.push({
+        key: p.phase,
+        label: PLAN_PHASE_LABELS[p.phase] || p.description || p.phase,
+        detail,
+        status,
+        steps: steps.length > 0 ? steps : undefined,
+      })
+    }
+    return items
+  }
+
+  // ── 无策略时：展示通用攻击链 ──
   const CHAIN_PHASES: Array<{ key: string; label: string }> = [
     { key: 'recon', label: '侦察' },
     { key: 'surface_enum', label: '攻击面枚举' },
@@ -599,31 +684,20 @@ const strategyPlan = computed(() => {
     { key: 'objective_collect', label: '目标收集' },
     { key: 'report', label: '报告' },
   ]
-
-  const visited = (t.chain_visited || []) as string[]
-  const visitedSet = new Set(visited)
-  const curPhase = t.current_phase || ''
-
-  const items: Array<{ key: string; label: string; detail: string; status: 'done' | 'active' | 'pending' }> = []
-
+  const items: StrategyItem[] = []
   for (let i = 0; i < CHAIN_PHASES.length; i++) {
     const p = CHAIN_PHASES[i]
     let status: 'done' | 'active' | 'pending' = 'pending'
     let detail = ''
-
     if (curPhase === p.key) {
-      // 当前正在这个阶段 (含 awaiting_approval 等暂停态)
       status = 'active'
       detail = '进行中'
     } else if (visitedSet.has(p.key)) {
-      // 已经走完
       status = 'done'
       detail = '已完成'
     }
-
     items.push({ key: p.key, label: p.label, detail, status })
   }
-
   return items
 })
 
@@ -1780,6 +1854,51 @@ onUnmounted(() => {
   font-size: 10px;
   color: var(--text-muted);
   line-height: 1.3;
+}
+.strategy-steps {
+  margin-top: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.strategy-step {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  color: var(--text-muted);
+  line-height: 1.3;
+}
+.strategy-step-idx {
+  flex-shrink: 0;
+  width: 14px;
+  height: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: var(--bg-soft);
+  color: var(--text-secondary);
+  font-size: 9px;
+  font-weight: 600;
+}
+.strategy-step-tool,
+.strategy-step-skill {
+  flex-shrink: 0;
+  font-size: 10px;
+  padding: 0 3px;
+  border-radius: 3px;
+  background: rgba(var(--c-brand-rgb, 64, 158, 255), 0.1);
+  color: var(--el-color-primary);
+}
+.strategy-step-skill {
+  background: rgba(var(--el-color-success-rgb, 103, 194, 58), 0.1);
+  color: var(--el-color-success);
+}
+.strategy-step-purpose {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ── 攻击链节点状态 ── */

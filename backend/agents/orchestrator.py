@@ -669,21 +669,47 @@ def _plan_get_phase_steps(state: PentestState, phase_name: str) -> list[dict]:
 def _plan_should_skip_phase(state: PentestState, phase_name: str) -> tuple[bool, str]:
     """检查 pentest_plan 是否指示跳过该阶段。
 
-    如果 plan 中该阶段无 enabled 步骤，则跳过。
-    如果 plan 中根本没有该阶段，则不跳过（走正常逻辑）。
+    当策略存在时，未被策略覆盖的阶段一律跳过——确保执行流严格按策略走。
+
+    phase_name 可以是策略阶段名（recon/exploit/post_exploit）或攻击链节点名
+    （surface_enum/foothold_attempt 等），本函数统一处理映射。
     """
     plan = state.pentest_plan or {}
     if not plan:
         return False, ""
     phases = plan.get("phases", [])
-    phase_exists = any(p.get("phase") == phase_name for p in phases)
-    if not phase_exists:
-        # Plan doesn't mention this phase at all → let normal logic decide
+    if not phases:
         return False, ""
-    steps = _plan_get_phase_steps(state, phase_name)
-    if not steps:
-        return True, f"策略中 {phase_name} 阶段无启用步骤，跳过"
-    return False, ""
+
+    # 策略阶段名 → 它所覆盖的攻击链节点名
+    _PLAN_COVERS: dict[str, set[str]] = {
+        "recon":        {"recon"},
+        "surface_enum": {"surface_enum"},
+        "intel_harvest":{"intel_harvest"},
+        "vuln_scan":    {"vuln_scan"},
+        "exploit":      {"exploit_decision", "foothold_attempt", "secondary_attack"},
+        "post_exploit": {"post_foothold_enum", "internal_scan", "privesc_attempt",
+                         "lateral_movement", "persistence", "objective_collect"},
+        "report":       {"report"},
+    }
+
+    plan_phase_names = {p.get("phase") for p in phases}
+
+    # 直接命中策略阶段名
+    if phase_name in plan_phase_names:
+        steps = _plan_get_phase_steps(state, phase_name)
+        if not steps:
+            return True, f"策略中 {phase_name} 阶段无启用步骤，跳过"
+        return False, ""
+
+    # phase_name 可能是攻击链节点名 → 检查是否被某个策略阶段覆盖
+    for pp in plan_phase_names:
+        covered = _PLAN_COVERS.get(pp, {pp})
+        if phase_name in covered:
+            return False, ""
+
+    # 策略存在但该阶段未被任何策略阶段覆盖 → 跳过
+    return True, f"策略未包含 {phase_name} 阶段，跳过"
 
 
 def _plan_get_step_tools(state: PentestState, phase_name: str) -> list[str]:
@@ -1486,6 +1512,12 @@ async def node_surface_enum(state: PentestState) -> PentestState:
     from backend.tools.tool_coverage_planner import ToolCoveragePlanner
     state.current_phase = "surface_enum"
     _record_chain_visit(state, "surface_enum")
+
+    skip_plan, skip_plan_reason = _plan_should_skip_phase(state, "surface_enum")
+    if skip_plan:
+        state.log(f"[Plan] {skip_plan_reason}")
+        return state
+
     if _yield_if_interrupted(state, "surface_enum"):
         return state
     if _maybe_skip_or_finish(state, "surface_enum"):
@@ -2088,6 +2120,12 @@ async def node_intel_harvest(state: PentestState) -> PentestState:
 
     state.current_phase = "intel_harvest"
     _record_chain_visit(state, "intel_harvest")
+
+    skip_plan, skip_plan_reason = _plan_should_skip_phase(state, "intel_harvest")
+    if skip_plan:
+        state.log(f"[Plan] {skip_plan_reason}")
+        return state
+
     if _yield_if_interrupted(state, "intel_harvest"):
         return state
     if _maybe_skip_or_finish(state, "intel_harvest"):
@@ -2940,6 +2978,14 @@ async def node_post_foothold_approval(state: PentestState) -> PentestState:
     """
     state.current_phase = "post_foothold_approval"
     _record_chain_visit(state, "post_foothold_approval")
+
+    # 策略未包含 post_exploit → 跳过后渗透，保持 post_approved=False
+    # 使 edge_after_post_foothold_approval 直接路由到 objective_collect → report
+    skip_plan, skip_plan_reason = _plan_should_skip_phase(state, "post_exploit")
+    if skip_plan:
+        state.post_approved = False
+        state.log(f"[Plan] {skip_plan_reason}")
+        return state
 
     # 反馈/监督模式下，第二次及以后到达本节点时不再重新拉起人工审批
     if state.post_approved_once and not state.post_approved:
