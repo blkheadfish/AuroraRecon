@@ -285,13 +285,17 @@ def _intent_to_operator_plan(state: PentestState) -> None:
     next_phase: str | None = None
     exploit_with_known_vuln = bool(priority_vulns) and "exploit" in pentest_phases
 
+    _needs_ports = {"surface_enum", "vuln_scan", "intel_harvest"}
     if exploit_with_known_vuln:
-        next_phase = "vuln_scan"
+        next_phase = "vuln_scan" if state.open_ports else "recon"
     elif pentest_phases and "exploit" not in pentest_phases and "full_chain" not in pentest_phases:
         last_phase = pentest_phases[-1] if pentest_phases else ""
         phase_sequence = ["recon", "surface_enum", "intel_harvest", "vuln_scan"]
         if last_phase in phase_sequence:
-            next_phase = last_phase
+            if last_phase in _needs_ports and not state.open_ports:
+                next_phase = "recon"
+            else:
+                next_phase = last_phase
 
     # 没有任何有效约束，不创建空计划
     has_constraints = preferred or avoided or keyword_hints or next_phase or extra_hint
@@ -3709,7 +3713,7 @@ def _build_graph_linear(checkpointer=None):
 
     return graph.compile(
         checkpointer=checkpointer,
-        interrupt_before=["human_approval", "post_foothold_approval"] + _INTERACTIVE_INTERRUPT_NODES,
+        interrupt_before=["human_approval", "post_foothold_approval"],
     )
 
 
@@ -3826,7 +3830,7 @@ def _build_graph_feedback(checkpointer=None):
 
     return graph.compile(
         checkpointer=checkpointer,
-        interrupt_before=["human_approval", "post_foothold_approval"] + _INTERACTIVE_INTERRUPT_NODES,
+        interrupt_before=["human_approval", "post_foothold_approval"],
     )
 
 
@@ -3881,7 +3885,7 @@ def _build_graph_supervisor(checkpointer=None):
 
     return graph.compile(
         checkpointer=checkpointer,
-        interrupt_before=["human_approval", "post_foothold_approval"] + _INTERACTIVE_INTERRUPT_NODES,
+        interrupt_before=["human_approval", "post_foothold_approval"],
     )
 
 

@@ -89,28 +89,32 @@ async def _cache_redis_incremental(task_id: str, state: PentestState):
 # ── 通用: LangGraph interrupt_before 暂停检测 + 审批上下文 ───
 
 
+async def _auto_resume_task(task_id: str) -> None:
+    """auto_approve 任务碰到 interrupt_before 暂停后自动恢复执行。"""
+    sm = get_state_manager()
+    sm.register_bg_task(task_id, asyncio.current_task())
+    try:
+        await resume_task(task_id, approved=True)
+    except Exception as e:
+        logger.error(f"[API] auto_resume {task_id} 失败: {e}", exc_info=True)
+
+
 async def _handle_graph_interrupt(task_id: str, state: PentestState) -> bool:
-    """检测 LangGraph interrupt_before 暂停并创建审批上下文。
+    """检测 LangGraph interrupt_before 暂停并处理。
 
-    当 graph 因 interrupt_before (含 _INTERACTIVE_INTERRUPT_NODES 或
-    human_approval / post_foothold_approval) 暂停时, state.status 保持
-    RUNNING。本函数负责:
+    当 graph 因 interrupt_before (human_approval / post_foothold_approval)
+    暂停时, state.status 保持 RUNNING。本函数根据 auto_approve 分两路:
 
-      1. 设置 current_phase = \"awaiting_approval\" 让前端显示审批 UI。
-      2. 创建带上下文的 checkpoint (含阶段摘要、发现统计、操作选项)。
-      3. 推送 approval_required 事件 (兼容旧版前端)。
+      - auto_approve=True: 自动设置审批标志并后台恢复执行 (返回 True)。
+      - auto_approve=False: 创建审批上下文 + checkpoint + 事件 (返回 True)。
 
-    如果 state.pending_checkpoint 已经存在 (来自 node_human_approval 的
-    exploit_gate / post_foothold_gate), 说明审批上下文已在图内生成, 本函数
-    只补齐 current_phase 和 approval_required 事件, 不覆盖已有 checkpoint。
-
-    Returns True when interrupt handling was applied.
+    Returns True when interrupt handling was applied, False otherwise.
     """
-    if not state or state.status != TaskStatus.RUNNING or state.auto_approve:
+    if not state or state.status != TaskStatus.RUNNING:
         return False
 
     from datetime import datetime as _dt
-    from backend.agents.orchestrator import _INTERACTIVE_INTERRUPT_NODES, _CHAIN_PHASE_ORDER
+    from backend.agents.orchestrator import _CHAIN_PHASE_ORDER
 
     sm = get_state_manager()
 
@@ -125,6 +129,15 @@ async def _handle_graph_interrupt(task_id: str, state: PentestState) -> bool:
             break
     if not interrupted_phase:
         interrupted_phase = state.current_phase or "unknown"
+
+    # auto_approve: 自动通过审批暂停，后台恢复执行
+    if state.auto_approve:
+        state.approved = True
+        state.post_approved = True
+        sm.set(task_id, state)
+        state.log(f"✅ auto_approve: 自动通过 {interrupted_phase} 审批暂停，继续执行")
+        asyncio.ensure_future(_auto_resume_task(task_id))
+        return True
 
     PHASE_LABELS: dict[str, str] = {
         "recon": "侦察", "surface_enum": "攻击面枚举", "intel_harvest": "情报收集",
@@ -380,14 +393,12 @@ async def run_task(
         )
         return
 
-    # 检测 LangGraph interrupt 暂停(含 human_approval / post_foothold_approval
-    # 以及 _INTERACTIVE_INTERRUPT_NODES 的 interrupt_before 暂停)。
-    # auto_approve=True 的任务不会走到这里:edge_should_exploit 已经直通 foothold_attempt
+    # 检测 LangGraph interrupt 暂停 (human_approval / post_foothold_approval)。
+    # auto_approve=True 时 _handle_graph_interrupt 会自动恢复执行。
     state = sm.get(task_id)
     if await _handle_graph_interrupt(task_id, state):
         await _maybe_save_db(task_id, state, force=True)
-        logger.info(f"[API] 任务 {task_id} 等待人工审批 (phase={state.current_phase})")
-        # 待审批期间不关容器:恢复后继续利用还要用同一个工具环境
+        logger.info(f"[API] 任务 {task_id} 等待审批/自动恢复 (phase={state.current_phase})")
         return
 
     # 正常完成 / 失败 / 取消 → 统一关容器
@@ -510,6 +521,13 @@ async def resume_task(
         logger.info(
             f"[API] 任务 {task_id} resume 已被分支管理器接管, 跳过收尾"
         )
+        return
+
+    # 检测 resume 后图是否再次暂停 (例如 post_foothold_approval 的 interrupt_before)
+    state = sm.get(task_id)
+    if await _handle_graph_interrupt(task_id, state):
+        await _maybe_save_db(task_id, state, force=True)
+        logger.info(f"[API] 任务 {task_id} resume 后再次等待审批 (phase={state.current_phase})")
         return
 
     # Stop container only when we're the legitimate lifecycle owner.

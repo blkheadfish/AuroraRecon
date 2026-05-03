@@ -741,14 +741,13 @@ class BranchManager:
             elif final and final.status == TaskStatus.FAILED:
                 branch.status = "failed"
             elif final and final.status == TaskStatus.RUNNING:
-                # 可能是 LangGraph interrupt_before 暂停 (含 human_approval /
-                # post_foothold_approval 以及 _INTERACTIVE_INTERRUPT_NODES)。
-                # 创建审批上下文让前端显示审批卡, 并保持 "paused" 等待用户操作。
+                # LangGraph interrupt_before 暂停 (human_approval / post_foothold_approval)。
+                # auto_approve 时自动恢复; 否则创建审批上下文等待用户操作。
                 from backend.api.services.task_runner import _handle_graph_interrupt
                 state_for_sm = sm.get(task_id) or final
-                await _handle_graph_interrupt(task_id, state_for_sm)
+                handled = await _handle_graph_interrupt(task_id, state_for_sm)
                 sm.set(task_id, state_for_sm)
-                branch.status = "paused"
+                branch.status = "running" if (handled and state_for_sm.auto_approve) else "paused"
             else:
                 branch.status = "paused"
             branch.updated_at = datetime.utcnow().isoformat()
