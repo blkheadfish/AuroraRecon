@@ -262,7 +262,7 @@ const llmTestResult = ref(null)
 
 // ── 表单数据 ────────────────────────────────────────────
 const PROVIDER_DEFAULTS = {
-  deepseek:  { model: 'deepseek-chat',         base_url: 'https://api.deepseek.com' },
+  deepseek:  { model: 'deepseek-v4-flash',     base_url: 'https://api.deepseek.com' },
   openai:    { model: 'gpt-4o',                base_url: 'https://api.openai.com/v1' },
   anthropic: { model: 'claude-sonnet-4-6',   base_url: 'https://api.anthropic.com/v1' },
   custom:    { model: '',                       base_url: '' },
@@ -270,7 +270,7 @@ const PROVIDER_DEFAULTS = {
 
 const llm = ref({
   provider:   'deepseek',
-  model:      'deepseek-chat',
+  model:      'deepseek-v4-flash',
   base_url:   'https://api.deepseek.com',
   max_tokens: 4096,
 })

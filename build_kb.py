@@ -17,7 +17,7 @@
 
 前置条件:
     export LLM_API_KEY=
-    export LLM_MODEL=deepseek-chat          # 可选，默认deepseek-chat
+    export LLM_MODEL=deepseek-v4-flash      # 可选，默认deepseek-v4-flash
     export LLM_BASE_URL=https://api.deepseek.com  # 可选
     # 可选
     export KB_EMBEDDING_BASE_URL="https://api.jina.ai/v1"

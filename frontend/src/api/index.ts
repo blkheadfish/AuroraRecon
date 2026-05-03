@@ -102,14 +102,14 @@ export const api = {
         user_prompt: payload.userPrompt,
         workflow_mode: payload.workflowMode ?? 'pentest_engineer',
       },
-      { timeout: 12000 },
+      { timeout: 30000 },
     ),
 
   // Plan Mode: 在创建任务前生成渗透策略预览，不执行任何工具
   generatePlan: (payload: {
     userPrompt: string
   }): Promise<PlanResponse> =>
-    http.post('/tasks/plan', { user_prompt: payload.userPrompt }, { timeout: 90000 }),
+    http.post('/tasks/plan', { user_prompt: payload.userPrompt }, { timeout: 180000 }),
 
   createTask: (payload: {
     target: string

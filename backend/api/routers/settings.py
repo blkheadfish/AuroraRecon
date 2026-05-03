@@ -28,7 +28,7 @@ DEFAULT_SETTINGS = {
     "llm": {
         "provider":   "deepseek",
         "api_key":    "",
-        "model":      "deepseek-chat",
+        "model":      "deepseek-v4-flash",
         "base_url":   "https://api.deepseek.com",
         "max_tokens": 4096,
     },

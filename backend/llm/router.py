@@ -12,7 +12,11 @@ import asyncio
 import json
 import logging
 import os
+import socket
+import struct
+import random
 from typing import Callable, Optional, Union, overload
+from urllib.parse import urlparse
 
 from openai import AsyncOpenAI
 
@@ -63,6 +67,102 @@ SECURITY_EXPERT_SYSTEM_PROMPT = """你是一名拥有 10 年经验的高级渗�
 # 最大重试次数
 MAX_RETRIES = 5
 
+# ── DNS 容灾（异步版）────────────────────────────
+# Docker 容器内系统 DNS 可能不可达，通过 UDP 直连公共 DNS 兜底。
+# 所有 DNS 操作走 asyncio.to_thread() 线程池，绝不阻塞事件循环。
+# 模块级缓存确保同一 hostname 只解析一次。
+
+_DNS_FALLBACK_SERVERS = ["8.8.8.8", "114.114.114.114"]
+_dns_resolved: dict[str, bool] = {}
+_dns_lock = asyncio.Lock()
+
+
+def _udp_dns_resolve(hostname: str, dns_server: str, timeout: float = 5.0) -> str | None:
+    """通过 UDP 直连指定 DNS 服务器解析 A 记录（在线程池内执行）。"""
+    try:
+        txn_id = random.randint(0, 65535)
+        header = struct.pack('>HHHHHH', txn_id, 0x0100, 1, 0, 0, 0)
+        question = b''
+        for label in hostname.split('.'):
+            question += struct.pack('B', len(label)) + label.encode('ascii')
+        question += b'\x00'
+        question += struct.pack('>HH', 1, 1)
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        try:
+            sock.sendto(header + question, (dns_server, 53))
+            data, _ = sock.recvfrom(1024)
+        finally:
+            sock.close()
+
+        ancount = struct.unpack('>H', data[6:8])[0]
+        if ancount == 0:
+            return None
+        offset = 12
+        while offset < len(data) and data[offset] != 0:
+            offset += data[offset] + 1
+        offset += 5
+        for _ in range(ancount):
+            if offset + 2 > len(data):
+                break
+            if data[offset] & 0xC0 == 0xC0:
+                offset += 2
+            else:
+                while offset < len(data) and data[offset] != 0:
+                    offset += data[offset] + 1
+                offset += 1
+            if offset + 10 > len(data):
+                break
+            rtype, _, _, rdlength = struct.unpack('>HHIH', data[offset:offset + 10])
+            offset += 10
+            if rtype == 1 and rdlength == 4 and offset + 4 <= len(data):
+                return '.'.join(str(b) for b in data[offset:offset + 4])
+            offset += rdlength
+    except Exception as e:
+        logger.debug(f"[DNS] UDP 解析 {hostname} via {dns_server} 失败: {e}")
+    return None
+
+
+async def _ensure_host_resolvable_async(url: str) -> None:
+    """异步 DNS 兜底：系统 DNS 失败后用公共 DNS，在线程池执行，不阻塞事件循环。"""
+    hostname = urlparse(url).hostname
+    if not hostname or _dns_resolved.get(hostname):
+        return
+
+    async with _dns_lock:
+        if _dns_resolved.get(hostname):
+            return
+
+        try:
+            await asyncio.to_thread(socket.getaddrinfo, hostname, 443, socket.AF_INET)
+            _dns_resolved[hostname] = True
+            return
+        except socket.gaierror:
+            logger.warning(f"[DNS] 系统解析 {hostname} 失败，尝试公共 DNS 直连解析...")
+
+        for dns_server in _DNS_FALLBACK_SERVERS:
+            try:
+                ip = await asyncio.to_thread(_udp_dns_resolve, hostname, dns_server)
+                if ip:
+                    logger.info(f"[DNS] 通过 {dns_server} 解析 {hostname} → {ip}")
+                    try:
+                        with open('/etc/hosts', 'r') as f:
+                            content = f.read()
+                        if hostname not in content:
+                            with open('/etc/hosts', 'a') as f:
+                                f.write(f"{ip}\t{hostname}\n")
+                            logger.info(f"[DNS] 已写入 /etc/hosts: {ip} {hostname}")
+                    except OSError as e:
+                        logger.warning(f"[DNS] 写入 /etc/hosts 失败: {e}")
+                    _dns_resolved[hostname] = True
+                    return
+            except Exception as e:
+                logger.debug(f"[DNS] UDP {hostname} via {dns_server}: {e}")
+
+        logger.error(f"[DNS] 所有公共 DNS 均无法解析 {hostname}")
+        _dns_resolved[hostname] = True  # 不再重试
+
 
 class LLMRouter:
     """
@@ -79,6 +179,13 @@ class LLMRouter:
 
         base_url = LLM_BASE_URL or config["base_url"]
         model = LLM_MODEL or config["model"]
+
+        # 异步 DNS 兜底：投递到事件循环后台执行，不阻塞 __init__
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_ensure_host_resolvable_async(base_url))
+        except RuntimeError:
+            pass  # 不在事件循环中（如测试环境），跳过
 
         self._model = model
         import httpx as httpx_client
@@ -155,6 +262,13 @@ class LLMRouter:
                 response = await self._client.chat.completions.create(**kwargs)
                 msg = response.choices[0].message
                 content = msg.content or ""
+                # DeepSeek v4-flash 等推理模型在生成长内容时可能把回复
+                # 放在 reasoning_content 而非 content，在此做兜底
+                if not content.strip():
+                    reasoning = self._extract_reasoning(msg)
+                    if reasoning:
+                        logger.debug(f"[LLMRouter] content 为空，回退到 reasoning_content ({len(reasoning)} chars)")
+                        content = reasoning
                 logger.debug(f"[LLMRouter] 响应长度: {len(content)} chars")
                 if return_thinking:
                     return content, self._extract_reasoning(msg)
@@ -225,6 +339,11 @@ class LLMRouter:
                 response = await self._client.chat.completions.create(**kwargs)
                 msg = response.choices[0].message
                 content = msg.content or ""
+                if not content.strip():
+                    reasoning = self._extract_reasoning(msg)
+                    if reasoning:
+                        logger.debug(f"[LLMRouter] 多轮 content 为空，回退到 reasoning_content ({len(reasoning)} chars)")
+                        content = reasoning
                 logger.debug(
                     f"[LLMRouter] 多轮响应: {len(content)} chars, "
                     f"轮次={len(messages)}条消息"
@@ -368,6 +487,9 @@ class LLMRouter:
                 content = msg.content or ""
                 tool_calls = list(getattr(msg, "tool_calls", None) or [])
                 reasoning = self._extract_reasoning(msg)
+                if not content.strip() and reasoning:
+                    logger.debug(f"[LLMRouter] tools content 为空，回退到 reasoning_content ({len(reasoning)} chars)")
+                    content = reasoning
                 logger.debug(
                     f"[LLMRouter] tools 响应: content_len={len(content)}, "
                     f"tool_calls={len(tool_calls)}"

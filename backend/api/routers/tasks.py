@@ -252,10 +252,10 @@ async def parse_task_intent(req: ParseIntentRequest, request: Request):
                 temperature=0.1,
                 max_tokens=512,
             ),
-            timeout=8.0,
+            timeout=20.0,
         )
     except asyncio.TimeoutError:
-        logger.info("[parse_intent] LLM 超时,回退正则")
+        logger.info("[parse_intent] LLM 超时(20s),回退正则")
         return ParseIntentResponse(target=fallback_target, fallback=True, error="LLM 超时")
     except Exception as e:
         logger.warning(f"[parse_intent] LLM 调用异常: {e}")
@@ -454,9 +454,9 @@ async def generate_pentest_plan(req: PlanRequest, request: Request):
                 prompt,
                 response_format="json",
                 temperature=0.2,
-                max_tokens=4096,
+                max_tokens=2048,
             ),
-            timeout=60.0,
+            timeout=180.0,
         )
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="LLM 策略生成超时，请重试")
