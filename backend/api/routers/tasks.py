@@ -1223,7 +1223,7 @@ async def approve_task(task_id: str, req: ApproveRequest, request: Request):
         logger.warning(f"[审批] inflight 超时 ({elapsed:.0f}s),清除锁并允许重新审批: {task_id}")
         sm.clear_approval_inflight(task_id)
 
-    if state.current_phase != "awaiting_approval":
+    if state.current_phase != "awaiting_approval" and not state.pending_checkpoint:
         raise HTTPException(
             status_code=400,
             detail=f"任务当前阶段 '{state.current_phase}' 不需要审批",
@@ -1282,7 +1282,7 @@ async def respond_checkpoint(
         raise HTTPException(status_code=404, detail="任务不存在")
     _enforce_task_owner(state, request, "respond_checkpoint")
 
-    if state.current_phase not in ("awaiting_approval", "post_foothold_approval"):
+    if state.current_phase not in ("awaiting_approval", "post_foothold_approval") and not state.pending_checkpoint:
         raise HTTPException(
             status_code=400,
             detail=f"任务当前阶段 '{state.current_phase}' 不需要确认",

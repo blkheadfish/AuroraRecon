@@ -86,6 +86,169 @@ async def _cache_redis_incremental(task_id: str, state: PentestState):
         pass
 
 
+# ── 通用: LangGraph interrupt_before 暂停检测 + 审批上下文 ───
+
+
+async def _handle_graph_interrupt(task_id: str, state: PentestState) -> bool:
+    """检测 LangGraph interrupt_before 暂停并创建审批上下文。
+
+    当 graph 因 interrupt_before (含 _INTERACTIVE_INTERRUPT_NODES 或
+    human_approval / post_foothold_approval) 暂停时, state.status 保持
+    RUNNING。本函数负责:
+
+      1. 设置 current_phase = \"awaiting_approval\" 让前端显示审批 UI。
+      2. 创建带上下文的 checkpoint (含阶段摘要、发现统计、操作选项)。
+      3. 推送 approval_required 事件 (兼容旧版前端)。
+
+    如果 state.pending_checkpoint 已经存在 (来自 node_human_approval 的
+    exploit_gate / post_foothold_gate), 说明审批上下文已在图内生成, 本函数
+    只补齐 current_phase 和 approval_required 事件, 不覆盖已有 checkpoint。
+
+    Returns True when interrupt handling was applied.
+    """
+    if not state or state.status != TaskStatus.RUNNING or state.auto_approve:
+        return False
+
+    from datetime import datetime as _dt
+    from backend.agents.orchestrator import _INTERACTIVE_INTERRUPT_NODES, _CHAIN_PHASE_ORDER
+
+    sm = get_state_manager()
+
+    # 推断被中断的阶段: 根据 chain_visited 最后一项在 _CHAIN_PHASE_ORDER
+    # 中的位置, 下一个就是被 interrupt_before 挡住的阶段。
+    visited = list(state.chain_visited or [])
+    last_visited = visited[-1] if visited else ""
+    interrupted_phase = ""
+    for i, p in enumerate(_CHAIN_PHASE_ORDER):
+        if p == last_visited and i + 1 < len(_CHAIN_PHASE_ORDER):
+            interrupted_phase = _CHAIN_PHASE_ORDER[i + 1]
+            break
+    if not interrupted_phase:
+        interrupted_phase = state.current_phase or "unknown"
+
+    PHASE_LABELS: dict[str, str] = {
+        "recon": "侦察", "surface_enum": "攻击面枚举", "intel_harvest": "情报收集",
+        "vuln_scan": "漏洞扫描", "exploit_decision": "利用决策",
+        "awaiting_approval": "等待审批", "foothold_attempt": "立足点尝试",
+        "secondary_attack": "二次攻击", "post_foothold_enum": "立足后枚举",
+        "post_foothold_approval": "立足后确认", "internal_scan": "内网扫描",
+        "privesc_attempt": "提权尝试", "lateral_movement": "横向移动",
+        "persistence": "持久化", "objective_collect": "目标收集", "report": "报告",
+    }
+    phase_label = PHASE_LABELS.get(interrupted_phase, interrupted_phase)
+
+    # 构建摘要 —— 汇总当前已知事实, 让用户知道"走到哪了"
+    summary_parts: list[str] = []
+    open_ports_count = len(state.open_ports or [])
+    if open_ports_count:
+        ports_str = ", ".join(str(p.port) for p in (state.open_ports or [])[:5])
+        summary_parts.append(f"已发现 {open_ports_count} 个开放端口: {ports_str}")
+    web_paths_count = len(state.web_paths or [])
+    if web_paths_count:
+        summary_parts.append(f"已枚举 {web_paths_count} 条 Web 路径")
+    exploitable_findings = [f for f in (state.findings or []) if f.exploitable]
+    if exploitable_findings:
+        summary_parts.append(f"已识别 {len(exploitable_findings)} 个可利用漏洞")
+
+    summary = (
+        f"即将进入「{phase_label}」阶段。{' '.join(summary_parts)}"
+        if summary_parts
+        else f"即将进入「{phase_label}」阶段，请确认是否继续。"
+    )
+
+    # 构建 thinking 行 (漏洞详情)
+    thinking_lines: list[str] = []
+    if open_ports_count:
+        thinking_lines.append(f"- 开放端口: {open_ports_count} 个")
+    if web_paths_count:
+        thinking_lines.append(f"- Web 路径: {web_paths_count} 条")
+    for f in exploitable_findings[:5]:
+        line = f"- {f.severity.upper()} | {f.name}"
+        if f.cve:
+            line += f" ({f.cve})"
+        thinking_lines.append(line)
+
+    state.current_phase = "awaiting_approval"
+    state.log(f"⏸ 暂停在 {phase_label} 阶段前，等待确认继续")
+    sm.set(task_id, state)
+
+    # 如果已经有 pending_checkpoint (来自 node_human_approval 的 exploit_gate
+    # 或 node_post_foothold_approval 的 post_foothold_gate), 不创建新的, 避免
+    # 覆盖更丰富的审批上下文。
+    has_existing_checkpoint = bool(
+        state.pending_checkpoint
+        and state.pending_checkpoint.get("checkpoint_type")
+        in ("exploit_gate", "post_foothold_gate")
+    )
+    if not has_existing_checkpoint:
+        state.open_checkpoint({
+            "checkpoint_type": "interactive_gate",
+            "phase": interrupted_phase,
+            "summary": summary,
+            "thinking": "\n".join(thinking_lines) or f"当前阶段: {phase_label}",
+            "recommendation": f"点击「继续」进入 {phase_label} 阶段；点击「跳过」则跳过此阶段。",
+            "risk": (
+                "高风险" if any(f.severity in ("critical", "high") for f in exploitable_findings)
+                else ("中等风险" if exploitable_findings else "低风险")
+            ),
+            "default_action": "approve",
+            "options": [
+                {
+                    "id": "approve", "label": f"继续 → {phase_label}",
+                    "tone": "primary", "action": "approve",
+                },
+                {
+                    "id": "modify", "label": "提交建议(补充指令后继续)",
+                    "tone": "info", "action": "modify", "wants_prompt": True,
+                },
+                {
+                    "id": "reject", "label": f"跳过 {phase_label}",
+                    "tone": "danger", "action": "reject",
+                },
+            ],
+            "context": {
+                "interrupted_phase": interrupted_phase,
+                "chain_visited": list(state.chain_visited or []),
+                "open_ports_count": open_ports_count,
+                "web_paths_count": web_paths_count,
+                "findings_count": len(state.findings or []),
+                "exploitable_count": len(exploitable_findings),
+                "workflow_mode": state.workflow_mode,
+            },
+        })
+
+    # 兼容旧版前端: 仍然推送 approval_required 事件
+    risk_note = (
+        "高风险" if any(f.severity in ("critical", "high") for f in exploitable_findings)
+        else ("中等风险" if exploitable_findings else "低风险")
+    )
+    top_targets = [
+        {
+            "name": f.name, "severity": f.severity,
+            "vuln_id": f.vuln_id, "cve": f.cve or "",
+            "port": getattr(f, "port", None),
+            "description": (f.description or "")[:120],
+        }
+        for f in exploitable_findings[:5]
+    ]
+    await event_stream.publish(
+        task_id, type="approval_required",
+        payload={
+            "phase": interrupted_phase,
+            "status": "running",
+            "server_iso": _dt.utcnow().isoformat(),
+            "logs": state.phase_log[-3:],
+            "findings_count": len(state.findings or []),
+            "got_shell": state.got_shell,
+            "exploitable_count": len(exploitable_findings),
+            "top_targets": top_targets,
+            "risk": risk_note,
+        },
+        branch_id=state.active_branch_id or "",
+    )
+    return True
+
+
 # ── 主任务执行 ────────────────────────────────────────────
 
 async def run_task(
@@ -217,47 +380,13 @@ async def run_task(
         )
         return
 
-    # 检测 LangGraph interrupt 暂停(等待人工审批)
+    # 检测 LangGraph interrupt 暂停(含 human_approval / post_foothold_approval
+    # 以及 _INTERACTIVE_INTERRUPT_NODES 的 interrupt_before 暂停)。
     # auto_approve=True 的任务不会走到这里:edge_should_exploit 已经直通 foothold_attempt
     state = sm.get(task_id)
-    if state and state.status == TaskStatus.RUNNING and not state.auto_approve:
-        state.current_phase = "awaiting_approval"
-        state.log("⏸ 等待人工审批,请在前端点击「授权并继续」")
-        sm.set(task_id, state)
-        from datetime import datetime as _dt
-        exploitable = [f for f in state.findings if f.exploitable]
-        risk_note = (
-            "高风险" if any(f.severity in ("critical", "high") for f in exploitable)
-            else "中等风险" if exploitable else "低风险"
-        )
-        top_targets = [
-            {
-                "name": f.name,
-                "severity": f.severity,
-                "vuln_id": f.vuln_id,
-                "cve": f.cve or "",
-                "port": getattr(f, "port", None),
-                "description": (f.description or "")[:120],
-            }
-            for f in exploitable[:5]
-        ]
-        await event_stream.publish(
-            task_id, type="approval_required",
-            payload={
-                "phase": "awaiting_approval",
-                "status": "running",
-                "server_iso": _dt.utcnow().isoformat(),
-                "logs": state.phase_log[-3:],
-                "findings_count": len(state.findings),
-                "got_shell": state.got_shell,
-                "exploitable_count": len(exploitable),
-                "top_targets": top_targets,
-                "risk": risk_note,
-            },
-            branch_id=state.active_branch_id or "",
-        )
+    if await _handle_graph_interrupt(task_id, state):
         await _maybe_save_db(task_id, state, force=True)
-        logger.info(f"[API] 任务 {task_id} 等待人工审批")
+        logger.info(f"[API] 任务 {task_id} 等待人工审批 (phase={state.current_phase})")
         # 待审批期间不关容器:恢复后继续利用还要用同一个工具环境
         return
 

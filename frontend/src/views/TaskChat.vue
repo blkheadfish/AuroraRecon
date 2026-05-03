@@ -331,23 +331,28 @@
         </transition>
       </div>
 
-      <!-- 右侧策略面板，与左侧工具链对称 -->
+      <!-- 右侧策略面板，展示完整攻击链 + 动态行进状态 -->
       <div v-if="strategyPlan.length > 0" class="strategy-side">
         <div class="strategy-rail">
           <div class="strategy-rail-header">
-            <span class="strategy-rail-title">策略状态</span>
-            <span class="strategy-rail-count">{{ strategyPlan.length }}</span>
+            <span class="strategy-rail-title">攻击链</span>
+            <span class="strategy-rail-count">{{ strategyPlan.filter(i => i.status === 'done').length }}/{{ strategyPlan.length }}</span>
           </div>
           <div class="strategy-rail-list">
             <div
               v-for="(item, i) in strategyPlan"
               :key="item.key"
               class="strategy-node"
+              :class="{ 'strategy-node-active': item.status === 'active' }"
             >
-              <div class="strategy-connector" v-if="i > 0" />
-              <div class="strategy-dot" :class="item.enforced ? 'dot-success' : 'dot-warning'" />
+              <div class="strategy-connector" :class="item.status === 'done' ? 'connector-done' : ''" v-if="i > 0" />
+              <div class="strategy-dot" :class="{
+                'dot-done': item.status === 'done',
+                'dot-active': item.status === 'active',
+                'dot-pending': item.status === 'pending',
+              }" />
               <div class="strategy-body">
-                <div class="strategy-label">{{ item.label }}</div>
+                <div class="strategy-label" :class="{ 'label-active': item.status === 'active' }">{{ item.label }}</div>
                 <div class="strategy-detail" v-if="item.detail">{{ item.detail }}</div>
               </div>
             </div>
@@ -575,67 +580,48 @@ const strategyPlan = computed(() => {
   const t = task.value
   if (!t) return []
 
-  const parsed: Record<string, unknown> = t.parsed_intent || {}
-  if (!parsed || !Object.keys(parsed).length) return []
+  // 完整攻击链阶段顺序 (与后端 _CHAIN_PHASE_ORDER 对齐)
+  const CHAIN_PHASES: Array<{ key: string; label: string }> = [
+    { key: 'recon', label: '侦察' },
+    { key: 'surface_enum', label: '攻击面枚举' },
+    { key: 'intel_harvest', label: '情报收集' },
+    { key: 'vuln_scan', label: '漏洞扫描' },
+    { key: 'exploit_decision', label: '利用决策' },
+    { key: 'awaiting_approval', label: '等待审批' },
+    { key: 'foothold_attempt', label: '立足点尝试' },
+    { key: 'secondary_attack', label: '二次攻击' },
+    { key: 'post_foothold_enum', label: '立足后枚举' },
+    { key: 'post_foothold_approval', label: '立足后确认' },
+    { key: 'internal_scan', label: '内网扫描' },
+    { key: 'privesc_attempt', label: '提权尝试' },
+    { key: 'lateral_movement', label: '横向移动' },
+    { key: 'persistence', label: '持久化' },
+    { key: 'objective_collect', label: '目标收集' },
+    { key: 'report', label: '报告' },
+  ]
 
-  const items: Array<{ key: string; label: string; detail: string; enforced: boolean }> = []
+  const visited = (t.chain_visited || []) as string[]
+  const visitedSet = new Set(visited)
+  const curPhase = t.current_phase || ''
 
-  const enforcedActions = new Set(
-    (decisionEvents.value || [])
-      .filter(e => e.action === 'operator_plan_applied'
-                || e.action === 'intent_to_plan_converted'
-                || e.action === 'intent_recon_only')
-      .map(e => String(e.action))
-  )
-  const hasEnforcement = enforcedActions.size > 0
+  const items: Array<{ key: string; label: string; detail: string; status: 'done' | 'active' | 'pending' }> = []
 
-  const phases = Array.isArray(parsed.pentest_phase) ? parsed.pentest_phase as string[] : []
-  if (phases.length) {
-    const EXPLOIT_PHASES = new Set(['exploit', 'full_chain', 'post_exploit'])
-    const hasExploit = phases.some(p => EXPLOIT_PHASES.has(p))
-    const phaseLabels: Record<string, string> = {
-      recon: '侦察', exploit: '利用', post_exploit: '后渗透', full_chain: '完整链',
+  for (let i = 0; i < CHAIN_PHASES.length; i++) {
+    const p = CHAIN_PHASES[i]
+    let status: 'done' | 'active' | 'pending' = 'pending'
+    let detail = ''
+
+    if (curPhase === p.key) {
+      // 当前正在这个阶段 (含 awaiting_approval 等暂停态)
+      status = 'active'
+      detail = '进行中'
+    } else if (visitedSet.has(p.key)) {
+      // 已经走完
+      status = 'done'
+      detail = '已完成'
     }
-    const display = phases.map(p => phaseLabels[p] || p).join(' → ')
-    items.push({
-      key: 'phases',
-      label: `执行阶段: ${display}`,
-      detail: hasExploit ? '含利用阶段' : '仅侦察/扫描',
-      enforced: true,
-    })
-  }
 
-  const priorityVulns = Array.isArray(parsed.priority_vulns) ? parsed.priority_vulns as string[] : []
-  if (priorityVulns.length) {
-    items.push({
-      key: 'priority_vulns',
-      label: `重点漏洞: ${priorityVulns.slice(0, 5).join(', ')}`,
-      detail: hasEnforcement ? '已注入扫描约束' : '等待执行',
-      enforced: hasEnforcement,
-    })
-  }
-
-  const intents = Array.isArray(parsed.intents) ? parsed.intents as string[] : []
-  if (intents.length) {
-    items.push({
-      key: 'intents',
-      label: `意图标签: ${intents.slice(0, 5).join(', ')}`,
-      detail: hasEnforcement ? '已转换为工具约束' : '等待执行',
-      enforced: hasEnforcement,
-    })
-  }
-
-  // 兜底：parsed_intent 存在但没有具体策略项时，至少展示目标信息
-  if (!items.length) {
-    const targets = Array.isArray(parsed.targets) ? parsed.targets as string[] : []
-    if (targets.length) {
-      items.push({
-        key: 'target_fallback',
-        label: `目标: ${targets.slice(0, 3).join(', ')}`,
-        detail: '默认策略',
-        enforced: true,
-      })
-    }
+    items.push({ key: p.key, label: p.label, detail, status })
   }
 
   return items
@@ -655,15 +641,23 @@ interface ApprovalCardContext {
 }
 
 const approvalCardContext = computed<ApprovalCardContext | null>(() => {
-  // Priority 1: pending checkpoint (from node_human_approval)
+  // Priority 1: pending checkpoint (from node_human_approval / interactive pause)
   const ckpt = pendingCheckpoint.value
-  if (ckpt && (ckpt.checkpoint_type === 'exploit_gate' || ckpt.checkpoint_type === 'post_foothold_gate')) {
+  if (ckpt && (ckpt.checkpoint_type === 'exploit_gate' || ckpt.checkpoint_type === 'post_foothold_gate' || ckpt.checkpoint_type === 'interactive_gate')) {
     const ctx = (ckpt.context || {}) as Record<string, unknown>
     const topTargets = (ctx.top_targets || []) as { name: string; severity: string; vuln_id: string; cve?: string; port?: number }[]
     const count = Number(ctx.exploitable_count ?? topTargets.length)
+    // interactive_gate: use interrupted_phase for the phase label
+    const isInteractive = ckpt.checkpoint_type === 'interactive_gate'
+    const phaseLabel = isInteractive
+      ? '阶段确认'
+      : (ckpt.phase === 'post_foothold_approval' ? '立足后确认' : '利用前确认')
+    const phase = isInteractive
+      ? ((ckpt.context as Record<string, unknown> | undefined)?.interrupted_phase as string) || ckpt.phase || ''
+      : (ckpt.phase || 'awaiting_approval')
     return {
-      phase: ckpt.phase || 'awaiting_approval',
-      phaseLabel: ckpt.phase === 'post_foothold_approval' ? '立足后确认' : '利用前确认',
+      phase,
+      phaseLabel,
       risk: ckpt.risk || '',
       riskType: (ckpt.risk === '高风险' ? 'danger' : ckpt.risk === '中等风险' ? 'warning' : 'info') as ApprovalCardContext['riskType'],
       summary: ckpt.summary || `系统已识别 ${count} 个可利用漏洞，等待你的授权再开始利用。`,
@@ -1786,6 +1780,37 @@ onUnmounted(() => {
   font-size: 10px;
   color: var(--text-muted);
   line-height: 1.3;
+}
+
+/* ── 攻击链节点状态 ── */
+.strategy-node-active {
+  background: rgba(var(--c-brand-rgb, 64, 158, 255), 0.06);
+}
+.strategy-connector.connector-done {
+  background: var(--el-color-success);
+}
+.strategy-dot.dot-done {
+  border-color: var(--el-color-success);
+  background: var(--el-color-success);
+}
+.strategy-dot.dot-active {
+  border-color: var(--el-color-primary);
+  background: var(--el-color-primary);
+  box-shadow: 0 0 0 3px rgba(var(--c-brand-rgb, 64, 158, 255), 0.25);
+  animation: strategy-pulse 2s ease-in-out infinite;
+}
+.strategy-dot.dot-pending {
+  border-color: var(--border);
+  background: var(--bg-base);
+}
+.strategy-label.label-active {
+  color: var(--el-color-primary);
+  font-weight: 700;
+}
+
+@keyframes strategy-pulse {
+  0%, 100% { box-shadow: 0 0 0 2px rgba(var(--c-brand-rgb, 64, 158, 255), 0.2); }
+  50% { box-shadow: 0 0 0 5px rgba(var(--c-brand-rgb, 64, 158, 255), 0.08); }
 }
 
 .bubble-stream {
