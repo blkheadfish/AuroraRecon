@@ -611,6 +611,19 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
         }
         if (prevPhase === 'awaiting_approval' && patch.phase !== 'awaiting_approval') {
           state.approvalState = 'idle'
+          // 清理旧的 approval 事件，避免下次进入审批阶段时出现重复卡片
+          const removed = new Set<string>()
+          state.decisionEvents = state.decisionEvents.filter((ev) => {
+            if (ev.action === 'approval_required' || ev.action === 'approval') {
+              removed.add(String(ev.id || ''))
+              state.decisionEventIds.delete(String(ev.id || ''))
+              return false
+            }
+            return true
+          })
+          if (removed.size > 0 && state.task) {
+            state.task = { ...state.task, decision_events: state.decisionEvents.slice() }
+          }
         }
       }
       if (patch.logs?.length) {
@@ -645,7 +658,6 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
       const exploitableCount = Number(p.exploitable_count ?? 0)
       const topTargets = (p.top_targets as ApprovalTarget[]) || []
       const risk = String(p.risk || '')
-      // Build richer message: surface the actual context to approval card
       const targetsSummary = topTargets.slice(0, 3)
         .map((t) => `${t.severity?.toUpperCase?.() || '?'} | ${t.name}${t.cve ? ` (${t.cve})` : ''}`)
         .join('\n')

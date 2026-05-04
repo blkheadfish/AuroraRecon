@@ -580,7 +580,7 @@ const isRunning = computed(() => ['pending', 'running'].includes(task.value?.sta
 const needsApproval = computed(() => task.value?.current_phase === 'awaiting_approval')
 const approvalState = computed(() => state.value.approvalState)
 const approving = computed(() => approvalState.value === 'submitting')
-const showApprovalActions = computed(() => needsApproval.value && approvalState.value === 'idle')
+const showApprovalActions = computed(() => needsApproval.value && (approvalState.value === 'idle' || approvalState.value === 'submitting'))
 const pendingCheckpoint = computed(() => state.value?.pendingCheckpoint || null)
 const checkpointSubmitting = computed(() => state.value?.checkpointState === 'submitting')
 
