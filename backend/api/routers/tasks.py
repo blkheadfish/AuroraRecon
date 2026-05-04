@@ -937,7 +937,31 @@ async def get_task(task_id: str, request: Request, full: bool = False):
     sm = _get_sm()
     if full:
         return sm.to_detail(state)
-    return sm.to_detail_snapshot(state)
+
+    result = sm.to_detail_snapshot(state)
+
+    # 从 event_stream 回填 decision_events_tail，避免页面刷新后工具调用历史丢失。
+    # PentestState 不再持有 decision_events（事件全部走 Redis Stream / local ring），
+    # 但首屏快照如果完全不带事件，前端在 IndexedDB 冷启动 + WS 首帧到达之前
+    # 会有一段空白时间线，用户体感就是"工具调用记录丢了"。
+    try:
+        envelopes = await event_stream.replay(task_id, count=120)
+        if envelopes:
+            decision_events: list[dict] = []
+            for ev in envelopes:
+                payload = ev.get("payload", {}) if isinstance(ev.get("payload"), dict) else {}
+                decision_events.append({
+                    "id": ev.get("id", ""),
+                    "timestamp": ev.get("ts", ""),
+                    **payload,
+                })
+            result["decision_events"] = decision_events
+            result["decision_events_tail"] = decision_events
+            result["decision_events_total"] = await event_stream.stream_length(task_id)
+    except Exception:
+        pass  # 非关键路径，静默失败不影响首屏
+
+    return result
 
 
 @router.get("/tasks/{task_id}/report")

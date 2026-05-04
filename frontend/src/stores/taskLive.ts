@@ -361,6 +361,31 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
     const full = await api.getTask(taskId)
     const state = ensureState(taskId)
     mergeDecisionEvents(state, full.decision_events_tail || full.decision_events || [])
+
+    // 安全网: 快照 tail 只回填最近 120 条，若事件总数更大则从 REST /events
+    // 补差量，避免页面刷新后 IndexedDB 冷启动 + WS 首帧未到达时出现空白时间线。
+    // 从 Stream 头部开始拉 (after_id 为空)，mergeDecisionEvents 会自动按 id 去重。
+    const expectedTotal = full.decision_events_total ?? 0
+    if (state.decisionEvents.length < expectedTotal && expectedTotal > 0) {
+      try {
+        const page = await api.getEvents(taskId, { count: 1000 })
+        if (page.events?.length) {
+          const dEvents: DecisionEvent[] = []
+          for (const ev of page.events) {
+            const p = (ev.payload || {}) as Record<string, unknown>
+            dEvents.push({
+              id: String((ev as any).id || ''),
+              timestamp: String((ev as any).ts || (ev as any).timestamp || ''),
+              ...p,
+            } as DecisionEvent)
+          }
+          if (dEvents.length) mergeDecisionEvents(state, dEvents)
+        }
+      } catch {
+        // 非关键路径
+      }
+    }
+
     syncCheckpointFromSnapshot(
       state,
       (full.pending_checkpoint as CheckpointPayload | null | undefined) ?? null,
