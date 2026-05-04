@@ -134,9 +134,11 @@ class ReconAgent:
 		_run_dir_scan = not plan_tools or bool(set(plan_tools) & _DIR_SCAN_TOOLS)
 		_run_nmap_vuln = not plan_tools or "nmap" in plan_tools
 		_run_subdomain = not plan_tools or any(t in plan_tools for t in ("subfinder", "amass", "subdomain"))
+		_fast_scan = plan_tools is not None and not _run_dir_scan
+		_plan_steps = getattr(self, "_plan_steps", None) or []
 		if plan_tools:
 			logger.info(f"[ReconAgent] plan_tools={plan_tools}, dir_scan={_run_dir_scan}, "
-			            f"nmap_vuln={_run_nmap_vuln}, subdomain={_run_subdomain}")
+			            f"nmap_vuln={_run_nmap_vuln}, subdomain={_run_subdomain}, fast={_fast_scan}")
 
 		async def _tool_stream_cb(line: str) -> None:
 			"""Forward tool stdout/stderr lines as tool_stream decision events."""
@@ -189,6 +191,7 @@ class ReconAgent:
 
 		ports, os_info, raw_nmap = await self._nmap_scan(
 			target, target_port, task_id, log_callback,
+			fast=_fast_scan,
 		)
 
 		if decision_callback:
@@ -231,10 +234,13 @@ class ReconAgent:
 		elif plan_tools and log_callback:
 			await log_callback(f"[ReconAgent] [Plan] 跳过 nmap 漏洞脚本/LLM 分析 (plan_tools={plan_tools})")
 
+		# fast mode: no -sV so service fields are empty, run whatweb on ALL open ports
+		# normal mode: filter by service field or standard web ports + extra Java ports
 		web_ports = [
 			p for p in ports
-			if p.service in ("http", "https")
-			or p.port in (80, 443, 8080, 8443, 8888)
+			if _fast_scan
+			or p.service in ("http", "https")
+			or p.port in (80, 443, 8080, 8443, 8888, 8090, 9080, 9443, 7001, 8009)
 		]
 
 		if target_port:
@@ -376,6 +382,7 @@ class ReconAgent:
 		target_port: Optional[int],
 		task_id: Optional[str],
 		log_callback: LogCallback = None,
+		fast: bool = False,
 	) -> tuple[list[PortInfo], dict, str]:
 		# 短路分支：用户已显式指定端口 → 只精细扫描该端口，
 		# 跳过常用/全端口扩散（避免分散精力，加快进入利用阶段）
@@ -391,12 +398,14 @@ class ReconAgent:
 				_is_private = False
 			if _is_private:
 				nmap_detail_args = [
-					"-A", "--osscan-guess", "-Pn",
+					"-sS", "-A", "--osscan-guess", "-Pn",
+					"--reason", "--defeat-rst-ratelimit",
 					"-p", port_str, "-oX", "-", target,
 				]
 			else:
 				nmap_detail_args = [
-					"-sV", "--version-all", "-sC", "-Pn",
+					"-sS", "-sV", "--version-all", "-sC", "-Pn",
+					"--reason", "--defeat-rst-ratelimit",
 					"-p", port_str, "-oX", "-", target,
 				]
 			detail_result: ExecuteResult = await self.executor.run(
@@ -428,34 +437,48 @@ class ReconAgent:
 
 		common_ports = ",".join(str(p) for p in sorted(common_ports_list))
 
-		# 第一轮：常用端口精确扫描（快速、稳定）
+		# 第一轮：常用端口 SYN 扫描（快速、稳定）
 		precise_result: ExecuteResult = await self.executor.run(
 			tool="nmap",
-			args=["-T4", "-Pn", "--open", "-p", common_ports, "-oX", "-", target],
+			args=["-sS", "-T4", "-Pn", "--open", "--reason",
+			      "--defeat-rst-ratelimit", "--max-retries", "3",
+			      "-p", common_ports, "-oX", "-", target],
 			timeout=120,
 			task_id=task_id,
 			log_callback=log_callback,
 		)
 
-		precise_ports = []
+		precise_ports: list[int] = []
 		if precise_result.success:
-			precise_ports = self.nmap_parser.extract_open_ports(precise_result.stdout)
+			precise_ports, _ = self.nmap_parser.extract_open_ports(precise_result.stdout)
 
-		# 第二轮：全端口扫描（覆盖所有 65535 端口）
+
+		if fast and precise_ports:
+			# fast mode: common ports 命中 → 跳过全端口扫描和 -sV 版本探测
+			# 直接返回常用端口结果，节省 5-10 分钟
+			fast_ports_result = self.nmap_parser.parse_xml(precise_result.stdout)
+			logger.info(f"[ReconAgent] fast scan done: {len(fast_ports_result)} open ports (common ports hit)")
+			return fast_ports_result, {}, precise_result.stdout or ""
+		if fast and not precise_ports:
+			logger.info("[ReconAgent] fast mode but no common ports open, falling back to full scan")
+		# 第二轮：全端口 SYN 扫描（覆盖所有 65535 端口）
 		fast_result: ExecuteResult = await self.executor.run(
 			tool="nmap",
-			args=["-T4", "-Pn", "--open", "--min-rate", "2000", "-p-", "-oX", "-", target],
+			args=["-sS", "-T4", "-Pn", "--open", "--reason",
+			      "--defeat-rst-ratelimit", "--max-retries", "2",
+			      "--min-rate", "2000", "-p-", "-oX", "-", target],
 			timeout=600,
 			task_id=task_id,
 			log_callback=log_callback,
 		)
 
-		fast_ports = []
+		fast_open: list[int] = []
+		fast_filtered: list[int] = []
 		if fast_result.success:
-			fast_ports = self.nmap_parser.extract_open_ports(fast_result.stdout)
+			fast_open, fast_filtered = self.nmap_parser.extract_open_ports(fast_result.stdout)
 
-		# 合并两轮结果
-		all_ports = list(set(precise_ports + fast_ports))
+		# 合并两轮结果（open 直接合并；filtered 暂存待 TCP 验证）
+		all_ports = list(set(precise_ports + fast_open))
 		if not all_ports:
 			logger.warning("两轮扫描均未发现开放端口")
 			return [], {}, precise_result.stdout or ""
@@ -466,9 +489,13 @@ class ReconAgent:
 		except ValueError:
 			_is_private = False
 		if _is_private:
-			nmap_detail_args = ["-A", "--osscan-guess", "-Pn", "-p", port_str, "-oX", "-", target]
+			nmap_detail_args = ["-sS", "-A", "--osscan-guess", "-Pn",
+			                    "--reason", "--defeat-rst-ratelimit",
+			                    "-p", port_str, "-oX", "-", target]
 		else:
-			nmap_detail_args = ["-sV", "--version-all", "-sC", "-Pn", "-p", port_str, "-oX", "-", target]
+			nmap_detail_args = ["-sS", "-sV", "--version-all", "-sC", "-Pn",
+			                    "--reason", "--defeat-rst-ratelimit",
+			                    "-p", port_str, "-oX", "-", target]
 		detail_result: ExecuteResult = await self.executor.run(
 			tool="nmap",
 			args=nmap_detail_args,
@@ -482,7 +509,68 @@ class ReconAgent:
 			return self.nmap_parser.parse_xml(precise_result.stdout or fast_result.stdout), {}, ""
 
 		ports, os_info = self.nmap_parser.parse_xml_full(detail_result.stdout)
+
+		# TCP connect 二次验证 filtered 端口
+		verified_filtered = await self._tcp_verify_filtered_ports(
+			target, fast_filtered, task_id, log_callback
+		)
+		ports.extend(verified_filtered)
+
 		return ports, os_info, detail_result.stdout
+
+	async def _tcp_verify_filtered_ports(
+		self,
+		target: str,
+		filtered_ports: list[int],
+		task_id: Optional[str],
+		log_callback: LogCallback = None,
+	) -> list[PortInfo]:
+		"""TCP connect 二次验证 SYN 扫描标记为 filtered 的端口。
+
+		filtered 可能是防火墙丢包、网络拥塞、或主机离线。
+		用 -sT (TCP connect) 重新探测——三次握手能完成的才是真可达端口。
+		"""
+		if not filtered_ports:
+			return []
+
+		# 最多验证 200 个 filtered 端口，避免超时
+		verify_ports = filtered_ports[:200]
+		port_str = ",".join(str(p) for p in verify_ports)
+
+		logger.info(
+			f"[ReconAgent] TCP connect 验证 {len(verify_ports)} 个 filtered 端口: "
+			f"{port_str[:120]}"
+		)
+		if log_callback:
+			await log_callback(
+				f"[ReconAgent] TCP connect 二次验证 {len(verify_ports)} 个 filtered 端口..."
+			)
+
+		try:
+			result: ExecuteResult = await self.executor.run(
+				tool="nmap",
+				args=[
+					"-sT", "-T4", "-Pn", "--open", "--reason",
+					"--max-retries", "2",
+					"-p", port_str, "-oX", "-", target,
+				],
+				timeout=min(300, 30 + 3 * len(verify_ports)),
+				task_id=task_id,
+				log_callback=log_callback,
+			)
+			if result.success and result.stdout:
+				open_ports, _ = self.nmap_parser.extract_open_ports(result.stdout)
+				if open_ports:
+					verified = self.nmap_parser.parse_xml(result.stdout)
+					logger.info(
+						f"[ReconAgent] TCP 验证: {len(filtered_ports)} filtered → "
+						f"{len(open_ports)} 确认开放"
+					)
+					return verified
+		except Exception as e:
+			logger.warning(f"[ReconAgent] TCP 验证 filtered 端口异常: {e}")
+
+		return []
 
 	async def _nmap_vuln_scan(
 		self,
@@ -543,7 +631,7 @@ class ReconAgent:
 				result: ExecuteResult = await self.executor.run(
 					tool="nmap",
 					args=[
-						"-sT", "-Pn",
+						"-sT", "-Pn", "--reason", "--defeat-rst-ratelimit",
 						f"--script={scripts}",
 						f"--script-timeout={script_timeout}",
 						"-p", port_str, "-oX", "-", target,
@@ -576,7 +664,8 @@ class ReconAgent:
 				result = await self.executor.run(
 					tool="nmap",
 					args=[
-						"-sT", "-Pn", "--script=vuln",
+						"-sT", "-Pn", "--reason", "--defeat-rst-ratelimit",
+						"--script=vuln",
 						f"--script-timeout={script_timeout}",
 						"-p", port_str, "-oX", "-", target,
 					],
