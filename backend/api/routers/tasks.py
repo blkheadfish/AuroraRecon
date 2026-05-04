@@ -720,6 +720,29 @@ async def create_task(req: CreateTaskRequest, request: Request):
         from backend.agents.models import ParsedIntent
         safety_intent = ParsedIntent(**parsed_intent_dict)
 
+    # 确定性 regex 解析可能遗漏目标（如纯自然语言 prompt），
+    # 导致安全卡口拿到 targets=[] 并误判 ambiguity=vague。
+    # 若用户已确认了策略计划，从 target_understanding 中二次提取。
+    if not safety_intent.targets:
+        enrichment_text = ""
+        if req.target and req.target.strip():
+            enrichment_text = req.target.strip()
+        elif req.confirmed_plan and isinstance(req.confirmed_plan, dict):
+            enrichment_text = str(req.confirmed_plan.get("target_understanding", "") or "")
+
+        if enrichment_text:
+            enriched = parse_intent_deterministic(enrichment_text)
+            if enriched.targets:
+                safety_intent.targets = enriched.targets
+                safety_intent.target_type = enriched.target_type
+                # 降低歧义级别，避免「目标不明确」误判
+                if safety_intent.ambiguity_level == "vague":
+                    safety_intent.ambiguity_level = "partial"
+                logger.info(
+                    f"[create_task] 从 plan/target 补充提取目标: "
+                    f"targets={safety_intent.targets} type={safety_intent.target_type}"
+                )
+
     gate = get_safety_gate()
     safety_result = gate.check(
         safety_intent,
