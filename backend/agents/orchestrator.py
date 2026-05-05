@@ -659,6 +659,8 @@ def _plan_should_skip_phase(state: PentestState, phase_name: str) -> tuple[bool,
         return False, ""
 
     # 策略阶段名 → 它所覆盖的攻击链节点名
+    # 每个策略阶段只覆盖自己对应的节点，不越界覆盖其他阶段。
+    # 若需要 surface_enum / vuln_scan，LLM 必须在策略中显式包含这些阶段。
     _PLAN_COVERS: dict[str, set[str]] = {
         "recon":        {"recon"},
         "surface_enum": {"surface_enum"},
@@ -851,6 +853,7 @@ def _build_exploit_context(state: PentestState) -> dict[str, Any]:
     ctx: dict[str, Any] = {
         "ports_summary": ", ".join(
             f"{p.port}/{p.service}({p.version[:30]})" for p in state.open_ports[:20]
+            if p.state == "open"
         ),
         "web_paths": web_paths_str,
         "path_contents": path_content_summary,
@@ -937,6 +940,23 @@ def _sync_foothold_state(state: PentestState) -> None:
         state.foothold_status = "shell"
 
 
+def _enrich_finding_names_from_exploits(state: PentestState) -> None:
+    """Successful exploits carry a ``skill_id`` in session_info; backfill the
+    corresponding VulnFinding name so reports show the actual vuln type instead
+    of a vague service label like "HTTP Service"."""
+    for result in state.exploit_results:
+        if not result.success:
+            continue
+        skill_id = ((result.session_info or {}).get("skill_id") or "").strip()
+        if not skill_id:
+            continue
+        for f in state.findings:
+            if f.vuln_id == result.vuln_id:
+                if skill_id.replace("_", " ").lower() not in f.name.lower():
+                    f.name = f"{skill_id} ({f.name})"
+                break
+
+
 def _merge_attack_steps(state: PentestState, steps: list | None) -> None:
     existing = {(s.get("stage"), s.get("action")) for s in (state.attack_next_steps or [])}
     for s in steps or []:
@@ -991,17 +1011,20 @@ def retry_node(max_attempts: int = 3, delay: float = 2.0):
 # 节点函数
 # ───────────────────────────────────────────────────────
 
-def _run_host_discovery(state: PentestState) -> list[str]:
-    """意图驱动：使用 masscan 做存活主机发现。
+async def _run_host_discovery(state: PentestState) -> list[str]:
+    """意图驱动：使用 nmap -sn 做存活主机发现（在 toolbox 容器中执行）。
 
     从 parsed_intent.targets 中提取 CIDR/网段信息作为扫描范围。
     返回发现的存活主机 IP 列表。
 
     安全注意：
     - 仅扫描 parsed_intent 中明确指定的网段，不自作主张扩大范围
-    - masscan 使用 --rate 限制发包速率，避免对目标网络造成冲击
-    - 仅做 ping 扫描（-sn 等效），不做端口扫描
+    - 使用 ToolExecutor 在 Docker toolbox 容器中执行，避免 API 容器无 nmap 的问题
+    - 仅做 ping 扫描（-sn），不做端口扫描
     """
+    from backend.tools.executor import ToolExecutor
+    import re
+
     parsed = state.parsed_intent or {}
     targets = parsed.get("targets", [])
 
@@ -1011,25 +1034,21 @@ def _run_host_discovery(state: PentestState) -> list[str]:
         state.log("[意图驱动] 无法确定主机发现范围（无 CIDR 目标），跳过")
         return []
 
-    import asyncio
+    executor = ToolExecutor()
     discovered: list[str] = []
 
     for cidr in cidr_targets[:3]:  # 最多扫描 3 个网段
         try:
-            # 使用 nmap -sn（ping 扫描）而非 masscan，因为更可靠且内置
-            # masscan 更适合全端口快速扫描，这里只需存活探测
-            cmd = f"nmap -sn -T4 --max-retries 1 {cidr}"
-            state.log(f"[意图驱动] 执行主机发现: {cmd}")
+            state.log(f"[意图驱动] 执行主机发现: nmap -sn -T4 --max-retries 1 {cidr}")
 
-            import subprocess
-            proc = subprocess.run(
-                cmd, shell=True,
-                capture_output=True, text=True, timeout=120
+            result = await executor.run(
+                tool="nmap",
+                args=["-sn", "-T4", "--max-retries", "1", cidr],
+                timeout=120,
             )
-            output = proc.stdout + proc.stderr
+            output = (result.stdout or "") + (result.stderr or "")
 
             # 解析 nmap -sn 输出，提取存活主机
-            import re
             ip_pattern = re.compile(
                 r"Nmap scan report for (?:\S+ )?\(?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\)?"
             )
@@ -1040,8 +1059,6 @@ def _run_host_discovery(state: PentestState) -> list[str]:
 
             state.log(f"[意图驱动] {cidr} 发现 {len(discovered)} 个存活主机")
 
-        except subprocess.TimeoutExpired:
-            state.log(f"[意图驱动] 主机发现超时: {cidr}")
         except Exception as e:
             state.log(f"[意图驱动] 主机发现失败: {cidr}: {e}")
 
@@ -1073,7 +1090,7 @@ async def node_recon(state: PentestState) -> PentestState:
     requires_discovery = parsed_intent_raw.get("requires_discovery", False)
     if requires_discovery and state.phase_visit_count.get("recon", 0) == 0:
         state.log("[意图驱动] 检测到主机发现需求，先执行 masscan 存活扫描")
-        discovery_targets = _run_host_discovery(state)
+        discovery_targets = await _run_host_discovery(state)
         if discovery_targets:
             # 将发现的主机追加到 pending_seeds，下一轮 recon 会消费
             seeds = state.pending_seeds or {}
@@ -1137,6 +1154,7 @@ async def node_recon(state: PentestState) -> PentestState:
     _op_block = operator_guidance_block(state)
     _op_plan = getattr(state, "operator_plan", None)
     _recon_plan_tools = _plan_get_step_tools(state, "recon") or None
+    agent._plan_steps = _plan_get_phase_steps(state, "recon") or None
     result = await agent.run(
         target=state.target_host or state.target,
         target_port=state.target_port,
@@ -1245,6 +1263,8 @@ async def node_recon(state: PentestState) -> PentestState:
         host = state.target_host or state.target
         _attach_host_to_graph(state, host, discovered_by="recon")
         for p in state.open_ports:
+            if p.state != "open":
+                continue
             _attach_service_to_graph(
                 state, host, p.port,
                 service=p.service or "", version=p.version or "",
@@ -1303,7 +1323,7 @@ async def node_vuln_scan(state: PentestState) -> PentestState:
             state.log(f"vuln_scan 重入: 注入 {added} 条种子路径")
 
     sig_payload = {
-        "ports": [p.port for p in state.open_ports],
+        "ports": [p.port for p in state.open_ports if p.state == "open"],
         "web_paths_count": len(state.web_paths or []),
         "intel_count": len(state.intel_discovered_paths or []),
         "seed_creds_count": len(seed_creds),
@@ -1533,8 +1553,10 @@ async def node_surface_enum(state: PentestState) -> PentestState:
 
     web_ports = [
         p for p in state.open_ports
-        if p.port in (80, 443, 8080, 8443, 8000, 8888, 8081, 8090, 9000, 9090)
-        or "http" in (p.service or "").lower()
+        if p.state == "open" and (
+            p.port in (80, 443, 8080, 8443, 8000, 8888, 8081, 8090, 9000, 9090)
+            or "http" in (p.service or "").lower()
+        )
     ]
 
     # Extract tech hints from recon phase for dynamic probe list generation
@@ -2133,8 +2155,10 @@ async def node_intel_harvest(state: PentestState) -> PentestState:
     host = state.target_host or state.target
     web_ports = [
         p for p in state.open_ports
-        if p.port in (80, 443, 8080, 8443, 8000, 8888, 8081, 8090, 9000, 9090)
-        or "http" in (p.service or "").lower()
+        if p.state == "open" and (
+            p.port in (80, 443, 8080, 8443, 8000, 8888, 8081, 8090, 9000, 9090)
+            or "http" in (p.service or "").lower()
+        )
     ]
     if not web_ports:
         state.log("情报采集: 未发现 Web 端口，跳过")
@@ -2722,6 +2746,7 @@ async def node_foothold_attempt(state: PentestState) -> PentestState:
             state.push_decision(event)
         from backend.agents.prompt_utils import operator_guidance_block
         _op_block = operator_guidance_block(state)
+        _exploit_plan_skills = _plan_get_step_skills(state, "exploit") or None
         results = await agent.run(
             target=state.target_host or state.target,
             findings=exploitable,
@@ -2733,6 +2758,7 @@ async def node_foothold_attempt(state: PentestState) -> PentestState:
             decision_callback=_on_decision,
             fact_sink=_make_fact_sink(state),
             operator_block=_op_block,
+            plan_skills=_exploit_plan_skills,
         )
         state.exploit_results = results
         successes = [r for r in results if r.success]
@@ -2756,6 +2782,7 @@ async def node_foothold_attempt(state: PentestState) -> PentestState:
             else:
                 state.log("所有利用尝试均未成功")
         _sync_foothold_state(state)
+        _enrich_finding_names_from_exploits(state)
         _normalize_and_dedupe_state_facts(state, source_node="foothold_attempt_post")
         try:
             after_snapshot = _snapshot_facts(state)
@@ -2837,6 +2864,7 @@ async def node_secondary_attack(state: PentestState) -> PentestState:
             state.push_decision(event)
         from backend.agents.prompt_utils import operator_guidance_block
         _op_block = operator_guidance_block(state)
+        _exploit_plan_skills = _plan_get_step_skills(state, "exploit") or None
         new_results = await agent.run(
             target=state.target_host or state.target,
             findings=findings_retry,
@@ -2848,6 +2876,7 @@ async def node_secondary_attack(state: PentestState) -> PentestState:
             decision_callback=_on_decision,
             fact_sink=_make_fact_sink(state),
             operator_block=_op_block,
+            plan_skills=_exploit_plan_skills,
         )
         by_id: dict[str, ExploitResult] = {r.vuln_id: r for r in state.exploit_results}
         for nr in new_results:
@@ -2875,6 +2904,7 @@ async def node_secondary_attack(state: PentestState) -> PentestState:
             else:
                 state.log("二次攻击仍未成功")
         _sync_foothold_state(state)
+        _enrich_finding_names_from_exploits(state)
         _normalize_and_dedupe_state_facts(state, source_node="secondary_attack_post")
         # 反馈循环：secondary_attack 是最常见的"新事实产生地"
         try:
@@ -3453,7 +3483,18 @@ def edge_should_exploit(state: PentestState) -> str:
 def edge_after_approval(state: PentestState) -> str:
     if state.status == TaskStatus.FAILED:
         return "report"
-    return "foothold_attempt" if any(f.exploitable for f in state.findings) else "report"
+    if any(f.exploitable for f in state.findings):
+        return "foothold_attempt"
+    # 与 edge_should_exploit 对齐：策略明确要求利用 + 用户指定了漏洞类型时,
+    # 即使没有工具确认的可利用 finding，也允许进入利用阶段
+    plan = state.pentest_plan or {}
+    has_exploit_plan = any(
+        p.get("phase") == "exploit" for p in plan.get("phases", [])
+    )
+    priority_vulns = (state.parsed_intent or {}).get("priority_vulns", [])
+    if has_exploit_plan and priority_vulns:
+        return "foothold_attempt"
+    return "report"
 
 
 def edge_after_foothold(state: PentestState) -> str:
@@ -3481,12 +3522,12 @@ def edge_after_secondary(state: PentestState) -> str:
 
 def edge_after_privesc(state: PentestState) -> str:
     if state.status == TaskStatus.FAILED:
-        return "lateral_movement"
+        return "objective_collect"
     pl = (state.privilege_level or "").lower()
     if pl == "root":
-        return "lateral_movement"
+        return "objective_collect"
     if state.privesc_attempt_count >= state.max_privesc_rounds:
-        return "lateral_movement"
+        return "objective_collect"
     return "privesc_again"
 
 
@@ -3613,17 +3654,17 @@ def edge_after_post_foothold_enum_v2(state: PentestState) -> str:
 
 
 def edge_after_privesc_v2(state: PentestState) -> str:
-    """提权出口：到 root → lateral；产生新凭据 → vuln_scan；否则按老规则。"""
+    """提权出口：到 root / 达上限 / 失败 → objective_collect；产生新凭据 → vuln_scan。"""
     if state.status == TaskStatus.FAILED:
-        return "lateral_movement"
+        return "objective_collect"
     pl = (state.privilege_level or "").lower()
     if pl == "root":
-        return "lateral_movement"
+        return "objective_collect"
     sig = state.replan_signals or {}
     if sig.get("re_vuln_scan_for_creds") and _can_replan(state, "vuln_scan"):
         return _do_replan(state, "vuln_scan", "re_vuln_scan_for_creds")
     if state.privesc_attempt_count >= state.max_privesc_rounds:
-        return "lateral_movement"
+        return "objective_collect"
     return "privesc_again"
 
 
@@ -3791,7 +3832,7 @@ def _build_graph_linear(checkpointer=None):
     graph.add_edge("post_foothold_enum", "post_foothold_approval")
     graph.add_conditional_edges(
         "post_foothold_approval", edge_after_post_foothold_approval,
-        {"privesc_attempt": "privesc_attempt", "internal_scan": "internal_scan"},
+        {"internal_scan": "internal_scan", "objective_collect": "objective_collect"},
     )
     graph.add_edge("internal_scan", "privesc_attempt")
     graph.add_conditional_edges(
@@ -3799,6 +3840,7 @@ def _build_graph_linear(checkpointer=None):
         {
             "lateral_movement": "lateral_movement",
             "privesc_again": "privesc_attempt",
+            "objective_collect": "objective_collect",
         },
     )
     graph.add_edge("lateral_movement", "persistence")
@@ -3925,6 +3967,7 @@ def _build_graph_feedback(checkpointer=None):
             "lateral_movement": "lateral_movement",
             "privesc_again": "privesc_attempt",
             "vuln_scan": "vuln_scan",
+            "objective_collect": "objective_collect",
         },
     )
     graph.add_edge("lateral_movement", "persistence")
@@ -4378,7 +4421,8 @@ def _stringify_dict_keys(obj: Any) -> Any:
 
 
 def _infer_os(ports: list[PortInfo], os_info: dict) -> str:
-    port_nums = {p.port for p in ports}
+    open_ports = [p for p in ports if p.state == "open"]
+    port_nums = {p.port for p in open_ports}
     linux_signs = port_nums & {22, 111, 2049}
     windows_signs = port_nums & {135, 139, 445, 3389, 5985}
 
@@ -4389,7 +4433,7 @@ def _infer_os(ports: list[PortInfo], os_info: dict) -> str:
         port_guess = "windows"
 
     service_guess = "unknown"
-    for p in ports:
+    for p in open_ports:
         combined = f"{p.service} {p.version} {p.banner}".lower()
         if any(k in combined for k in ["apache", "nginx", "openssh", "ubuntu", "debian"]):
             service_guess = "linux"
@@ -4417,7 +4461,7 @@ def _build_exploit_decision_prompt(state: PentestState) -> str:
         ensure_ascii=False, indent=2,
     )
     ports_json = json.dumps(
-        [p.model_dump() for p in state.open_ports[:20]],
+        [p.model_dump() for p in state.open_ports[:20] if p.state == "open"],
         ensure_ascii=False,
     )
     dir_intel = state.dir_intel or _build_dir_intel(state)
