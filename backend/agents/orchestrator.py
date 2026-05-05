@@ -279,7 +279,7 @@ def _intent_to_operator_plan(state: PentestState) -> None:
                     preferred.append(tool)
                 # Skill 名不转为 tool，由 ExploitAgent 通过 kb_hits 机制消费
 
-    # ── 4. skip_phases → operator plan 中的 next_phase 锚点 ───────────
+    # ── 4. pentest_phases → operator plan 中的 next_phase 锚点 ───────────
     # LLM 已通过 parsed_intent 确定了 pentest_phases 和 priority_vulns，
     # 这里根据 LLM 的判断决定路由，不做额外的硬编码规则匹配。
     next_phase: str | None = None
@@ -288,7 +288,10 @@ def _intent_to_operator_plan(state: PentestState) -> None:
     _needs_ports = {"surface_enum", "vuln_scan", "intel_harvest"}
     if exploit_with_known_vuln:
         next_phase = "vuln_scan" if state.open_ports else "recon"
-    elif pentest_phases and "exploit" not in pentest_phases and "full_chain" not in pentest_phases:
+    elif pentest_phases and "full_chain" in pentest_phases:
+        # 用户仅给出 IP/域名无具体漏洞时默认走完整渗透链，从 recon 起步
+        next_phase = "recon"
+    elif pentest_phases and "exploit" not in pentest_phases:
         last_phase = pentest_phases[-1] if pentest_phases else ""
         phase_sequence = ["recon", "surface_enum", "intel_harvest", "vuln_scan"]
         if last_phase in phase_sequence:
@@ -941,19 +944,36 @@ def _sync_foothold_state(state: PentestState) -> None:
 
 
 def _enrich_finding_names_from_exploits(state: PentestState) -> None:
-    """Successful exploits carry a ``skill_id`` in session_info; backfill the
-    corresponding VulnFinding name so reports show the actual vuln type instead
-    of a vague service label like "HTTP Service"."""
+    """Backfill generic VulnFinding names (e.g. "HTTP Service") with the
+    actual exploit type that succeeded (e.g. "fastjson_rce").
+
+    Extracts the exploit identifier from multiple sources in priority order:
+      1. ``session_info.skill_id``   (Skill engine / ReAct / MSF)
+      2. ``session_info.method``     e.g. "skill:fastjson_rce:llm_freeform"
+      3. ``shell_type`` / ``exploit_level``  e.g. "rce", "meterpreter"
+    """
     for result in state.exploit_results:
         if not result.success:
             continue
-        skill_id = ((result.session_info or {}).get("skill_id") or "").strip()
-        if not skill_id:
+        si = result.session_info or {}
+        exploit_name = (si.get("skill_id") or "").strip()
+        if not exploit_name:
+            # Fallback: parse "skill:<id>" / "skill:<id>:llm_freeform"
+            method = si.get("method", "")
+            if method.startswith("skill:"):
+                parts = method.split(":")
+                exploit_name = parts[1] if len(parts) >= 2 else ""
+        if not exploit_name:
+            exploit_name = result.shell_type.strip() or result.exploit_level.strip()
+        if not exploit_name or exploit_name.lower() in ("rce", "shell", "info_leak"):
+            # "rce" alone is too generic to enrich the finding name
             continue
+
         for f in state.findings:
             if f.vuln_id == result.vuln_id:
-                if skill_id.replace("_", " ").lower() not in f.name.lower():
-                    f.name = f"{skill_id} ({f.name})"
+                display = exploit_name.replace("_", " ").strip()
+                if display.lower() not in f.name.lower():
+                    f.name = f"{exploit_name} ({f.name})"
                 break
 
 

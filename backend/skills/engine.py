@@ -889,6 +889,7 @@ class SkillEngine:
                     exploit_level=vr.level.value.replace("confirmed_", "").replace("probable_", ""),
                     session_info={
                         "method": f"skill:{skill.skill_id}:llm_freeform",
+                        "skill_id": skill.skill_id,
                         "current_user": decision.get("current_user", ""),
                         "rounds": round_num + 1,
                         "evidence_level": vr.level.value,
