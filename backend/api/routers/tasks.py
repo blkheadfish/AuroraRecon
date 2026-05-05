@@ -447,6 +447,7 @@ async def generate_pentest_plan(req: PlanRequest, request: Request):
         available_skills=skills_text,
     )
 
+    # AI辅助生成：DeepSeek-V4-Pro,2026-05-03
     llm = LLMRouter()
     try:
         raw = await asyncio.wait_for(
@@ -735,9 +736,8 @@ async def create_task(req: CreateTaskRequest, request: Request):
             if enriched.targets:
                 safety_intent.targets = enriched.targets
                 safety_intent.target_type = enriched.target_type
-                # 降低歧义级别，避免「目标不明确」误判
-                if safety_intent.ambiguity_level == "vague":
-                    safety_intent.ambiguity_level = "partial"
+                # 用户已确认策略计划，意图明确，不再触发「目标不明确」警告
+                safety_intent.ambiguity_level = "clear"
                 logger.info(
                     f"[create_task] 从 plan/target 补充提取目标: "
                     f"targets={safety_intent.targets} type={safety_intent.target_type}"
@@ -848,7 +848,7 @@ async def create_task(req: CreateTaskRequest, request: Request):
             logger.warning(f"[DB] 保存失败: {e}")
 
     # ── 推送初始策略到前端 ─────────────────────────────────
-    _push_initial_plan_event(task_id, state, req, parsed_intent_dict, effective_target)
+    await _push_initial_plan_event(task_id, state, req, parsed_intent_dict, effective_target)
 
     from backend.api.services.task_runner import run_task
     from backend.api.services.branch_manager import get_branch_manager
