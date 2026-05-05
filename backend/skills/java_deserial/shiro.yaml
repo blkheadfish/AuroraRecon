@@ -167,7 +167,35 @@ exploit_paths:
         evidence_capture:
           shell_type: "rce_shiro_blind"
 
-  # ═══ 路径 C: LLM 兜底 ═══
+  # ═══ 路径 C: 回显检测（su18 EX-TomcatEcho，命令输出写回 HTTP 响应）═══
+  - path_id: shiro_echo
+    name: "shiro_exploit.py 回显检测（TomcatEcho）"
+    priority: 3
+    principle: |
+      用 su18 ysoserial 的 EX-TomcatEcho 在反序列化时注入回显机制：
+      1. 生成 EX-TomcatEcho payload（从当前线程找到 request/response）
+      2. 遍历 密钥×gadget 组合，发送加密 Cookie + X-Token-Data: id 头
+      3. 目标反序列化 → 读取 X-Token-Data 头 → 执行命令 → 写入 response
+      4. HTTP 响应体中含 uid= 等命令输出 → RCE 确认
+
+      优势：不依赖回连、不依赖 webroot、不依赖时序、命令输出直读。
+      需要 su18 ysoserial（/opt/ysuserial.jar）。
+    conditions:
+      shiro_confirmed: true
+    steps:
+      - id: shiro_echo
+        description: "回显检测爆破（EX-TomcatEcho，命令输出在 HTTP 响应中）"
+        command: |
+          python3 /opt/shiro_exploit.py {ENDPOINT} --echo
+        timeout: 600
+        success_criteria:
+          stdout_contains_any: ["SHIRO_RCE_CONFIRMED"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "rce_shiro_echo"
+
+  # ═══ 路径 D: LLM 兜底 ═══
   - path_id: llm_freeform
     name: "LLM 自由推理（限定 Shiro 漏洞范围）"
     priority: 99
