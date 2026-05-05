@@ -392,22 +392,11 @@ class ReconAgent:
 				f"跳过端口枚举，直接 nmap -sV/-A 精细扫描"
 			)
 			port_str = str(target_port)
-			try:
-				_is_private = _ipaddress.ip_address(target).is_private
-			except ValueError:
-				_is_private = False
-			if _is_private:
-				nmap_detail_args = [
-					"-sS", "-A", "--osscan-guess", "-Pn",
-					"--reason", "--defeat-rst-ratelimit",
-					"-p", port_str, "-oX", "-", target,
-				]
-			else:
-				nmap_detail_args = [
-					"-sS", "-sV", "--version-all", "-sC", "-Pn",
-					"--reason", "--defeat-rst-ratelimit",
-					"-p", port_str, "-oX", "-", target,
-				]
+			nmap_detail_args = [
+				"-sS", "-A", "-Pn",
+				"--reason", "--defeat-rst-ratelimit",
+				"-p", port_str, "-oX", "-", target,
+			]
 			detail_result: ExecuteResult = await self.executor.run(
 				tool="nmap",
 				args=nmap_detail_args,
