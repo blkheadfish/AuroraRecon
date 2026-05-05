@@ -631,7 +631,7 @@ _FALLBACK_TEMPLATE = """# 渗透测试报告
 ```{{ detect_lang(rec.stdout) }}
 {{ truncate_block(rec.stdout if rec.stdout else "(无输出)") }}
 ```
-{% set _ = prev_stdout.update(value=current_stdout) %}
+{% set prev_stdout.value = current_stdout %}
 {% endif %}
 
 {% if rec.stderr %}
