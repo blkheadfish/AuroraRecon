@@ -412,6 +412,7 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
         pending_user_prompt: full.pending_user_prompt ?? state.task.pending_user_prompt,
         pentest_plan: full.pentest_plan ?? state.task.pentest_plan,
         parsed_intent: full.parsed_intent ?? state.task.parsed_intent,
+        attack_graph: full.attack_graph ?? state.task.attack_graph,
       }
     }
 
@@ -605,6 +606,7 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
           secondary_elided: patch.secondary_elided ?? state.task.secondary_elided,
           attack_next_steps: patch.attack_next_steps ?? state.task.attack_next_steps,
           privesc_attempt_count: patch.privesc_attempt_count ?? state.task.privesc_attempt_count,
+          attack_graph: (patch.attack_graph as TaskDetail['attack_graph']) ?? state.task.attack_graph,
         }
         if (prevPhase !== 'awaiting_approval' && patch.phase === 'awaiting_approval') {
           state.approvalState = 'idle'

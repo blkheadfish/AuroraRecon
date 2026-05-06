@@ -70,7 +70,6 @@ def _enforce_task_owner(state: PentestState, request: Request, action: str) -> N
     if not owner_id:
         raise HTTPException(status_code=401, detail="未登录")
     if not (state.owner_id or ""):
-        # legacy task migration path: bind once when first accessed by authenticated owner
         state.owner_id = owner_id
         logger.info(f"[AuthZ] legacy task owner bound: task={state.task_id}, owner={owner_id}")
         return
@@ -99,9 +98,7 @@ async def _resolve_state(task_id: str) -> PentestState | None:
     return None
 
 
-# ── 意图解析 (LLM 驱动) ───────────────────────────────────
 
-# 与前端 TaskCreateChat.vue 的 extractTarget 对齐的兜底正则集合
 _FALLBACK_TARGET_PATTERNS = [
     re.compile(r"https?://[^\s,;'\"，。、）)]+", re.IGNORECASE),
     re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?\b"),
@@ -270,14 +267,12 @@ async def parse_task_intent(req: ParseIntentRequest, request: Request):
         return ParseIntentResponse(target=fallback_target, fallback=True, error=f"JSON 解析失败: {e}")
 
     payload = _coerce_intent_payload(data)
-    # 即便 LLM 没解析出 target,也尽量回填正则结果,前端体验更平滑
     if not payload["target"] and fallback_target:
         payload["target"] = fallback_target
 
     return ParseIntentResponse(**payload, fallback=False)
 
 
-# ── 策略规划辅助函数 ──────────────────────────────────────
 
 def _load_available_tools() -> list[dict[str, str]]:
     """遍历 tools/definitions/ 目录，提取所有已注册工具的名称与描述。
@@ -400,7 +395,6 @@ def _build_available_skills_text(skills: list[dict[str, str]]) -> str:
     return "\n".join(lines)
 
 
-# ── 策略规划接口（Plan Mode）──────────────────────────────
 
 @router.post("/tasks/plan", response_model=PlanResponse)
 async def generate_pentest_plan(req: PlanRequest, request: Request):
@@ -425,7 +419,6 @@ async def generate_pentest_plan(req: PlanRequest, request: Request):
     if not user_prompt.strip():
         raise HTTPException(status_code=400, detail="user_prompt 不能为空")
 
-    # Step 1: 动态加载可用工具和 Skill
     available_tools = _load_available_tools()
     available_skills = _load_available_skills()
 
@@ -437,7 +430,6 @@ async def generate_pentest_plan(req: PlanRequest, request: Request):
         f"{len(available_skills)} 个 Skill"
     )
 
-    # Step 2: 调用 LLM 生成策略
     from backend.llm.router import LLMRouter
     from backend.llm.prompts.templates import PLAN_GENERATION_PROMPT
 
@@ -447,7 +439,6 @@ async def generate_pentest_plan(req: PlanRequest, request: Request):
         available_skills=skills_text,
     )
 
-    # AI辅助生成：DeepSeek-V4-Pro,2026-05-03
     llm = LLMRouter()
     try:
         raw = await asyncio.wait_for(
@@ -465,7 +456,6 @@ async def generate_pentest_plan(req: PlanRequest, request: Request):
         logger.error(f"[plan] LLM 调用失败: {e}")
         raise HTTPException(status_code=502, detail=f"LLM 调用失败: {e}")
 
-    # Step 3: 解析 LLM 返回的 JSON
     try:
         data = json.loads(raw if isinstance(raw, str) else str(raw))
         if not isinstance(data, dict):
@@ -474,7 +464,6 @@ async def generate_pentest_plan(req: PlanRequest, request: Request):
         logger.error(f"[plan] JSON 解析失败: {e}, raw={raw[:500]}")
         raise HTTPException(status_code=502, detail=f"策略解析失败: {e}")
 
-    # Step 4: 校验生成的工具名/Skill 名是否都在已注册列表中
     valid_tool_names = {t["name"] for t in available_tools}
     valid_skill_ids = {s["skill_id"] for s in available_skills}
 
@@ -496,9 +485,7 @@ async def generate_pentest_plan(req: PlanRequest, request: Request):
         if unknown_skills:
             warning_parts.append(f"未知 Skill: {', '.join(unknown_skills)}")
         logger.warning(f"[plan] LLM 生成了未注册的能力: {'; '.join(warning_parts)}")
-        # 不直接拒绝，但记录警告；前端可根据 unsupported_hints 判断
 
-    # Step 5: 构建响应
     plan_id = str(uuid.uuid4())
     plan_obj = PentestPlan(
         target_understanding=str(data.get("target_understanding") or ""),
@@ -539,7 +526,6 @@ async def generate_pentest_plan(req: PlanRequest, request: Request):
     )
 
 
-# ── 初始策略推送 ──────────────────────────────────────────
 
 async def _push_initial_plan_event(
     task_id: str,
@@ -557,14 +543,12 @@ async def _push_initial_plan_event(
     try:
         from backend.agents.models import WorkflowMode
 
-        # ── 构建策略卡片内容 ─────────────────────────────
         mode_label = {
             "pentest_engineer": "渗透工程师",
             "ctf_expert": "CTF 选手",
         }.get(req.workflow_mode, req.workflow_mode)
 
         plan_steps: list[str] = []
-        # 核心阶段序列
         core_phases = ["recon", "surface_enum", "vuln_scan", "exploit_decision"]
         if req.auto_approve:
             core_phases.append("foothold_attempt")
@@ -573,7 +557,6 @@ async def _push_initial_plan_event(
             core_phases.append("foothold_attempt")
         plan_steps.append("阶段序列: " + " → ".join(core_phases) + " → ...")
 
-        # 工作模式
         plan_steps.append(f"工作模式: {mode_label}")
         if req.auto_approve:
             plan_steps.append("自动审批: 已启用 (关键节点不暂停)")
@@ -585,7 +568,6 @@ async def _push_initial_plan_event(
         if req.extra_hint:
             plan_steps.append(f"额外提示: {req.extra_hint[:200]}")
 
-        # 从 parsed_intent 提取攻击偏好
         if parsed_intent_dict:
             intents = parsed_intent_dict.get("intents", []) or []
             if intents:
@@ -597,7 +579,6 @@ async def _push_initial_plan_event(
         else:
             summary = ""
 
-        # 目标理解文本
         target_understanding = summary or (
             f"目标: {effective_target}, "
             f"授权范围: {req.scope_note or 'CTF/靶场测试'}"
@@ -625,7 +606,6 @@ async def _push_initial_plan_event(
         logger.warning(f"[create_task] 推送初始策略事件失败: {exc}")
 
 
-# ── CRUD ──────────────────────────────────────────────────
 
 @router.post("/tasks", response_model=TaskCreateResponse)
 async def create_task(req: CreateTaskRequest, request: Request):
@@ -649,7 +629,6 @@ async def create_task(req: CreateTaskRequest, request: Request):
     owner_id = getattr(request.state, "user_id", "") or ""
     tenant_id = getattr(request.state, "tenant_id", "") or "default"
 
-    # ── 第一步：意图解析 + 目标推导 ───────────────────────
     raw_prompt = req.raw_prompt.strip() or req.user_prompt.strip()
     raw_target = req.target.strip()
 
@@ -662,10 +641,6 @@ async def create_task(req: CreateTaskRequest, request: Request):
         parsed_intent = parse_intent_deterministic(raw_prompt)
         parsed_intent_dict = parsed_intent.model_dump()
 
-        # ★ 新增：把 LLM parse-intent 解析出的 intents/extra_hint/scope_note
-        # 回填到 parsed_intent_dict，让 orchestrator 的转换函数能读到这些字段
-        # （这些字段来自前端 /tasks/parse-intent 调用后存在前端状态里，
-        #   用户提交 create_task 时通过 req 传入）
         if req.parsed_intent_extra:
             extra = req.parsed_intent_extra
             if not parsed_intent_dict.get("intents"):
@@ -674,7 +649,6 @@ async def create_task(req: CreateTaskRequest, request: Request):
                 parsed_intent_dict["extra_hint"] = extra.get("extra_hint", "")
             if not parsed_intent_dict.get("scope_note"):
                 parsed_intent_dict["scope_note"] = extra.get("scope_note", "")
-            # LLM 可能发现确定性解析遗漏的漏洞类型，合并去重
             llm_vulns = extra.get("priority_vulns") or []
             if isinstance(llm_vulns, list):
                 existing = set(parsed_intent_dict.get("priority_vulns") or [])
@@ -683,7 +657,6 @@ async def create_task(req: CreateTaskRequest, request: Request):
                         parsed_intent_dict.setdefault("priority_vulns", []).append(v.strip())
                         existing.add(v.strip())
 
-        # 如果 target 为空，从 raw_prompt 提取
         if not effective_target and parsed_intent.targets:
             effective_target = parsed_intent.targets[0]
             logger.info(
@@ -691,7 +664,6 @@ async def create_task(req: CreateTaskRequest, request: Request):
                 f"(type={parsed_intent.target_type})"
             )
 
-        # 如果 target 和 raw_prompt 都为空 → 400
         if not effective_target:
             raise HTTPException(
                 status_code=400,
@@ -708,11 +680,9 @@ async def create_task(req: CreateTaskRequest, request: Request):
             detail="target 和 raw_prompt 至少需要提供一个"
         )
 
-    # ── 第二步：安全卡口检查（确定性规则，不依赖 LLM）────
     from backend.agents.safety_gate import get_safety_gate
     from backend.agents.intent_parser import parse_intent_deterministic
 
-    # 复用已解析的 intent 或重新解析
     if parsed_intent_dict is None:
         safety_intent = parse_intent_deterministic(
             raw_prompt or f"对 {effective_target} 进行渗透测试"
@@ -721,9 +691,6 @@ async def create_task(req: CreateTaskRequest, request: Request):
         from backend.agents.models import ParsedIntent
         safety_intent = ParsedIntent(**parsed_intent_dict)
 
-    # 确定性 regex 解析可能遗漏目标（如纯自然语言 prompt），
-    # 导致安全卡口拿到 targets=[] 并误判 ambiguity=vague。
-    # 若用户已确认了策略计划，从 target_understanding 中二次提取。
     if not safety_intent.targets:
         enrichment_text = ""
         if req.target and req.target.strip():
@@ -736,7 +703,6 @@ async def create_task(req: CreateTaskRequest, request: Request):
             if enriched.targets:
                 safety_intent.targets = enriched.targets
                 safety_intent.target_type = enriched.target_type
-                # 用户已确认策略计划，意图明确，不再触发「目标不明确」警告
                 safety_intent.ambiguity_level = "clear"
                 logger.info(
                     f"[create_task] 从 plan/target 补充提取目标: "
@@ -750,7 +716,6 @@ async def create_task(req: CreateTaskRequest, request: Request):
         user_id=owner_id,
     )
 
-    # ── BLOCK：直接拒绝 ──────────────────────────────────
     if safety_result.risk_level == "blocked":
         raise HTTPException(
             status_code=400,
@@ -761,7 +726,6 @@ async def create_task(req: CreateTaskRequest, request: Request):
             }
         )
 
-    # ── WARNING：检查用户是否已确认 ──────────────────────
     if safety_result.risk_level == "warning":
         pending_confirmations = [
             c for c in safety_result.required_confirmations
@@ -778,10 +742,6 @@ async def create_task(req: CreateTaskRequest, request: Request):
                 message="需要确认以下风险项后再提交",
             )
 
-    # ── PENDING_CLARIFICATION：目标不明确 ────────────────
-    # 仅当 effective_target 为空时才需要从自然语言中反推目标；
-    # 若用户已显式提供了 target（通过 target 字段或前端识别），
-    # 即使 raw_prompt 中提取不到，也视为用户已有明确意图，不应拦截。
     if not effective_target and \
        safety_intent.ambiguity_level in ("partial", "vague") and \
        safety_intent.clarification_needed:
@@ -795,10 +755,8 @@ async def create_task(req: CreateTaskRequest, request: Request):
             }
         )
 
-    # ── 第三步：通过所有检查，创建任务 ─────────────────────
     task_id = str(uuid.uuid4())
 
-    # 验证最终 target 的合法性
     try:
         from backend.agents.models import parse_target
         parsed = parse_target(effective_target)
@@ -823,9 +781,8 @@ async def create_task(req: CreateTaskRequest, request: Request):
         authorization_token=req.authorization_token,
         parsed_intent=parsed_intent_dict or safety_intent.model_dump(),
         safety_check_result=safety_result.model_dump(),
-        pentest_plan=req.confirmed_plan,  # Plan Mode: 用户确认的策略
+        pentest_plan=req.confirmed_plan,
     )
-    # 填入 workflow_mode 默认值,并用请求里显式传入的覆盖项替换
     apply_mode_defaults(
         state,
         overrides={
@@ -847,12 +804,10 @@ async def create_task(req: CreateTaskRequest, request: Request):
         except Exception as e:
             logger.warning(f"[DB] 保存失败: {e}")
 
-    # ── 推送初始策略到前端 ─────────────────────────────────
     await _push_initial_plan_event(task_id, state, req, parsed_intent_dict, effective_target)
 
     from backend.api.services.task_runner import run_task
     from backend.api.services.branch_manager import get_branch_manager
-    # 注册 root 分支(thread_id == task_id 兼容老逻辑)
     try:
         await get_branch_manager().lazy_init_root(task_id, state)
     except Exception as exc:
@@ -963,10 +918,6 @@ async def get_task(task_id: str, request: Request, full: bool = False):
 
     result = sm.to_detail_snapshot(state)
 
-    # 从 event_stream 回填 decision_events_tail，避免页面刷新后工具调用历史丢失。
-    # PentestState 不再持有 decision_events（事件全部走 Redis Stream / local ring），
-    # 但首屏快照如果完全不带事件，前端在 IndexedDB 冷启动 + WS 首帧到达之前
-    # 会有一段空白时间线，用户体感就是"工具调用记录丢了"。
     try:
         envelopes = await event_stream.replay(task_id, count=120)
         if envelopes:
@@ -982,7 +933,7 @@ async def get_task(task_id: str, request: Request, full: bool = False):
             result["decision_events_tail"] = decision_events
             result["decision_events_total"] = await event_stream.stream_length(task_id)
     except Exception:
-        pass  # 非关键路径，静默失败不影响首屏
+        pass
 
     return result
 
@@ -1030,8 +981,6 @@ async def get_logs(
         raise HTTPException(status_code=404, detail="任务不存在")
     _enforce_task_owner(state, request, "get_logs")
 
-    # 合并 Redis(若可用) 与内存 phase_log,Redis 优先(更完整);
-    # Redis 不可用或为空时回退到内存数组。
     source: list[str] = []
     if sm.redis_available:
         try:
@@ -1074,7 +1023,6 @@ async def get_logs(
         }
 
     if offset == 0 and limit == 500:
-        # 默认行为(不带参数):返回最近 500 条,避免大日志全量下发。
         n = min(500, LIMIT_MAX)
         start = max(0, total - n)
         sliced = source[start:]
@@ -1176,7 +1124,6 @@ async def cancel_task(task_id: str, request: Request):
         except Exception:
             pass
 
-    # 主动取消后台协程 + 停掉工具容器,避免继续消耗资源
     sm.cancel_bg_task(task_id)
     await _stop_task_container(task_id)
 
@@ -1209,7 +1156,6 @@ async def delete_task(task_id: str, request: Request):
     if state and state.status in (TaskStatus.RUNNING, TaskStatus.PENDING):
         raise HTTPException(status_code=400, detail="运行中的任务不能删除,请先取消")
 
-    # 不管任务是否仍在运行(前端已阻塞这种情况),统一确保容器/后台协程被清理
     sm.cancel_bg_task(task_id)
     await _stop_task_container(task_id)
 
@@ -1227,8 +1173,6 @@ async def delete_task(task_id: str, request: Request):
             await delete_cached_task(task_id)
         except Exception:
             pass
-    # 协议 v2: 把 task 的 Stream 连同本地降级 ring 一起回收, 避免新建的同 id
-    # 任务读到老事件污染界面。
     try:
         await event_stream.drop(task_id)
     except Exception:
@@ -1242,7 +1186,6 @@ async def delete_task(task_id: str, request: Request):
     return {"status": "deleted", "task_id": task_id}
 
 
-# ── 审批 ──────────────────────────────────────────────────
 
 @router.post("/tasks/{task_id}/approve")
 async def approve_task(task_id: str, req: ApproveRequest, request: Request):
@@ -1276,13 +1219,11 @@ async def approve_task(task_id: str, req: ApproveRequest, request: Request):
             detail=f"任务当前阶段 '{state.current_phase}' 不需要审批",
         )
 
-    # 先锁,再记一条日志(phase 保持 awaiting_approval,交给引擎节点去更新)
     sm.set_approval_inflight(task_id, _time.time())
     state.approved = bool(req.approved)
     state.log(f"[审批] {'已授权,继续利用' if req.approved else '已拒绝,跳过利用'}")
     sm.set(task_id, state)
 
-    # 触发 resume,让 LangGraph 从 interrupt 处继续运行
     from backend.api.services.task_runner import resume_task
     from backend.api.services.branch_manager import get_branch_manager
     bm = get_branch_manager()
@@ -1307,7 +1248,6 @@ async def approve_task(task_id: str, req: ApproveRequest, request: Request):
     return {"status": "ok", "approved": req.approved}
 
 
-# ── 通用 checkpoint 响应 ──────────────────────────────────
 
 @router.post("/tasks/{task_id}/checkpoint/respond")
 async def respond_checkpoint(
@@ -1392,7 +1332,6 @@ async def respond_checkpoint(
     }
 
 
-# ── 用户-代理对话 ─────────────────────────────────────────
 
 @router.post("/tasks/{task_id}/chat")
 async def send_chat_message(task_id: str, req: ChatMessageRequest, request: Request):
@@ -1434,29 +1373,15 @@ async def send_chat_message(task_id: str, req: ChatMessageRequest, request: Requ
         "timestamp": now_iso,
     }
 
-    # ``state.status`` 是"业务状态"(running / awaiting_approval / completed),
-    # 但当某个分支被 ``_resume_branch_bg`` 错误标记为 paused 后, 任务仍然在
-    # 进行中(_running_tasks 集合 = 真正的 lifecycle 标识), 此时我们仍然要
-    # 允许 fork — 否则用户的"80端口有什么目录?"消息会落到 else 分支被
-    # 当成"终态追加"丢弃, 表现为 root 已暂停 + 没有新分支启动。
     fork_active = (
         state.status in (TaskStatus.RUNNING, TaskStatus.AWAITING_APPROVAL)
         or sm.is_running(task_id)
     )
 
-    # ── user_messages 写入责任划分 ──────────────────────────
-    # fork 路径: 此处不 append 到 ``sm.state.user_messages``。
-    #   ``BranchManager.fork_from_active`` 内部已经基于父分支 user_messages
-    #   构造 ``new_messages = parent_msgs + [new_msg]`` 写到 child thread
-    #   的 LangGraph checkpoint 里; 如果这里又往 sm.state 追加, fork 出
-    #   的子分支 user_messages 就会出现"父历史 + 当前 + 当前"的双写,
-    #   前端按 branch_id 过滤后会显示同一条用户消息出现两次。
-    # 终态路径(completed/failed): 不会 fork, 这里写入是唯一记录点。
     new_branch_payload = None
     if fork_active:
         from backend.api.services.branch_manager import get_branch_manager
         bm = get_branch_manager()
-        # Ensure root exists (lazy bootstrap for legacy tasks).
         try:
             await bm.lazy_init_root(task_id, state)
         except Exception as exc:
@@ -1464,8 +1389,6 @@ async def send_chat_message(task_id: str, req: ChatMessageRequest, request: Requ
                 f"[chat] lazy_init_root failed task={task_id}: {exc}"
             )
 
-        # Persist message + state *before* fork so the snapshot we copy
-        # already contains the operator instruction.
         joined = (state.pending_user_prompt or "").strip()
         state.pending_user_prompt = (
             f"{joined}\n{text}" if joined else text
@@ -1475,11 +1398,6 @@ async def send_chat_message(task_id: str, req: ChatMessageRequest, request: Requ
         state.replan_signals = signals
         sm.set(task_id, state)
 
-        # Forking handles cooperative interrupt of the parent + checkpoint
-        # copy + bg task scheduling for the child.
-        # Claude 风格: 若前端指定了 ``from_event_id`` (在某条历史消息处分叉),
-        # 把它当作 ``TaskBranch.fork_event_id`` 落库, 并用 ``from_event_ts``
-        # 作为时间锚点交给 ``find_checkpoint_at_or_before`` 找对应 checkpoint。
         fork_event_id = (
             req.from_event_id
             if req.from_event_id
@@ -1498,8 +1416,6 @@ async def send_chat_message(task_id: str, req: ChatMessageRequest, request: Requ
                 f"[chat] fork_from_active failed task={task_id}: {exc}",
                 exc_info=True,
             )
-            # Fall back to PR1 behaviour: at least flip operator_intent +
-            # request_interrupt so the in-flight branch reroutes itself.
             try:
                 from backend.agents.interrupt_registry import request_interrupt
                 request_interrupt(
@@ -1509,7 +1425,6 @@ async def send_chat_message(task_id: str, req: ChatMessageRequest, request: Requ
             except Exception:
                 pass
     else:
-        # 终态/无 fork 场景下唯一的写入点。
         state.user_messages.append(msg)
         sm.set(task_id, state)
 
@@ -1573,7 +1488,6 @@ async def get_chat_history(task_id: str, request: Request):
     return {"messages": timeline}
 
 
-# ── 任务分支 (Claude/Kimi 风格 branch tree) ────────────────
 
 @router.get("/tasks/{task_id}/branches")
 async def list_task_branches(task_id: str, request: Request):
@@ -1586,7 +1500,6 @@ async def list_task_branches(task_id: str, request: Request):
 
     from backend.api.services.branch_manager import get_branch_manager
     bm = get_branch_manager()
-    # Lazy bootstrap so the legacy task always shows at least its root.
     try:
         await bm.lazy_init_root(task_id, state)
     except Exception as exc:
