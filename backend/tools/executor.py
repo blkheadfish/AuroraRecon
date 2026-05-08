@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional, Awaitable
 
 from backend.tools.tool_registry import ToolRegistry
+from backend.metrics.collector import get_collector
 
 logger = logging.getLogger(__name__)
 
@@ -774,6 +775,16 @@ class ToolExecutor:
 
     @staticmethod
     async def _emit_record(*, record_callback: RecordCallback, record: dict) -> None:
+        try:
+            get_collector().collect_tool_exec(
+                tool_name=record.get("display_tool") or record.get("tool", ""),
+                phase=record.get("phase", ""),
+                success=record.get("exit_code", -1) == 0,
+                elapsed=float(record.get("elapsed", 0) or 0),
+                timed_out=bool(record.get("timed_out", False)),
+            )
+        except Exception:
+            pass
         if not record_callback:
             return
         try:

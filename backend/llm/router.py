@@ -15,10 +15,13 @@ import os
 import socket
 import struct
 import random
+import time
 from typing import Callable, Optional, Union, overload
 from urllib.parse import urlparse
 
 from openai import AsyncOpenAI
+
+from backend.metrics.collector import get_collector
 
 logger = logging.getLogger(__name__)
 
@@ -212,20 +215,13 @@ class LLMRouter:
         temperature: float = 0.2,
         max_tokens: int = LLM_MAX_TOKENS,
         return_thinking: bool = False,
+        phase: str = "",
+        caller: str = "",
     ) -> Union[str, tuple[str, str]]:
         """
         发送消息并返回模型回复（带自动重试）。
-
-        Args:
-            user_message:    用户消息
-            system_prompt:   可覆盖默认的安全专家 System Prompt
-            response_format: "json" 时强制要求模型返回 JSON
-            temperature:     模型温度（越低越确定，渗透分析建议 0.1~0.3）
-            return_thinking: True 时返回 (content, reasoning_content) 元组
-
-        Returns:
-            模型回复的文本，或 (content, reasoning) 元组
         """
+        start = time.monotonic()
         messages = [
             {
                 "role": "system",
@@ -258,6 +254,13 @@ class LLMRouter:
                         logger.debug(f"[LLMRouter] content 为空，回退到 reasoning_content ({len(reasoning)} chars)")
                         content = reasoning
                 logger.debug(f"[LLMRouter] 响应长度: {len(content)} chars")
+                get_collector().collect_llm_call(
+                    phase=phase, method="chat",
+                    duration_ms=(time.monotonic() - start) * 1000,
+                    usage=getattr(response, "usage", None),
+                    status="ok", caller=caller,
+                    provider=LLM_PROVIDER, model=self._model,
+                )
                 if return_thinking:
                     return content, self._extract_reasoning(msg)
                 return content
@@ -274,9 +277,21 @@ class LLMRouter:
                     logger.error(
                         f"[LLMRouter] API 调用失败 (已重试{MAX_RETRIES}次): {e}"
                     )
+                    get_collector().collect_llm_call(
+                        phase=phase, method="chat",
+                        duration_ms=(time.monotonic() - start) * 1000,
+                        status="error", caller=caller,
+                        provider=LLM_PROVIDER, model=self._model,
+                    )
                     fallback = json.dumps({"error": str(e), "targets": []}) if response_format == "json" else f"LLM 调用失败: {e}"
                     return (fallback, "") if return_thinking else fallback
 
+        get_collector().collect_llm_call(
+            phase=phase, method="chat",
+            duration_ms=(time.monotonic() - start) * 1000,
+            status="error", caller=caller,
+            provider=LLM_PROVIDER, model=self._model,
+        )
         fallback = json.dumps({"error": "unexpected", "targets": []}) if response_format == "json" else "LLM 调用失败: 未知错误"
         return (fallback, "") if return_thinking else fallback
 
@@ -288,22 +303,14 @@ class LLMRouter:
         temperature: float = 0.2,
         max_tokens: int = LLM_MAX_TOKENS,
         return_thinking: bool = False,
+        phase: str = "",
+        caller: str = "",
     ) -> Union[str, tuple[str, str]]:
         """
         多轮对话接口 —— 传入完整 messages 历史。
-
         用于 ReAct 循环等需要保持对话上下文的场景。
-
-        Args:
-            messages:        完整的对话历史 [{"role": "user/assistant", "content": "..."}]
-            system_prompt:   System Prompt（如不指定则使用默认安全专家角色）
-            response_format: "json" 时强制返回 JSON
-            temperature:     模型温度
-            return_thinking: True 时返回 (content, reasoning_content) 元组
-
-        Returns:
-            模型回复文本，或 (content, reasoning) 元组
         """
+        start = time.monotonic()
         full_messages = [
             {
                 "role": "system",
@@ -336,6 +343,13 @@ class LLMRouter:
                     f"[LLMRouter] 多轮响应: {len(content)} chars, "
                     f"轮次={len(messages)}条消息"
                 )
+                get_collector().collect_llm_call(
+                    phase=phase, method="multi_turn",
+                    duration_ms=(time.monotonic() - start) * 1000,
+                    usage=getattr(response, "usage", None),
+                    status="ok", caller=caller,
+                    provider=LLM_PROVIDER, model=self._model,
+                )
                 if return_thinking:
                     return content, self._extract_reasoning(msg)
                 return content
@@ -351,9 +365,21 @@ class LLMRouter:
                     logger.error(
                         f"[LLMRouter] 多轮调用失败 (已重试{MAX_RETRIES}次): {e}"
                     )
+                    get_collector().collect_llm_call(
+                        phase=phase, method="multi_turn",
+                        duration_ms=(time.monotonic() - start) * 1000,
+                        status="error", caller=caller,
+                        provider=LLM_PROVIDER, model=self._model,
+                    )
                     fallback = json.dumps({"error": str(e), "action": "conclude_fail"}) if response_format == "json" else f"LLM 调用失败: {e}"
                     return (fallback, "") if return_thinking else fallback
 
+        get_collector().collect_llm_call(
+            phase=phase, method="multi_turn",
+            duration_ms=(time.monotonic() - start) * 1000,
+            status="error", caller=caller,
+            provider=LLM_PROVIDER, model=self._model,
+        )
         fallback = json.dumps({"error": "unexpected", "action": "conclude_fail"}) if response_format == "json" else "LLM 调用失败: 未知错误"
         return (fallback, "") if return_thinking else fallback
 
@@ -367,8 +393,11 @@ class LLMRouter:
         response_format: str = "text",
         temperature: float = 0.2,
         max_tokens: int = LLM_MAX_TOKENS,
+        phase: str = "",
+        caller: str = "",
     ) -> tuple[str, str]:
         """Streaming multi-turn chat with callbacks. Returns (content, reasoning)."""
+        start = time.monotonic()
         if response_format == "json" and on_content_delta is not None:
             logger.debug(
                 "[LLMRouter] chat_multi_turn_stream: dropping on_content_delta "
@@ -385,16 +414,21 @@ class LLMRouter:
             "temperature": temperature,
             "max_tokens": max_tokens,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         if response_format == "json":
             kwargs["response_format"] = {"type": "json_object"}
 
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
+        last_usage = None
 
         try:
             stream = await self._client.chat.completions.create(**kwargs)
             async for chunk in stream:
+                usage = getattr(chunk, "usage", None)
+                if usage:
+                    last_usage = usage
                 delta = chunk.choices[0].delta if chunk.choices else None
                 if not delta:
                     continue
@@ -416,8 +450,20 @@ class LLMRouter:
                             await on_reasoning_delta(rc)
                         except Exception:
                             pass
+            get_collector().collect_llm_call(
+                phase=phase, method="stream",
+                duration_ms=(time.monotonic() - start) * 1000,
+                usage=last_usage, status="ok", caller=caller,
+                provider=LLM_PROVIDER, model=self._model,
+            )
         except Exception as e:
             logger.error(f"[LLMRouter] multi-turn stream 失败: {e}")
+            get_collector().collect_llm_call(
+                phase=phase, method="stream",
+                duration_ms=(time.monotonic() - start) * 1000,
+                status="error", caller=caller,
+                provider=LLM_PROVIDER, model=self._model,
+            )
             fallback = json.dumps({"error": str(e), "action": "conclude_fail"}) if response_format == "json" else f"LLM stream error: {e}"
             return fallback, ""
 
@@ -432,24 +478,14 @@ class LLMRouter:
         system_prompt: Optional[str] = None,
         temperature: float = 0.2,
         max_tokens: int = LLM_MAX_TOKENS,
+        phase: str = "",
+        caller: str = "",
     ) -> tuple[str, list, str]:
         """
         多轮对话 + Function Calling。
-
-        与 ``chat_multi_turn_stream`` 不同，本方法**不流式**，因为 OpenAI
-        function calling 的 streaming chunk 拼接相对复杂；ReAct 单轮等待
-        几秒到十几秒的体验是可接受的。
-
-        Args:
-            tools:        OpenAI tools schema（见 backend/tools/tool_registry.to_openai_tools）
-            tool_choice:  ``auto`` / ``required`` / ``none`` / ``{"type":"function","function":{"name":...}}``
-
-        Returns:
-            (content_text, tool_calls_list, reasoning_text)
-            - content_text: assistant 文本回复（可能为空）
-            - tool_calls_list: list of openai SDK tool_call object
-            - reasoning_text: DeepSeek reasoning_content
+        不流式，因为 OpenAI function calling 的 streaming chunk 拼接复杂。
         """
+        start = time.monotonic()
         full_messages = [
             {"role": "system", "content": system_prompt or SECURITY_EXPERT_SYSTEM_PROMPT},
             *messages,
@@ -477,6 +513,13 @@ class LLMRouter:
                     f"[LLMRouter] tools 响应: content_len={len(content)}, "
                     f"tool_calls={len(tool_calls)}"
                 )
+                get_collector().collect_llm_call(
+                    phase=phase, method="tools",
+                    duration_ms=(time.monotonic() - start) * 1000,
+                    usage=getattr(response, "usage", None),
+                    status="ok", caller=caller,
+                    provider=LLM_PROVIDER, model=self._model,
+                )
                 return content, tool_calls, reasoning
             except Exception as e:
                 if attempt < MAX_RETRIES - 1:
@@ -487,8 +530,20 @@ class LLMRouter:
                     await asyncio.sleep(wait)
                 else:
                     logger.error(f"[LLMRouter] tools 调用失败 (重试{MAX_RETRIES}次): {e}")
+                    get_collector().collect_llm_call(
+                        phase=phase, method="tools",
+                        duration_ms=(time.monotonic() - start) * 1000,
+                        status="error", caller=caller,
+                        provider=LLM_PROVIDER, model=self._model,
+                    )
                     return "", [], ""
 
+        get_collector().collect_llm_call(
+            phase=phase, method="tools",
+            duration_ms=(time.monotonic() - start) * 1000,
+            status="error", caller=caller,
+            provider=LLM_PROVIDER, model=self._model,
+        )
         return "", [], ""
 
     async def chat_stream(

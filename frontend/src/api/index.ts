@@ -440,6 +440,20 @@ export const api = {
     }
   }> => http.get('/admin/system-metrics', { timeout: 15000 }),
 
+  adminLlmMetrics: (): Promise<{
+    calls_total: number
+    tokens_total: number
+    by_phase: Record<string, { count: number; total_tokens: number; total_ms: number; avg_tokens: number; avg_ms: number }>
+    recent_calls: { timestamp: string; phase: string; method: string; provider: string; model: string; prompt_tokens: number; completion_tokens: number; total_tokens: number; duration_ms: number; status: string; caller: string }[]
+  }> => http.get('/admin/llm-metrics'),
+
+  adminToolMetrics: (): Promise<{
+    tools_total: number
+    calls_total: number
+    tools: { name: string; calls: number; success: number; fail: number; timeout: number; success_rate: number; avg_elapsed_ms: number }[]
+    recent_calls: { timestamp: string; tool_name: string; phase: string; success: boolean; elapsed_ms: number; timed_out: boolean }[]
+  }> => http.get('/admin/tool-metrics'),
+
   adminSetToolTimeout: (
     toolName: string,
     timeout: number,

@@ -22,6 +22,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from backend.api.deps import require_admin
 from backend.api.schemas import AdminResetPasswordRequest, AdminUpdateRoleRequest
+from backend.metrics.collector import get_collector
 
 logger = logging.getLogger(__name__)
 
@@ -493,6 +494,16 @@ async def get_system_metrics(_admin=Depends(require_admin)):
         docker_info = {"containers": [], "total_running": 0, "total_stopped": 0, "error": "Docker 采集超时（>10s），daemon 响应缓慢或容器过多"}
 
     return {"host": host_info, "docker": docker_info}
+
+
+@router.get("/llm-metrics")
+async def get_llm_metrics(_admin=Depends(require_admin)):
+    return get_collector().get_llm_summary()
+
+
+@router.get("/tool-metrics")
+async def get_tool_metrics(_admin=Depends(require_admin)):
+    return get_collector().get_tool_summary()
 
 
 @router.post("/docker/{container_name}/{action}")

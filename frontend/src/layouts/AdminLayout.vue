@@ -193,6 +193,7 @@ const navGroups = [
     title: '运维工具',
     items: [
       { path: '/admin/terminal', label: 'SSH 终端', sublabel: 'Terminal', icon: Monitor },
+      { path: '/admin/metrics', label: '性能指标', sublabel: 'Metrics', icon: Odometer },
     ],
   },
 ]

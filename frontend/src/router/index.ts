@@ -43,6 +43,7 @@ const routes: RouteRecordRaw[] = [
       { path: 'settings', name: 'admin-settings', component: () => import('@/views/admin/AdminSettings.vue') },
       { path: 'audit', name: 'admin-audit', component: () => import('@/views/admin/AdminAudit.vue') },
       { path: 'terminal', name: 'admin-terminal', component: () => import('@/views/admin/AdminTerminal.vue') },
+      { path: 'metrics', name: 'admin-metrics', component: () => import('@/views/admin/AdminMetrics.vue') },
     ],
   },
   {
