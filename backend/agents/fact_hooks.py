@@ -43,9 +43,6 @@ def _safe_fact_key(fact_type: str, value: Any) -> str:
 
 
 def _project_confirmed_from_task_facts(task_facts: dict[str, TaskFact]) -> dict[str, Any]:
-    # 标量字段（lfi_param/lfi_depth/lfi_style/service_ssh_port）采用"首值优先"语义：
-    # 一旦某条事实被首次确认，后续不同值的同类事实不应覆盖它，避免假阳性观测污染。
-    # 因此按 first_seen_at 升序遍历，标量字段使用 setdefault；列表字段仍保持 union/dedup。
     confirmed: dict[str, Any] = {"lfi": {}, "services": {}, "creds": []}
     sorted_facts = sorted(
         (task_facts or {}).values(),
@@ -86,7 +83,6 @@ def normalize_and_dedupe_state_facts(state: PentestState, source_node: str = "")
     """Normalize task_facts and backfill compatibility projections."""
     task_facts: dict[str, TaskFact] = dict(state.task_facts or {})
     if not task_facts:
-        # bootstrap from legacy confirmed_facts fields
         lfi = (state.confirmed_facts or {}).get("lfi") or {}
         services = (state.confirmed_facts or {}).get("services") or {}
         creds = (state.confirmed_facts or {}).get("creds") or []
@@ -253,7 +249,6 @@ def extract_facts(result: ExploitResult, finding: VulnFinding) -> dict[str, Any]
     return facts
 
 
-# ── Fact sink ─────────────────────────────────────────────
 
 _LFI_REPROBE_PATTERNS = [
     re.compile(r"for\s+\w+\s+in\s+\$?\(?\s*seq\s+\d+\s+\d+", re.IGNORECASE),
@@ -321,12 +316,8 @@ def make_fact_sink(state: PentestState):
                                 first_seen_at=now,
                                 last_seen_at=now,
                             )
-                            # 新凭据 → 顺手写入 attack_graph + pending_seeds
                             try:
                                 cred_dict = c if isinstance(c, dict) else {"value": str(c)}
-                                # credential_store 是 replan snapshot 的主观察点；
-                                # 只写 task_facts/confirmed_facts 会导致 emit_replan_signals
-                                # 看不到 +credential，从而无法回流 vuln_scan。
                                 if cred_dict not in (state.credential_store or []):
                                     state.credential_store.append(cred_dict)
                                 attach_credential_to_graph(
@@ -408,7 +399,6 @@ def make_fact_sink(state: PentestState):
     return _sink
 
 
-# ── service-info extraction hook ──────────────────────────
 
 def _merge_facts(dst: dict[str, Any], src: dict[str, Any]) -> dict[str, Any]:
     """Shallow merge with list-union semantics. ``dst`` is mutated and returned."""
@@ -661,7 +651,6 @@ def apply_service_info_extraction(
     if "php" in runtime_facts:
         state.php_runtime = runtime_facts["php"]
 
-    # 同步写入 attack_graph：服务节点 + finding 节点
     try:
         host = ""
         if "://" in (base_url or ""):
@@ -670,7 +659,6 @@ def apply_service_info_extraction(
             attach_service_to_graph(
                 state, host, port, service="http", discovered_by="intel_harvest",
             )
-        # 把刚 emit 的高价值 findings 也挂上
         for f in state.findings[-10:]:
             if f.tool in ("intel_harvest", "phpinfo_parser", "apache_status_parser",
                           "nginx_stub_parser", "tomcat_status_parser",
@@ -690,9 +678,6 @@ def apply_phpinfo_extraction(
     apply_service_info_extraction(state, harvested, base_url, port)
 
 
-# ── Phase 幂等 / 反馈循环辅助工具 ─────────────────────────
-# 核心思想：让上游阶段（recon/surface_enum/vuln_scan/...）可以被反复进入，
-# 但相同输入跳过、新增输入只跑增量。配合 emit_replan_signals 形成完整循环。
 
 import json as _json
 
@@ -719,7 +704,6 @@ def push_pending_seed(state: PentestState, bucket: str, value: Any) -> None:
             "hosts": [], "ports": [], "web_paths": [], "credentials": [],
         }
     seeds = state.pending_seeds.setdefault(bucket, [])
-    # 简单去重（dict / list 用 json 序列化比较）
     try:
         marker = _json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
     except Exception:
@@ -788,7 +772,7 @@ def snapshot_facts(state: PentestState) -> dict[str, Any]:
     for h in (state.subdomains or []):
         if h:
             hosts.add(h)
-    open_ports = [getattr(p, "port", None) or (p.get("port") if isinstance(p, dict) else None) for p in (state.open_ports or [])]
+    open_ports = [getattr(p, "port", None) or (p.get("port") if isinstance(p, dict) else None) for p in (state.open_ports or []) if getattr(p, "state", "open") == "open"]
     open_ports = [p for p in open_ports if p]
     return {
         "credentials": [_json.dumps(c, sort_keys=True, default=str) if isinstance(c, (dict, list)) else str(c) for c in creds],
@@ -873,7 +857,6 @@ def consume_replan_signal(state: PentestState, key: str) -> None:
         state.replan_signals = signals
 
 
-# ── AttackGraph 写入辅助 ──────────────────────────────────
 
 def _ag_host_id(host: str) -> str:
     return f"host:{host}"

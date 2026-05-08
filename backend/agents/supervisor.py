@@ -27,7 +27,6 @@ from backend.agents.models import PentestState, TaskStatus
 logger = logging.getLogger(__name__)
 
 
-# 所有可被 supervisor 调度的"阶段节点"。报表节点是终态，不参与调度集合。
 SUPERVISOR_PHASES: list[str] = [
     "recon", "surface_enum", "intel_harvest", "vuln_scan",
     "exploit_decision", "human_approval", "foothold_attempt",
@@ -36,9 +35,6 @@ SUPERVISOR_PHASES: list[str] = [
 ]
 
 
-# ─────────────────────────────────────────────────────────────
-# 决策核心
-# ─────────────────────────────────────────────────────────────
 
 def _has_visited(state: PentestState, phase: str) -> bool:
     return int((state.phase_visit_count or {}).get(phase, 0)) > 0
@@ -109,7 +105,6 @@ def _rule_decide(state: PentestState) -> Optional[dict[str, Any]]:
     Returns a dict ``{"next": phase, "reason": "...", "rule": "..."}`` or
     ``None`` to defer to the LLM.
     """
-    # ── 0. 收敛保护 ────────────────────────────────────────────
     if state.status == TaskStatus.FAILED:
         return {"next": "report", "reason": "task already failed", "rule": "guard.failed"}
     if state.supervisor_round >= state.supervisor_round_limit:
@@ -117,12 +112,8 @@ def _rule_decide(state: PentestState) -> Optional[dict[str, Any]]:
     if state.objective_status.get("report_ready"):
         return {"next": "report", "reason": "objective_collect already produced report_ready", "rule": "guard.report_ready"}
 
-    # ── 1. 反馈循环 signals 优先于阶段递推 ──────────────────────
     sig = state.replan_signals or {}
 
-    # 1.0a 操作员重规划计划(最高优先级): 如果 Operator Replanner 已经把
-    # 用户的指令翻译成 OperatorPlan, 这里直接落地到路由, 不必再走 LLM
-    # 兜底——plan.next_phase 已经在 ALLOWED_PHASES 白名单内。
     plan = getattr(state, "operator_plan", None)
     if plan is not None and not _is_plan_consumed_by(plan, "supervisor"):
         nxt = (plan.next_phase or "").strip()
@@ -150,13 +141,9 @@ def _rule_decide(state: PentestState) -> Optional[dict[str, Any]]:
                 "rule": "plan.target_phases",
             }
 
-    # 1.0b 操作员实时意图(次优先级): 没有结构化 plan 时退回到 LLM 兜底,
-    # _llm_decide 会读取 user_messages / pending_user_prompt 决定下一阶段。
     if int(sig.get("operator_intent", 0)) > 0:
         return None
 
-    # 1.1 当已有可利用 finding 且尚未尝试 foothold 时，不允许 replan
-    #     信号把流程拉回前置侦察阶段，优先推进利用链路。
     _exploit_pending = (
         _has_exploitable(state) and not _has_visited(state, "foothold_attempt")
     )
@@ -180,9 +167,6 @@ def _rule_decide(state: PentestState) -> Optional[dict[str, Any]]:
     if sig.get("re_intel_harvest_for_paths") and _under_cap(state, "intel_harvest"):
         return {"next": "intel_harvest", "reason": "new intel paths to harvest", "rule": "replan.re_intel_harvest_for_paths"}
 
-    # ── 2. 已拿 shell 时优先进入立足后链路 ─────────────────────
-    # supervisor 可能从 checkpoint / 测试构造状态恢复，此时 got_shell=True
-    # 本身就是强事实，不应因为 phase_visit_count 缺少 recon 而倒回侦察。
     if state.got_shell:
         if not _has_visited(state, "post_foothold_enum"):
             return {"next": "post_foothold_enum", "reason": "拿到 shell，开始立足后枚举", "rule": "phase.post_enum"}
@@ -195,7 +179,6 @@ def _rule_decide(state: PentestState) -> Optional[dict[str, Any]]:
             if not _has_visited(state, "objective_collect"):
                 return {"next": "objective_collect", "reason": "进入目标收集", "rule": "phase.objective"}
 
-    # ── 3. 阶段递推（按"未访问且前置条件满足"的顺序） ─────────────
     if not _has_visited(state, "recon"):
         return {"next": "recon", "reason": "first run", "rule": "phase.recon_first"}
 
@@ -213,7 +196,6 @@ def _rule_decide(state: PentestState) -> Optional[dict[str, Any]]:
     if _has_exploitable(state) and not _has_visited(state, "exploit_decision"):
         return {"next": "exploit_decision", "reason": "exploitable findings → decide", "rule": "phase.exploit_decision"}
 
-    # ── 4. 利用阶段 ────────────────────────────────────────────
     if _has_exploitable(state) and not state.approved_once and not state.auto_approve and not state.approved:
         return {"next": "human_approval", "reason": "需要人工授权", "rule": "phase.human_approval"}
 
@@ -223,11 +205,9 @@ def _rule_decide(state: PentestState) -> Optional[dict[str, Any]]:
         if not state.got_shell and state.foothold_status == "file_read" and state.secondary_attack_count < state.max_secondary_attacks:
             return {"next": "secondary_attack", "reason": "file_read 已确认，继续尝试 RCE", "rule": "phase.secondary"}
 
-    # ── 5. 兜底：连续多轮无新事实 → 直接出报告 ─────────────────
     if _no_new_facts(state, k=3):
         return {"next": "report", "reason": "连续 3 轮无新 fact，强制收敛", "rule": "guard.no_new_facts"}
 
-    # ── 6. 默认：进入 objective_collect 收尾 ───────────────────
     if not _has_visited(state, "objective_collect"):
         return {"next": "objective_collect", "reason": "收尾路径", "rule": "phase.objective_default"}
 
@@ -279,9 +259,6 @@ async def _llm_decide(state: PentestState) -> Optional[dict[str, Any]]:
         return {"next": "report", "reason": f"llm error: {exc}", "rule": "llm.error"}
 
 
-# ─────────────────────────────────────────────────────────────
-# Supervisor 节点 + 路由函数
-# ─────────────────────────────────────────────────────────────
 
 async def node_supervisor(state: PentestState) -> PentestState:
     """Pure decider node: 决定下一阶段并写入 ``state.next_phase``。"""
@@ -302,14 +279,9 @@ async def node_supervisor(state: PentestState) -> PentestState:
     if decision is None:
         decision = {"next": "report", "reason": "fallback", "rule": "guard.no_decision"}
 
-    # 标记 operator_plan 已被 supervisor 消费, 防止后续每一轮 supervisor
-    # 都按同一份 plan 强制路由制造死循环。
     if plan_pending:
         _mark_plan_consumed_by(state.operator_plan, "supervisor")
 
-    # 操作员意图已经由 LLM 兜底消化, 清掉信号 + 摘除 interrupt registry 里
-    # 那条记录, 避免下一轮反复回到 LLM 路径制造死循环。pending_user_prompt
-    # 故意不清空 — 它是 sticky 指令, 在新指令写入前一直对后续节点有效。
     if operator_intent_pending:
         signals = dict(state.replan_signals or {})
         signals.pop("operator_intent", None)

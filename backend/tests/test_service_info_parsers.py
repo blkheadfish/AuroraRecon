@@ -22,7 +22,6 @@ from backend.tools.parsers import (
 )
 
 
-# ── Apache ──────────────────────────────────────────────────────
 
 APACHE_HTML = (
     '<html><title>Apache Status</title>\n'
@@ -77,7 +76,6 @@ def test_apache_is_apache_content_negative():
     assert A.is_apache_status_content("<h1>nothing</h1>") is False
 
 
-# ── Nginx ───────────────────────────────────────────────────────
 
 NGINX_STUB = (
     "Active connections: 291\n"
@@ -110,7 +108,6 @@ def test_nginx_signature_from_welcome_page():
     assert N.is_nginx_status_content(html) is True
 
 
-# ── Tomcat ──────────────────────────────────────────────────────
 
 TOMCAT_MANAGER = (
     '<html><title>/manager</title>\n'
@@ -151,7 +148,6 @@ def test_tomcat_error_page_version_leak():
     assert facts["tomcat_version"].startswith("9.0.30")
 
 
-# ── Spring Actuator ─────────────────────────────────────────────
 
 ACTUATOR_ENV = (
     '{"activeProfiles":["prod"],"propertySources":[{'
@@ -208,7 +204,6 @@ def test_actuator_merge_and_surface():
     assert surface["env_exposed"] is True
 
 
-# ── .env ────────────────────────────────────────────────────────
 
 ENV_LARAVEL = (
     "APP_NAME=Laravel\n"
@@ -250,7 +245,6 @@ def test_env_file_sniff_by_content_shape():
     assert E.is_env_file_content(body, path="/config/dotenv") is True
 
 
-# ── Dispatcher ──────────────────────────────────────────────────
 
 def test_dispatcher_routes_all_kinds():
     harvested = [
@@ -262,7 +256,6 @@ def test_dispatcher_routes_all_kinds():
     ]
     matches = D.parse_harvested(harvested)
     kinds = [m.kind for m in matches]
-    # All five must appear, order does not matter
     assert set(kinds) == {"apache", "nginx", "tomcat", "spring", "env_file"}
 
 

@@ -13,8 +13,7 @@ api/main.py —— 向后兼容入口
 本文件仅做 re-export，保证 `uvicorn backend.api.main:app` 和
 `from backend.api.main import app` 等旧引用继续工作。
 """
-from backend.api.app import app  # noqa: F401
+from backend.api.app import app
 
-# 供 exploit_agent / post_agent 调用（旧代码路径兼容）
-from backend.api.services.task_runner import is_msf_available  # noqa: F401
-from backend.api.services.task_runner import get_orchestrator  # noqa: F401
+from backend.api.services.task_runner import is_msf_available
+from backend.api.services.task_runner import get_orchestrator

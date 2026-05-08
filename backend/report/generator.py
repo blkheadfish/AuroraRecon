@@ -21,21 +21,17 @@ REPORT_BLOCK_MAX_CHARS = max(1200, int(os.getenv("REPORT_BLOCK_MAX_CHARS", "1200
 
 def _extract_phpinfo_fields(body: str) -> str:
     """从 phpinfo() 输出中提取安全评估相关的关键字段，忽略冗余 HTML。"""
-    # 识别 phpinfo 页面特征头部
     version_match = re.search(r'<h1 class="p">PHP Version ([\d.]+(?:[-\w.]*)?)</h1>', body)
     if not version_match:
-        return body  # 不是 phpinfo 输出，原样返回
+        return body
 
     php_version = version_match.group(1)
 
-    # 提取 phpinfo 表格中的关键字段
-    # 匹配 <tr><td class="e">Key</td><td class="v">Value</td></tr>
     tr_pattern = re.compile(
         r'<tr>\s*<td class="e">\s*(.*?)\s*</td>\s*<td class="v">\s*(.*?)\s*</td>\s*</tr>',
         re.DOTALL,
     )
 
-    # 安全评估关键字段白名单
     key_fields = {
         "System", "Server API", "PHP Version", "Build Date",
         "Virtual Directory Support",
@@ -64,15 +60,12 @@ def _extract_phpinfo_fields(body: str) -> str:
         value_raw = match.group(2)
 
         if key in key_fields:
-            # 清理值中的 HTML 标签和多余空白
             value = re.sub(r'<[^>]+>', '', value_raw)
             value = re.sub(r'\s+', ' ', value).strip()
-            # 将长文本截断
             if len(value) > 200:
                 value = value[:200] + "..."
             extracted.append(f"{key}: {value}")
 
-    # 如果没有提取到关键字段，回退到通用 HTML 清洗
     if len(extracted) <= 1:
         return _html_to_text(body)
 
@@ -81,19 +74,13 @@ def _extract_phpinfo_fields(body: str) -> str:
 
 def _html_to_text(body: str) -> str:
     """将通用 HTML 响应体转为可读的纯文本摘要。"""
-    # 移除 style/script 块
     text = re.sub(r"<style[^>]*>.*?</style>", "", body, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"<script[^>]*>.*?</script>", "", text, flags=re.DOTALL | re.IGNORECASE)
-    # 移除 base64 内联图片
     text = re.sub(r'src="data:image/[^"]{100,}"', '[image removed]', text)
-    # 将常见块级标签替换为换行
     for tag in ("</?br[^>]*>", "</p>", "</div>", "</li>", "</tr>", "</h[1-6]>"):
         text = re.sub(tag, "\n", text, flags=re.IGNORECASE)
-    # 移除其余 HTML 标签
     text = re.sub(r"<[^>]+>", " ", text)
-    # 解码常见 HTML 实体
     text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"').replace("&#39;", "'")
-    # 合并多余空白
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = re.sub(r"^[ \t]+", "", text, flags=re.MULTILINE)
@@ -366,7 +353,6 @@ def _filter_phase_log(phase_log: list) -> list:
     filtered: list = []
     for entry in phase_log:
         text = str(entry)
-        # 过滤掉 [stdout] 和 [stderr] 标签的纯输出行
         if "[stdout]" in text or "[stderr]" in text:
             continue
         filtered.append(entry)
@@ -411,7 +397,6 @@ def normalize_markdown_whitespace(content: str) -> str:
     return "\n".join(output) + "\n"
 
 
-# 模板路径（相对于本文件）
 _TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
 _TEMPLATE_FILE = os.environ.get("REPORT_TEMPLATE", os.path.join(_TEMPLATE_DIR, "report.md.j2"))
 
@@ -436,7 +421,6 @@ _FALLBACK_TEMPLATE = """# 渗透测试报告
 | **最终权限** | {{ safe_val(state.privilege_level, "未获得") }} |
 | **授权说明** | {{ safe_val(state.scope_note, "未填写") }} |
 
-## 一、执行摘要
 
 {% set critical_count = state.findings | selectattr('severity','eq','critical') | list | length %}
 {% set high_count = state.findings | selectattr('severity','eq','high') | list | length %}
@@ -456,7 +440,6 @@ _FALLBACK_TEMPLATE = """# 渗透测试报告
 > ❌ 本次测试未获得目标交互式访问权限。
 {% endif %}
 
-### 攻链状态
 
 | 字段 | 值 |
 |------|-----|
@@ -489,9 +472,7 @@ _FALLBACK_TEMPLATE = """# 渗透测试报告
 ```
 {% endif %}
 
-## 二、侦察结果
 
-### 开放端口
 
 | 端口 | 协议 | 服务 | 版本 |
 |------|------|------|------|
@@ -502,20 +483,17 @@ _FALLBACK_TEMPLATE = """# 渗透测试报告
 {% endfor %}
 
 {% if state.web_paths %}
-### Web 路径发现
 {% for path in state.web_paths %}
 - `{{ path }}`
 {% endfor %}
 {% endif %}
 
 {% if state.subdomains %}
-### 子域名发现
 {% for sub in state.subdomains %}
 - `{{ sub }}`
 {% endfor %}
 {% endif %}
 
-## 三、漏洞发现
 
 {% set real_vulns = [] %}
 {% set info_items = [] %}
@@ -528,9 +506,7 @@ _FALLBACK_TEMPLATE = """# 渗透测试报告
 {% endfor %}
 
 {% if real_vulns %}
-### 可利用漏洞
 {% for f in real_vulns %}
-#### {{ loop.index }}. {{ f.name }}
 
 | 属性 | 值 |
 |------|-----|
@@ -565,7 +541,6 @@ _FALLBACK_TEMPLATE = """# 渗透测试报告
 {% endif %}
 
 {% if info_items %}
-### 信息类发现
 <details>
 <summary>共 {{ info_items | length }} 项信息类发现（点击展开）</summary>
 
@@ -575,10 +550,8 @@ _FALLBACK_TEMPLATE = """# 渗透测试报告
 </details>
 {% endif %}
 
-## 四、漏洞利用结果
 
 {% if state.exploit_results %}
-### 利用结果摘要
 
 | 漏洞 ID | 状态 | Shell 类型 | 命令数 | 结论摘要 |
 |---------|------|------------|--------|----------|
@@ -587,7 +560,6 @@ _FALLBACK_TEMPLATE = """# 渗透测试报告
 {% endfor %}
 
 {% for r in state.exploit_results %}
-### {{ loop.index }}. 漏洞 `{{ r.vuln_id }}`
 
 | 属性 | 值 |
 |------|-----|
@@ -596,12 +568,10 @@ _FALLBACK_TEMPLATE = """# 渗透测试报告
 
 {% set rec_list = r.command_records if r.command_records else r.command_results %}
 {% if rec_list %}
-#### 命令执行过程（{{ rec_list | length }} 条）
 {% set prev_stdout = namespace(value='') %}
 {% for rec in rec_list %}
 {% set current_stdout = rec.stdout if rec.stdout else '' %}
 {% set is_duplicate = (current_stdout == prev_stdout.value and current_stdout and current_stdout | length > 500) %}
-##### 第 {{ normalize_round(rec.round, loop.index) }} 轮迭代{% if rec.purpose %} — {{ rec.purpose }}{% endif %}{% if is_duplicate %} *(同上){% endif %}
 
 | 属性 | 值 |
 |------|-----|
@@ -645,7 +615,6 @@ _FALLBACK_TEMPLATE = """# 渗透测试报告
 ---
 {% endfor %}
 {% elif r.commands_run %}
-#### 执行命令（{{ r.commands_run | length }} 条）
 {% for cmd in r.commands_run %}
 **第 {{ loop.index }} 条命令：**
 
@@ -656,7 +625,6 @@ _FALLBACK_TEMPLATE = """# 渗透测试报告
 {% endif %}
 
 {% if r.evidence %}
-#### 最终证据
 
 {% set sections = split_evidence(r.evidence) %}
 {% for sec in sections %}
@@ -673,7 +641,6 @@ _FALLBACK_TEMPLATE = """# 渗透测试报告
 无利用尝试或所有漏洞不满足利用条件。
 {% endif %}
 
-## 五、后渗透发现
 
 {% if state.post_findings and state.post_findings.get('findings') %}
 {% for k, v in state.post_findings.get('findings', {}).items() %}
@@ -686,7 +653,6 @@ _FALLBACK_TEMPLATE = """# 渗透测试报告
 无后渗透数据。
 {% endif %}
 
-## 六、修复建议
 
 {% set remediation_items = [] %}
 {% for f in state.findings %}
@@ -697,7 +663,6 @@ _FALLBACK_TEMPLATE = """# 渗透测试报告
 
 {% if remediation_items %}
 {% for f in remediation_items %}
-### {{ loop.index }}. {{ f.name }}
 **优先级：** {{ sev_emoji(f.severity) }} {{ sev_label(f.severity) }}
 
 {% if f.remediation %}
@@ -711,7 +676,6 @@ _FALLBACK_TEMPLATE = """# 渗透测试报告
 当前未发现需要立即处置的高/中危漏洞，建议保持基线巡检与补丁更新节奏。
 {% endif %}
 
-## 七、测试过程日志（关键事件摘要）
 
 ```text
 {% for entry in (state.filtered_log[-200:] if state.filtered_log else (state.phase_log[-200:] if state.phase_log else [])) %}
@@ -719,7 +683,6 @@ _FALLBACK_TEMPLATE = """# 渗透测试报告
 {% endfor %}
 ```
 
-## 八、风险评级标准
 
 本报告采用 CVSS v3.1 标准进行漏洞严重程度评级：
 
@@ -731,7 +694,6 @@ _FALLBACK_TEMPLATE = """# 渗透测试报告
 | 低危 (Low) | 0.1 - 3.9 | 几乎无实际危害、或利用条件极其苛刻 |
 | 信息 (Info) | 0 | 不构成直接安全风险 |
 
-## 九、测试限制与免责声明
 
 1. 本次测试在授权范围内进行，未对超出范围的系统进行任何探测。
 2. 测试期间未进行拒绝服务（DoS）攻击、社会工程学攻击等非授权方法。
@@ -739,7 +701,6 @@ _FALLBACK_TEMPLATE = """# 渗透测试报告
 4. 修复建议基于自动化分析生成，建议结合实际情况由安全工程师审阅后实施。
 5. 本报告仅供授权方内部使用，未经授权不得向第三方披露。
 
-## 十、测试方法论
 
 1. 信息收集：端口发现、服务识别、目录/路径枚举
 2. 漏洞扫描：模板/签名检测 + 证据回收

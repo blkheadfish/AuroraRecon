@@ -87,6 +87,11 @@ COPY shiro_exploit.py /opt/shiro_exploit.py
 COPY shiro_webshell_brute.sh /opt/shiro_webshell_brute.sh
 RUN chmod +x /opt/jndi_fastjson.sh /opt/bcel_fastjson.py /opt/shiro_exploit.py /opt/shiro_webshell_brute.sh
 
+# ---------- Skill 脚本（/opt/skills/）----------
+# 通过 fix_skills.sh 注入：bash docker/toolbox/fix_skills.sh
+# 每个 skill 的 scripts/ 通过 {skill_dir}/scripts/xxx 引用
+# {skill_dir} 在容器内由 SKILLS_BASE_DIR=/opt/skills 环境变量控制
+
 # ---------- Metasploit（包较大，加重试）----------
 RUN apt-get update \
     && for i in 1 2 3; do \

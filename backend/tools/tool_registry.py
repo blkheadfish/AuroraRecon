@@ -32,12 +32,12 @@ DEFINITIONS_DIR = Path(__file__).parent / "definitions"
 class ToolDefinition:
     """单个工具的定义"""
     name: str
-    executor: str = "container"          # local | container | remote
-    command: str = ""                     # 实际执行的命令（默认=name）
-    category: str = "general"            # recon | vuln_scan | exploit | post_exploit | general
-    timeout: int = 120                    # 默认超时秒数
+    executor: str = "container"
+    command: str = ""
+    category: str = "general"
+    timeout: int = 120
     description: str = ""
-    requires_ports: list[int] = field(default_factory=list)  # 多人时需要动态分配的端口
+    requires_ports: list[int] = field(default_factory=list)
 
 
 class ToolRegistry:
@@ -45,9 +45,9 @@ class ToolRegistry:
     工具注册表。
 
     用法:
-        registry = ToolRegistry()         # 自动从 definitions/ 加载
-        tool = registry.get("nmap")       # 查询工具定义
-        tools = registry.list_by_category("recon")  # 按分类查询
+        registry = ToolRegistry()
+        tool = registry.get("nmap")
+        tools = registry.list_by_category("recon")
     """
 
     def __init__(self, auto_load: bool = True):
@@ -114,7 +114,6 @@ class ToolRegistry:
             counts[t.category] = counts.get(t.category, 0) + 1
         return counts
 
-    # ── Function Calling Schema ────────────────────────
 
     def to_openai_tools(
         self,
@@ -146,7 +145,6 @@ class ToolRegistry:
         cat_filter = set(categories) if categories else None
         tools: list[dict] = []
 
-        # 出现频次高的工具优先（避免 schema 超长）
         priority_names = {
             "curl", "wget", "nmap", "gobuster", "ffuf", "sqlmap", "nuclei",
             "hydra", "ncrack", "whatweb", "httpx", "wpscan", "msfconsole",
@@ -177,7 +175,6 @@ class ToolRegistry:
     @staticmethod
     def _tool_to_openai_function(tool: ToolDefinition) -> dict:
         """单个 ToolDefinition → OpenAI function schema。"""
-        # OpenAI 要求 function name 满足 ^[a-zA-Z0-9_-]+$，长度 ≤ 64
         name = re.sub(r"[^A-Za-z0-9_\-]", "_", tool.name)[:64]
         desc = tool.description or f"{tool.name} command"
         return {

@@ -50,9 +50,6 @@ def log_poison_skill(all_skills: list[Skill]) -> Skill:
     pytest.fail(f"Skill {LOG_POISON_SKILL_ID} not found in loaded skills")
 
 
-# ─────────────────────────────────────────────────────────────────
-# D1 · log_poisoning probes
-# ─────────────────────────────────────────────────────────────────
 
 def test_log_poison_has_check_ssh_port(log_poison_skill: Skill) -> None:
     probes_by_id = {p.id: p for p in log_poison_skill.probes}
@@ -90,9 +87,6 @@ def test_log_poison_has_canary_probes(log_poison_skill: Skill) -> None:
         )
 
 
-# ─────────────────────────────────────────────────────────────────
-# D2 · log_poisoning exploit paths gated by canary flags
-# ─────────────────────────────────────────────────────────────────
 
 def test_log_poison_paths_by_vector(log_poison_skill: Skill) -> None:
     paths_by_id = {p.path_id: p for p in log_poison_skill.exploit_paths}
@@ -139,9 +133,6 @@ def test_log_poison_paths_have_deliver_and_trigger_steps(log_poison_skill: Skill
         assert has_trigger, f"{path_id} missing trigger step; got {step_ids}"
 
 
-# ─────────────────────────────────────────────────────────────────
-# D3 · lfi_rfi_exploit no longer contains log poisoning artifacts
-# ─────────────────────────────────────────────────────────────────
 
 def test_lfi_skill_has_no_log_poison_probes(lfi_skill: Skill) -> None:
     removed_probes = {"check_ssh_port", "probe_webshell_lang"}
@@ -172,9 +163,6 @@ def test_lfi_paths_not_gated_by_webshell_lang(lfi_skill: Skill) -> None:
             )
 
 
-# ─────────────────────────────────────────────────────────────────
-# D4 · engine._exploit_level_map coverage
-# ─────────────────────────────────────────────────────────────────
 
 def test_engine_exploit_level_map_covers_vector_shell_types() -> None:
     """engine.py's _exploit_level_map must cover the new vector-based shell_types."""

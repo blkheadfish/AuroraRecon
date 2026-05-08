@@ -41,8 +41,6 @@ logger = logging.getLogger(__name__)
 
 TOOLBOX_IMAGE  = os.getenv("TOOLBOX_IMAGE", "pentest-toolbox:latest")
 DOCKER_NETWORK = os.getenv("DOCKER_NETWORK", "pentest_net")
-# 工具容器网络：默认 host，让工具用宿主机 IP 出去
-# 解决 RemoteAddrValve 等基于源 IP 的访问控制
 TOOLBOX_NETWORK = os.getenv("TOOLBOX_NETWORK", "host")
 USE_HOST_TOOLS = os.getenv("USE_HOST_TOOLS", "false").lower() == "true"
 DATA_VOLUME    = os.getenv("DATA_VOLUME", "/tmp/pentest_data")
@@ -53,11 +51,6 @@ RecordCallback = Optional[Callable[[dict], Awaitable[None]]]
 DecisionCallback = Optional[Callable[[dict], Awaitable[None]]]
 
 
-# ── 工具名展示推断 ─────────────────────────────────────────
-# ``run_script()`` 把 ``tool`` 设成 ``/bin/bash``,真实命令在 script 里。
-# 直接把 ``/bin/bash`` 透传到前端工具链非常阴间,这里在 executor 层就把
-# 友好名(``curl``/``nmap``/``nuclei``/``script`` 等)算好,日志和 record
-# 里同时带上 ``display_tool``,避免每个调用方/前端各自再写 infer 逻辑。
 _DISPLAY_SHELL_NAMES = frozenset({"/bin/bash", "/bin/sh", "bash", "sh", "/bin/zsh", "zsh"})
 
 import re as _display_re
@@ -108,21 +101,18 @@ class ExecuteResult:
     elapsed:   float
     command:   str = ""
     tool_name: str = ""
-    backend:   str = ""   # "local" | "container-exec" | "container-run" | "remote"
+    backend:   str = ""
 
 
-# ─────────────────────────────────────────────────────────────
-# 持久化容器管理（有状态工具专用，阶段二多人模式扩展点）
-# ─────────────────────────────────────────────────────────────
 
 class TaskContainerManager:
     """
     为每个 task_id 维护一个长活 toolbox 容器。
 
     单人阶段用法（orchestrator 层调用）：
-        await TaskContainerManager.start(task_id)   # node_recon 前
-        ...                                          # agent 调用中自动使用
-        await TaskContainerManager.stop(task_id)    # node_report 后
+        await TaskContainerManager.start(task_id)
+        ...
+        await TaskContainerManager.stop(task_id)
 
     阶段二多人扩展：
         - 改成按 user_id 或 team_id 分配容器
@@ -130,7 +120,7 @@ class TaskContainerManager:
         - 接口 start/stop/get_container 不变，上层零改动
     """
 
-    _containers: dict[str, str] = {}   # task_id → container_name
+    _containers: dict[str, str] = {}
     _lock = asyncio.Lock()
 
     @classmethod
@@ -148,7 +138,7 @@ class TaskContainerManager:
                 "--rm",
                 "-v", f"{DATA_VOLUME}:/data",
                 "-v", f"{REPORTS_DIR}:/reports",
-                "--privileged",          # 与 docker run --rm 保持一致，nmap 需要
+                "--privileged",
                 "--cap-add", "NET_RAW",
                 "--cap-add", "NET_ADMIN",
                 TOOLBOX_IMAGE,
@@ -233,9 +223,6 @@ class TaskContainerManager:
         return len(orphans)
 
 
-# ─────────────────────────────────────────────────────────────
-# 远程后端预留（阶段二：SSH 到独立攻击机）
-# ─────────────────────────────────────────────────────────────
 
 class _RemoteBackendStub:
     """
@@ -256,9 +243,6 @@ class _RemoteBackendStub:
 _remote_stub = _RemoteBackendStub()
 
 
-# ─────────────────────────────────────────────────────────────
-# 主调度器
-# ─────────────────────────────────────────────────────────────
 
 class ToolExecutor:
     """
@@ -275,7 +259,7 @@ class ToolExecutor:
             tool="nmap",
             args=["-sV", "-p", "80,443", "192.168.1.1"],
             timeout=120,
-            task_id=state.task_id,   # 可选，有状态工具需要
+            task_id=state.task_id,
         )
     """
 
@@ -309,15 +293,13 @@ class ToolExecutor:
         effective_timeout = timeout or tool_def.timeout
         effective_record_command = record_command or " ".join([tool_def.command, *args]).strip()
 
-        # ── 路由 ──────────────────────────────────────────
-        executor_type = tool_def.executor  # "local" | "container" | "remote"
+        executor_type = tool_def.executor
 
         if USE_HOST_TOOLS or executor_type == "local":
             cmd = [tool_def.command, *args]
             backend_label = "local"
 
         elif executor_type == "remote":
-            # 阶段二：转交 RemoteBackend
             try:
                 return await self._run_remote(
                     tool, args, timeout=effective_timeout,
@@ -338,9 +320,6 @@ class ToolExecutor:
                 )
 
         else:
-            # container 模式：有持久容器用 exec，否则用 run --rm
-            # 例外: publish_ports 需要端口映射，docker exec 不支持运行时加 -p，
-            #       必须走 docker run --rm 让容器创建时带上端口映射
             container_name = TaskContainerManager.get_container(task_id) if task_id else None
             if container_name and not publish_ports:
                 return await self._run_docker_exec(
@@ -364,7 +343,6 @@ class ToolExecutor:
                 cmd = self._build_docker_run_cmd(tool_def, args, env, workdir, publish_ports)
                 backend_label = "container-run"
 
-        # ── subprocess 执行（local 和 container-run 共用）──
         return await self._run_subprocess(
             tool, cmd, backend_label,
             timeout=effective_timeout,
@@ -379,7 +357,6 @@ class ToolExecutor:
             stream_callback=stream_callback,
         )
 
-    # ── docker exec（持久容器）────────────────────────────
 
     async def _run_docker_exec(
         self,
@@ -406,8 +383,6 @@ class ToolExecutor:
 
         import shlex
         import base64 as _b64
-        # docker exec 不自动加载镜像 ENV，需要显式注入 PATH
-        # 同时注入 LHOST（Shiro/JNDI 利用需要）
         kali_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         path_args = ["-e", f"PATH={kali_path}"]
         lhost_val = os.getenv("LHOST", "")
@@ -417,18 +392,12 @@ class ToolExecutor:
         cmd_parts = tool_def.command.split()
 
         if input_data:
-            # ── 关键修复: 不走 stdin，把脚本内容 base64 编码嵌入命令行 ──
-            # docker exec 的 stdin 管道在嵌套 bash 中不可靠（race condition
-            # 导致内层 bash 收到 EOF，0B 输出）。
-            # 方案: echo '<base64>' | base64 -d | /bin/bash -s
-            # base64 字符集 [A-Za-z0-9+/=] 不含 shell 特殊字符，安全嵌入。
             b64_script = _b64.b64encode(input_data.encode("utf-8")).decode("ascii")
             tool_cmd = shlex.join(cmd_parts + args)
             inner_cmd = f"echo '{b64_script}' | base64 -d | {tool_cmd}"
             cmd = (["docker", "exec", "-w", workdir]
                    + path_args + env_args
                    + [container_name, "bash", "-c", inner_cmd])
-            # stdin 数据已编码进命令行，不再通过 pipe 传递
             effective_input = None
         else:
             inner_cmd = shlex.join(cmd_parts + args)
@@ -441,7 +410,6 @@ class ToolExecutor:
             ["docker", "exec", "-w", workdir] + path_args + env_args + [container_name] + cmd_parts + args
         ).strip()
 
-        # 友好名(避免日志里出现 ``🔧 /bin/bash [exec→...]``)。
         display_tool = _infer_display_tool(
             tool, script_or_command=record_command or "", purpose=record_purpose or "",
         )
@@ -462,20 +430,17 @@ class ToolExecutor:
             record_runtime_command=record_runtime_command or runtime_display_cmd,
         )
 
-    # ── docker run --rm（临时容器）────────────────────────
 
     def _build_docker_run_cmd(self, tool_def, args, env, workdir, publish_ports=None) -> list[str]:
         docker_cmd = [
             "docker", "run", "--rm", "-i",
-            "--network", TOOLBOX_NETWORK,   # host 模式：工具用宿主机 IP 出去
+            "--network", TOOLBOX_NETWORK,
             "-w", workdir,
             "-v", f"{DATA_VOLUME}:/data",
             "-v", f"{REPORTS_DIR}:/reports",
             "--privileged",
         ]
-        # 端口映射（用于反连回调，如 Shiro 利用）
         if publish_ports:
-            # host 网络模式下 -p 会被 Docker 忽略并打印 warning，直接跳过映射参数。
             if TOOLBOX_NETWORK == "host":
                 logger.info(
                     f"[Executor] TOOLBOX_NETWORK=host，跳过 publish_ports={publish_ports} 的 -p 参数"
@@ -494,7 +459,6 @@ class ToolExecutor:
         docker_cmd.extend(args)
         return docker_cmd
 
-    # ── remote 后端（阶段二）─────────────────────────────
 
     async def _run_remote(
         self,
@@ -515,7 +479,6 @@ class ToolExecutor:
     ):
         await _remote_stub.execute(args, timeout=timeout, env=env, workdir=workdir, task_id=task_id)
 
-    # ── 通用 subprocess 执行 ──────────────────────────────
 
     async def _run_subprocess(
         self,
@@ -535,9 +498,6 @@ class ToolExecutor:
         stream_callback=None,
     ) -> ExecuteResult:
         cmd_display = " ".join(cmd)
-        # 友好工具名: 让 phase_log 的 ``执行 {display_tool} [{backend}]`` 直接被
-        # state.py 的 TOOL_START_RE 抓到正确的工具名,前端工具链就不会再出现
-        # 一片 ``/bin/bash``。tool 仍按原值落库,后续按 tool 维度做统计仍然有效。
         display_tool = _infer_display_tool(
             tool, script_or_command=record_command or "", purpose=record_purpose or "",
         )
@@ -550,11 +510,6 @@ class ToolExecutor:
 
         start = time.monotonic()
         try:
-            # 只要存在 log_callback 或 stream_callback,就走逐行 readline 模式,
-            # 让 feroxbuster / gobuster 等长时间扫描工具的每一行输出都能即时
-            # 通过 log_callback → state.log() → EventBus 推到前端 Log Panel,
-            # 而不是等 proc.communicate() 整个进程结束才一次性涌出。
-            # input_data 路径仍然走 communicate, 因为需要把 stdin 写完整。
             use_streaming = (
                 (stream_callback is not None or log_callback is not None)
                 and input_data is None
@@ -826,7 +781,6 @@ class ToolExecutor:
         except Exception:
             pass
 
-    # ── 容器生命周期快捷方法（供 orchestrator 调用）──────
 
     async def start_task_container(self, task_id: str) -> str:
         """task 开始时调用，启动专属持久容器。"""

@@ -83,7 +83,6 @@ def test_apply_emits_high_severity_findings():
     assert any("Actuator" in n for n in names)
     assert any(".env" in n for n in names)
 
-    # All of them should be high severity
     for f in state.findings:
         assert f.severity == "high"
         assert f.exploitable is True
@@ -106,7 +105,6 @@ def test_php_runtime_backcompat_alias_still_written():
         "http://x", 80,
     )
     assert state.runtime_facts.get("php", {}).get("allow_url_include") is True
-    # back-compat alias
     assert state.php_runtime.get("allow_url_include") is True
     assert state.php_runtime is state.runtime_facts["php"] or \
            state.php_runtime == state.runtime_facts["php"]

@@ -63,36 +63,28 @@ def _should_keep(finding: VulnFinding, rules: dict) -> bool:
 
     keep_patterns = rules["keep_always_patterns"]
 
-    # ── 规则 0: 已确认为可利用的，无条件保留 ─────────────
     if finding.exploitable:
         return True
 
-    # ── 规则 1: keep_always 白名单优先 ───────────────────
     combined = f"{name_lower} {desc_lower}"
     if any(kp in combined for kp in keep_patterns):
         return True
 
-    # ── 规则 2: 检测命中标记 — 标记是否匹配检测类模式 ───
-    # 使用一个统一的命中计数器：命中越多，越可能是纯探测结果
     detection_hits = 0
 
-    # 规则 2a: name 关键词匹配
     name_keywords = rules["name_keywords"]
     if any(kw in name_lower for kw in name_keywords):
-        detection_hits += 2  # name 命中是最强的信号
+        detection_hits += 2
 
-    # 规则 2b: description 关键词匹配
     desc_keywords = rules["description_keywords"]
     if any(kw in desc_lower for kw in desc_keywords):
         detection_hits += 1
 
-    # 规则 2c: template-id 模式匹配
     tid_patterns = rules["template_id_patterns"]
     tid = (getattr(finding, "template_id", "") or "").lower()
     if tid and any(pat in tid for pat in tid_patterns):
         detection_hits += 1
 
-    # 规则 2d: 从 evidence 中提取 template-id
     if '"template-id"' in evidence_lower or '"template_id"' in evidence_lower:
         import re
         m = re.search(r'"template[-_]id"\s*:\s*"([^"]+)"', evidence_lower)
@@ -101,20 +93,15 @@ def _should_keep(finding: VulnFinding, rules: dict) -> bool:
             if any(pat in ev_tid for pat in tid_patterns):
                 detection_hits += 1
 
-    # ── 规则 3: 如果同时满足 info 级别 + 有检测命中 → 过滤 ──
     severity_lower = (finding.severity or "info").lower()
     if detection_hits > 0 and severity_lower == "info":
         return False
 
-    # ── 规则 4: 强检测命中（≥2）且不是高置信 → 过滤 ──────
     if detection_hits >= 2 and finding.confidence < 60:
         return False
 
-    # ── 规则 5: info 级别 + nikto 工具 + 无可利用路径 → 过滤 ──
     tool_lower = (finding.tool or "").lower()
     if severity_lower == "info" and tool_lower == "nikto":
-        # nikto 的 info 级别结果通常是纯探测/信息性输出
-        # 除非命中 keep_always（已在规则 1 检查）
         return False
 
     return True

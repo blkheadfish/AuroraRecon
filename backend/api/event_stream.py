@@ -43,19 +43,14 @@ from typing import AsyncIterator, Optional
 
 logger = logging.getLogger(__name__)
 
-# ── 配置 ──────────────────────────────────────────────────────
 STREAM_MAXLEN = int(os.getenv("EVENT_STREAM_MAXLEN", "50000"))
 STREAM_TTL_SECONDS = int(os.getenv("EVENT_STREAM_TTL", str(7 * 24 * 3600)))
 XREAD_BLOCK_MS = int(os.getenv("EVENT_STREAM_BLOCK_MS", "25000"))
 PROTOCOL_VERSION = int(os.getenv("REALTIME_PROTOCOL_VERSION", "2"))
 
-# EXPIRE 节流: 同一个 stream key 不需要每条 XADD 都刷 TTL,
-# 每 60s 刷一次就够了, 省掉大量无意义的连接 checkout。
 _EXPIRE_INTERVAL_S = 60.0
 _last_expire: dict[str, float] = {}
 
-# Local fallback ring per task (Redis 不可用时使用)。每个 task 最多缓存 2k 条,
-# 满足前端短时间内重连补丁; 超过则 LRU 丢弃最旧, 与 Stream 的 MAXLEN 对齐。
 _LOCAL_RING_CAP = 2000
 _local_rings: dict[str, deque[dict]] = defaultdict(lambda: deque(maxlen=_LOCAL_RING_CAP))
 _local_seq: dict[str, int] = defaultdict(int)
@@ -71,11 +66,9 @@ def _ts_now_iso() -> str:
     return datetime.utcnow().isoformat(timespec="microseconds")
 
 
-# ── Redis 探测 (短操作池) ────────────────────────────────────
 _redis_probe_done = False
 _redis_ok = False
 
-# ── Redis 探测 (XREAD 长连接池) ──────────────────────────────
 _xread_probe_done = False
 _xread_ok = False
 
@@ -152,7 +145,6 @@ def reset_redis_probe() -> None:
     _redis_ok = False
 
 
-# ── publish ───────────────────────────────────────────────────
 async def publish(
     task_id: str,
     *,
@@ -204,8 +196,6 @@ async def publish(
         except Exception as exc:
             msg = str(exc)
             if "Too many connections" in msg:
-                # 连接池 / Redis 服务器已满, 短时间内不可能恢复,
-                # 标记降级, 避免后续 publish 每一条都尝试 Redis 都失败。
                 global _redis_ok
                 _redis_ok = False
                 logger.warning(
@@ -217,7 +207,6 @@ async def publish(
                     "[event_stream] XADD 失败, 退到本地 ring task=%s err=%s",
                     task_id, exc,
                 )
-            # fallthrough 到本地降级
 
     return await _publish_local(task_id, body)
 
@@ -227,8 +216,6 @@ async def _publish_local(task_id: str, body: dict) -> str:
     sid = f"local-{_local_seq[task_id]:09d}"
     body["id"] = sid
     _local_rings[task_id].append(body)
-    # 同步 fanout 到本地订阅者: Redis 模式下没有本地订阅, 这里仅在降级模式
-    # 起作用; Redis 模式 subscribe 走 XREAD 直接从 Stream 读。
     queues = list(_local_subscribers.get(task_id, ()))
     for q in queues:
         try:
@@ -242,7 +229,6 @@ async def _publish_local(task_id: str, body: dict) -> str:
     return sid
 
 
-# ── replay ────────────────────────────────────────────────────
 async def replay(
     task_id: str,
     *,
@@ -259,7 +245,7 @@ async def replay(
         return []
     count = min(count, 5000)
     if not after_id or after_id == "0":
-        start = "-"  # XRANGE 包含最早
+        start = "-"
         inclusive = True
     else:
         start = f"({after_id}"
@@ -278,7 +264,6 @@ async def replay(
                 task_id, exc,
             )
 
-    # 本地 ring 模式: 严格按 ID 字典序过滤 (本地 ID 形如 ``local-000000123``)
     ring = list(_local_rings.get(task_id, ()))
     if inclusive:
         return ring[:count]
@@ -308,7 +293,6 @@ def _decode_xrange_entry(stream_id, fields) -> dict:
     return body
 
 
-# ── subscribe ─────────────────────────────────────────────────
 async def subscribe(
     task_id: str,
     *,
@@ -328,7 +312,6 @@ async def subscribe(
     """
     r = await _get_redis_xread_or_none()
     if r is None:
-        # 降级模式: 监听本地 queue
         queue: asyncio.Queue = asyncio.Queue(maxsize=2000)
         _local_subscribers[task_id].append(queue)
         try:
@@ -348,7 +331,6 @@ async def subscribe(
                 _local_subscribers.pop(task_id, None)
         return
 
-    # Redis 模式: XREAD BLOCK 循环
     cur = last_id or "$"
     while True:
         try:
@@ -367,8 +349,6 @@ async def subscribe(
             continue
 
         if not result:
-            # 超时无消息, 继续 BLOCK; 这里不 yield 任何东西, ws 层自己用
-            # ``asyncio.wait_for`` 控制 heartbeat 节奏。
             continue
 
         for _key, entries in result:
@@ -380,7 +360,6 @@ async def subscribe(
                 yield ev
 
 
-# ── housekeeping ──────────────────────────────────────────────
 async def drop(task_id: str) -> None:
     """删除某 task 的 Stream + 本地缓存 (任务删除接口调用)。"""
     r = await _get_redis_or_none()

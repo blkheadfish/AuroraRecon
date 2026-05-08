@@ -51,7 +51,6 @@ _GATE_PASS: dict[GatePolicy, set[EvidenceLevel]] = {
     },
 }
 
-# ── Hard-evidence patterns ────────────────────────────────
 
 _UID_RE = re.compile(r"uid=\d+\([a-z0-9_.-]+\)\s+gid=\d+\([a-z0-9_.-]+\)", re.IGNORECASE)
 _WHOAMI_RE = re.compile(r"^[a-z_][a-z0-9_.-]{0,31}$", re.MULTILINE)
@@ -196,7 +195,6 @@ class EvidenceVerifier:
         combined = f"{stdout}\n{stderr}"
         snippets: list[str] = []
 
-        # ── Check LFI → RCE escalation ───────────────────
         lfi_escalation = self._detect_lfi_escalation(combined, all_records)
         if lfi_escalation:
             snippets.append(lfi_escalation)
@@ -205,7 +203,6 @@ class EvidenceVerifier:
                 snippets.append(m.group(0))
                 return EvidenceLevel.LFI_ESCALATED_TO_RCE, f"LFI escalated to RCE: {lfi_escalation}", snippets
 
-        # ── Check confirmed RCE ──────────────────────────
         m = _UID_RE.search(combined)
         if m:
             snippets.append(m.group(0))
@@ -216,7 +213,6 @@ class EvidenceVerifier:
                 snippets.append(kw)
                 return EvidenceLevel.CONFIRMED_RCE, f"RCE keyword matched: {kw}", snippets
 
-        # Also scan historical records for uid= that might be in prior rounds
         if all_records:
             for rec in all_records:
                 rec_out = str(rec.get("stdout", ""))
@@ -229,7 +225,6 @@ class EvidenceVerifier:
                         snippets,
                     )
 
-        # ── Check probable RCE ───────────────────────────
         for kw in _RCE_PROBABLE_KEYWORDS:
             if kw in combined:
                 has_negative = any(neg in combined for neg in _RCE_NEGATIVE_KEYWORDS)
@@ -237,7 +232,6 @@ class EvidenceVerifier:
                     snippets.append(kw)
                     return EvidenceLevel.PROBABLE_RCE, f"probable RCE keyword: {kw}", snippets
 
-        # ── Check file read ──────────────────────────────
         if _passwd_content_detected(combined):
             snippets.append("/etc/passwd content detected")
             return EvidenceLevel.FILE_READ_ONLY, "passwd file content readable", snippets
@@ -257,7 +251,6 @@ class EvidenceVerifier:
                     snippets.append(f"[round {rec.get('round', '?')}] /etc/passwd readable")
                     return EvidenceLevel.FILE_READ_ONLY, "file read in prior round", snippets
 
-        # ── shell_type hint ──────────────────────────────
         if shell_type and "file_read" in shell_type.lower():
             return EvidenceLevel.FILE_READ_ONLY, f"shell_type={shell_type}", snippets
 
@@ -322,7 +315,6 @@ class EvidenceVerifier:
         return "→".join(stages) if stages else "lfi→rce"
 
 
-# ── Module-level default instance ─────────────────────────
 
 _default_verifier: EvidenceVerifier | None = None
 

@@ -42,7 +42,6 @@ def _attack_mode(value: str):
             os.environ["ATTACK_CHAIN_MODE"] = prev
 
 
-# ─── 模式分发 + 编译 ──────────────────────────────────────
 
 def test_feedback_mode_resolves():
     with _attack_mode("feedback"):
@@ -60,7 +59,6 @@ def test_direct_feedback_builder_compiles():
     assert compiled is not None
 
 
-# ─── recursion_limit 提高到 100 ───────────────────────────
 
 def test_feedback_mode_recursion_limit_raised():
     with _attack_mode("feedback"):
@@ -68,13 +66,11 @@ def test_feedback_mode_recursion_limit_raised():
         assert cfg["recursion_limit"] == 100
 
 
-# ─── feedback 拓扑必须含反馈边 ──────────────────────────
 
 def test_feedback_graph_topology_has_replan_edges():
     compiled = _build_graph_feedback(checkpointer=None)
     drawn = compiled.get_graph()
     edge_pairs = {(e.source, e.target) for e in drawn.edges}
-    # 阶段 A 要求的回流边集合（其中部分通过 conditional_edges 渲染）
     expected = [
         ("post_foothold_enum", "vuln_scan"),
         ("post_foothold_enum", "recon"),
@@ -89,7 +85,6 @@ def test_feedback_graph_topology_has_replan_edges():
     assert not missing, f"feedback 模式缺失反馈边: {missing}"
 
 
-# ─── 端到端模拟：LFI → 凭据 → 重跑 vuln_scan → shell ─────
 
 def test_e2e_lfi_creds_revuln_scan_shell():
     """
@@ -106,14 +101,12 @@ def test_e2e_lfi_creds_revuln_scan_shell():
     state = PentestState(target="http://x")
     state.target_host = "10.10.10.10"
 
-    # ── 1. foothold_attempt 完成: 仅 file_read ──
     state.foothold_status = "file_read"
     state.findings = [
         VulnFinding(name="LFI via image", severity="high", target="http://x/info.php",
                     port=80, exploitable=True, vuln_id="lfi-1"),
     ]
 
-    # ── 2. fact_sink 添加凭据，触发 snapshot diff ──
     before = snapshot_facts(state)
     state.credential_store.append({"user": "wp", "value": "secret123",
                                     "source": "wp-config.php"})
@@ -121,12 +114,10 @@ def test_e2e_lfi_creds_revuln_scan_shell():
     emit_replan_signals(state, before=before, after=after, source_node="foothold_attempt")
     assert state.replan_signals.get("re_vuln_scan_for_creds", 0) == 1
 
-    # ── 3. edge 路由 → vuln_scan ──
     nxt = edge_after_foothold_v2(state)
     assert nxt == "vuln_scan"
     assert state.replan_count == 1
 
-    # ── 4. 模拟 vuln_scan 重跑：基于凭据增加 SSH finding ──
     state.open_ports.append(PortInfo(port=22, service="ssh", state="open"))
     state.findings.append(
         VulnFinding(name="SSH weak credentials", severity="high",
@@ -134,11 +125,9 @@ def test_e2e_lfi_creds_revuln_scan_shell():
                     exploitable=True, vuln_id="ssh-weak"),
     )
 
-    # ── 5. foothold 重入：这次成功拿到 shell ──
     state.got_shell = True
     state.privilege_level = "user"
 
-    # ── 6. edge 路由 → post_foothold_enum ──
     nxt2 = edge_after_foothold_v2(state)
     assert nxt2 == "post_foothold_enum"
 
@@ -185,21 +174,18 @@ def test_e2e_privesc_failure_creds_to_vuln_scan():
     assert nxt == "vuln_scan"
 
 
-# ─── 收敛/防爆护栏 ────────────────────────────────────────
 
 def test_e2e_max_replan_prevents_infinite_loop():
     """连续触发反馈直到 replan_count == max_replan 后强制退出回流。"""
     state = PentestState(target="http://x")
     state.max_replan = 2
 
-    # 模拟两次回流（每次都注入新凭据，每次都路由到 vuln_scan）
     for _ in range(state.max_replan):
         state.replan_signals = {"re_vuln_scan_for_creds": 1}
         nxt = edge_after_post_foothold_enum_v2(state)
         assert nxt == "vuln_scan"
     assert state.replan_count == state.max_replan
 
-    # 第三次触发：再注入信号也不应再 replan
     state.replan_signals = {"re_vuln_scan_for_creds": 1}
     nxt = edge_after_post_foothold_enum_v2(state)
     assert nxt == "post_foothold_approval"
@@ -209,7 +195,6 @@ def test_e2e_phase_visit_cap_blocks_replan():
     state = PentestState(target="http://x")
     state.phase_visit_count = {"vuln_scan": state.max_phase_visits["vuln_scan"]}
     state.replan_signals = {"re_vuln_scan_for_creds": 5}
-    # 即使有强信号, 阶段已经到达 cap, 不再回流
     nxt = edge_after_secondary_v2(state)
     assert nxt == "report"
 

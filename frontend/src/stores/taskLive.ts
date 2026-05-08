@@ -576,6 +576,10 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
         attack_next_steps: (p.attack_next_steps || []) as { stage?: string; action?: string; priority?: number }[],
         privesc_attempt_count: Number(p.privesc_attempt_count || 0),
         branch_id: String(p.branch_id || raw.branch_id || ''),
+        // backend `ws_phase_payload` 每次都会附带最新 attack_graph 快照,
+        // 必须在这里取出, 否则前端攻击图永远停留在初始 REST 快照, 不会
+        // 随漏洞发现/凭据收集等增量事实更新。
+        attack_graph: p.attack_graph as TaskDetail['attack_graph'] | undefined,
       }
 
       const updateBid = patch.branch_id

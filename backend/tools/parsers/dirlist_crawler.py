@@ -18,22 +18,16 @@ from backend.tools.executor import ToolExecutor, LogCallback, RecordCallback
 logger = logging.getLogger(__name__)
 
 _DIR_LISTING_PATTERNS = [
-    # Apache / Nginx
     re.compile(r"Index\s+of\s+/", re.IGNORECASE),
     re.compile(r"<title>\s*Index\s+of\s+", re.IGNORECASE),
     re.compile(r"Parent\s+Directory", re.IGNORECASE),
     re.compile(r"<h1>\s*Index\s+of\s+", re.IGNORECASE),
     re.compile(r'class="indexcolname"', re.IGNORECASE),
-    # IIS
     re.compile(r"Directory\s+Listing\s+--?\s+/", re.IGNORECASE),
     re.compile(r"<title>\s*\S+\s*-\s*/.*</title>", re.IGNORECASE),
-    # Tomcat
     re.compile(r"Directory\s+Listing\s+For\s+/", re.IGNORECASE),
-    # Python http.server / SimpleHTTPServer
     re.compile(r"Directory\s+listing\s+for\s+/", re.IGNORECASE),
-    # LightTPD
     re.compile(r"<title>\s*Index\s+of\s+/", re.IGNORECASE),
-    # Generic table-based directory listing (Name + Last Modified + Size columns)
     re.compile(
         r"<th[^>]*>\s*Name\s*</th>.*<th[^>]*>\s*Last\s+Modified\s*</th>",
         re.IGNORECASE | re.DOTALL,
@@ -204,7 +198,6 @@ async def crawl_directory_listings(
             if len(result.entries) >= max_total_entries:
                 break
 
-    # Fetch Content-Length for interesting files via HEAD requests
     interesting_entries = [e for e in result.entries if e.interesting and not e.is_dir]
     if interesting_entries:
         head_targets = interesting_entries[:30]

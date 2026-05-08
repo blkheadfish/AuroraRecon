@@ -3,16 +3,15 @@ from __future__ import annotations
 
 import pytest
 
-pytest.importorskip("openai")  # exploit_agent transitively imports openai
+pytest.importorskip("openai")
 pytest.importorskip("langgraph", reason="state deps")
 
-from backend.agents.exploit_agent import (  # noqa: E402
+from backend.agents.exploit_agent import (
     _build_findings_summary,
     _build_log_poison_pivot_hint,
 )
 
 
-# /etc/passwd fixture to trip _passwd_content_detected
 _PASSWD_OUT = (
     "root:x:0:0:root:/root:/bin/bash\n"
     "daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n"
@@ -20,12 +19,11 @@ _PASSWD_OUT = (
     "www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin\n"
 )
 
-# auth.log content with typical sshd failed login lines
 _AUTH_LOG_OUT = (
     "Nov 25 10:12:33 host sshd[1234]: Invalid user admin from 1.2.3.4 port 33445\n"
     "Nov 25 10:12:35 host sshd[1234]: Failed password for invalid user admin from 1.2.3.4\n"
     "Nov 25 10:12:37 host sshd[1234]: Connection closed by 1.2.3.4 port 33445 [preauth]\n"
-) * 3  # make sure len > 50
+) * 3
 
 
 def _rec(cmd: str, stdout: str, rnd: int = 1) -> dict:
@@ -49,7 +47,6 @@ def test_findings_summary_webshell_lang_from_header():
     out = "HTTP/1.1 200 OK\nX-Powered-By: PHP/7.4.3\nServer: Apache\n\nhello"
     records = [_rec("curl -I http://t/", out)]
     summary = _build_findings_summary(records)
-    # Only webshell_lang trigger, no lfi yet
     if summary:
         assert "webshell_lang:" in summary or summary == ""
 
@@ -80,7 +77,6 @@ def test_pivot_hint_empty_when_rce_already_confirmed():
 
 
 def test_pivot_hint_picks_jsp_when_detected():
-    # jsessionid in earlier output → webshell_lang=jsp
     out_with_jsp = (
         "HTTP/1.1 200 OK\nSet-Cookie: JSESSIONID=ABC123\nServer: Apache Tomcat/9.0\n\nhello"
     )

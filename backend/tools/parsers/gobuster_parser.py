@@ -4,7 +4,6 @@ import re
 
 
 class GobusterParser:
-    # 匹配形如: /admin (Status: 200) [Size: 1234]
     _LINE_RE = re.compile(r"^(/\S*)\s+\(Status:\s*(\d+)\)", re.MULTILINE)
 
     def parse(self, output: str) -> list[str]:

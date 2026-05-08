@@ -43,7 +43,6 @@ def _parse_argv(argv: list[str]) -> tuple[str, int, str | None]:
     while i < n:
         a = argv[i]
         if a == "-o":
-            # ssh: -o Name=Val  — discard
             i += 2
             continue
         if a == "-p":
@@ -56,16 +55,14 @@ def _parse_argv(argv: list[str]) -> tuple[str, int, str | None]:
         if a in ("-i", "-l", "-F", "-E", "-L", "-R", "-D", "-W", "-S",
                  "-J", "-B", "-b", "-c", "-e", "-I", "-m", "-O", "-Q",
                  "-w"):
-            # ssh flags that take a single argument — discard both tokens
             i += 2
             continue
         if a.startswith("-"):
-            # single-char boolean flag (-v, -q, -T, -N, -4, -6, -C, -A, -a, ...)
             i += 1
             continue
         target = a
         i += 1
-        break  # anything after the target is the remote command; ignore
+        break
     if not target:
         return "", port, "missing USER@HOST positional argument"
     if "@" not in target:
@@ -80,7 +77,6 @@ def main(argv: list[str]) -> int:
         return 2
     user, host = target.split("@", 1)
 
-    # Lazy import so CLI errors are reported without requiring paramiko.
     try:
         import paramiko
     except ImportError as e:
@@ -101,8 +97,6 @@ def main(argv: list[str]) -> int:
             sys.stderr.write(f"kex_exchange_identification: {e}\n")
             return 1
 
-        # Any password string works — auth is *expected* to fail.
-        # The magic is that `user` lands in the target's auth.log verbatim.
         try:
             transport.auth_password(user, "x")
         except paramiko.AuthenticationException:
@@ -110,8 +104,6 @@ def main(argv: list[str]) -> int:
                 f"{user}@{host}: Permission denied (publickey,password).\n"
             )
         except paramiko.SSHException as e:
-            # e.g. "No authentication methods available" / banner truncation;
-            # the USERAUTH_REQUEST already went out, so treat as success.
             sys.stderr.write(f"{user}@{host}: {e}\n")
         except Exception as e:
             sys.stderr.write(f"{user}@{host}: auth error: {e}\n")

@@ -91,10 +91,6 @@ class DirScanOrchestrator:
         self._rec_cb = record_callback
         self._task_id = task_id
         self._round = 0
-        # Local queue acts as fallback when no coordinator is provided (tests,
-        # single-port stand-alone use). When a coordinator is wired up, the
-        # orchestrator still pushes into the shared queue first and only drains
-        # locally if the coordinator has been deferred by the caller.
         self._deep_scan_queue: list[DeepScanTarget] = []
         self._coordinator = coordinator
         self._custom_entries: list[str] = []
@@ -144,7 +140,6 @@ class DirScanOrchestrator:
         scan_strategy = scan_strategy or {}
         self._active_plan = plan
 
-        # Step 0: probe LLM priority paths
         priority_paths = []
         for pp in scan_strategy.get("priority_paths", []):
             if isinstance(pp, dict):
@@ -155,7 +150,6 @@ class DirScanOrchestrator:
         if priority_paths:
             await self._probe_priority_paths(base_url, priority_paths)
 
-        # Step 1: main tool loop with LLM mid-scan eval
         for tool_spec in plan:
             should, skip_reason = self.planner.should_run(tool_spec)
             if not should:
@@ -175,7 +169,6 @@ class DirScanOrchestrator:
                 await self._log_cb(
                     f"[DirOrch] 执行 {tool_name} | timeout={tool_spec['timeout']}s"
                 )
-            # 工具启动事件: 让 Chat 时间轴在第一时间显示"正在跑 feroxbuster"。
             await self._push_tool_event(
                 "tool_use_start",
                 tool=tool_name,
@@ -226,8 +219,6 @@ class DirScanOrchestrator:
                         await self._log_cb(
                             f"[DirOrch] {tool_name} 本轮新增路径: {detail}"
                         )
-                # 工具完成事件: 把"+N 条新路径 / 耗时"广播到 Chat 时间轴,
-                # 这样即使没有显式 finding, 用户也能持续看到进度而不是空白。
                 await self._push_tool_event(
                     "tool_use_done",
                     tool=tool_name,
@@ -289,7 +280,6 @@ class DirScanOrchestrator:
                 )
                 self._round += 1
 
-        # Step 1.5: deterministic backup variant probe for all source/config files
         source_files = self._collect_source_file_paths()
         if source_files:
             logger.info(
@@ -303,7 +293,6 @@ class DirScanOrchestrator:
                 )
             await self._probe_backup_variants(base_url, source_files)
 
-        # Step 2: execute queued deep scans
         await self._execute_deep_scans(base_url)
 
         report = self.planner.coverage_report()
@@ -349,25 +338,20 @@ class DirScanOrchestrator:
                 self._recent_new_hints.add(h)
 
     def _should_consult_llm(self, new_paths: int, tool_name: str, elapsed: float) -> bool:
-        # 高价值命中或目录列表 → 立即 consult（不论轮次，是最强触发条件）
         if self._recent_new_hints & _HIGH_VALUE_HINTS:
             return True
         if "dirlist" in self._recent_new_hints:
             return True
-        # 第 1 轮跑完（_round==1）后才允许其他条件触发，避免工具还没暖身就 consult
         if self._round < 1:
             return False
-        # 本轮大量新路径 → 让 LLM 评估要不要调整扩展名/深度（阈值 15 → 8）
         if new_paths > 8:
             return True
-        # 预算吃紧 + 本轮空手 → 让 LLM 决定早停 / 换工具
         try:
             budget_left = float(getattr(self.planner, "remaining_budget", 0) or 0)
         except (TypeError, ValueError):
             budget_left = 0.0
         if budget_left < 180 and new_paths == 0 and self._round >= 2:
             return True
-        # 累计路径达量 + 已跑过 2 轮 → 进入评估阶段决定是否进入深扫
         if self.aggregator.count > 25 and self._round >= 2:
             return True
         return False
@@ -432,7 +416,7 @@ class DirScanOrchestrator:
                     reason=target.get("reason", ""),
                     wordlist=target.get("wordlist", "small"),
                     base_url=base_url,
-                    priority=40,  # LLM-suggested targets get mid-high priority
+                    priority=40,
                 )
 
         variants = adaptation.get("backup_variant_checks", [])
@@ -582,7 +566,6 @@ class DirScanOrchestrator:
         except Exception as e:
             logger.warning(f"[DirOrch] Backup variant probe failed: {e}")
 
-    # 扩展后的深扫关键词（35+），substring 匹配
     _DEEP_KEYWORDS: frozenset[str] = frozenset({
         "admin", "api", "backup", "config", "upload", "manager",
         "console", "debug", "internal", "private", "portal", "panel",
@@ -627,7 +610,6 @@ class DirScanOrchestrator:
                 priority=priority,
                 base_url=base_url,
             ))
-        # Local fallback — preserve pre-refactor behaviour for tests / stand-alone
         self._deep_scan_queue.append(DeepScanTarget(
             path=path,
             reason=reason,
@@ -648,9 +630,6 @@ class DirScanOrchestrator:
         scanned_paths: set[str] = set()
 
         if self._coordinator is not None:
-            # When sharing, only do a single shallow round here so that Phase 3
-            # has a chance to enrich the queue with LLM-suggested targets and
-            # the final drain picks up everything in priority order.
             targets = self._coordinator.pop_batch(_PER_ROUND_CAP)
             if not targets:
                 return

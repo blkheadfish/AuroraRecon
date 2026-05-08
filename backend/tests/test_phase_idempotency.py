@@ -20,17 +20,15 @@ from backend.agents.fact_hooks import (
 from backend.agents.models import PentestState
 
 
-# ─── 基础签名 ────────────────────────────────────────────────
 
 def test_compute_phase_signature_stable_for_same_payload():
     a = compute_phase_signature({"hosts": ["1.1.1.1", "2.2.2.2"]})
     b = compute_phase_signature({"hosts": ["1.1.1.1", "2.2.2.2"]})
     assert a == b
-    assert len(a) == 40  # sha1 hex
+    assert len(a) == 40
 
 
 def test_compute_phase_signature_invariant_to_dict_order():
-    # 两个 dict 的键序不同, signature 应一致(sort_keys=True)
     a = compute_phase_signature({"a": 1, "b": 2})
     b = compute_phase_signature({"b": 2, "a": 1})
     assert a == b
@@ -42,7 +40,6 @@ def test_compute_phase_signature_changes_with_payload():
     assert a != b
 
 
-# ─── 跳过逻辑 ────────────────────────────────────────────────
 
 def test_should_skip_phase_first_visit_never_skips():
     state = PentestState(target="http://x")
@@ -57,7 +54,6 @@ def test_should_skip_phase_duplicate_signature_skips():
     sig = compute_phase_signature({"hosts": ["1.1.1.1"]})
     mark_phase_visited(state, "recon", sig)
 
-    # 同样的 signature 第二次进入 → 应直接跳过
     skip, reason = should_skip_phase(state, "recon", sig)
     assert skip is True
     assert "duplicate" in reason
@@ -68,7 +64,6 @@ def test_should_skip_phase_new_signature_does_not_skip():
     sig1 = compute_phase_signature({"hosts": ["1.1.1.1"]})
     mark_phase_visited(state, "recon", sig1)
 
-    # 新主机加入后 signature 变化 → 不应跳过
     sig2 = compute_phase_signature({"hosts": ["1.1.1.1", "2.2.2.2"]})
     skip, reason = should_skip_phase(state, "recon", sig2)
     assert skip is False
@@ -99,14 +94,12 @@ def test_mark_phase_visited_increments_counter():
     assert state.phase_signature["vuln_scan"] == "sig-2"
 
 
-# ─── pending_seeds 增量 ──────────────────────────────────────
 
 def test_consume_pending_seeds_returns_and_clears_bucket():
     state = PentestState(target="http://x")
     state.pending_seeds["hosts"].extend(["10.0.0.1", "10.0.0.2"])
     seeds = consume_pending_seeds(state, "hosts")
     assert seeds == ["10.0.0.1", "10.0.0.2"]
-    # 第二次调用应该是空的
     assert consume_pending_seeds(state, "hosts") == []
 
 
@@ -125,31 +118,27 @@ def test_push_pending_seed_dedupes():
 
 def test_push_pending_seed_handles_missing_pending_seeds():
     state = PentestState(target="http://x")
-    state.pending_seeds = {}  # 模拟旧 checkpoint 反序列化场景
+    state.pending_seeds = {}
     push_pending_seed(state, "web_paths", "/admin/login")
     assert "web_paths" in state.pending_seeds
     assert state.pending_seeds["web_paths"] == ["/admin/login"]
 
 
-# ─── 综合：增量驱动重入应触发重跑（不跳过） ─────────────────
 
 def test_idempotency_with_seed_drives_reentry():
     """在第一轮固化签名后，加入新种子使签名变化，确保第二轮不会跳过。"""
     state = PentestState(target="http://x")
     state.target_host = "1.1.1.1"
 
-    # 第一轮 recon
     targets_round1 = [state.target_host]
     sig1 = compute_phase_signature({"targets": targets_round1})
     skip, _ = should_skip_phase(state, "recon", sig1)
     assert skip is False
     mark_phase_visited(state, "recon", sig1)
 
-    # 同样输入第二次进入 → 跳过
     skip, reason = should_skip_phase(state, "recon", sig1)
     assert skip is True
 
-    # 注入新种子主机 → signature 变化, 不应跳过
     push_pending_seed(state, "hosts", "2.2.2.2")
     seeds = consume_pending_seeds(state, "hosts")
     targets_round2 = [state.target_host] + seeds

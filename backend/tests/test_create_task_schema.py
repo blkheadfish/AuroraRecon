@@ -22,8 +22,6 @@ class TestCreateTaskRequest:
     def test_minimal_payload_uses_pentest_engineer_defaults(self):
         req = CreateTaskRequest(target="http://10.0.0.1")
         assert req.workflow_mode == "pentest_engineer"
-        # per-task overrides should default to None so router can detect
-        # "not provided" vs explicit override.
         assert req.auto_approve is None
         assert req.success_gate_level is None
         assert req.risk_budget is None
@@ -55,7 +53,7 @@ class TestCreateTaskRequest:
         req = CreateTaskRequest(
             target="http://example.com",
             workflow_mode="ctf_expert",
-            auto_approve=False,           # override CTF default (True)
+            auto_approve=False,
             max_react_rounds=7,
             skill_min_score=33,
         )
@@ -80,14 +78,12 @@ class TestCreateTaskRequest:
         assert state.auto_approve is False
         assert state.max_react_rounds == 7
         assert state.skill_min_score == 33
-        # Un-overridden field still inherits ctf_expert default.
         assert state.success_gate_level == "lenient"
         assert state.skill_weak_boost == 10
 
 
 class TestTaskSummary:
     def test_defaults_include_workflow_mode_and_auto_approve(self):
-        # All required fields present, everything else default-able.
         summary = TaskSummary(
             task_id="t1",
             target="http://x",

@@ -18,7 +18,6 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
-# ── Login rate limiting (in-memory sliding window) ───────
 _login_attempts: dict[str, list[float]] = {}
 _LOGIN_MAX_ATTEMPTS = int(os.getenv("LOGIN_MAX_ATTEMPTS", "10"))
 _LOGIN_WINDOW_SECONDS = 300
@@ -57,7 +56,6 @@ async def auth_register(req: AuthRegisterRequest):
     hashed = await asyncio.to_thread(
         _bcrypt_lib.hashpw, req.password.encode(), _bcrypt_lib.gensalt()
     )
-    # 首位注册用户自动提升为 admin（便于部署后冷启动就有管理员）
     try:
         is_first = (await count_users()) == 0
     except Exception:

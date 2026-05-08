@@ -40,18 +40,12 @@ BRUTE_SERVICES = {
 }
 
 _NUCLEI_TAG_BLACKLIST: set[str] = {
-    # Credential testing — handled by ExploitAgent Skill engine
     "default-login", "default-credentials", "brute-force",
-    # Pure detection / informational noise
     "tech-detect", "exposure", "info",
-    # HTTP header / TLS noise (not exploitable)
     "http-missing-security-headers", "ssl", "tls",
     "cookie", "csp", "xss-protection", "hsts",
-    # DNS infrastructure noise
     "dns", "cname", "nameserver", "mx",
-    # CMS detection (not vulns)
     "wordpress-plugin-detect", "joomla-detect", "cms-detect",
-    # Network service detection
     "tcp", "udp", "network-service-detect",
 }
 
@@ -71,8 +65,6 @@ class VulnAgent:
         self.llm = LLMRouter()
         self.kb = ExploitKB()
         self._decision_callback: DecisionCallback = None
-        # 操作员实时指令(由 node_vuln_scan 从 PentestState 计算后传入), 注入到
-        # 本 agent 的所有 LLM prompt 两端。空字符串等价于无指令(无副作用)。
         self._operator_block: str = ""
 
     async def run(
@@ -100,8 +92,8 @@ class VulnAgent:
 
                 {
                     "credentials": [{"user": "...", "value": "...", "source": "..."}, ...],
-                    "web_paths":   ["/admin", ...],   # 由 orchestrator 直接合并到 web_paths
-                    "ports":       [22, 3306, ...],   # 由 orchestrator 合并
+                    "web_paths":   ["/admin", ...],
+                    "ports":       [22, 3306, ...],
                 }
 
                 凭据会驱动两件事：
@@ -112,16 +104,7 @@ class VulnAgent:
         self._decision_callback = decision_callback
         self._workflow_mode = workflow_mode
         self._operator_block = operator_block or ""
-        # 结构化战术 plan; 用于:
-        #   1) ``_active_vuln_discovery`` prompt 里把 plan.preferred_tools /
-        #      plan.focus_targets 作为额外约束注入, 让 LLM 生成 verify_command
-        #      时倾向用户偏好的工具(例如 sqlmap 而非 curl 注入)。
-        #   2) 主动验证阶段在 _select_skills / scan strategy 里降权 avoided
-        #      tools 对应的扫描类型。
-        # 当前 P0 仅做存放与 prompt 注入, 工具级精挑由后续 PR 接入 _select_skills。
         self._operator_plan: Any = operator_plan
-        # ★ 新增：从 operator_plan.keyword_hints 提取 nuclei 模板 tag
-        # keyword_hints 由 _intent_to_operator_plan 从 priority_vulns 映射而来
         self._nuclei_focus_tags: list[str] = []
         if operator_plan is not None:
             hints = getattr(operator_plan, "keyword_hints", None) or []
@@ -174,7 +157,6 @@ class VulnAgent:
                           8443, 8888, 9000, 9001, 9090, 9200, 9443, 10000)
         ]
 
-        # 如果用户显式指定了端口，确保它在 web_ports 中
         if target_port:
             existing_web_port_nums = {p.port for p in web_ports}
             if target_port not in existing_web_port_nums:
@@ -183,15 +165,12 @@ class VulnAgent:
                         web_ports.insert(0, p)
                         break
                 else:
-                    # 端口不在 nmap 扫描结果中（可能扫描遗漏），手动补充
                     web_ports.insert(0, PortInfo(port=target_port, service="http"))
 
-        # 用户指定的 scheme 作为全局默认（未指定时按端口号推断）
         _user_scheme = target_scheme.lower() if target_scheme else ""
 
         all_findings: list[VulnFinding] = []
 
-        # ── Phase 0: 将 nmap --script=vuln 结果转为 VulnFinding ──
         if nmap_vuln_hints:
             for hint in nmap_vuln_hints:
                 cves = hint.get("cves", [])
@@ -215,7 +194,6 @@ class VulnAgent:
                 ))
             logger.info(f"[VulnAgent] nmap vuln hints → {len(nmap_vuln_hints)} findings")
 
-        # ── Phase 1: 指纹识别（各端口并发）───────────────
         fingerprints: dict[int, dict] = {}
         fp_tasks = []
         for wp in web_ports:
@@ -235,7 +213,6 @@ class VulnAgent:
                 fingerprints[wp.port] = fp_result
                 logger.info(f"[VulnAgent] 指纹 :{wp.port} -> {fp_result.get('summary', 'unknown')}")
 
-        # ── Phase 2: LLM 分析指纹 → 扫描策略 ────────────
         scan_strategy = await self._llm_scan_strategy(
             target,
             target_os,
@@ -263,7 +240,6 @@ class VulnAgent:
                 "message": f"LLM 扫描策略: {len(tags)} 个标签, {len(hv_targets) if isinstance(hv_targets, list) else 0} 个高价值目标",
             })
 
-        # ── Phase 3: 按端口并发，端口内串行扫描 ──────────
         async def _scan_one_port(wp: PortInfo) -> list[VulnFinding]:
             if _user_scheme and wp.port == target_port:
                 scheme = _user_scheme
@@ -273,34 +249,26 @@ class VulnAgent:
             port_findings: list[VulnFinding] = []
             port_fp = fingerprints.get(wp.port, {})
 
-            # 3a: LLM 推荐标签专扫（最精准，优先跑）
             llm_tags = scan_strategy.get("nuclei_tags", [])
-            # 过滤掉会触发 LockOutRealm 的凭据测试标签
-            # 凭据爆破留给 ExploitAgent 的 Skill 统一处理
             blacklist = _get_nuclei_tag_blacklist()
             llm_tags = [t for t in llm_tags if t.lower() not in blacklist]
             if llm_tags:
                 r = await self._nuclei_tag_scan(web_url, target, llm_tags)
                 port_findings.extend(r.get("findings", []))
 
-            # 3b: 基础 CVE + 漏洞 + 配置错误扫描
             r = await self._nuclei_broad_scan(web_url, target)
             port_findings.extend(r.get("findings", []))
 
-            # 3c: 对 Gobuster 发现的路径做深入扫描
             if web_paths:
                 r = await self._nuclei_path_scan(web_url, target, web_paths)
                 port_findings.extend(r.get("findings", []))
 
-            # 3d: Nikto 补充
             r = await self._nikto_scan(web_url)
             port_findings.extend(r.get("findings", []))
 
-            # 3d-2: sqlmap SQL injection scan (if injectable URLs found)
             sqli_r = await self._sql_injection_scan(web_url, target, web_paths)
             port_findings.extend(sqli_r.get("findings", []))
 
-            # 3e: 命中 PHP/PHP-FPM 信号时，主动触发 phuip 探针
             phuip_finding = await self._phuip_probe_if_php_signal(
                 web_url=web_url,
                 target=target,
@@ -322,20 +290,14 @@ class VulnAgent:
             elif isinstance(r, list):
                 all_findings.extend(r)
 
-        # ── Phase 3.1: CVE 专项直检（无条件对所有 Web 端口）──
-        # 某些 CVE 的检测不依赖指纹，直接发探测请求即可判断
-        # CVE-2019-11043: 对所有 Web 端口发 %0a 路径注入请求
         cve_direct_findings = await self._cve_direct_checks(target, web_ports, fingerprints)
         all_findings.extend(cve_direct_findings)
 
-        # ── Phase 3.5: 知识库驱动精准检测 ────────────────
-        # 用指纹信息查知识库，用知识库里的具体检测命令验证漏洞
         kb_findings = await self._kb_driven_detection(
             target, target_os, ports, fingerprints, web_paths, all_findings
         )
         all_findings.extend(kb_findings)
 
-        # ── Phase 4: LLM 主动漏洞发现（工具扫不到时兜底）──
         exploitable_count = sum(1 for f in all_findings if f.exploitable)
         has_high = any(f.severity in ("critical", "high") for f in all_findings)
         if exploitable_count == 0 or not has_high:
@@ -366,14 +328,9 @@ class VulnAgent:
                     "message": f"LLM 主动发现 {len(llm_findings)} 个潜在漏洞",
                 })
 
-        # ── Phase 4.5: 为非 Web 服务端口生成 service-level findings ──
-        # 确保 SSH/FTP/SMB/RDP 等端口有对应 finding，让 ExploitAgent 的 Skill 能匹配
         svc_findings = self._generate_service_findings(target, ports, all_findings)
         all_findings.extend(svc_findings)
 
-        # ── Phase 4.6: 凭据复用 finding 合成 ───────────────
-        # feedback / supervisor 模式下，前序漏洞产生的真实凭据会通过 seeds 注入；
-        # 这里为每个匹配端口产出"凭据复用机会"finding，触发 credential_replay Skill。
         cred_replay_findings = self._synthesize_credential_replay_findings(target, ports)
         if cred_replay_findings:
             all_findings.extend(cred_replay_findings)
@@ -393,11 +350,8 @@ class VulnAgent:
 
         all_findings = _deduplicate(all_findings)
 
-        # ── Phase 5: Finding 事后校验与修正 ───────────────
-        # 根据指纹信息修正误判的 finding（如 Struts2 应用被识别为 Tomcat 弱口令）
         all_findings = self._enrich_findings(all_findings, fingerprints)
 
-        # ── Phase 6: 统一 FindingVerifier 复核 ───────────
         from backend.agents.finding_verifier import FindingVerifier
         verifier = FindingVerifier()
         all_findings = [
@@ -405,9 +359,6 @@ class VulnAgent:
             for f in all_findings
         ]
 
-        # ── Phase 7: 纯探测类结果过滤 ────────────────────
-        # 将 nuclei/nikto 的纯服务识别、组件版本探测等结果
-        # 从漏洞列表移除，降级为侦察附属信息
         from backend.agents.detection_filter import filter_findings
         all_findings, detection_results = filter_findings(all_findings)
         if detection_results:
@@ -571,9 +522,6 @@ $PHUIP "{web_url}/index.php" 2>&1
             tool="phuip-probe",
         )
 
-    # ================================================================
-    # Phase 4.5: 为非 Web 服务端口生成 service-level findings
-    # ================================================================
 
     _SERVICE_FINDING_MAP: dict[str, dict] = {
         "ssh":    {"name": "SSH Service",  "severity": "medium", "desc": "SSH 服务开放，可尝试弱口令/版本漏洞利用"},
@@ -640,9 +588,6 @@ $PHUIP "{web_url}/index.php" 2>&1
                         + ", ".join(f.name for f in findings))
         return findings
 
-    # ================================================================
-    # Phase 1: 指纹识别
-    # ================================================================
 
     async def _fingerprint(self, web_url: str, port_info: PortInfo) -> dict:
         """用 whatweb + httpx + 主动 JSON 探测做指纹识别"""
@@ -658,7 +603,6 @@ $PHUIP "{web_url}/index.php" 2>&1
             "summary": "",
         }
 
-        # whatweb
         whatweb_result: ExecuteResult = await self.executor.run(
             tool="whatweb",
             args=["--color=never", "-a", "3", web_url],
@@ -667,7 +611,6 @@ $PHUIP "{web_url}/index.php" 2>&1
         if whatweb_result.success and whatweb_result.stdout:
             fp["whatweb"] = whatweb_result.stdout.strip()
 
-        # httpx
         httpx_result: ExecuteResult = await self.executor.run(
             tool="httpx",
             args=[
@@ -682,9 +625,6 @@ $PHUIP "{web_url}/index.php" 2>&1
         if httpx_result.success and httpx_result.stdout:
             fp["httpx"] = httpx_result.stdout.strip()
 
-        # ── 获取首页 HTML 内容用于框架识别 ─────────────────
-        # whatweb/httpx 只看 header，很多框架特征在 HTML body 中
-        # 比如 Struts2 Showcase 页面包含 "struts", ".action", "opensymphony"
         html_body_result: ExecuteResult = await self.executor.run(
             tool="curl",
             args=["-s", "-L", "--max-time", "8", web_url],
@@ -695,7 +635,6 @@ $PHUIP "{web_url}/index.php" 2>&1
             html_body = html_body_result.stdout
             fp["html_body_preview"] = html_body[:1000]
 
-        # 基础关键词匹配（增加 HTML body）
         combined = f"{fp['whatweb']} {fp['httpx']} {port_info.version} {port_info.banner} {html_body}".lower()
         techs = []
         tech_keywords = {
@@ -718,12 +657,9 @@ $PHUIP "{web_url}/index.php" 2>&1
             if kw in combined:
                 techs.append(name)
 
-        # ── HTML body 深度框架检测（补充简单关键词匹配的盲区）──
-        # 有些框架不在 header 里暴露，只能从 HTML body 的特征判断
         if html_body:
             html_lower = html_body.lower()
 
-            # Struts2: 需要 opensymphony/xwork 强特征 + 至少 3 分
             import re
             if not any(t == "Struts" for t in techs):
                 struts_indicators = 0
@@ -742,32 +678,24 @@ $PHUIP "{web_url}/index.php" 2>&1
                         techs.append("Java")
                     logger.info(f"[VulnAgent] HTML body 检测到 Struts2 (score={struts_indicators})")
 
-            # Shiro: 页面内容中的 rememberMe 相关
             if not any(t == "Shiro" for t in techs):
                 if "rememberme" in html_lower or "shiro" in html_lower:
                     techs.append("Shiro")
 
-            # GeoServer: OWS/WFS/WMS 接口
             if not any(t == "GeoServer" for t in techs):
                 if "geoserver" in html_lower or ("/ows?" in html_lower) or ("/wfs?" in html_lower):
                     techs.append("GeoServer")
 
-            # ActiveMQ: admin console
             if not any(t == "ActiveMQ" for t in techs):
                 if "activemq" in html_lower or "amq-" in html_lower:
                     techs.append("ActiveMQ")
 
-        # ── 技术栈层级区分 ────────────────────────────────
-        # 应用框架（决定漏洞类型的核心技术）
         APP_FRAMEWORKS = {"Struts", "ThinkPHP", "Flask", "Django", "Spring",
                           "Laravel", "WordPress", "Drupal", "Joomla",
                           "GeoServer", "GitLab", "Jenkins", "Nacos",
                           "Confluence", "Grafana", "XXL-JOB", "Solr"}
-        # 中间件/容器（漏洞归属独立于上层应用）
         MIDDLEWARE = {"Tomcat", "WebLogic", "JBoss", "ActiveMQ", "RabbitMQ"}
-        # 运行时/服务器（最底层，只有在没有更具体技术时才有意义）
         SERVERS = {"Nginx", "Apache", "IIS"}
-        # 安全组件（可能叠加在任何框架上）
         SECURITY_COMPONENTS = {"Shiro", "Fastjson", "Jackson"}
 
         app_frameworks_found = [t for t in techs if t in APP_FRAMEWORKS]
@@ -775,8 +703,6 @@ $PHUIP "{web_url}/index.php" 2>&1
         security_found = [t for t in techs if t in SECURITY_COMPONENTS]
         servers_found = [t for t in techs if t in SERVERS]
 
-        # primary_tech: 决定这个端口"是什么应用"
-        # 优先级: 应用框架 > 安全组件 > 中间件 > 服务器
         if app_frameworks_found:
             fp["primary_tech"] = app_frameworks_found[0]
         elif security_found:
@@ -793,8 +719,6 @@ $PHUIP "{web_url}/index.php" 2>&1
         fp["security_components"] = security_found
         fp["server_tech"] = servers_found
 
-        # ── 主动 JSON 探测（检测 fastjson/jackson/spring 等）──
-        # 探测1: 发畸形 @type 看响应状态码
         json_probe_status: ExecuteResult = await self.executor.run(
             tool="curl",
             args=[
@@ -808,7 +732,6 @@ $PHUIP "{web_url}/index.php" 2>&1
             timeout=10,
         )
 
-        # 探测2: 发 @type payload 看报错内容
         json_probe_body: ExecuteResult = await self.executor.run(
             tool="curl",
             args=[
@@ -821,7 +744,6 @@ $PHUIP "{web_url}/index.php" 2>&1
             timeout=10,
         )
 
-        # 探测3: 发正常 JSON 看是否接受
         json_probe_normal: ExecuteResult = await self.executor.run(
             tool="curl",
             args=[
@@ -857,7 +779,6 @@ $PHUIP "{web_url}/index.php" 2>&1
                 techs.append("Java")
             fp["json_probe"] = f"SPRING_DETECTED: {json_probe_body.stdout}"
         elif json_probe_status.success and json_probe_status.stdout.strip() in ("400", "500", "415"):
-            # 后端解析了 JSON 请求，可能是 Java 框架
             fp["json_probe"] = f"JSON_ENDPOINT: status={json_probe_status.stdout.strip()}, body={json_probe_body.stdout}"
             if "application/json" in normal_output and "Java" not in techs:
                 techs.append("Java")
@@ -865,9 +786,6 @@ $PHUIP "{web_url}/index.php" 2>&1
         fp["summary"] = ", ".join(techs) if techs else "unknown"
         return fp
 
-    # ================================================================
-    # Phase 2: LLM 驱动扫描策略
-    # ================================================================
 
     async def _llm_scan_strategy(
         self,
@@ -945,7 +863,6 @@ $PHUIP "{web_url}/index.php" 2>&1
             }
         except Exception as e:
             logger.warning(f"[VulnAgent] LLM 扫描策略失败，根据指纹生成回退策略: {e}")
-            # 从指纹自动生成标签
             fallback_tags = set()
             for port, fp in fingerprints.items():
                 summary = fp.get("summary", "").lower()
@@ -955,9 +872,6 @@ $PHUIP "{web_url}/index.php" 2>&1
                         fallback_tags.update(tags)
             return {"nuclei_tags": list(fallback_tags)[:8], "analysis": f"LLM 不可用，根据指纹自动回退: {list(fallback_tags)}", }
 
-    # ================================================================
-    # Phase 3: Nuclei 扫描
-    # ================================================================
 
     @staticmethod
     def _target_scan_profile(host: str) -> dict:
@@ -1009,13 +923,11 @@ $PHUIP "{web_url}/index.php" 2>&1
 
     async def _nuclei_tag_scan(self, web_url: str, target: str, tags: list[str]) -> dict:
         """LLM 推荐标签的专项扫描"""
-        # ★ 新增：若 operator_plan 中有 keyword_hints（从 priority_vulns 映射而来），
-        # 追加到 tags 列表，实现 nuclei 定向扫描
         focus_tags = getattr(self, "_nuclei_focus_tags", None) or []
         if focus_tags:
             for ft in focus_tags:
                 if ft not in tags:
-                    tags.insert(0, ft)  # 用户关注的标签插到最前面
+                    tags.insert(0, ft)
         if not tags:
             return {"findings": []}
 
@@ -1091,7 +1003,6 @@ $PHUIP "{web_url}/index.php" 2>&1
         patterns discovered by gobuster / dirbuster."""
         injectable_urls: list[str] = []
         _PARAM_RE = re.compile(r'\?[^#\s]*=')
-        # Path patterns that commonly accept SQL-injectable parameters
         _SQLI_PATH_PATTERNS = re.compile(
             r'\.(?:php|asp|aspx|jsp)(?:\?|$)|'
             r'/(?:search|login|product|item|user|profile|article|page|cat|'
@@ -1104,7 +1015,6 @@ $PHUIP "{web_url}/index.php" 2>&1
             if _PARAM_RE.search(full) or _SQLI_PATH_PATTERNS.search(full):
                 injectable_urls.append(full)
 
-        # If no injectable paths found in web_paths, also check the base URL
         if not injectable_urls and _PARAM_RE.search(web_url):
             injectable_urls.append(web_url)
 
@@ -1160,9 +1070,6 @@ $PHUIP "{web_url}/index.php" 2>&1
 
         return {"findings": findings}
 
-    # ================================================================
-    # Phase 3.5: 知识库驱动精准检测
-    # ================================================================
 
     async def _kb_driven_detection(
         self,
@@ -1186,7 +1093,6 @@ $PHUIP "{web_url}/index.php" 2>&1
             logger.info("[VulnAgent] 知识库为空，跳过 KB 检测")
             return []
 
-        # ── 收集搜索信号 ──────────────────────────────
         search_signals = set()
         all_fp_text = ""
 
@@ -1197,7 +1103,6 @@ $PHUIP "{web_url}/index.php" 2>&1
                 if tech and tech != "unknown":
                     search_signals.add(tech)
 
-            # JSON 探测结果也是重要信号
             json_probe = fp.get("json_probe", "")
             if json_probe:
                 search_signals.add("json")
@@ -1207,22 +1112,18 @@ $PHUIP "{web_url}/index.php" 2>&1
                     search_signals.add("jackson")
                 if "SPRING" in json_probe.upper():
                     search_signals.add("spring")
-                # 关键：即使没有明确检测到 fastjson 字样，
-                # 只要是 Java + JSON endpoint，也应该尝试 fastjson 检测
                 if "JSON_ENDPOINT" in json_probe:
                     search_signals.add("fastjson")
                     search_signals.add("java")
 
             all_fp_text += f" {summary} {json_probe} "
 
-            # 从 whatweb/httpx 原始输出提取更多信号
             whatweb = fp.get("whatweb", "").lower()
             httpx_out = fp.get("httpx", "").lower()
             nmap_ver = fp.get("nmap_version", "").lower()
             nmap_banner = fp.get("nmap_banner", "").lower()
             combined_fp = f"{whatweb} {httpx_out} {nmap_ver} {nmap_banner} {summary}".lower()
 
-            # 直接关键词提取
             fp_keywords = {
                 "tomcat": ["tomcat"], "struts": ["struts"], "jboss": ["jboss"],
                 "weblogic": ["weblogic"], "shiro": ["shiro", "rememberme", "deleteme"],
@@ -1242,7 +1143,6 @@ $PHUIP "{web_url}/index.php" 2>&1
                         search_signals.add(signal_name)
                         break
 
-        # 从端口服务名提取信号
         for p in ports:
             svc = f"{p.service} {p.version} {p.banner}".lower()
             for kw in ["tomcat", "struts", "jboss", "weblogic", "shiro",
@@ -1252,19 +1152,17 @@ $PHUIP "{web_url}/index.php" 2>&1
                 if kw in svc:
                     search_signals.add(kw)
 
-        # ── 端口推理规则 ─────────────────────────────
-        # 某些端口高概率对应特定服务，即使指纹未明确识别
         open_ports = {p.port for p in ports}
         port_inference = {
-            8080: ["tomcat", "java"],           # Tomcat 默认端口
-            8009: ["tomcat", "java"],           # Tomcat AJP
-            8443: ["tomcat", "java"],           # Tomcat HTTPS
-            7001: ["weblogic", "java"],         # WebLogic
-            7002: ["weblogic", "java"],         # WebLogic
-            8161: ["activemq", "jolokia"],      # ActiveMQ Console
-            61616: ["activemq"],                # ActiveMQ OpenWire
-            9090: ["jenkins"],                  # Jenkins
-            8888: ["java"],                     # 常见 Java Web 端口
+            8080: ["tomcat", "java"],
+            8009: ["tomcat", "java"],
+            8443: ["tomcat", "java"],
+            7001: ["weblogic", "java"],
+            7002: ["weblogic", "java"],
+            8161: ["activemq", "jolokia"],
+            61616: ["activemq"],
+            9090: ["jenkins"],
+            8888: ["java"],
         }
         for port_num, inferred_signals in port_inference.items():
             if port_num in open_ports:
@@ -1273,7 +1171,6 @@ $PHUIP "{web_url}/index.php" 2>&1
                         search_signals.add(sig)
                         logger.debug(f"[VulnAgent] 端口推理: :{port_num} → {sig}")
 
-        # 同时检查 nmap 的 service 字段中 "http-proxy" / "ajp13" 等
         for p in ports:
             if p.service in ("ajp13", "ajp"):
                 search_signals.add("tomcat")
@@ -1282,50 +1179,37 @@ $PHUIP "{web_url}/index.php" 2>&1
                 search_signals.add("tomcat")
                 search_signals.add("java")
 
-        # ── Web 框架推理规则 ─────────────────────────
-        # 根据已有信号推断可能的框架和漏洞类型
         inference_rules = {
-            # Python Web 服务器 → 可能是 Flask/Django，搜索 SSTI
             ("python",):     ["flask", "django", "ssti"],
             ("gunicorn",):   ["flask", "django", "ssti", "python"],
             ("werkzeug",):   ["flask", "ssti", "python"],
             ("wsgiserver",): ["flask", "django", "ssti", "python"],
-            # Java 服务器 → 搜索常见 Java 漏洞（struts 需独立指纹确认）
             ("java",):       ["fastjson", "shiro", "spring"],
             ("tomcat",):     ["tomcat", "java", "shiro"],
             ("jboss",):      ["jboss", "java", "jmxinvoker"],
             ("weblogic",):   ["weblogic", "java", "t3"],
-            # PHP → ThinkPHP 等 + PHP-FPM（Nginx+PHP 组合是 CVE-2019-11043 的前提）
             ("php",):        ["thinkphp", "wordpress", "php-fpm"],
-            # Shiro 相关
             ("rememberme",): ["shiro"],
             ("deleteme",):   ["shiro"],
         }
 
-        # ── 组合推理规则（需要多个信号同时存在）──────────
-        # 先放到下面，在 signals_to_add 初始化之后执行
 
         signals_to_add = set()
         for trigger_signals, inferred in inference_rules.items():
             if any(s.lower() in {x.lower() for x in search_signals} for s in trigger_signals):
                 signals_to_add.update(inferred)
 
-        # 组合推理（多信号同时存在才触发）
         signals_lower = {s.lower() for s in search_signals}
-        # Nginx + PHP → 强烈暗示 PHP-FPM 配置，CVE-2019-11043
         if "nginx" in signals_lower and "php" in signals_lower:
             signals_to_add.update(["php-fpm", "fastcgi", "cve-2019-11043"])
-        # ActiveMQ 端口信号补充
         if "activemq" in signals_lower:
             signals_to_add.update(["jolokia", "cve-2022-41678"])
 
         search_signals.update(signals_to_add)
 
-        # 已发现的漏洞名也是信号
         existing_names = {f.name.lower() for f in existing_findings}
         existing_cves = {f.cve.lower() for f in existing_findings if f.cve}
 
-        # 从已发现的漏洞中提取额外信号
         for name in existing_names:
             for kw in ["shiro", "flask", "django", "fastjson", "struts",
                         "tomcat", "ssti", "spring", "jboss", "weblogic"]:
@@ -1334,7 +1218,6 @@ $PHUIP "{web_url}/index.php" 2>&1
 
         logger.info(f"[VulnAgent] KB 搜索信号: {search_signals}")
 
-        # ── 多维度搜索知识库 ──────────────────────────
         matched_entries: dict[str, ExploitEntry] = {}
         for signal in search_signals:
             results = self.kb.search(vuln_name=signal, fingerprint=signal)
@@ -1342,7 +1225,6 @@ $PHUIP "{web_url}/index.php" 2>&1
                 if entry.vuln_id not in matched_entries:
                     matched_entries[entry.vuln_id] = entry
 
-        # ── 过滤方法论 / 泛化条目（不是具体漏洞）────────
         matched_entries = {
             vid: e for vid, e in matched_entries.items()
             if (e.category or "").lower() not in ("web_enum", "methodology")
@@ -1353,9 +1235,6 @@ $PHUIP "{web_url}/index.php" 2>&1
             logger.info("[VulnAgent] KB 未匹配到任何条目")
             return []
 
-        # ── 技术栈层级过滤 ────────────────────────────────
-        # 当检测到应用框架时，跳过容器/服务器级的"弱口令""配置错误"类 KB 条目
-        # 避免 Struts2 应用被匹配到 "Tomcat弱口令" KB 条目
         all_app_frameworks = set()
         for port, fp in fingerprints.items():
             for tech in fp.get("app_frameworks", []):
@@ -1369,7 +1248,6 @@ $PHUIP "{web_url}/index.php" 2>&1
                 desc_lower = entry.description.lower()
                 category_lower = entry.category.lower() if entry.category else ""
 
-                # 检查是否是容器/服务器级的弱口令/配置类条目
                 is_infra_vuln = False
                 for kw in infra_keywords:
                     if kw in desc_lower or kw in category_lower:
@@ -1377,10 +1255,8 @@ $PHUIP "{web_url}/index.php" 2>&1
                         break
 
                 if is_infra_vuln:
-                    # 检查该 KB 条目的技术（如 tomcat）是否只是容器
                     entry_tech = entry.category.lower() if entry.category else ""
                     if any(infra in entry_tech for infra in ["tomcat", "nginx", "apache", "iis"]):
-                        # 容器级弱口令条目，但有应用框架存在 → 跳过
                         logger.info(
                             f"[VulnAgent] KB 跳过基础设施条目: {vid} "
                             f"('{entry.description[:40]}')，"
@@ -1416,24 +1292,19 @@ $PHUIP "{web_url}/index.php" 2>&1
                 "message": f"KB 匹配 {len(matched_entries)} 个条目，开始逐一验证",
             })
 
-        # ── 对每个匹配条目执行检测 ────────────────────
         findings: list[VulnFinding] = []
 
         for entry in matched_entries.values():
-            # 跳过已经发现过的
             entry_cves_lower = {c.lower() for c in entry.match_cves}
             if entry_cves_lower & existing_cves:
                 logger.debug(f"[VulnAgent] KB 跳过已发现: {entry.vuln_id}")
                 continue
 
-            # 确定目标 URL
             port = entry.default_port or 80
-            # 看哪个指纹端口最匹配
             for fp_port in fingerprints:
                 if fp_port == entry.default_port:
                     port = fp_port
                     break
-            # 如果KB默认端口不在开放端口中，用第一个web端口
             open_ports = {p.port for p in ports}
             if port not in open_ports:
                 for fp_port in fingerprints:
@@ -1445,7 +1316,6 @@ $PHUIP "{web_url}/index.php" 2>&1
 
             logger.info(f"[VulnAgent] KB 检测: {entry.vuln_id} @ {target_url}")
 
-            # 执行验证命令
             verified = await self._run_kb_detection(entry, target_url, target)
 
             if verified:
@@ -1496,25 +1366,20 @@ $PHUIP "{web_url}/index.php" 2>&1
         """
         success_sign = entry.verification_success_sign.lower() if entry.verification_success_sign else ""
 
-        # 收集检测命令
         commands_to_try: list[tuple[str, str]] = []
 
-        # 1. 用 verification_command
         if entry.verification_command:
             cmd = self._replace_target(entry.verification_command, target_url, target_ip)
             commands_to_try.append((cmd, "verification_command"))
 
-        # 2. 根据漏洞类型生成内置检测探针（不依赖 LLM 生成的 KB 内容）
         builtin = self._builtin_detection_probes(entry, target_url)
         commands_to_try.extend(builtin)
 
-        # 3. 都没有就让 LLM 生成
         if not commands_to_try:
             if entry.detection_method:
                 return await self._run_kb_detection_via_llm(entry, target_url, target_ip)
             return ""
 
-        # 依次尝试
         for cmd, source in commands_to_try:
             logger.info(f"[VulnAgent] KB 执行 [{source}]: {cmd[:120]}...")
 
@@ -1530,15 +1395,12 @@ $PHUIP "{web_url}/index.php" 2>&1
             if not stdout and not stderr:
                 continue
 
-            # 检查成功标志
             confirmed = False
 
             if success_sign and success_sign in combined:
                 confirmed = True
             else:
-                # 通用确认标志（与具体漏洞类型无关的 RCE/漏洞证据）
                 rce_signs = ["uid=", "root:", "www-data"]
-                # 框架特定确认标志（只在对应探针上下文中有效）
                 probe_specific_signs = {
                     "builtin_fastjson_detect": ["fastjson", "com.alibaba.fastjson", "autotype", "type not match", "@type"],
                     "builtin_fastjson_inet": ["fastjson", "com.alibaba.fastjson", "autotype"],
@@ -1559,16 +1421,13 @@ $PHUIP "{web_url}/index.php" 2>&1
                     "builtin_django_sqli_detect": ["django_sqli_detected"],
                 }
 
-                # 通用 RCE 证据（任何探针都算确认）
                 if any(sign in combined for sign in rce_signs):
                     confirmed = True
 
-                # 探针特定标志
                 if not confirmed and source in probe_specific_signs:
                     if any(sign in combined for sign in probe_specific_signs[source]):
                         confirmed = True
 
-                # 都不匹配 → LLM 快速判断（仅 ctf_expert 模式启用，pentest_engineer 不允许 LLM 自判）
                 if (
                     not confirmed
                     and result.exit_code == 0
@@ -1606,24 +1465,19 @@ $PHUIP "{web_url}/index.php" 2>&1
         import re
 
         parsed = urlparse(target_url)
-        hostname = parsed.hostname or target_ip   # 纯 IP，如 "192.168.127.129"
-        host_port = parsed.netloc or target_ip     # IP:port，如 "192.168.127.129:8080"
+        hostname = parsed.hostname or target_ip
+        host_port = parsed.netloc or target_ip
 
         has_scheme = "http://{TARGET}" in cmd or "https://{TARGET}" in cmd
 
         if has_scheme:
-            # 检查命令中 {TARGET} 后面是否紧跟 :端口号
-            # 如 http://{TARGET}:8080/path → 命令自带端口，只替换纯 IP
             if re.search(r'\{TARGET\}:\d+', cmd):
                 cmd = cmd.replace("{TARGET}", hostname)
             else:
-                # 命令没有自带端口，替换为 IP:port
                 cmd = cmd.replace("{TARGET}", host_port)
         else:
-            # 命令里没有协议头，{TARGET} 替换为完整 URL
             cmd = cmd.replace("{TARGET}", target_url)
 
-        # 兜底清理
         cmd = cmd.replace("your-ip", target_ip).replace("your_ip", target_ip)
         return cmd
 
@@ -1640,7 +1494,6 @@ $PHUIP "{web_url}/index.php" 2>&1
         keywords = " ".join(entry.match_keywords + entry.tags).lower()
         category = entry.category.lower()
 
-        # ── Fastjson 检测 ──────────────────────────────
         if "fastjson" in keywords or "fastjson" in category:
             probes.append((
                 f'curl -s -X POST {target_url} '
@@ -1657,9 +1510,7 @@ $PHUIP "{web_url}/index.php" 2>&1
                 "builtin_fastjson_inet"
             ))
 
-        # ── Struts2 检测 ──────────────────────────────
         if "struts" in keywords or "s2-" in keywords or "ognl" in keywords:
-            # S2-045: Content-Type OGNL 注入
             if "s2-045" in keywords or "s2-046" in keywords or "struts" in keywords:
                 probes.append((
                     f'curl -s -I {target_url} '
@@ -1668,7 +1519,6 @@ $PHUIP "{web_url}/index.php" 2>&1
                     "builtin_s2045_detect"
                 ))
 
-            # S2-057: namespace OGNL 注入（URL 路径中 ${233*233}）
             if "s2-057" in keywords or "namespace" in keywords or "11776" in keywords or "struts" in keywords:
                 probes.append((
                     f'curl -s -D - -o /dev/null '
@@ -1676,7 +1526,6 @@ $PHUIP "{web_url}/index.php" 2>&1
                     f'--max-time 10',
                     "builtin_s2057_detect"
                 ))
-                # 也试不带 struts2-showcase 前缀的路径
                 probes.append((
                     f'curl -s -D - -o /dev/null '
                     f'"{target_url}/struts2-showcase/%24%7B233*233%7D/actionChain1.action" '
@@ -1684,32 +1533,25 @@ $PHUIP "{web_url}/index.php" 2>&1
                     "builtin_s2057_showcase_detect"
                 ))
 
-        # ── Shiro 检测 ──────────────────────────────
         if "shiro" in keywords:
-            # 发一个带错误 rememberMe cookie 的请求，看响应头是否有 deleteMe
             probes.append((
                 f'curl -s -D - -o /dev/null {target_url} '
                 f'-H "Cookie: rememberMe=invalid_token" --max-time 10',
                 "builtin_shiro_detect"
             ))
 
-        # ── Flask SSTI 检测 ──────────────────────────
         if "ssti" in keywords or "flask" in keywords or "jinja2" in keywords:
-            # 用 --data-urlencode 避免花括号被 shell 解释
             probes.append((
                 f'curl -s -G --data-urlencode "name={{{{7*7}}}}" {target_url} --max-time 10',
                 "builtin_ssti_detect"
             ))
 
-        # ── Django 检测 ──────────────────────────────
         if "django" in keywords:
-            # 触发 Django debug 页面
             probes.append((
                 f'curl -s {target_url}/nonexistent_path_for_debug --max-time 10',
                 "builtin_django_detect"
             ))
 
-        # ── ThinkPHP 检测（passive: check captcha route & error page fingerprint）──
         if "thinkphp" in keywords:
             probes.append((
                 f'status=$(curl -s -o /dev/null -w "%{{http_code}}" '
@@ -1720,7 +1562,6 @@ $PHUIP "{web_url}/index.php" 2>&1
                 "builtin_thinkphp_detect"
             ))
 
-        # ── Tomcat PUT 检测 ──────────────────────────
         if "tomcat" in keywords and ("put" in keywords or "12615" in keywords):
             probes.append((
                 f'curl -s -X PUT {target_url}/test_put_check.txt '
@@ -1728,10 +1569,6 @@ $PHUIP "{web_url}/index.php" 2>&1
                 "builtin_tomcat_put_detect"
             ))
 
-        # ── Tomcat 弱口令 检测 ────────────────────────
-        # 重要: 只检测 Manager 是否存在（401），不试凭据！
-        # Tomcat 8+ 有 LockOutRealm，5 次失败锁 5 分钟
-        # 凭据爆破留给 ExploitAgent 的 Skill 一次性完成
         if "tomcat" in keywords and ("weak" in keywords or "弱口令" in keywords or "password" in keywords):
             probes.append((
                 f'code=$(curl -s -o /dev/null -w "%{{http_code}}" '
@@ -1742,8 +1579,6 @@ $PHUIP "{web_url}/index.php" 2>&1
                 "builtin_tomcat_weak_detect"
             ))
 
-        # ── PHP-FPM CVE-2019-11043 检测（增强版）──────
-        # 扩展触发条件：php/nginx/fastcgi 任一信号就检测
         if ("php-fpm" in keywords or ("php" in keywords and "fpm" in keywords)
             or "11043" in keywords or "fastcgi" in keywords
             or ("php" in keywords and "nginx" in keywords)):
@@ -1761,22 +1596,18 @@ $PHUIP "{web_url}/index.php" 2>&1
                 "builtin_php_fpm_detect"
             ))
 
-        # ── ActiveMQ 默认凭据检测 ────────────────────
         if "activemq" in keywords or "jolokia" in keywords or "41678" in keywords:
             from urllib.parse import urlparse
             parsed = urlparse(target_url)
             ip = parsed.hostname or ""
-            # 试当前端口
             probes.append((
                 f'resp=$(curl -s -u admin:admin -D - -o /dev/null {target_url}/admin/ --max-time 10); '
                 f'if echo "$resp" | grep -qi "activemq"; then echo "ACTIVEMQ_ADMIN_CONFIRMED"; fi; '
-                # 也试 8161
                 f'resp2=$(curl -s -u admin:admin -D - -o /dev/null "http://{ip}:8161/admin/" --max-time 10); '
                 f'if echo "$resp2" | grep -qi "activemq"; then echo "ACTIVEMQ_ADMIN_CONFIRMED"; fi',
                 "builtin_activemq_detect"
             ))
 
-        # ── JBoss JMXInvokerServlet 检测 ─────────────
         if "jboss" in keywords or "7504" in keywords or "12149" in keywords:
             probes.append((
                 f'for path in /invoker/JMXInvokerServlet /invoker/EJBInvokerServlet; do '
@@ -1786,7 +1617,6 @@ $PHUIP "{web_url}/index.php" 2>&1
                 "builtin_jboss_detect"
             ))
 
-        # ── WebLogic Console 检测 ────────────────────
         if "weblogic" in keywords or "21839" in keywords:
             probes.append((
                 f'code=$(curl -s -o /dev/null -w "%{{http_code}}" '
@@ -1796,7 +1626,6 @@ $PHUIP "{web_url}/index.php" 2>&1
                 "builtin_weblogic_detect"
             ))
 
-        # ── Django SQL 注入检测 ──────────────────────
         if "django" in keywords and ("sql" in keywords or "34265" in keywords or "trunc" in keywords):
             probes.append((
                 f'resp=$(curl -s "{target_url}/?date=year%27" --max-time 10 2>/dev/null); '
@@ -1864,9 +1693,6 @@ $PHUIP "{web_url}/index.php" 2>&1
         except Exception:
             return False
 
-    # ================================================================
-    # Phase 4: LLM 主动漏洞发现
-    # ================================================================
 
     async def _llm_active_discovery(
         self,
@@ -1908,11 +1734,6 @@ $PHUIP "{web_url}/index.php" 2>&1
         from backend.agents.prompt_utils import wrap_prompt_with_block
         prompt = wrap_prompt_with_block(prompt, self._operator_block)
 
-        # 结构化 plan 提示注入: 让 LLM 在生成 verify_command 时显式倾向用户
-        # 偏好的工具/聚焦目标。注意这里和 operator_block 的关系是:
-        #   - operator_block 是用户原话(LLM 自己解读)
-        #   - operator_plan 是已经被 replanner 翻译过的结构化偏好(LLM 直接套)
-        # 二者并存可以互相印证, plan 缺字段时还能 fallback 到原话。
         plan_obj = getattr(self, "_operator_plan", None)
         if plan_obj is not None:
             plan_lines: list[str] = []
@@ -1954,13 +1775,6 @@ $PHUIP "{web_url}/index.php" 2>&1
             import uuid as _uuid
             stream_id = f"llm-discovery-{_uuid.uuid4().hex[:8]}"
 
-            # 注意: 这里 LLM 输出是 JSON (response_format='json'), content
-            # delta 全是 ``{"checks":[{"vuln_name":...}, ...]}`` 这种带引号
-            # 的原始 JSON 字符序列, 直接推到 chat 流会让 "正在思考..." 气泡
-            # 显示一大坨没格式化的 JSON, 用户根本读不下去。
-            # 解决方式: **不流 content**, 只把人类可读的 reasoning(LLM r1
-            # 思考链)推到前端; 解析后的结构化结果通过下面的 thought 事件
-            # 以"建议验证 N 个潜在漏洞 + 计划列表"形式呈现。
             async def _on_reasoning(delta: str):
                 if self._decision_callback:
                     await self._decision_callback({
@@ -2033,21 +1847,15 @@ $PHUIP "{web_url}/index.php" 2>&1
                     "message": f"LLM 验证 {vuln_name}",
                 })
 
-            # ── 预检测：对完整 stdout 做确定性 LFI/RCE 特征匹配 ──────
-            # LLM 只拿到截断后的输出，大响应体（如 phpinfo + /etc/passwd）时
-            # 文件内容出现在末尾，[:2000] 根本看不到 → 必须先对全文做硬判断
             full_stdout = exec_result.stdout or ""
             full_stdout_lower = full_stdout.lower()
 
-            # /etc/passwd 文件包含成功的特征
             _LFI_PASSWD_SIGNS = [
                 "root:x:0:0:", "root:!:0:0:", "daemon:x:1:",
                 "bin:x:2:", "nobody:x:", "/bin/bash", "/bin/sh",
                 "www-data:x:", "nobody:/nonexistent",
             ]
-            # 通用 RCE / 命令回显特征
             _RCE_SIGNS = ["uid=0(root)", "uid=33(www-data)", "linux ", "gnu/linux"]
-            # SSTI 数学计算回显（如 7*7=49）
             _SSTI_SIGNS = ["49", "7777777"]
 
             _pre_confirmed = False
@@ -2057,7 +1865,6 @@ $PHUIP "{web_url}/index.php" 2>&1
             if any(sign in full_stdout for sign in _LFI_PASSWD_SIGNS):
                 _pre_confirmed = True
                 _pre_exploitable = True
-                # 找到 passwd 内容所在片段作为证据
                 for sign in _LFI_PASSWD_SIGNS:
                     idx = full_stdout.find(sign)
                     if idx != -1:
@@ -2076,7 +1883,6 @@ $PHUIP "{web_url}/index.php" 2>&1
                     vuln_name,
                 )
 
-            # 如果预检测已确认，直接跳过 LLM
             if _pre_confirmed:
                 analysis = {
                     "confirmed": True,
@@ -2084,7 +1890,6 @@ $PHUIP "{web_url}/index.php" 2>&1
                     "evidence": _pre_evidence,
                 }
             else:
-                # ── 构造发给 LLM 的 stdout 片段（头 + 尾，避免大响应体截断漏证据）──
                 _HEAD = 1500
                 _TAIL = 800
                 if len(full_stdout) > _HEAD + _TAIL:
@@ -2096,7 +1901,6 @@ $PHUIP "{web_url}/index.php" 2>&1
                 else:
                     stdout_for_llm = full_stdout
 
-                # 让 LLM 判断验证结果
                 analyze_prompt = (
                     f"分析以下漏洞验证命令的执行结果：\n\n"
                     f"验证目标: {vuln_name}\n"
@@ -2145,9 +1949,6 @@ $PHUIP "{web_url}/index.php" 2>&1
             if analysis.get("confirmed"):
                 logger.info(f"[VulnAgent] LLM 确认漏洞: {vuln_name}")
 
-                # 从 verify_command 里抽出真正的漏洞 URL（含路径+查询），
-                # 否则下游 LFI 探针/SkillEngine 只能拿到 http://host:port，
-                # 会把探测打到网站根而不是漏洞端点。
                 resolved_target = ""
                 resolved_port = port
                 url_match = re.search(
@@ -2192,9 +1993,6 @@ $PHUIP "{web_url}/index.php" 2>&1
         logger.info(f"[VulnAgent] LLM 主动发现: {len(findings)} 个确认漏洞")
         return findings
 
-    # ================================================================
-    # Phase 3.1: CVE 专项直检（无条件，不依赖指纹信号）
-    # ================================================================
 
     async def _cve_direct_checks(
         self,
@@ -2214,7 +2012,6 @@ $PHUIP "{web_url}/index.php" 2>&1
             scheme = "https" if wp.port in (443, 8443) else "http"
             web_url = f"{scheme}://{target}:{wp.port}"
 
-            # ── CVE-2019-11043: PHP-FPM %0a 路径注入 ──
             try:
                 fpm_finding = await self._check_cve_2019_11043(web_url, target, wp.port)
                 if fpm_finding:
@@ -2237,7 +2034,6 @@ $PHUIP "{web_url}/index.php" 2>&1
                   body 含 "File not found"/"No input file specified"/"Primary script unknown" = 确认
                   状态码或 body 长度与基线显著不同 = 疑似
         """
-        # 步骤 1: 基线请求
         baseline_result: ExecuteResult = await self.executor.run(
             tool="curl",
             args=["-s", "-w", "\n%{http_code}", f"{web_url}/index.php", "--max-time", "8"],
@@ -2249,9 +2045,8 @@ $PHUIP "{web_url}/index.php" 2>&1
         baseline_code = baseline_lines[-1].strip() if baseline_lines else ""
 
         if baseline_code not in ("200", "301", "302", "403"):
-            return None  # 不是 PHP 环境
+            return None
 
-        # 步骤 2: %0a 路径注入
         anomaly_result: ExecuteResult = await self.executor.run(
             tool="curl",
             args=["-s", "-w", "\n%{http_code}", f"{web_url}/index.php/%0a", "--max-time", "8"],
@@ -2269,7 +2064,6 @@ $PHUIP "{web_url}/index.php" 2>&1
             f"0a_body_preview={anomaly_body[:120]}"
         )
 
-        # 步骤 3: 判定
         confirmed = False
         likely = False
         evidence_parts = [
@@ -2279,12 +2073,10 @@ $PHUIP "{web_url}/index.php" 2>&1
 
         anomaly_body_lower = anomaly_body.lower()
 
-        # 最强信号: 502/500
         if anomaly_code in ("502", "500"):
             confirmed = True
             evidence_parts.append("判定: 502/500 状态码确认")
 
-        # 次强信号: PHP-FPM 特征错误消息
         elif any(sig in anomaly_body_lower for sig in [
             "file not found", "no input file specified",
             "primary script unknown", "unable to open primary script",
@@ -2292,12 +2084,10 @@ $PHUIP "{web_url}/index.php" 2>&1
             confirmed = True
             evidence_parts.append(f"判定: FPM 错误消息确认 ({anomaly_body[:80]})")
 
-        # 疑似信号: 状态码不同
         elif anomaly_code != baseline_code and anomaly_code not in ("404", "000", ""):
             likely = True
             evidence_parts.append(f"判定: 状态码差异 ({baseline_code} → {anomaly_code})")
 
-        # 疑似信号: body 长度剧变（基线有内容但 %0a 为空，或反之）
         elif len(baseline_body) > 100 and len(anomaly_body) < 50:
             likely = True
             evidence_parts.append(f"判定: body 长度剧变 ({len(baseline_body)} → {len(anomaly_body)})")
@@ -2328,9 +2118,6 @@ $PHUIP "{web_url}/index.php" 2>&1
             tool="cve-direct-check",
         )
 
-    # ================================================================
-    # Nikto + Hydra
-    # ================================================================
 
     async def _nikto_scan(self, web_url: str) -> dict:
         result: ExecuteResult = await self.executor.run(
@@ -2350,13 +2137,11 @@ $PHUIP "{web_url}/index.php" 2>&1
     async def _brute_force_scan(self, target: str, ports: list[PortInfo]) -> dict:
         findings: list[VulnFinding] = []
         tasks = []
-        # 把种子凭据里的密码合并到 hydra 字典里（feedback 模式下从前序漏洞抓的真实密码）
         seed_passwords = self._extract_seed_passwords()
         seed_users = self._extract_seed_users()
         for port_info in ports:
             if port_info.port in BRUTE_SERVICES:
                 proto, default_users = BRUTE_SERVICES[port_info.port]
-                # 把种子用户加到默认用户名前面（优先尝试真实账号）
                 merged_users = list(dict.fromkeys(seed_users + default_users))
                 tasks.append(
                     self._hydra_brute(
@@ -2410,10 +2195,7 @@ $PHUIP "{web_url}/index.php" 2>&1
         其后再追加 rockyou-top100。这样命中率从 "rockyou 字典是否覆盖" 提升为
         "目标是否复用配置文件里的密码"，对依赖型多漏洞链场景非常有效。
         """
-        # 构造合并字典：种子密码（可能 0 条）+ 内置 rockyou-top100
-        # 用 stdin 传 password list，避免在容器内写文件
         pwd_lines: list[str] = list(extra_passwords or [])
-        # 内置 fallback 字典（精简）；当种子凭据足够时，依然保留这些常见密码
         builtin_pwds = [
             "root", "toor", "admin", "password", "123456",
             "12345678", "qwerty", "letmein", "welcome", "ubuntu",
@@ -2422,9 +2204,6 @@ $PHUIP "{web_url}/index.php" 2>&1
             if p not in pwd_lines:
                 pwd_lines.append(p)
 
-        # hydra: -L 用户名 stdin / -P 密码字典文件
-        # 我们让 -L 读 /tmp/hydra_users.txt, -P 读 /tmp/hydra_pwds.txt（容器内写）
-        # 简化：用 here-string 传一个临时密码文件
         prep_cmd = (
             "set -e; "
             f"printf '%s\\n' {self._shell_quote_each(pwd_lines)} > /tmp/hydra_pwds.txt; "
@@ -2442,7 +2221,6 @@ $PHUIP "{web_url}/index.php" 2>&1
         if "login:" in out:
             for line in out.splitlines():
                 if "[" in line and "login:" in line:
-                    # 标记密码来源：是从种子凭据命中还是固定字典
                     cracked = line.strip()
                     cred_source = "hydra"
                     if extra_passwords and any(p in cracked for p in extra_passwords):
@@ -2468,7 +2246,6 @@ $PHUIP "{web_url}/index.php" 2>&1
         """Single-quote each string and join with spaces (safe for printf)."""
         out: list[str] = []
         for s in items:
-            # 单引号包裹，把字面单引号转为 '\'' 模式
             esc = s.replace("'", "'\\''")
             out.append(f"'{esc}'")
         return " ".join(out)
@@ -2491,7 +2268,6 @@ $PHUIP "{web_url}/index.php" 2>&1
         seeds = getattr(self, "_seed_credentials", None) or []
         if not seeds:
             return []
-        # 哪些端口适合凭据复用
         replayable_ports: dict[int, str] = {
             22: "ssh", 2211: "ssh", 2222: "ssh", 22222: "ssh",
             21: "ftp",
@@ -2528,9 +2304,6 @@ $PHUIP "{web_url}/index.php" 2>&1
         return out
 
 
-    # ================================================================
-    # Phase 5: Finding 事后校验与修正
-    # ================================================================
 
     @staticmethod
     def _enrich_findings(
@@ -2552,7 +2325,6 @@ $PHUIP "{web_url}/index.php" 2>&1
         if not fingerprints:
             return findings
 
-        # 收集所有端口的技术栈层级信息
         all_app_frameworks = set()
         all_middleware = set()
         all_security = set()
@@ -2570,11 +2342,8 @@ $PHUIP "{web_url}/index.php" 2>&1
                 primary_techs.add(pt.lower())
 
         if not all_app_frameworks and not all_security:
-            # 没检测到应用框架，不做修正
             return findings
 
-        # ── 定义"容器/基础设施级"漏洞关键词 ──
-        # 这些关键词出现在 finding name 里，说明这是一个基础设施漏洞
         infra_vuln_keywords = {
             "tomcat": ["弱口令", "weak", "default", "manager", "war部署"],
             "nginx": ["配置", "misconfig", "traversal", "crlf"],
@@ -2586,20 +2355,14 @@ $PHUIP "{web_url}/index.php" 2>&1
             name_lower = finding.name.lower()
             port = finding.port
 
-            # 获取该端口的指纹
             port_fp = fingerprints.get(port, {}) if port else {}
             port_primary = port_fp.get("primary_tech", "").lower()
             port_apps = [t.lower() for t in port_fp.get("app_frameworks", [])]
 
-            # ── 规则 1: 基础设施漏洞 + 同端口有应用框架 → 降级 ──
-            # 关键修复: 只看同端口的指纹，不看全局
-            # 场景: Struts2 在 8080 → 该端口的 Tomcat 弱口令降级
-            # 场景: Tomcat8 靶场（裸 Tomcat）→ 不降级（本端口无应用框架）
             should_downgrade = False
             for infra_name, vuln_keywords in infra_vuln_keywords.items():
                 if infra_name in name_lower:
                     if any(kw in name_lower for kw in vuln_keywords):
-                        # 只看同端口是否有应用框架
                         if port_apps:
                             actual_app = port_primary or port_apps[0]
                             logger.info(
@@ -2609,7 +2372,6 @@ $PHUIP "{web_url}/index.php" 2>&1
                             )
                             should_downgrade = True
                             break
-                        # 其他端口有应用框架但本端口没有 → 不降级
                         elif all_app_frameworks - {infra_name}:
                             logger.info(
                                 f"[VulnAgent] 保留 Finding: '{finding.name}' "
@@ -2625,8 +2387,6 @@ $PHUIP "{web_url}/index.php" 2>&1
                     f"此漏洞可能是误判）"
                 )
 
-            # ── 规则 2: 给所有 finding 补充指纹上下文 ──
-            # 让 registry 评分时有更多信息
             fp_context_parts = []
             if port_primary:
                 fp_context_parts.append(f"primary_tech={port_primary}")

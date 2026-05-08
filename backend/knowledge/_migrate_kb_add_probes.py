@@ -12,7 +12,6 @@ from pathlib import Path
 
 KB_DIR = Path(__file__).parent / "kb_data"
 
-# 漏洞 ID → Skill ID 映射（KB 命中后直接派发到该 Skill）
 DISPATCH_SKILL_MAP: dict[str, str] = {
     "fastjson_1247": "fastjson_rce",
     "fastjson_1224": "fastjson_rce",
@@ -31,11 +30,8 @@ DISPATCH_SKILL_MAP: dict[str, str] = {
     "tomcat8_weak_password": "tomcat_exploit",
     "directory_listing_exploit": "directory_discovery",
     "backup_file_exploit": "directory_discovery",
-    # vulnhub_* 是 CTF 指南，无固定 Skill 派发
 }
 
-# 每个漏洞的探针定义（HTTP 优先，少数走 command）
-# 探针只负责 "确认漏洞是否存在"，不负责利用 — 利用是 Skill 的职责
 PROBES_MAP: dict[str, list[dict]] = {
     "fastjson_1247": [
         {
@@ -378,21 +374,18 @@ def migrate_one(json_file: Path) -> bool:
 
     changed = False
 
-    # 1. dispatch_skill
     if "dispatch_skill" not in data:
         skill_id = DISPATCH_SKILL_MAP.get(vuln_id, "")
         if skill_id:
             data["dispatch_skill"] = skill_id
             changed = True
 
-    # 2. probes
     if "probes" not in data:
         probes = PROBES_MAP.get(vuln_id, [])
         if probes:
             data["probes"] = probes
             changed = True
 
-    # 3. exploit_steps deprecated 标记
     if data.get("exploit_steps") and "_exploit_steps_deprecated" not in data:
         data["_exploit_steps_deprecated"] = True
         data["_exploit_steps_note"] = (
@@ -403,13 +396,11 @@ def migrate_one(json_file: Path) -> bool:
         changed = True
 
     if changed:
-        # 保留键顺序：把新字段插在 vuln_id 之后
         ordered: dict = {}
         for key in ("vuln_id", "dispatch_skill", "description", "category"):
             if key in data:
                 ordered[key] = data.pop(key)
 
-        # 把 probes 放在 detection_method 之后
         rest_keys = list(data.keys())
         if "detection_method" in rest_keys and "probes" in rest_keys:
             rest_keys.remove("probes")

@@ -44,11 +44,8 @@ DEFAULT_SETTINGS = {
         "persistent_container": True,
         "lhost":                os.getenv("LHOST", ""),
     },
-    # workflow 块里保留全局"默认值"(给前端新建任务对话框预填),
-    # 但这些字段都是 per-task 的,不会再写回 os.environ。
-    # 真正的策略源是 models._MODE_DEFAULTS,此处仅用于 UI 显示。
     "workflow": {
-        "default_mode":       "pentest_engineer",   # pentest_engineer | ctf_expert
+        "default_mode":       "pentest_engineer",
         "max_retries":        3,
         "default_scope":      "CTF/授权靶场测试",
         "report_lang":        "zh",
@@ -177,13 +174,6 @@ async def _save_user_profile(owner_id: str, profile: dict) -> None:
         _save_profile(profile)
 
 
-# ── 敏感字段处理 ─────────────────────────────────────────
-#
-# 设计：LLM / Embedding 的 API Key 改为"后端统一分配"（当前阶段仍从
-#   环境变量读取），前端不再直接编辑 api_key：
-#   - GET /settings：不返回真实 api_key，只返回 `has_key` 布尔值
-#   - POST /settings：忽略前端提交的 api_key（不会覆盖服务端已配置的 key）
-# 这样可以避免把 Key 暴露到前端/日志/备份里。
 
 _REDACTED_SECTIONS = ("llm", "embedding")
 
@@ -198,11 +188,9 @@ def _redact_api_keys(data: dict) -> dict:
         if isinstance(block, dict):
             block = dict(block)
             key = str(block.get("api_key") or "")
-            # 兼容历史：如果落盘时存过真实 key，这里也不回传
             block["api_key"] = ""
             block["has_key"] = bool(key)
             out[section] = block
-    # 追加一份服务端当前生效的 key 状态（从环境变量读取），管理员可见
     out["_llm_runtime"] = {
         "has_key": bool(os.getenv("LLM_API_KEY", "")),
         "provider": os.getenv("LLM_PROVIDER", ""),
@@ -232,7 +220,6 @@ def _strip_client_api_keys(incoming: dict) -> dict:
     return cleaned
 
 
-# ── 设置端点 ──────────────────────────────────────────────
 
 @router.get("/settings")
 async def get_settings(request: Request):
@@ -245,17 +232,14 @@ async def get_settings(request: Request):
 async def save_settings(data: dict, request: Request):
     owner_id, _tenant_id = resolve_scope(request)
     incoming = _strip_client_api_keys(dict(data or {}))
-    # allowlist: 禁止普通用户覆盖高风险运行时安全参数
     if isinstance(incoming.get("executor"), dict):
         blocked = {"docker_network", "toolbox_image", "persistent_container"}
         for k in list(incoming["executor"].keys()):
             if k in blocked:
                 incoming["executor"].pop(k, None)
     merged = _deep_merge_dict(await _load_user_settings(owner_id), incoming)
-    # 持久化前再次剥掉 api_key（兼容历史数据），避免污染磁盘/DB
     await _save_user_settings(owner_id, _strip_client_api_keys(merged))
     llm = merged.get("llm", {})
-    # api_key 不再由 /settings 写入环境变量，只接受非敏感字段
     if llm.get("model"):      os.environ["LLM_MODEL"]      = llm["model"]
     if llm.get("base_url"):   os.environ["LLM_BASE_URL"]   = llm["base_url"]
     if llm.get("provider"):   os.environ["LLM_PROVIDER"]   = llm["provider"]
@@ -271,7 +255,6 @@ async def save_settings(data: dict, request: Request):
     lhost = merged.get("executor", {}).get("lhost")
     if lhost:
         os.environ["LHOST"] = lhost
-    # workflow 设置全部改为 per-task,不再通过 os.environ 广播给引擎
     return {"status": "ok"}
 
 
@@ -286,7 +269,6 @@ async def test_llm_connection():
         raise HTTPException(status_code=502, detail=str(e))
 
 
-# ── Profile 端点 ──────────────────────────────────────────
 
 @router.get("/profile")
 async def get_profile(request: Request):

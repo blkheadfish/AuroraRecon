@@ -41,14 +41,13 @@ DEFAULT_REACT_ACTIONS = frozenset({
 })
 
 
-# ── 1. JSON 决策解析 ──────────────────────────────────────
 
 @dataclass
 class ParsedDecision:
     """LLM 决策的解析结果。"""
-    ok: bool                     # JSON 是否成功解析
-    decision: dict[str, Any]      # 解析出的结构（不合法时为空）
-    raw: str                      # 原始字符串（截断到 1000）
+    ok: bool
+    decision: dict[str, Any]
+    raw: str
 
     @property
     def action(self) -> str:
@@ -97,21 +96,19 @@ def parse_react_decision(response_raw: str) -> ParsedDecision:
     return ParsedDecision(ok=False, decision={}, raw=raw_preview)
 
 
-# ── 2. 命令安全/去重综合检查 ───────────────────────────────
 
 @dataclass
 class CommandSafetyResult:
     """命令进入执行器之前所有前置检查的结果。"""
     allowed: bool
-    code: str = ""           # "guard" / "dangerous" / "duplicate" / ""
-    reason: str = ""         # 给 LLM 的 user message 内容（非空时直接 append）
+    code: str = ""
+    reason: str = ""
 
     @classmethod
     def ok(cls) -> "CommandSafetyResult":
         return cls(allowed=True)
 
 
-# 危险命令模式（与 ExploitAgent._is_dangerous_command 一致，集中维护）
 _DANGEROUS_PATTERNS = (
     "rm -rf /",
     "rm -rf /*",
@@ -219,13 +216,12 @@ def normalize_command(cmd: str) -> str:
     return " ".join((cmd or "").split())
 
 
-# ── 3. EvidenceVerifier 包装 ──────────────────────────────
 
 @dataclass
 class ConclusionVerification:
     """conclude_success 验证结果。"""
     passed: bool
-    level: str = ""          # VerifyResult.level.value
+    level: str = ""
     reason: str = ""
     snippets: list[str] = field(default_factory=list)
 
@@ -266,7 +262,6 @@ def verify_conclude_success(
     )
 
 
-# ── 4. 命令执行记录结构 ───────────────────────────────────
 
 def build_exec_record(
     *,
@@ -300,7 +295,6 @@ def build_exec_record(
     return record
 
 
-# ── 5. user-feedback 消息辅助 ─────────────────────────────
 
 def feedback_for_invalid_action(action: str) -> str:
     """LLM 返回未知 action 时给的 user 反馈。"""

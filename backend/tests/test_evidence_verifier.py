@@ -19,7 +19,6 @@ from backend.agents.evidence_verifier import (
 )
 
 
-# ── Fixtures ──────────────────────────────────────────────
 
 @pytest.fixture(params=[GatePolicy.STRICT, GatePolicy.MEDIUM, GatePolicy.LENIENT])
 def verifier(request) -> EvidenceVerifier:
@@ -30,7 +29,6 @@ def _v(policy: GatePolicy) -> EvidenceVerifier:
     return EvidenceVerifier(policy=policy)
 
 
-# ── 1. Confirmed RCE evidence ────────────────────────────
 
 class TestConfirmedRCE:
     UID_OUTPUT = "uid=0(root) gid=0(root) groups=0(root)"
@@ -54,7 +52,6 @@ class TestConfirmedRCE:
         assert vr.passed is True
 
 
-# ── 2. Probable RCE evidence ─────────────────────────────
 
 class TestProbableRCE:
     def test_response_code_200_passes_medium(self):
@@ -75,7 +72,6 @@ class TestProbableRCE:
         assert vr.level != EvidenceLevel.PROBABLE_RCE
 
 
-# ── 3. File-read evidence (LFI scenarios) ────────────────
 
 class TestFileReadLFI:
     PASSWD_CONTENT = (
@@ -181,7 +177,6 @@ class TestFileReadLFI:
         assert vr.passed is True
 
 
-# ── 4. No evidence (failed) ──────────────────────────────
 
 class TestFailed:
     def test_empty_output(self):
@@ -202,7 +197,6 @@ class TestFailed:
         assert vr.level == EvidenceLevel.FAILED
 
 
-# ── 5. Role-policy regression matrix ─────────────────────
 
 _SCENARIOS = [
     ("confirmed_rce_uid", "uid=0(root) gid=0(root)", EvidenceLevel.CONFIRMED_RCE),

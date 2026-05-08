@@ -28,7 +28,6 @@ from backend.tools.tool_registry import ToolRegistry
 logger = logging.getLogger(__name__)
 
 
-# ── 开关 ───────────────────────────────────────────────────
 
 def function_calling_enabled() -> bool:
     """ReAct 是否启用 Function Calling 模式。"""
@@ -36,16 +35,15 @@ def function_calling_enabled() -> bool:
     return val in ("1", "true", "yes", "on")
 
 
-# ── 翻译结果 ───────────────────────────────────────────────
 
 @dataclass
 class ResolvedToolCall:
     """tool_call → 可执行 shell 脚本 的中间表示。"""
-    tool_name: str           # YAML 里登记的 name（或 'run_shell' / 'http_request'）
-    script: str              # 给 executor.run_script 的 script_content
-    purpose: str             # 给 record_purpose
-    timeout: int             # 覆盖超时（0=用默认）
-    raw_args: dict           # LLM 原始 arguments，供日志/审计
+    tool_name: str
+    script: str
+    purpose: str
+    timeout: int
+    raw_args: dict
 
     @property
     def display(self) -> str:
@@ -54,7 +52,6 @@ class ResolvedToolCall:
         return cmd[:300]
 
 
-# ── 主入口 ─────────────────────────────────────────────────
 
 def build_react_tools_schema(
     registry: Optional[ToolRegistry] = None,
@@ -96,7 +93,6 @@ def resolve_tool_call(
     purpose = str(args.get("purpose") or "")[:200]
     timeout = _coerce_int(args.get("timeout"))
 
-    # 1. meta 工具：run_shell
     if name == "run_shell":
         script = str(args.get("script") or "").strip()
         if not script:
@@ -109,7 +105,6 @@ def resolve_tool_call(
             raw_args=args,
         )
 
-    # 2. meta 工具：http_request
     if name == "http_request":
         script = _http_request_to_curl(args)
         if not script:
@@ -122,11 +117,9 @@ def resolve_tool_call(
             raw_args=args,
         )
 
-    # 3. 注册表里的具体工具
     reg = registry or ToolRegistry()
     tool_def = reg.get(name) or reg.get(name.replace("_", "-"))
     if not tool_def:
-        # OpenAI 把 - 替换为 _，反向尝试
         for candidate in reg.list_all():
             sanitized = re.sub(r"[^A-Za-z0-9_\-]", "_", candidate.name)
             if sanitized == name:
@@ -151,19 +144,16 @@ def resolve_tool_call(
     )
 
 
-# ── 内部工具 ───────────────────────────────────────────────
 
 def _extract_call_fields(tool_call: Any) -> tuple[str, str]:
     """从 SDK 对象/dict 里抽出 (function_name, arguments_json_string)。"""
     if tool_call is None:
         return "", ""
 
-    # dict path
     if isinstance(tool_call, dict):
         fn = tool_call.get("function") or {}
         return str(fn.get("name") or ""), str(fn.get("arguments") or "{}")
 
-    # openai SDK object
     fn = getattr(tool_call, "function", None)
     if fn is None:
         return "", ""
@@ -178,7 +168,6 @@ def _parse_arguments(raw: str) -> dict:
         parsed = json.loads(raw)
         return parsed if isinstance(parsed, dict) else {}
     except json.JSONDecodeError:
-        # 兜底：偶尔 LLM 输出非严格 JSON，尝试单引号修正
         try:
             return json.loads(raw.replace("'", '"'))
         except Exception:
@@ -222,7 +211,6 @@ def _http_request_to_curl(args: dict) -> str:
     return " ".join(parts)
 
 
-# ── ReAct system prompt 增量 ───────────────────────────────
 
 REACT_TOOLS_SYSTEM_ADDENDUM = """
 你现在使用 OpenAI Function Calling 协议，请直接返回 tool_calls，

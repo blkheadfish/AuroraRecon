@@ -66,8 +66,6 @@ class TestModeWeightedMatching:
         )
         result_eng = self.reg.match(finding, workflow_mode="pentest_engineer")
         result_ctf = self.reg.match(finding, workflow_mode="ctf_expert")
-        # Under engineer (min_score=20), a 10-point evidence match is rejected.
-        # Under ctf (min_score=5, boost=10), a 10+10=20 point match may be accepted.
         if result_eng is not None:
             assert result_ctf is not None, (
                 "CTF should match if engineer matches (CTF is more permissive)"
@@ -92,8 +90,6 @@ class TestModeWeightedMatching:
             target="http://target:8080",
             exploitable=True,
         )
-        # Even in pentest_engineer, if we drop the threshold to 5 and boost weak
-        # signals, we should behave like ctf_expert.
         result_override = self.reg.match(
             finding,
             workflow_mode="pentest_engineer",
@@ -120,7 +116,7 @@ class TestModeWeightedMatching:
         result = self.reg.match(
             finding,
             workflow_mode="ctf_expert",
-            min_score=1000,  # arbitrarily high => nothing can match
+            min_score=1000,
             weak_signal_boost=0,
         )
         assert result is None, "Extreme min_score should reject all matches"

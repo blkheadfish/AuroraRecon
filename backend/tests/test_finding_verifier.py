@@ -22,7 +22,6 @@ def verifier():
     return FindingVerifier()
 
 
-# ── Case 1: Nmap script execution failed (screenshot 1) ──
 
 class TestNmapScriptFailedRejection:
     """Nmap reports 'VULNERABLE' but output only contains 'Script execution failed'."""
@@ -67,7 +66,6 @@ class TestNmapScriptFailedRejection:
         assert result.confidence > 20
 
 
-# ── Case 2: ActiveMQ false positive (screenshot 2) ──
 
 class TestActiveMQFalsePositive:
     """KB detection returns HTTP 200 on nginx but description claims ActiveMQ."""
@@ -102,7 +100,6 @@ class TestActiveMQFalsePositive:
         assert result.confidence > 20
 
 
-# ── Case 3: True positive — /etc/passwd read ──
 
 class TestTruePositivePasswd:
     PASSWD_EVIDENCE = (
@@ -136,7 +133,6 @@ class TestTruePositivePasswd:
         assert result.confidence >= 85
 
 
-# ── Case 4: Hydra cracked credentials ──
 
 class TestHydraConfirmed:
     def test_hydra_login_confirmed(self, verifier):
@@ -152,7 +148,6 @@ class TestHydraConfirmed:
         assert result.confidence >= 85
 
 
-# ── Case 5: Service-only finding stays low confidence ──
 
 class TestServiceFindingLowConfidence:
     def test_service_enum_stays_low(self, verifier):
@@ -170,7 +165,6 @@ class TestServiceFindingLowConfidence:
         assert result.verification_status in ("suspected",)
 
 
-# ── Case 6: Confidence threshold gates exploitable ──
 
 class TestConfidenceGate:
     def test_low_confidence_blocks_exploitable(self, verifier):

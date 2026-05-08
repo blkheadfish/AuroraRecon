@@ -89,16 +89,13 @@ def _safe_substitute(template: str, placeholder: str, value: str) -> str:
     return shlex.quote(value)
 
 
-# ─────────────────────────────────────────────────────────
-# 基础类型
-# ─────────────────────────────────────────────────────────
 
 class StepOutcome(str, Enum):
     """步骤执行后的跳转指令"""
-    NEXT_STEP = "next_step"           # 继续当前路径的下一步
-    NEXT_PATH = "next_path"           # 放弃当前路径，尝试下一条
-    CONCLUDE_SUCCESS = "conclude_success"  # 利用成功
-    CONCLUDE_FAIL = "conclude_fail"    # 利用失败（不再尝试）
+    NEXT_STEP = "next_step"
+    NEXT_PATH = "next_path"
+    CONCLUDE_SUCCESS = "conclude_success"
+    CONCLUDE_FAIL = "conclude_fail"
 
 
 @dataclass
@@ -109,16 +106,13 @@ class ParseRule:
     声明式：根据命令输出的内容，设置上下文变量。
     每条规则互不排斥，按顺序全部评估。
     """
-    # 触发条件（满足 ANY 一个即触发）
     if_contains: list[str] = field(default_factory=list)
     if_not_contains: list[str] = field(default_factory=list)
     if_status_code: list[int] = field(default_factory=list)
-    if_regex: str = ""  # 正则匹配
+    if_regex: str = ""
 
-    # 附加条件
     and_body_not_empty: bool = False
 
-    # 触发后设置的上下文变量
     set: dict[str, Any] = field(default_factory=dict)
 
     def evaluate(self, stdout: str, stderr: str, status_code: int) -> dict[str, Any]:
@@ -192,7 +186,6 @@ class SuccessCriteria:
                 return False
 
         if self.stdout_not_empty:
-            # 去除空白和常见无意义输出
             clean = stdout.strip()
             if not clean or clean in ("null", "None", "{}", "[]"):
                 return False
@@ -208,9 +201,6 @@ class SuccessCriteria:
         return True
 
 
-# ─────────────────────────────────────────────────────────
-# 探测阶段
-# ─────────────────────────────────────────────────────────
 
 @dataclass
 class ProbeStep:
@@ -231,28 +221,19 @@ class Probe:
     id: str
     description: str = ""
 
-    # 单命令探测（简单场景）
     command: str = ""
     parse_rules: list[ParseRule] = field(default_factory=list)
     timeout: int = 15
 
-    # 多步骤探测（复杂场景，如需要多个 payload 对比）
     steps: list[ProbeStep] = field(default_factory=list)
 
-    # 前置条件：上下文变量满足才执行
     depends_on: dict[str, Any] = field(default_factory=dict)
 
-    # 环境要求：如 env.can_reverse = true
     requires: dict[str, Any] = field(default_factory=dict)
 
-    # 跳过条件：满足时不执行（典型用法：{variable_present: "lfi_depth"}，
-    # 表示已经有别的来源确认过 lfi_depth，此探测无需重复）
     skip_if: dict[str, Any] = field(default_factory=dict)
 
 
-# ─────────────────────────────────────────────────────────
-# 利用步骤和路径
-# ─────────────────────────────────────────────────────────
 
 @dataclass
 class ExploitStep:
@@ -262,20 +243,14 @@ class ExploitStep:
     command: str = ""
     timeout: int = 30
 
-    # 端口映射（用于反连回调）
     publish_ports: list[int] = field(default_factory=list)
 
-    # 成功判定
     success_criteria: SuccessCriteria = field(default_factory=SuccessCriteria)
 
-    # 跳转控制
-    on_success: str = "next_step"       # step_id 或 StepOutcome
-    on_fail: str = "next_path"          # step_id 或 StepOutcome
+    on_success: str = "next_step"
+    on_fail: str = "next_path"
 
-    # 成功时的证据提取
     evidence_capture: dict[str, str] = field(default_factory=dict)
-    # 如 {"current_user": "stdout", "shell_type": "rce_bcel"}
-    # "stdout" = 从命令输出中提取，其他值为字面量
 
 
 @dataclass
@@ -289,28 +264,20 @@ class ExploitPath:
     path_id: str
     name: str = ""
     priority: int = 10
-    principle: str = ""   # 原理说明（给 LLM 参考）
+    principle: str = ""
 
-    # 前置条件（全部满足才选择此路径）
     conditions: dict[str, Any] = field(default_factory=dict)
 
-    # OR 条件组：列表中任一 dict 全部满足即可（与 conditions AND 关系）
     conditions_any: list[dict[str, Any]] = field(default_factory=list)
 
-    # 排除条件（满足任一则跳过）
     skip_if: dict[str, Any] = field(default_factory=dict)
 
-    # 利用步骤
     steps: list[ExploitStep] = field(default_factory=list)
 
-    # 特殊模式：LLM 自由推理
-    mode: str = ""  # "" = 正常步骤执行, "react_freeform" = LLM 自由推理
+    mode: str = ""
     max_rounds: int = 5
 
 
-# ─────────────────────────────────────────────────────────
-# 匹配规则
-# ─────────────────────────────────────────────────────────
 
 @dataclass
 class MatchRule:
@@ -319,13 +286,9 @@ class MatchRule:
     cve_matches: list[str] = field(default_factory=list)
     evidence_contains: list[str] = field(default_factory=list)
     json_probe_result: str = ""
-    service_is: str = ""       # nmap service 字段
+    service_is: str = ""
     port_is: list[int] = field(default_factory=list)
-    # finding.tool 精确匹配，用于让 fact_sink 合成的 service-level finding
-    # （例如 tool="cred-replay" / tool="service-sweep"）能高精度命中专用 Skill。
     tool_is: str = ""
-    # 运行时变量存在性检查: 列表中任一变量在 context 中存在且为 truthy 即匹配。
-    # 用于解耦 skill 间的衔接——上游 skill 产出变量后，下游 skill 通过此字段自声明依赖。
     variable_present: list[str] = field(default_factory=list)
 
     def matches(
@@ -389,7 +352,6 @@ class MatchRule:
                 )
             )
 
-        # 无条件 = 不匹配
         if not checks:
             return False
 
@@ -399,13 +361,10 @@ class MatchRule:
 @dataclass
 class MatchConfig:
     """匹配配置"""
-    rules: list[MatchRule] = field(default_factory=list)   # 满足 ANY 即匹配
-    exclude: list[MatchRule] = field(default_factory=list)  # 满足 ANY 即排除
+    rules: list[MatchRule] = field(default_factory=list)
+    exclude: list[MatchRule] = field(default_factory=list)
 
 
-# ─────────────────────────────────────────────────────────
-# 顶层 Skill 定义
-# ─────────────────────────────────────────────────────────
 
 @dataclass
 class Skill:
@@ -422,9 +381,9 @@ class Skill:
     skill_id: str
     name: str
     category: str = ""
-    phase: str = "foothold"   # foothold | post_foothold | privesc | recon
+    phase: str = "foothold"
     version: str = "1.0"
-    principle: str = ""   # 漏洞原理（给 LLM 兜底时参考）
+    principle: str = ""
 
     match: MatchConfig = field(default_factory=MatchConfig)
     probes: list[Probe] = field(default_factory=list)
@@ -432,13 +391,12 @@ class Skill:
 
     remediation: str = ""
 
-    # 加载元信息
-    source_file: str = ""  # YAML 文件路径
+    source_file: str = ""
+
+    # AI 引导文档（从 SKILL.md 加载，可选）
+    doc: Any = field(default=None, repr=False)
 
 
-# ─────────────────────────────────────────────────────────
-# 运行时上下文
-# ─────────────────────────────────────────────────────────
 
 @dataclass
 class SkillContext:
@@ -451,38 +409,27 @@ class SkillContext:
     - 探测阶段设置的变量
     - 步骤执行记录
     """
-    # 目标信息
-    endpoint: str = ""          # 实际的 JSON/Web 接口 URL
+    endpoint: str = ""
     target_ip: str = ""
     target_port: int = 0
     target_os: str = "unknown"
 
-    # 环境信息
     lhost: str = ""
     can_reverse: bool = False
-    task_id: Optional[str] = None  # 任务 ID，用于持久容器执行
-    log_callback: Any = None       # 可选日志回调，用于推送命令/输出到前端
+    task_id: Optional[str] = None
+    log_callback: Any = None
+    skill_dir: str = ""  # Skill 脚本所在目录（Docker 内为 /opt/skills/xxx）
 
-    # 动态变量（探测阶段设置，决策树使用）
     variables: dict[str, Any] = field(default_factory=dict)
 
-    # 从 phpinfo_parser 得到的 PHP 运行时事实（只读，供 check/substitute 使用）
     php_runtime: dict[str, Any] = field(default_factory=dict)
-    # 通用 service-info 事实桶（per-service）：
-    #   runtime_facts["php"] / ["apache"] / ["nginx"] / ["tomcat"] /
-    #   ["spring"] / ["env_file"]
-    # 每个桶里都带 _attack_surface 子字段，供 env.<kind>.<key> 条件匹配。
     runtime_facts: dict[str, dict[str, Any]] = field(default_factory=dict)
-    # 前序利用已确认的事实（lfi/services/creds），供 check/substitute 及
-    # 条件判断使用，保证二次利用不重复探测
     confirmed_facts: dict[str, Any] = field(default_factory=dict)
 
-    # 执行记录
     probe_records: list[dict] = field(default_factory=list)
     step_records: list[dict] = field(default_factory=list)
     commands_run: list[str] = field(default_factory=list)
 
-    # 当前成功的利用命令模板（用于验证阶段复用）
     exploit_cmd_template: str = ""
 
     _var_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
@@ -603,6 +550,7 @@ class SkillContext:
             "{TARGET_PORT}": str(self.target_port),
             "{LHOST}": self.lhost,
             "{EXPLOIT_CMD}": self.exploit_cmd_template,
+            "{skill_dir}": self.skill_dir,
         }
 
         for placeholder, value in replacements.items():

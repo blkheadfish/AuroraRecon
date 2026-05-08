@@ -24,7 +24,6 @@ from backend.api.services.branch_manager import BranchManager
 from backend.api.state import TaskStateManager
 
 
-# ── 测试夹具 ────────────────────────────────────────────────
 
 
 class FakeOrchestrator:
@@ -37,9 +36,7 @@ class FakeOrchestrator:
 
     def __init__(self) -> None:
         self.threads: dict[str, dict] = {}
-        # Per-thread block until released
         self.gates: dict[str, asyncio.Event] = {}
-        # Each entry: (source_thread_id, target_thread_id, patch, source_checkpoint_id)
         self.fork_calls: list[tuple[str, str, dict, str | None]] = []
 
     def _gate(self, thread_id: str) -> asyncio.Event:
@@ -59,16 +56,11 @@ class FakeOrchestrator:
         patch: dict[str, Any], as_node: str | None = None,
         source_checkpoint_id: str | None = None,
     ) -> bool:
-        # 真实 Orchestrator.fork_branch_state 在 phase3 升级时新增了
-        # ``source_checkpoint_id`` 参数（可选），用来从历史中任意 checkpoint
-        # 分叉。FakeOrchestrator 也接住这个 kwarg，行为上不区分：
-        # 不论是否传 source_checkpoint_id，都从最新 thread 状态克隆。
         self.fork_calls.append(
             (source_thread_id, target_thread_id, dict(patch), source_checkpoint_id)
         )
         src = self.threads.get(source_thread_id)
         if src is None:
-            # Plant the patch verbatim so child can still bootstrap.
             self.threads[target_thread_id] = dict(patch)
             return False
         merged = dict(src)
@@ -79,12 +71,8 @@ class FakeOrchestrator:
     async def resume_branch_stream(
         self, thread_id: str, *, patch: dict[str, Any] | None = None,
     ):
-        # In real life the graph yields per node; here we yield one
-        # "supervisor" tick after the test releases the gate. This proves
-        # the bg runner is wired up without actually running an LLM.
         await self._gate(thread_id).wait()
         state = dict(self.threads.get(thread_id, {}))
-        # Mark the run as having advanced — supervisor would normally do this.
         state.setdefault("status", TaskStatus.RUNNING)
         yield "supervisor", state
 
@@ -101,8 +89,6 @@ class FakeOrchestrator:
 @pytest.fixture
 def fake_orchestrator(monkeypatch: pytest.MonkeyPatch) -> FakeOrchestrator:
     fake = FakeOrchestrator()
-    # branch_manager imports get_orchestrator inside fork_from_active /
-    # _resume_branch_bg via task_runner; monkeypatch *that* symbol.
     from backend.api.services import task_runner
 
     monkeypatch.setattr(task_runner, "get_orchestrator", lambda: fake)
@@ -112,12 +98,11 @@ def fake_orchestrator(monkeypatch: pytest.MonkeyPatch) -> FakeOrchestrator:
 @pytest.fixture
 def fresh_state_manager(monkeypatch: pytest.MonkeyPatch) -> TaskStateManager:
     sm = TaskStateManager()
-    sm.db_available = False  # bypass DB
+    sm.db_available = False
     from backend.api import state as state_module
 
     monkeypatch.setattr(state_module, "_state_manager", sm, raising=False)
     monkeypatch.setattr(state_module, "get_state_manager", lambda: sm)
-    # branch_manager.py also imports get_state_manager at module level
     monkeypatch.setattr(branch_manager_module, "get_state_manager", lambda: sm)
     return sm
 
@@ -140,7 +125,6 @@ def _make_state(task_id: str = "task-x", **kwargs) -> PentestState:
     )
 
 
-# ── 测试: lazy_init_root ─────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -156,8 +140,6 @@ async def test_lazy_init_root_is_idempotent_and_thread_eq_task_id(
 
     assert root_a.is_root is True
     assert root_a.branch_id == "root"
-    # Legacy compatibility: root keeps thread_id == task_id so the existing
-    # checkpoint history lives at the same location.
     assert root_a.thread_id == "task-a"
     assert root_b.branch_id == root_a.branch_id, "lazy_init must be idempotent"
 
@@ -165,7 +147,6 @@ async def test_lazy_init_root_is_idempotent_and_thread_eq_task_id(
     assert len(branches) == 1
 
 
-# ── 测试: fork_from_active ───────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -176,7 +157,6 @@ async def test_fork_from_active_pauses_parent_and_starts_child(
 ):
     state = _make_state("task-fork", supervisor_round=3)
     fresh_state_manager.set("task-fork", state)
-    # Bootstrap the orchestrator with a parent checkpoint so fork can copy.
     fake_orchestrator.threads["task-fork"] = state.model_dump()
 
     child = await branch_mgr.fork_from_active(
@@ -191,7 +171,6 @@ async def test_fork_from_active_pauses_parent_and_starts_child(
     assert child.label.startswith("改打")
     assert child.initiating_prompt == "改打 SQL 注入"
 
-    # Parent pause, child active
     branches = await branch_mgr.list_branches("task-fork")
     by_id = {b.branch_id: b for b in branches}
     assert by_id["root"].status == "paused"
@@ -200,13 +179,10 @@ async def test_fork_from_active_pauses_parent_and_starts_child(
     assert active.branch_id == child.branch_id
     assert active.status == "running"
 
-    # Patch was applied: pending_user_prompt + operator_intent live on the
-    # child's thread.
     child_thread = fake_orchestrator.threads[child.thread_id]
     assert "改打 SQL 注入" in (child_thread.get("pending_user_prompt") or "")
     assert int((child_thread.get("replan_signals") or {}).get("operator_intent", 0)) >= 1
 
-    # Cleanup the bg task we spawned.
     fake_orchestrator.release_all()
     bg = branch_mgr._bg.get(child.branch_id)
     if bg:
@@ -216,7 +192,6 @@ async def test_fork_from_active_pauses_parent_and_starts_child(
             pass
 
 
-# ── 测试: 切换 active 自动暂停旧分支 ──────────────────────────
 
 
 @pytest.mark.asyncio
@@ -229,11 +204,9 @@ async def test_switch_active_pauses_previous(
     fresh_state_manager.set("task-sw", state)
     fake_orchestrator.threads["task-sw"] = state.model_dump()
 
-    # Fork once so we have two branches: root (will be paused), child A.
     child_a = await branch_mgr.fork_from_active(
         "task-sw", user_prompt="branch A", fork_event_id="evt-A",
     )
-    # Switch back to root → child A should be paused.
     fake_orchestrator.release_all()
     target = await branch_mgr.switch_active("task-sw", "root")
     assert target.branch_id == "root"
@@ -244,7 +217,6 @@ async def test_switch_active_pauses_previous(
     )
 
 
-# ── 测试: paused 不自恢复 ────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -262,18 +234,15 @@ async def test_paused_branch_does_not_self_resume(
     )
     await branch_mgr.pause("task-paused", child.branch_id)
 
-    # No bg task should remain after pause.
     assert child.branch_id not in branch_mgr._bg
     branches = {b.branch_id: b for b in await branch_mgr.list_branches("task-paused")}
     assert branches[child.branch_id].status == "paused"
 
-    # Sleeping briefly must not flip the status back to running.
     await asyncio.sleep(0.05)
     branches2 = {b.branch_id: b for b in await branch_mgr.list_branches("task-paused")}
     assert branches2[child.branch_id].status == "paused"
 
 
-# ── 测试: sibling 计数 ──────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -286,8 +255,6 @@ async def test_sibling_counts_in_tree_payload(
     fresh_state_manager.set("task-sib", state)
     fake_orchestrator.threads["task-sib"] = state.model_dump()
 
-    # Fork, switch back to root, fork again → root now has 2 children with
-    # different fork_event_ids ⇒ each is its own group of size 1.
     child_a = await branch_mgr.fork_from_active(
         "task-sib", user_prompt="A", fork_event_id="evt-A",
     )
@@ -298,8 +265,6 @@ async def test_sibling_counts_in_tree_payload(
     )
     fake_orchestrator.release_all()
 
-    # And one more sibling on the *same* event as A → group size 2 there.
-    # Reset to root + same fork_event_id so siblings collide.
     await branch_mgr.switch_active("task-sib", "root")
     child_a2 = await branch_mgr.fork_from_active(
         "task-sib", user_prompt="A again", fork_event_id="evt-A",
@@ -312,19 +277,15 @@ async def test_sibling_counts_in_tree_payload(
     payload = branch_mgr.to_tree_payload(branches, active.branch_id)
 
     by_id = {item["branch_id"]: item for item in payload["branches"]}
-    # evt-A children: {child_a, child_a2} → sibling_total 2
     assert by_id[child_a.branch_id]["sibling_total"] == 2
     assert by_id[child_a2.branch_id]["sibling_total"] == 2
     assert {by_id[child_a.branch_id]["sibling_index"],
             by_id[child_a2.branch_id]["sibling_index"]} == {1, 2}
-    # evt-B child alone in its sibling group
     assert by_id[child_b.branch_id]["sibling_total"] == 1
     assert by_id[child_b.branch_id]["sibling_index"] == 1
-    # Root is the only "no-parent" entry.
     assert by_id["root"]["sibling_total"] == 1
 
 
-# ── 测试: completed 任务不 fork (chat 端 append 路径) ─────────
 
 
 @pytest.mark.asyncio
@@ -344,20 +305,15 @@ async def test_completed_task_chat_only_appends(
     state.current_phase = "report"
     fresh_state_manager.set("task-done", state)
 
-    # Bootstrap root.
     await branch_mgr.lazy_init_root("task-done", state)
     branches_before = await branch_mgr.list_branches("task-done")
     assert len(branches_before) == 1
 
-    # Simulate the "completed" path: chat handler must NOT call
-    # fork_from_active. We verify by ensuring no new branch appeared and no
-    # fork call was issued.
     assert fake_orchestrator.fork_calls == []
     branches_after = await branch_mgr.list_branches("task-done")
     assert len(branches_after) == 1
 
 
-# ── 测试: 分支上限保护 ─────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -373,7 +329,6 @@ async def test_max_branches_per_task_enforced(
 
     monkeypatch.setattr(branch_manager_module, "MAX_BRANCHES_PER_TASK", 2)
 
-    # First fork → root + child1 (2 total, at the cap).
     await branch_mgr.fork_from_active(
         "task-cap", user_prompt="one", fork_event_id="evt-1",
     )

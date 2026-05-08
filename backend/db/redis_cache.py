@@ -20,13 +20,8 @@ logger = logging.getLogger(__name__)
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
-# ── 短操作池 (publish / cache / 工具结果读写) ──────────────
-# 短连接, 用完即还, 不需要太大。
 _pool: Optional[aioredis.Redis] = None
 
-# ── XREAD BLOCK 长连接池 (subscribe) ──────────────────────
-# 每个 WS 订阅者通过 XREAD BLOCK 25s 持有一条连接, 单独配池避免
-# 长连接饿死短操作。容量需要覆盖最大并发 WS Tab 数。
 _xread_pool: Optional[aioredis.Redis] = None
 
 
@@ -69,7 +64,6 @@ async def close_redis():
         _xread_pool = None
 
 
-# ── 任务状态缓存 ─────────────────────────────────────────
 
 def _task_key(task_id: str) -> str:
     return f"task:{task_id}:state"
@@ -104,7 +98,6 @@ async def delete_cached_task(task_id: str) -> None:
     await r.delete(_task_key(task_id), _log_key(task_id), _cancel_key(task_id))
 
 
-# ── 任务日志 ─────────────────────────────────────────────
 
 async def append_task_log(task_id: str, log_entry: str) -> None:
     """追加一条日志到 Redis List"""
@@ -125,7 +118,6 @@ async def get_recent_logs(task_id: str, count: int = 20) -> list[str]:
     return await r.lrange(_log_key(task_id), -count, -1)
 
 
-# ── 任务取消信号 ─────────────────────────────────────────
 
 async def set_cancel_flag(task_id: str) -> None:
     """设置取消标志"""
@@ -139,7 +131,6 @@ async def is_cancelled(task_id: str) -> bool:
     return await r.exists(_cancel_key(task_id)) > 0
 
 
-# ── 工具结果缓存 ─────────────────────────────────────────
 
 async def cache_tool_result(
     tool: str, target: str, result: str, ttl: int = 3600
@@ -156,7 +147,6 @@ async def get_cached_tool_result(tool: str, target: str) -> Optional[str]:
     return await r.get(f"tool_cache:{tool}:{target}")
 
 
-# ── 全局统计 ─────────────────────────────────────────────
 
 async def incr_stat(key: str, amount: int = 1) -> int:
     """递增统计计数器"""

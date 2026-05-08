@@ -18,10 +18,6 @@ import pytest
 from backend.agents.exploit_agent import ExploitAgent
 
 
-# ─────────────────────────────────────────────────────────────────
-# Lightweight stand-ins so we don't depend on the full Skill loader
-# (which transitively imports yaml / openai / langgraph in some envs).
-# ─────────────────────────────────────────────────────────────────
 
 @dataclass
 class _FakeSkill:
@@ -39,7 +35,7 @@ class _FakeRegistry:
 
 
 def _make_agent(with_log_poison_skill: bool = True) -> ExploitAgent:
-    agent = object.__new__(ExploitAgent)  # bypass __init__ / heavy deps
+    agent = object.__new__(ExploitAgent)
     by_id = {
         "credential_bruteforce": _FakeSkill(
             skill_id="credential_bruteforce", category="credential",
@@ -49,13 +45,10 @@ def _make_agent(with_log_poison_skill: bool = True) -> ExploitAgent:
         by_id["log_poisoning"] = _FakeSkill(
             skill_id="log_poisoning", category="web_rce",
         )
-    agent.skill_registry = _FakeRegistry(by_id)  # type: ignore[attr-defined]
+    agent.skill_registry = _FakeRegistry(by_id)
     return agent
 
 
-# ─────────────────────────────────────────────────────────────────
-# Triggered: LFI + log_readable
-# ─────────────────────────────────────────────────────────────────
 
 def test_bias_replaces_credential_bruteforce_when_log_readable():
     agent = _make_agent()
@@ -109,9 +102,6 @@ def test_bias_catches_generic_credential_category_on_ssh_ports(ssh_port):
     assert out.skill_id == "log_poisoning"
 
 
-# ─────────────────────────────────────────────────────────────────
-# Not triggered
-# ─────────────────────────────────────────────────────────────────
 
 def test_bias_passthrough_when_no_lfi_confirmed():
     agent = _make_agent()
@@ -125,7 +115,7 @@ def test_bias_passthrough_when_no_lfi_confirmed():
     out = agent._apply_log_poison_chain_bias(
         skill, port=22, context=ctx, origin="match",
     )
-    assert out is skill   # unchanged
+    assert out is skill
 
 
 def test_bias_passthrough_when_no_log_readable():
@@ -182,13 +172,11 @@ def test_bias_handles_none_skill_and_missing_alt():
             "services": {"log_readable": ["auth.log"]},
         },
     }
-    # None skill → passthrough
     out = agent._apply_log_poison_chain_bias(
         None, port=22, context=ctx, origin="match_by_port",
     )
     assert out is None
 
-    # credential_bruteforce but alt not loaded → keep original (fail open)
     skill = _FakeSkill("credential_bruteforce", category="credential")
     out = agent._apply_log_poison_chain_bias(
         skill, port=22, context=ctx, origin="match",

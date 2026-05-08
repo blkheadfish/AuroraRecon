@@ -19,7 +19,6 @@ from backend.agents.models import (
 )
 
 
-# 所有模式必须携带的 per-task 键
 _REQUIRED_KEYS = {
     "auto_approve",
     "success_gate_level",
@@ -100,7 +99,6 @@ class TestApplyModeDefaults:
         assert state.auto_approve is False
         assert state.max_react_rounds == 7
         assert state.skill_min_score == 42
-        # 未覆盖的键仍来自 ctf_expert 默认
         assert state.success_gate_level == _MODE_DEFAULTS["ctf_expert"]["success_gate_level"]
         assert state.skill_weak_boost == _MODE_DEFAULTS["ctf_expert"]["skill_weak_boost"]
 
@@ -116,7 +114,6 @@ class TestApplyModeDefaults:
 
     def test_unknown_mode_still_applies_engineer_defaults(self):
         state = PentestState()
-        # 强制注入一个非法 mode（绕过 Literal 校验，模拟脏数据）
         object.__setattr__(state, "workflow_mode", "shadow")
         apply_mode_defaults(state)
         cfg = _MODE_DEFAULTS["pentest_engineer"]

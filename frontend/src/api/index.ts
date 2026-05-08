@@ -80,7 +80,7 @@ export const api = {
     http.put('/auth/me', data),
 
   healthCheck: (): Promise<HealthInfo> => http.get('/health'),
-
+  // AI辅助生成：DeepSeek-V4-Pro,2026-05-03
   parseTaskIntent: (payload: {
     userPrompt: string
     workflowMode?: 'pentest_engineer' | 'ctf_expert'
@@ -106,6 +106,7 @@ export const api = {
     ),
 
   // Plan Mode: 在创建任务前生成渗透策略预览，不执行任何工具
+  // AI辅助生成：DeepSeek-V4-Pro,2026-05-03
   generatePlan: (payload: {
     userPrompt: string
   }): Promise<PlanResponse> =>

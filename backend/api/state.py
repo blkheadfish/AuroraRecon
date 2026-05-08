@@ -40,22 +40,11 @@ class TaskStateManager:
         self._tool_registry_cache = None
         self._tool_registry_mtime = 0.0
 
-        # 后台任务句柄注册表(run_task / resume_task 的 asyncio.Task)
-        # cancel / delete 时可以精确取消对应协程,避免 zombie 残留。
         self._bg_tasks: dict[str, asyncio.Task] = {}
 
-        # ── task 级单调 log seq counter ────────────────────
-        # ``PentestState.log()`` 把 ``len(phase_log)-1`` 当作 seq 给 WS 用,
-        # 但 fork 出新分支时 child 的 phase_log 是父分支的拷贝, 之后两条
-        # 分支各自向前追加, seq 在 task 维度上不再单调; WS 重连按 seq 增量
-        # 补丁的逻辑会乱。改用进程内 task 级 counter, 配合
-        # ``PentestState.phase_log_seqs`` 持久化每条日志的真实 seq, WS
-        # 重连用 bisect 定位 start_idx, 跨分支也能严格单调对齐。
-        # counter 可能在 worker 线程被 ``state.log`` 间接读到, 加锁保证原子。
         self._log_seq_counter: dict[str, int] = {}
         self._log_seq_lock = threading.Lock()
 
-    # ── 任务 CRUD ─────────────────────────────────────────
 
     def get(self, task_id: str) -> Optional[PentestState]:
         return self._tasks.get(task_id)
@@ -64,8 +53,6 @@ class TaskStateManager:
         self._tasks[task_id] = state
 
     def pop(self, task_id: str) -> Optional[PentestState]:
-        # 任务彻底退出时清理 task-scoped 缓存, 避免 task_id 复用 (测试 / 重启)
-        # 时把旧的 log seq 当成新任务初始值。
         self.reset_log_seq(task_id)
         return self._tasks.pop(task_id, None)
 
@@ -75,7 +62,6 @@ class TaskStateManager:
     def items(self):
         return self._tasks.items()
 
-    # ── 运行中任务集合 ────────────────────────────────────
 
     def mark_running(self, task_id: str):
         self._running_tasks.add(task_id)
@@ -90,7 +76,6 @@ class TaskStateManager:
     def is_running(self, task_id: str) -> bool:
         return task_id in self._running_tasks
 
-    # ── 审批锁 ────────────────────────────────────────────
 
     def set_approval_inflight(self, task_id: str, ts: float):
         self._approval_inflight[task_id] = ts
@@ -101,7 +86,6 @@ class TaskStateManager:
     def clear_approval_inflight(self, task_id: str):
         self._approval_inflight.pop(task_id, None)
 
-    # ── 后台任务注册表 ────────────────────────────────────
 
     def register_bg_task(self, task_id: str, task: asyncio.Task) -> None:
         """注册一个后台协程(若已有旧句柄则先取消,避免泄漏)。"""
@@ -113,7 +97,6 @@ class TaskStateManager:
     def unregister_bg_task(self, task_id: str) -> None:
         self._bg_tasks.pop(task_id, None)
 
-    # ── 任务级 log seq ────────────────────────────────────
 
     def next_log_seq(self, task_id: str, *, anchor: int | None = None) -> int:
         """返回 ``task_id`` 维度下一条日志的单调 seq。
@@ -162,8 +145,6 @@ class TaskStateManager:
         task.cancel()
         return True
 
-    # ── 工具注册表（基于文件 mtime 的惰性缓存）──────
-    # YAML 变更后自动检测，无需重启；未变更时走缓存，零额外开销
 
     def get_tool_registry(self):
         from pathlib import Path as _Path
@@ -178,7 +159,6 @@ class TaskStateManager:
             self._tool_registry_mtime = latest_mtime
         return self._tool_registry_cache
 
-    # ── 辅助转换函数 ──────────────────────────────────────
 
     def to_summary(self, state: PentestState) -> dict:
         from backend.api.schemas import TaskSummary
@@ -204,7 +184,6 @@ class TaskStateManager:
             "scope_note": state.scope_note,
             "extra_hint": state.extra_hint,
             "user_prompt": state.user_prompt,
-            # ★ 新增：意图解析 + 策略计划数据，供前端策略执行状态条消费
             "parsed_intent": state.parsed_intent,
             "pentest_plan": state.pentest_plan,
             "error_msg": state.error_msg,
@@ -216,10 +195,6 @@ class TaskStateManager:
             "findings": [f.model_dump() for f in state.findings],
             "exploit_results": [r.model_dump() for r in state.exploit_results],
             "tool_records": [r.model_dump() for r in state.tool_records],
-            # 协议 v2: 实时事件不再由 state 派生; 这里 ``decision_events`` 字段
-            # 留空数组保持响应 schema 兼容, 老前端读到空数组只会渲染一个空
-            # 时间线 (新前端会忽略它直接走 WS / IndexedDB)。完整事件历史走
-            # ``GET /tasks/{id}/events?after_id=&count=``。
             "decision_events": [],
             "post_findings": state.post_findings,
             "report_md": state.report_md,
@@ -238,18 +213,15 @@ class TaskStateManager:
             "secondary_elided": state.secondary_elided,
             "secondary_attack_count": state.secondary_attack_count,
             "max_secondary_attacks": state.max_secondary_attacks,
-            # per-task 运行时参数(workflow_mode/auto_approve 已在 summary 里)
             "success_gate_level": state.success_gate_level,
             "risk_budget": state.risk_budget,
             "max_react_rounds": state.max_react_rounds,
             "max_explore_rounds": state.max_explore_rounds,
             "skill_min_score": state.skill_min_score,
             "skill_weak_boost": state.skill_weak_boost,
-            # 通用 Plan 模式 checkpoint(刷新页面后用于回填确认卡片)
             "pending_checkpoint": state.pending_checkpoint,
             "checkpoint_history": list(state.checkpoint_history or []),
             "pending_user_prompt": state.pending_user_prompt,
-            # 攻击链反馈循环 / Supervisor 模式可视化字段
             "attack_graph": state.attack_graph.to_payload() if state.attack_graph else {"nodes": [], "edges": []},
             "phase_visit_count": dict(state.phase_visit_count or {}),
             "replan_signals": dict(state.replan_signals or {}),
@@ -258,7 +230,6 @@ class TaskStateManager:
             "supervisor_round": state.supervisor_round,
             "supervisor_history": list(state.supervisor_history or []),
         })
-        # stdout/stderr 截断（避免 MB 级响应）+ 标注 truncated_reason
         for rec in base.get("tool_records", []):
             for field in ("stdout", "stderr"):
                 val = rec.get(field, "")
@@ -272,9 +243,6 @@ class TaskStateManager:
                     )
         return base
 
-    # 任务详情接口默认返回的轻量快照大小阈值。运行时间长的任务 phase_log /
-    # decision_events 会增长到 5k+,直接整体下发会让前端首屏卡顿,所以默认
-    # 只回最近 N 条,完整数据通过 /tasks/{id}/logs 与 ?full=true 走分页/按需。
     DEFAULT_SNAPSHOT_LOG_TAIL = 60
     DEFAULT_SNAPSHOT_DECISION_TAIL = 120
     SNAPSHOT_PATH_SNIPPET_MAX = 400
@@ -314,8 +282,6 @@ class TaskStateManager:
             list(state.phase_log[-log_tail:]) if (log_tail and log_total) else []
         )
 
-        # 协议 v2: 不再从 state 派生 decision events; 首屏快照里这两个字段
-        # 留空, 让前端进入页面时主动从 IndexedDB 预热 + WS history 帧补齐。
         decision_total = 0
         decision_tail_slice: list[dict] = []
 
@@ -359,7 +325,6 @@ class TaskStateManager:
             "scope_note": state.scope_note,
             "extra_hint": state.extra_hint,
             "user_prompt": state.user_prompt,
-            # ★ 新增：意图解析 + 策略计划数据，供前端策略执行状态条消费
             "parsed_intent": state.parsed_intent,
             "pentest_plan": state.pentest_plan,
             "error_msg": state.error_msg,
@@ -370,18 +335,14 @@ class TaskStateManager:
             "subdomains": state.subdomains,
             "findings": [f.model_dump() for f in state.findings],
             "exploit_results": exploit_results_snapshot,
-            # 显式置空,避免老前端再去渲染整张大表;计数/快照足够支撑 UI。
             "tool_records": [],
             "tool_records_count": len(state.tool_records or []),
-            # 兼容字段:旧前端 read decision_events,等价于 tail
             "decision_events": decision_tail_slice,
             "decision_events_tail": decision_tail_slice,
             "decision_events_total": decision_total,
             "post_findings": state.post_findings,
-            # report_md 单独走 /tasks/{id}/report,首屏不再随车
             "report_md": "",
             "report_available": bool(state.report_md or state.report_path),
-            # phase_log 改为 tail + total,前端分页走 /tasks/{id}/logs
             "phase_log": [],
             "phase_log_tail": phase_log_tail,
             "phase_log_total": log_total,
@@ -403,11 +364,9 @@ class TaskStateManager:
             "max_explore_rounds": state.max_explore_rounds,
             "skill_min_score": state.skill_min_score,
             "skill_weak_boost": state.skill_weak_boost,
-            # Plan 风格 checkpoint 数据,刷新后用于回填确认卡片
             "pending_checkpoint": state.pending_checkpoint,
             "checkpoint_history": list(state.checkpoint_history or [])[-10:],
             "pending_user_prompt": state.pending_user_prompt,
-            # 攻击链反馈循环 / Supervisor 模式可视化字段（首屏精简版）
             "attack_graph": state.attack_graph.to_payload() if state.attack_graph else {"nodes": [], "edges": []},
             "phase_visit_count": dict(state.phase_visit_count or {}),
             "replan_signals": dict(state.replan_signals or {}),
@@ -433,10 +392,7 @@ class TaskStateManager:
             "phase": state.current_phase,
             "status": state.status.value,
             "logs": state.phase_log[-tail:],
-            # 把 phase_log 当前末尾的 task 级 seq 透出, 让前端 phase_update
-            # 也能推进 ``lastLogSeq``, 与 history_logs / log 事件统一口径。
             "log_seq_last": last_seq,
-            # 便于前端按 activeBranchId 过滤 phase_update 事件流。
             "branch_id": getattr(state, "active_branch_id", "") or "",
             "findings_count": len(state.findings),
             "got_shell": state.got_shell,
@@ -446,11 +402,9 @@ class TaskStateManager:
             "secondary_elided": state.secondary_elided,
             "attack_next_steps": state.attack_next_steps,
             "privesc_attempt_count": state.privesc_attempt_count,
+            "attack_graph": state.attack_graph.to_payload() if state.attack_graph else {"nodes": [], "edges": []},
         }
 
-    # ── 仅保留: 时间戳标准化辅助 (DB 字段写入用) ──────────
-    # 历史上 ``build_decision_events`` 用过的 phase_log 反推逻辑全部移除,
-    # 仅留下这个 staticmethod 给迁移期单测用。新代码不要再调用。
     @staticmethod
     def _normalize_phase_log_ts(
         state_created_at: str, ts_short: str, prev_iso: str
@@ -501,7 +455,6 @@ class TaskStateManager:
 
 
 
-# ── 模块级单例 ────────────────────────────────────────────
 _state_manager = TaskStateManager()
 
 

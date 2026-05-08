@@ -26,9 +26,9 @@ _LINE_RE = re.compile(
         (?P<val>
             "(?:\\.|[^"\\])*"      # double-quoted
           | '(?:\\.|[^'\\])*'      # single-quoted
-          | [^\r\n#]*              # bare
+          | [^\r\n
         )
-        \s*(?:\#.*)?$
+        \s*(?:\
     """,
     re.VERBOSE | re.MULTILINE,
 )

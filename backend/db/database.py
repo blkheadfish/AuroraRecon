@@ -23,7 +23,6 @@ from backend.agents.models import PentestState, TaskStatus
 
 logger = logging.getLogger(__name__)
 
-# ── 连接配置 ──────────────────────────────────────────────
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 if not DATABASE_URL:
     logger.warning(
@@ -36,12 +35,10 @@ engine = create_async_engine(DATABASE_URL, echo=False, pool_size=10, max_overflo
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
-# ── ORM 基类 ──────────────────────────────────────────────
 class Base(DeclarativeBase):
     pass
 
 
-# ── 任务表 ────────────────────────────────────────────────
 class TaskRecord(Base):
     __tablename__ = "tasks"
 
@@ -60,9 +57,7 @@ class TaskRecord(Base):
     privilege_level: Mapped[str] = mapped_column(String(32), default="")
     report_path: Mapped[str] = mapped_column(String(512), default="")
 
-    # JSON 序列化的完整状态（用于恢复 PentestState）
     state_json: Mapped[str] = mapped_column(Text, default="{}")
-    # 日志独立存储（可能很长）
     phase_log_json: Mapped[str] = mapped_column(Text, default="[]")
 
     created_at: Mapped[datetime] = mapped_column(
@@ -73,7 +68,6 @@ class TaskRecord(Base):
     )
 
 
-# ── 用户表 ────────────────────────────────────────────────
 class UserRecord(Base):
     __tablename__ = "users"
 
@@ -110,9 +104,9 @@ class TaskFactRecord(Base):
 class TenantAssetRecord(Base):
     __tablename__ = "tenant_assets"
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    asset_type: Mapped[str] = mapped_column(String(32), index=True)  # skill|knowledge|prompt
+    asset_type: Mapped[str] = mapped_column(String(32), index=True)
     asset_key: Mapped[str] = mapped_column(String(128), index=True)
-    layer: Mapped[str] = mapped_column(String(32), default="user")  # global_template|tenant_override|user_override
+    layer: Mapped[str] = mapped_column(String(32), default="user")
     owner_id: Mapped[str] = mapped_column(String(36), default="", index=True)
     tenant_id: Mapped[str] = mapped_column(String(64), default="default", index=True)
     content: Mapped[str] = mapped_column(Text, default="")
@@ -130,7 +124,7 @@ class UserSettingRecord(Base):
     __tablename__ = "user_settings"
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     owner_id: Mapped[str] = mapped_column(String(36), index=True)
-    scope: Mapped[str] = mapped_column(String(32), default="settings")  # settings|profile
+    scope: Mapped[str] = mapped_column(String(32), default="settings")
     data_json: Mapped[str] = mapped_column(Text, default="{}")
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     __table_args__ = (
@@ -190,14 +184,12 @@ class TaskBranchRecord(Base):
     )
 
 
-# ── 数据库操作 ────────────────────────────────────────────
 
 async def init_db():
     """创建表（幂等）+ 增量迁移"""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-    # 增量迁移：为已有表添加新列（create_all 不会修改已有表结构）
     migrations = [
         ("tasks", "owner_id", "ALTER TABLE tasks ADD COLUMN owner_id VARCHAR(36) DEFAULT '' NOT NULL"),
         ("tasks", "tenant_id", "ALTER TABLE tasks ADD COLUMN tenant_id VARCHAR(64) DEFAULT 'default' NOT NULL"),
@@ -221,7 +213,6 @@ async def init_db():
             except Exception as e:
                 logger.warning(f"[DB] 迁移 {table}.{column} 跳过: {e}")
 
-    # 保证至少一个 admin：如果用户表非空但无任何 admin，把最早注册的用户提升为 admin
     try:
         async with engine.begin() as conn:
             row = (await conn.execute(text(
@@ -266,13 +257,11 @@ async def save_task(state: PentestState) -> None:
         record.report_path = state.report_path
         record.updated_at = datetime.utcnow()
 
-        # 完整状态序列化
         try:
             record.state_json = state.model_dump_json()
         except Exception:
             record.state_json = "{}"
 
-        # 日志
         try:
             record.phase_log_json = json.dumps(state.phase_log, ensure_ascii=False)
         except Exception:
@@ -290,7 +279,6 @@ async def load_task(task_id: str) -> Optional[PentestState]:
         try:
             return PentestState.model_validate_json(record.state_json)
         except Exception:
-            # 回退到基本字段构造
             return PentestState(
                 task_id=record.task_id,
                 target=record.target,
@@ -608,7 +596,6 @@ async def list_audit_logs(
         return items, total
 
 
-# ── Admin Override 操作 ───────────────────────────────────
 
 async def get_override(resource_type: str, resource_key: str) -> AdminOverrideRecord | None:
     rid = f"{resource_type}:{resource_key}"[:64]
@@ -661,7 +648,6 @@ async def list_overrides(resource_type: str | None = None) -> list[dict]:
         ]
 
 
-# ── 用户操作 ──────────────────────────────────────────────
 
 async def create_user(
     username: str,
@@ -760,7 +746,6 @@ async def update_user(user_id: str, **kwargs) -> Optional[UserRecord]:
         return user
 
 
-# ── 任务分支 CRUD ─────────────────────────────────────────
 
 def _branch_record_to_dict(rec: TaskBranchRecord) -> dict:
     return {

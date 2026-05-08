@@ -33,8 +33,8 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
 try:
-    from psycopg_pool import AsyncConnectionPool           # type: ignore
-    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver  # type: ignore
+    from psycopg_pool import AsyncConnectionPool
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
     _HAS_PG_SAVER = True
 except ImportError as _pg_import_err:
     _HAS_PG_SAVER = False
@@ -59,11 +59,6 @@ logger = logging.getLogger(__name__)
 
 TASK_TIMEOUT = int(os.getenv("TASK_TIMEOUT_SECONDS", "7200"))
 
-# Attack chain mode 分发开关
-#   linear      — 默认；当前的单向流水线
-#   feedback    — 在 secondary_attack / post_foothold_enum / privesc_attempt 出口
-#                 加条件回流边，根据 replan_signals 决定是否回上游重跑
-#   supervisor  — 星形拓扑，所有阶段都回 supervisor 节点决定下一步
 ATTACK_CHAIN_MODE_ENV = "ATTACK_CHAIN_MODE"
 _VALID_CHAIN_MODES = {"linear", "feedback", "supervisor"}
 
@@ -77,7 +72,6 @@ def _current_chain_mode() -> str:
         return "linear"
     return mode
 
-# 与前端 TaskProgressMermaid 节点顺序一致（单调推进）
 _CHAIN_PHASE_ORDER: list[str] = [
     "recon",
     "surface_enum",
@@ -97,8 +91,6 @@ _CHAIN_PHASE_ORDER: list[str] = [
     "report",
 ]
 
-# 交互式模式下，每个阶段结束后暂停等待用户指令
-# interrupt_before 的含义：在进入该节点前暂停，让用户审查上一阶段的结果
 _INTERACTIVE_INTERRUPT_NODES: list[str] = [
     "surface_enum",
     "intel_harvest",
@@ -133,9 +125,6 @@ def _consume_risk_budget(state: PentestState, cost: int = 1) -> bool:
     return True
 
 
-# ───────────────────────────────────────────────────────
-# 目标解析 → 写入 state
-# ───────────────────────────────────────────────────────
 
 def _apply_parsed_target(state: PentestState) -> None:
     """
@@ -151,9 +140,6 @@ def _apply_parsed_target(state: PentestState) -> None:
     state.target_path = parsed.path
     state.target_raw = parsed.raw or state.target
 
-    # 如果 target 本身含协议/端口/路径，把 target 归一化为纯 host
-    # 以确保 nmap 等工具拿到的是干净的扫描目标
-    # （state.target 保持不变，仍然是用户原始输入）
     if parsed.host:
         port_info = f":{parsed.port}" if parsed.port else ""
         scheme_info = f" (scheme={parsed.scheme})" if parsed.scheme else ""
@@ -164,17 +150,13 @@ def _apply_parsed_target(state: PentestState) -> None:
         state.log(f"⚠ 目标解析失败，原始输入: {state.target}")
 
 
-# ── 意图驱动 → OperatorPlan 转换 ─────────────────────────────────────────
-# 把 parsed_intent 中的策略字段转化为 OperatorPlan，让所有现有 agent 基础
-# 设施（ToolCoveragePlanner / VulnAgent / ReconAgent）自动感知用户意图。
-# 调用时机：_prepare_state() 内部，仅在 state.operator_plan 为 None 时执行。
 
 _INTENT_TAG_TO_AVOIDED_TOOLS: dict[str, list[str]] = {
-    "stealth":     ["masscan", "nuclei", "nikto"],     # 高噪声工具
+    "stealth":     ["masscan", "nuclei", "nikto"],
     "low_noise":   ["masscan", "nikto", "wpscan"],
     "no_brute":    ["hydra", "medusa", "john", "hashcat"],
     "web_only":    ["enum4linux", "smbclient"],
-    "prefer_msf":  [],   # 只影响 preferred_tools，见下方
+    "prefer_msf":  [],
 }
 
 _INTENT_TAG_TO_PREFERRED_TOOLS: dict[str, list[str]] = {
@@ -184,7 +166,6 @@ _INTENT_TAG_TO_PREFERRED_TOOLS: dict[str, list[str]] = {
     "get_flag":      ["gobuster", "ffuf", "nuclei"],
 }
 
-# priority_vulns → 在 recon/vuln 阶段推荐的针对性工具
 _VULN_TO_RECON_TOOLS: dict[str, list[str]] = {
     "shiro":           ["whatweb", "httpx"],
     "fastjson":        ["whatweb", "httpx"],
@@ -200,7 +181,6 @@ _VULN_TO_RECON_TOOLS: dict[str, list[str]] = {
     "default_creds":   ["hydra"],
 }
 
-# priority_vulns → 在 vuln_scan 阶段推荐的 nuclei template tags
 _VULN_TO_NUCLEI_TAGS: dict[str, str] = {
     "shiro":       "apache-shiro",
     "fastjson":    "fastjson",
@@ -230,7 +210,6 @@ def _intent_to_operator_plan(state: PentestState) -> None:
     """
     from backend.agents.models import OperatorPlan, OperatorFocusTarget
 
-    # 已有用户实时计划，不覆盖
     if state.operator_plan is not None:
         return
 
@@ -244,7 +223,6 @@ def _intent_to_operator_plan(state: PentestState) -> None:
     extra_hint: str = (state.extra_hint or "").strip()
     scope_note: str = (state.scope_note or "").strip()
 
-    # ── 1. intents → preferred / avoided tools ──────────────────────────
     preferred: list[str] = []
     avoided: list[str] = []
     for tag in intents:
@@ -256,7 +234,6 @@ def _intent_to_operator_plan(state: PentestState) -> None:
             if tool not in preferred:
                 preferred.append(tool)
 
-    # ── 2. priority_vulns → preferred tools（recon/vuln 阶段定向扫描）──
     keyword_hints: list[str] = []
     for vuln_tag in priority_vulns:
         tag_lc = vuln_tag.lower().strip()
@@ -267,7 +244,6 @@ def _intent_to_operator_plan(state: PentestState) -> None:
         if nuclei_tag and nuclei_tag not in keyword_hints:
             keyword_hints.append(nuclei_tag)
 
-    # ── 3. pentest_plan 已启用步骤的工具名 → preferred_tools ─────────
     plan: dict = state.pentest_plan or {}
     if plan:
         for phase in plan.get("phases", []):
@@ -277,11 +253,7 @@ def _intent_to_operator_plan(state: PentestState) -> None:
                 tool = (step.get("tool") or "").strip()
                 if tool and tool not in preferred:
                     preferred.append(tool)
-                # Skill 名不转为 tool，由 ExploitAgent 通过 kb_hits 机制消费
 
-    # ── 4. pentest_phases → operator plan 中的 next_phase 锚点 ───────────
-    # LLM 已通过 parsed_intent 确定了 pentest_phases 和 priority_vulns，
-    # 这里根据 LLM 的判断决定路由，不做额外的硬编码规则匹配。
     next_phase: str | None = None
     exploit_with_known_vuln = bool(priority_vulns) and "exploit" in pentest_phases
 
@@ -289,7 +261,6 @@ def _intent_to_operator_plan(state: PentestState) -> None:
     if exploit_with_known_vuln:
         next_phase = "vuln_scan" if state.open_ports else "recon"
     elif pentest_phases and "full_chain" in pentest_phases:
-        # 用户仅给出 IP/域名无具体漏洞时默认走完整渗透链，从 recon 起步
         next_phase = "recon"
     elif pentest_phases and "exploit" not in pentest_phases:
         last_phase = pentest_phases[-1] if pentest_phases else ""
@@ -300,12 +271,10 @@ def _intent_to_operator_plan(state: PentestState) -> None:
             else:
                 next_phase = last_phase
 
-    # 没有任何有效约束，不创建空计划
     has_constraints = preferred or avoided or keyword_hints or next_phase or extra_hint
     if not has_constraints:
         return
 
-    # ── 5. 构建摘要 ──────────────────────────────────────────────────────
     summary_parts: list[str] = []
     if intents:
         summary_parts.append(f"意图标签: {', '.join(intents[:6])}")
@@ -330,10 +299,6 @@ def _intent_to_operator_plan(state: PentestState) -> None:
         f"keyword_hints={keyword_hints[:4]}"
     )
 
-    # 注意: 不再注入 synthetic finding 到 state.findings。
-    # 用户指定的漏洞类型通过 operator_plan.keyword_hints 和 parsed_intent.priority_vulns
-    # 传递给各阶段消费，不污染真实漏洞发现列表。
-    # exploit_decision 和 edge_should_exploit 会检查策略 + parsed_intent 决定是否进入利用阶段。
 
 
 def get_intent_skill_boost(parsed_intent: dict | None) -> dict[str, int]:
@@ -349,7 +314,7 @@ def get_intent_skill_boost(parsed_intent: dict | None) -> dict[str, int]:
         return {}
     priority_vulns: list[str] = parsed_intent.get("priority_vulns", []) or []
     boosts: dict[str, int] = {}
-    base_boost = 15  # 意图指定的漏洞类型基础加权
+    base_boost = 15
     for tag in priority_vulns:
         tag_lower = tag.lower().strip()
         if tag_lower and tag_lower not in boosts:
@@ -375,12 +340,9 @@ def _append_tool_record(
     if rec.id and any(item.id == rec.id for item in state.tool_records):
         return
     state.tool_records.append(rec)
-    # 滚动淘汰：反馈/监督模式下命令记录会持续增长，超过 2000 条
-    # 截留最近 1000 条，避免 LangGraph checkpoint payload 失控。
     if len(state.tool_records) > 2000:
         state.tool_records = state.tool_records[-1000:]
 
-    # 推送 command_exec 事件到前端，让用户看到 KB 探针、表面枚举等工具执行的 stdout/stderr
     exit_code = payload.get("exit_code", -1)
     stdout = payload.get("stdout", "") or ""
     stderr = payload.get("stderr", "") or ""
@@ -473,11 +435,9 @@ def _read_last_user_action(state: PentestState) -> str:
     last = history[-1]
     resp = last.get("response", {}) if isinstance(last, dict) else {}
     action = str(resp.get("action") or "").strip().lower()
-    # 支持通过 next_action 显式指定（优先级高于 action）
     next_action = str(resp.get("next_action") or "").strip().lower()
     if next_action in ("continue", "skip", "finish"):
         return next_action
-    # 兼容旧 action 字段
     if action == "reject":
         return "skip"
     return "continue"
@@ -566,22 +526,18 @@ def _consume_operator_plan_for_phase(
     if not plan_obj:
         return
 
-    # Track who has consumed this plan; idempotent per consumer label.
     try:
         consumed = list(getattr(plan_obj, "consumed_by", None) or [])
         if consumer_label not in consumed:
             consumed.append(consumer_label)
             plan_obj.consumed_by = consumed
     except Exception:
-        # consumed_by 写失败不能炸主流程 (旧 plan 可能没有这个字段)
         pass
 
     preferred = list(getattr(plan_obj, "preferred_tools", None) or [])
     avoided = list(getattr(plan_obj, "avoided_tools", None) or [])
     keywords = list(getattr(plan_obj, "keyword_hints", None) or [])
 
-    # 没有任何战术维度提示就不必发事件 (路由型 plan 已由 operator_replan 卡片
-    # 表达过, 这里再发一条只会造成噪音)。
     if not (preferred or avoided or keywords):
         return
 
@@ -596,9 +552,6 @@ def _consume_operator_plan_for_phase(
     selected_names: list[str] = []
     skipped_names: list[str] = []
     if tool_plan:
-        # tool_plan 已经被 planner 按 plan 重排过 + 滤过 avoided, 这里只是
-        # 把"实际会执行的工具序列"回显给用户, 形成"我说要 gobuster -> agent
-        # 真的把 gobuster 排在了第一位"的可解释闭环。
         for spec in tool_plan[:8]:
             name = spec.get("name", "?")
             if spec.get("operator_preferred"):
@@ -661,9 +614,6 @@ def _plan_should_skip_phase(state: PentestState, phase_name: str) -> tuple[bool,
     if not phases:
         return False, ""
 
-    # 策略阶段名 → 它所覆盖的攻击链节点名
-    # 每个策略阶段只覆盖自己对应的节点，不越界覆盖其他阶段。
-    # 若需要 surface_enum / vuln_scan，LLM 必须在策略中显式包含这些阶段。
     _PLAN_COVERS: dict[str, set[str]] = {
         "recon":        {"recon"},
         "surface_enum": {"surface_enum"},
@@ -677,20 +627,17 @@ def _plan_should_skip_phase(state: PentestState, phase_name: str) -> tuple[bool,
 
     plan_phase_names = {p.get("phase") for p in phases}
 
-    # 直接命中策略阶段名
     if phase_name in plan_phase_names:
         steps = _plan_get_phase_steps(state, phase_name)
         if not steps:
             return True, f"策略中 {phase_name} 阶段无启用步骤，跳过"
         return False, ""
 
-    # phase_name 可能是攻击链节点名 → 检查是否被某个策略阶段覆盖
     for pp in plan_phase_names:
         covered = _PLAN_COVERS.get(pp, {pp})
         if phase_name in covered:
             return False, ""
 
-    # 策略存在但该阶段未被任何策略阶段覆盖 → 跳过
     return True, f"策略未包含 {phase_name} 阶段，跳过"
 
 
@@ -802,24 +749,18 @@ def _build_exploit_context(state: PentestState) -> dict[str, Any]:
 
     web_paths_str = ", ".join(state.web_paths[:30]) if state.web_paths else "无"
 
-    # Include directory listing tree if available
     dirlist_info = ""
     if state.dirlist_tree:
         dirlist_info = f"\n目录列表文件树:\n{state.dirlist_tree}"
     if state.dirlist_interesting_files:
         dirlist_info += f"\n有价值文件: {', '.join(state.dirlist_interesting_files[:15])}"
 
-    # Build structured directory intelligence for exploit decision
     dir_intel: dict[str, Any] = state.dir_intel or {}
     if not dir_intel:
         dir_intel = _build_dir_intel(state)
 
-    # KB 探针命中：交给 SkillRegistry.match() 用 dispatch_skill 加 +150 分
     kb_hits = list(state.kb_probe_hits) if state.kb_probe_hits else []
 
-    # ── 意图驱动：priority_vulns → skill_id 映射并注入 kb_hits ──
-    # 通过 kb_hits 机制实现 Skill 优先级加权，不修改 Skill YAML 和 ExploitAgent。
-    # confidence=0.5 保证权重要弱于真实探针命中(0.9+)但强于常规关键词匹配。
     _INTENT_VULN_TO_SKILL: dict[str, str] = {
         "shiro": "shiro_rce",
         "fastjson": "fastjson_rce",
@@ -845,11 +786,11 @@ def _build_exploit_context(state: PentestState) -> dict[str, Any]:
             kb_hits.append({
                 "vuln_id": f"intent_{tag_lower}",
                 "dispatch_skill": skill_id,
-                "confidence": 0.5,  # 主观意图的置信度低于探针实际命中
+                "confidence": 0.5,
                 "base_url": f"http://{state.target_host}" if state.target_host else "",
                 "port": state.target_port,
                 "cves": [],
-                "finding_vuln_id": "",  # 不限 finding，全局加权
+                "finding_vuln_id": "",
                 "source": "parsed_intent",
             })
 
@@ -879,7 +820,6 @@ def _build_exploit_context(state: PentestState) -> dict[str, Any]:
         "confirmed_facts": state.confirmed_facts or {},
         "prior_probe_variables": state.exploit_probe_variables or {},
         "prior_failed_commands": state.failed_commands_by_vuln or {},
-        # KB 探针命中 + 意图驱动加权
         "kb_probe_hits": kb_hits,
         "attack_chain_mode": True,
         "attack_chain_hint": (
@@ -958,7 +898,6 @@ def _enrich_finding_names_from_exploits(state: PentestState) -> None:
         si = result.session_info or {}
         exploit_name = (si.get("skill_id") or "").strip()
         if not exploit_name:
-            # Fallback: parse "skill:<id>" / "skill:<id>:llm_freeform"
             method = si.get("method", "")
             if method.startswith("skill:"):
                 parts = method.split(":")
@@ -966,7 +905,6 @@ def _enrich_finding_names_from_exploits(state: PentestState) -> None:
         if not exploit_name:
             exploit_name = result.shell_type.strip() or result.exploit_level.strip()
         if not exploit_name or exploit_name.lower() in ("rce", "shell", "info_leak"):
-            # "rce" alone is too generic to enrich the finding name
             continue
 
         for f in state.findings:
@@ -1002,9 +940,6 @@ def _flatten_post_findings_for_report(state: PentestState) -> None:
     state.post_findings = pf
 
 
-# ───────────────────────────────────────────────────────
-# retry 装饰器
-# ───────────────────────────────────────────────────────
 
 def retry_node(max_attempts: int = 3, delay: float = 2.0):
     def decorator(fn):
@@ -1027,9 +962,6 @@ def retry_node(max_attempts: int = 3, delay: float = 2.0):
     return decorator
 
 
-# ───────────────────────────────────────────────────────
-# 节点函数
-# ───────────────────────────────────────────────────────
 
 async def _run_host_discovery(state: PentestState) -> list[str]:
     """意图驱动：使用 nmap -sn 做存活主机发现（在 toolbox 容器中执行）。
@@ -1048,7 +980,6 @@ async def _run_host_discovery(state: PentestState) -> list[str]:
     parsed = state.parsed_intent or {}
     targets = parsed.get("targets", [])
 
-    # 找到所有 CIDR 目标作为扫描范围
     cidr_targets = [t for t in targets if "/" in t]
     if not cidr_targets:
         state.log("[意图驱动] 无法确定主机发现范围（无 CIDR 目标），跳过")
@@ -1057,7 +988,7 @@ async def _run_host_discovery(state: PentestState) -> list[str]:
     executor = ToolExecutor()
     discovered: list[str] = []
 
-    for cidr in cidr_targets[:3]:  # 最多扫描 3 个网段
+    for cidr in cidr_targets[:3]:
         try:
             state.log(f"[意图驱动] 执行主机发现: nmap -sn -T4 --max-retries 1 {cidr}")
 
@@ -1068,7 +999,6 @@ async def _run_host_discovery(state: PentestState) -> list[str]:
             )
             output = (result.stdout or "") + (result.stderr or "")
 
-            # 解析 nmap -sn 输出，提取存活主机
             ip_pattern = re.compile(
                 r"Nmap scan report for (?:\S+ )?\(?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\)?"
             )
@@ -1093,7 +1023,6 @@ async def node_recon(state: PentestState) -> PentestState:
     _record_chain_visit(state, "recon")
     state.status = TaskStatus.RUNNING
 
-    # ── Plan Mode: 检查策略是否要求跳过该阶段 ─────────────────
     skip_plan, skip_plan_reason = _plan_should_skip_phase(state, "recon")
     if skip_plan:
         state.log(f"[Plan] {skip_plan_reason}")
@@ -1103,16 +1032,12 @@ async def node_recon(state: PentestState) -> PentestState:
     if _yield_if_interrupted(state, "recon"):
         return state
 
-    # ── 意图驱动：主机发现（masscan 存活扫描）───────────────
-    # 当 parsed_intent.requires_discovery 为 True 且首次进入 recon 时，
-    # 先用 masscan 做全端口 ping 扫描发现存活主机，再对每个主机执行侦察。
     parsed_intent_raw = state.parsed_intent or {}
     requires_discovery = parsed_intent_raw.get("requires_discovery", False)
     if requires_discovery and state.phase_visit_count.get("recon", 0) == 0:
         state.log("[意图驱动] 检测到主机发现需求，先执行 masscan 存活扫描")
         discovery_targets = await _run_host_discovery(state)
         if discovery_targets:
-            # 将发现的主机追加到 pending_seeds，下一轮 recon 会消费
             seeds = state.pending_seeds or {}
             existing_hosts = list(seeds.get("hosts", []))
             for host in discovery_targets:
@@ -1128,7 +1053,6 @@ async def node_recon(state: PentestState) -> PentestState:
         else:
             state.log("[意图驱动] masscan 未发现存活主机")
 
-    # ── 增量入口：把 pending_seeds["hosts"] 并入；签名命中则跳过 ──
     seed_hosts = _consume_pending_seeds(state, "hosts")
     targets: list[str] = []
     if state.target_host:
@@ -1146,7 +1070,6 @@ async def node_recon(state: PentestState) -> PentestState:
         _mark_phase_visited(state, "recon", sig)
         return state
 
-    # 为本次任务启动专属工具容器（多人并发时每个 task 独立隔离；幂等）
     try:
         _exec = ToolExecutor()
         await _exec.start_task_container(state.task_id)
@@ -1166,10 +1089,6 @@ async def node_recon(state: PentestState) -> PentestState:
         _append_tool_record(state, record, default_phase="recon")
     async def _on_decision(event: dict):
         state.push_decision(event)
-    # 把操作员实时指令(/chat 写入的 pending_user_prompt + user_messages)
-    # 在调用 agent.run() 前预计算成一段文本块, 让 ReconAgent 内部的 LLM
-    # 调用都能感知用户意图(例如"看看80端口下有什么目录")。state-free 注入
-    # 避免 agent 类反向依赖 PentestState。
     from backend.agents.prompt_utils import operator_guidance_block
     _op_block = operator_guidance_block(state)
     _op_plan = getattr(state, "operator_plan", None)
@@ -1187,8 +1106,6 @@ async def node_recon(state: PentestState) -> PentestState:
         plan_tools=_recon_plan_tools,
     )
     if _op_plan is not None:
-        # _dir_scan 内部对 plan 的消费已经发生 (plan 已注入 dir_discovery
-        # planner), 这里只是补一条 chain 上的可观测事件。
         _consume_operator_plan_for_phase(state, "recon_dir_scan", None)
     state.open_ports = result.get("ports", [])
     state.os_info = _stringify_dict_keys(result.get("os_info", {}))
@@ -1199,7 +1116,6 @@ async def node_recon(state: PentestState) -> PentestState:
     state.target_os = _infer_os(state.open_ports, state.os_info)
     state.dir_scan_strategy = _stringify_dict_keys(result.get("scan_strategy", {}))
 
-    # Emit dir-discovery coverage report as a decision event
     dir_cov = result.get("dir_coverage")
     if dir_cov:
         state.push_decision({
@@ -1213,7 +1129,6 @@ async def node_recon(state: PentestState) -> PentestState:
             "tone": "info" if dir_cov.get("satisfied") else "warn",
             "raw": json.dumps(dir_cov, ensure_ascii=False),
         })
-        # Emit per-tool events
         for t in dir_cov.get("tools", []):
             if t["status"] == "skipped":
                 state.push_decision({
@@ -1235,7 +1150,6 @@ async def node_recon(state: PentestState) -> PentestState:
                     "tone": "info" if t["status"] == "executed" else "warn",
                 })
 
-    # Emit LLM recon analysis hints if available
     llm_hints = result.get("llm_recon_hints") or {}
     if llm_hints:
         vectors = llm_hints.get("potential_attack_vectors", [])
@@ -1254,7 +1168,6 @@ async def node_recon(state: PentestState) -> PentestState:
 
     state.log(f"侦察完成: {len(state.open_ports)} 端口, OS={state.target_os}")
 
-    # Emit recon summary thought event
     ports_summary = ", ".join(
         f"{p.port}/{p.service}" for p in state.open_ports[:15]
     )
@@ -1278,7 +1191,6 @@ async def node_recon(state: PentestState) -> PentestState:
         ],
         "message": f"侦察完成: {len(state.open_ports)} 端口, {web_count} 路径, OS={state.target_os}",
     })
-    # 同步到 attack_graph：host + service
     try:
         host = state.target_host or state.target
         _attach_host_to_graph(state, host, discovered_by="recon")
@@ -1303,7 +1215,6 @@ async def node_vuln_scan(state: PentestState) -> PentestState:
     state.current_phase = "vuln_scan"
     _record_chain_visit(state, "vuln_scan")
 
-    # ── Plan Mode: 检查策略是否要求跳过该阶段 ─────────────────
     skip_plan, skip_plan_reason = _plan_should_skip_phase(state, "vuln_scan")
     if skip_plan:
         state.log(f"[Plan] {skip_plan_reason}")
@@ -1315,7 +1226,6 @@ async def node_vuln_scan(state: PentestState) -> PentestState:
     if _maybe_skip_or_finish(state, "vuln_scan"):
         return state
 
-    # Consume paths discovered by intel_harvest and merge into attack surface
     if state.intel_discovered_paths:
         existing = set(state.web_paths or [])
         new_count = 0
@@ -1327,7 +1237,6 @@ async def node_vuln_scan(state: PentestState) -> PentestState:
         if new_count:
             state.log(f"情报回注: intel_harvest 新增 {new_count} 条路径到攻击面")
 
-    # ── 增量入口：消费 pending_seeds 中的 web_paths/credentials/ports ──
     seed_paths = _consume_pending_seeds(state, "web_paths")
     seed_creds = _consume_pending_seeds(state, "credentials")
     seed_ports = _consume_pending_seeds(state, "ports")
@@ -1373,11 +1282,6 @@ async def node_vuln_scan(state: PentestState) -> PentestState:
         state.push_decision(event)
     nmap_vuln_hints = state.raw_recon.get("nmap_vuln_hints", [])
 
-    # 反馈循环：seed_creds 已经从 pending_seeds["credentials"] 消费出来，
-    # 需要再合并 state.credential_store 里 fact_sink 抓到的所有真实凭据，
-    # 一并传给 VulnAgent.run(seeds=...)，触发：
-    #   1) hydra 字典动态扩充（真实密码优先于固定 wordlist）
-    #   2) credential-replay finding 合成（确定性触发 credential_replay Skill）
     merged_seed_creds: list[dict] = []
     seen_cred_keys: set[str] = set()
     for src in (seed_creds, list(state.credential_store or [])):
@@ -1422,8 +1326,6 @@ async def node_vuln_scan(state: PentestState) -> PentestState:
         operator_plan=_op_plan,
     )
     state.findings = result.get("findings", [])
-    # msgpack (LangGraph checkpoint) 不允许 int 作 dict key
-    # raw_vuln 和 fingerprints 都可能含 int key（端口号），必须递归转换
     state.raw_vuln = _stringify_dict_keys(result)
     state.fingerprints = _stringify_dict_keys(result.get("fingerprints", {}))
     exploitable = [f for f in state.findings if f.exploitable]
@@ -1439,7 +1341,6 @@ async def node_vuln_scan(state: PentestState) -> PentestState:
     return state
 
 
-# ── Tech-adaptive sensitive file probe list ──────────────────────
 _TECH_SENSITIVE_MAP: dict[str, list[str]] = {
     "PHP": [
         "phpinfo.php", "config.php", "settings.php", "wp-config.php",
@@ -1542,7 +1443,6 @@ async def node_surface_enum(state: PentestState) -> PentestState:
     if _maybe_skip_or_finish(state, "surface_enum"):
         return state
 
-    # ── 增量入口：消费 pending_seeds["ports"]/["web_paths"] ──
     seed_ports = _consume_pending_seeds(state, "ports")
     seed_paths = _consume_pending_seeds(state, "web_paths")
     if seed_paths:
@@ -1579,7 +1479,6 @@ async def node_surface_enum(state: PentestState) -> PentestState:
         )
     ]
 
-    # Extract tech hints from recon phase for dynamic probe list generation
     _raw_recon = state.raw_recon or {}
     _recon_tech_hints: list[str] = []
     for _pi in state.open_ports:
@@ -1637,7 +1536,6 @@ async def node_surface_enum(state: PentestState) -> PentestState:
             except Exception as e:
                 logger.warning(f"[SurfaceEnum] 敏感文件探测异常: {e}")
 
-            # ── Directory listing crawl (recursive) ──
             existing_paths = aggregator.get_actionable_paths()
 
             def _looks_like_directory(p: str) -> bool:
@@ -1689,14 +1587,11 @@ async def node_surface_enum(state: PentestState) -> PentestState:
             except Exception as e:
                 logger.warning(f"[SurfaceEnum] 目录列表爬取异常: {e}")
 
-            # ── Planner-driven web probe + fuzz tools ──
             planner = ToolCoveragePlanner(
                 categories=["web_probe", "fuzz"],
                 max_tools=4,
                 max_stage_runtime=360,
             )
-            # 把 operator_plan 透传给 planner, 让用户的"重点用 gobuster /
-            # 别用 dirsearch"在战术层真的生效, 而不是只停留在 supervisor 路由。
             _op_plan = getattr(state, "operator_plan", None)
             plan = planner.build_plan(
                 base_url,
@@ -1746,7 +1641,6 @@ async def node_surface_enum(state: PentestState) -> PentestState:
                     )
                     logger.warning(f"[SurfaceEnum] {tool_name} 异常: {e}")
 
-            # Emit coverage report
             report = planner.coverage_report()
             report_dict = report.to_log_dict()
             state.push_decision({
@@ -1773,7 +1667,6 @@ async def node_surface_enum(state: PentestState) -> PentestState:
         f"来源工具: {', '.join(inv['source_tools'])}"
     )
 
-    # Emit surface_enum summary thought
     high_value_paths = [
         p for p in state.web_paths[:30]
         if any(kw in p.lower() for kw in (
@@ -1781,7 +1674,6 @@ async def node_surface_enum(state: PentestState) -> PentestState:
             "console", "upload", "api", "debug", "phpinfo",
         ))
     ]
-    # 全量路径列表(截断到150条,避免事件体过大)
     all_paths_truncated = state.web_paths[:150]
     path_list_text = "\n".join(f"  • {p}" for p in all_paths_truncated)
     path_overflow = "" if len(state.web_paths) <= 150 else f"\n  … 共 {len(state.web_paths)} 条, 仅展示前 150 条"
@@ -1811,9 +1703,6 @@ async def node_surface_enum(state: PentestState) -> PentestState:
     return state
 
 
-# ───────────────────────────────────────────────────────
-# intel_harvest — 文件情报提取 + 页面源码审计
-# ───────────────────────────────────────────────────────
 
 _FILE_EXTS = {
     ".sql", ".conf", ".cfg", ".ini", ".xml", ".yaml", ".yml", ".json",
@@ -1876,7 +1765,6 @@ def _classify_harvest_targets(state: PentestState) -> tuple[list[str], list[str]
             seen.add(p)
             page_candidates.append(p)
 
-    # LLM-confirmed high-value paths from intel analysis (via update_hints_from_intel)
     _intel_confirmed = {
         "high_risk_intel", "credential_confirmed", "secret_confirmed",
         "config_leak", "db_dump", "attack_lead",
@@ -2079,7 +1967,6 @@ async def _run_kb_probe_scan(
         state.log("KB 探针扫描: 无命中")
         return
 
-    # 去重：同一 finding 之前已存在则跳过
     existing_signatures = {
         (f.name, f.target, f.cve or "")
         for f in state.findings
@@ -2153,7 +2040,6 @@ async def node_intel_harvest(state: PentestState) -> PentestState:
         return state
 
     file_targets, page_targets = _classify_harvest_targets(state)
-    # 增量幂等：基于本轮目标集合签名
     sig = _compute_phase_signature({
         "files": sorted(file_targets), "pages": sorted(page_targets),
     })
@@ -2196,7 +2082,6 @@ async def node_intel_harvest(state: PentestState) -> PentestState:
     async def _on_exec_record(record: dict):
         _append_tool_record(state, record, default_phase="intel_harvest")
 
-    # ── Step B: batch download ──
     script = _build_harvest_script(base_url, file_targets, page_targets)
     try:
         dl_result = await executor.run_script(
@@ -2218,12 +2103,8 @@ async def node_intel_harvest(state: PentestState) -> PentestState:
 
     state.log(f"情报采集: 下载完成, 共 {len(harvested)} 个目标")
 
-    # ── Step C.0: deterministic service-info extraction (before LLM) ──
-    # phpinfo / apache server-status / nginx stub_status / tomcat manager /
-    # spring actuator / .env 一次性过完所有 parser，写入 state.runtime_facts
     _apply_service_info_extraction(state, harvested, base_url, wp.port)
 
-    # ── Step C: LLM analysis (concurrent, semaphore=3) ──
     llm = LLMRouter()
     sem = asyncio.Semaphore(3)
 
@@ -2276,7 +2157,6 @@ async def node_intel_harvest(state: PentestState) -> PentestState:
     file_results = all_results[:len(file_tasks)]
     page_results = all_results[len(file_tasks):]
 
-    # ── Step E (Pipeline A): inject file intel into state ──
     for entry, intel in zip(file_entries, file_results):
         if isinstance(intel, Exception) or intel is None:
             continue
@@ -2313,10 +2193,8 @@ async def node_intel_harvest(state: PentestState) -> PentestState:
                 if np not in state.intel_discovered_paths:
                     state.intel_discovered_paths.append(np)
 
-        # Reflect LLM analysis conclusions back into inventory hints
         _update_inventory_hints_from_intel(state, entry["path"], intel)
 
-    # ── Step D + E (Pipeline B): verify params & inject findings ──
     for entry, audit in zip(page_entries, page_results):
         if isinstance(audit, Exception) or audit is None:
             continue
@@ -2338,7 +2216,6 @@ async def node_intel_harvest(state: PentestState) -> PentestState:
             if not param_url:
                 continue
 
-            # Step D: auto-verify high/medium confidence params
             verified = False
             verify_evidence = ""
             vtype = param.get("vuln_type", "unknown")
@@ -2403,9 +2280,6 @@ async def node_intel_harvest(state: PentestState) -> PentestState:
                 ))
                 state.log(f"情报采集: 已验证 {vuln_label} @ {param_url}")
 
-    # ── Step F: KB 主动探针扫描 ──
-    # 使用 KB 中声明的 probes 对所有 web 端口发起一轮快速指纹/CVE 扫描，
-    # 命中即生成 finding，dispatch_skill 直接通到对应 Skill。
     try:
         await _run_kb_probe_scan(
             state=state,
@@ -2418,7 +2292,6 @@ async def node_intel_harvest(state: PentestState) -> PentestState:
     except Exception as exc:
         logger.warning(f"[IntelHarvest] KB 探针扫描异常: {exc}")
 
-    # Summary
     verified_count = sum(1 for p in state.page_params if p.get("verified"))
     state.log(
         f"情报采集完成: "
@@ -2427,7 +2300,6 @@ async def node_intel_harvest(state: PentestState) -> PentestState:
         f"(已验证 {verified_count})"
         + (f", KB 探针命中 {len(state.kb_probe_hits)} 个" if state.kb_probe_hits else "")
     )
-    # Build KB probe hit details
     kb_probe_lines: list[str] = []
     if state.kb_probe_hits:
         for h in state.kb_probe_hits[:20]:
@@ -2446,7 +2318,6 @@ async def node_intel_harvest(state: PentestState) -> PentestState:
         if kb_probe_lines else ""
     )
 
-    # Build file intelligence details
     intel_file_lines: list[str] = []
     for f in state.intel_files[:15]:
         path = f.get("path", "")
@@ -2461,7 +2332,6 @@ async def node_intel_harvest(state: PentestState) -> PentestState:
         if intel_file_lines else ""
     )
 
-    # Build page param details
     param_lines: list[str] = []
     for p in state.page_params[:15]:
         verified_mark = "✓" if p.get("verified") else "?"
@@ -2507,7 +2377,6 @@ async def node_exploit_decision(state: PentestState) -> PentestState:
     state.current_phase = "exploit_decision"
     _record_chain_visit(state, "exploit_decision")
 
-    # ── Plan Mode: 检查策略是否要求跳过该阶段 ─────────────────
     skip_plan, skip_plan_reason = _plan_should_skip_phase(state, "exploit")
     if skip_plan:
         state.log(f"[Plan] {skip_plan_reason}")
@@ -2520,7 +2389,6 @@ async def node_exploit_decision(state: PentestState) -> PentestState:
         return state
     exploitable = [f for f in state.findings if f.exploitable]
     if not exploitable:
-        # 策略明确要求利用 + 用户指定了漏洞类型 → 仍然进入利用阶段
         plan = state.pentest_plan or {}
         has_exploit_plan = any(
             p.get("phase") == "exploit" for p in plan.get("phases", [])
@@ -2608,8 +2476,6 @@ async def node_human_approval(state: PentestState) -> PentestState:
     _record_chain_visit(state, "awaiting_approval")
     exploitable = [f for f in state.findings if f.exploitable]
 
-    # 反馈/监督模式下，第二次及以后到达本节点时不再重新拉起人工审批：
-    # 第一次审批通过后我们认为整个利用阶段都得到了授权。
     if state.approved_once and not state.approved:
         state.approved = True
         state.log("✅ 反馈循环：审批已在前序轮次通过，跳过人工审批")
@@ -2620,7 +2486,6 @@ async def node_human_approval(state: PentestState) -> PentestState:
     elif not state.approved:
         state.status = TaskStatus.AWAITING_APPROVAL
         state.log(f"⏸ 收到审批请求:{len(exploitable)} 个漏洞待利用")
-        # 推送通用 checkpoint(若已有 pending 则跳过,避免重复)
         if not state.pending_checkpoint:
             top_targets = [
                 {
@@ -2685,7 +2550,6 @@ async def node_human_approval(state: PentestState) -> PentestState:
         state.status = TaskStatus.RUNNING
         state.approved_once = True
         state.log("✅ 已获授权,继续利用阶段")
-        # checkpoint 在 /checkpoint/respond 里已经被 resolve 过了,这里兜底清一次
         if state.pending_checkpoint and (
             state.pending_checkpoint.get("checkpoint_type") == "exploit_gate"
         ):
@@ -2726,8 +2590,6 @@ async def node_foothold_attempt(state: PentestState) -> PentestState:
                 f"（tool={php_fpm[0].tool}）"
             )
 
-    # Pre-sweep: synthesize service-level findings for open ports without
-    # matching vulns, so ExploitAgent can match port-based Skills
     existing_ports = {f.port for f in state.findings if f.port}
     for p in state.open_ports:
         if p.port in existing_ports:
@@ -2829,8 +2691,6 @@ async def node_secondary_attack(state: PentestState) -> PentestState:
         return state
     if _maybe_skip_or_finish(state, "secondary_attack"):
         return state
-    # linear 模式保持兼容：done 标志仍然写为 True；feedback / supervisor 模式
-    # 通过 secondary_attack_count + max_secondary_attacks 控制重入次数。
     state.secondary_attack_done = True
     state.secondary_attack_count = int(state.secondary_attack_count or 0) + 1
     before_snapshot = _snapshot_facts(state)
@@ -2926,7 +2786,6 @@ async def node_secondary_attack(state: PentestState) -> PentestState:
         _sync_foothold_state(state)
         _enrich_finding_names_from_exploits(state)
         _normalize_and_dedupe_state_facts(state, source_node="secondary_attack_post")
-        # 反馈循环：secondary_attack 是最常见的"新事实产生地"
         try:
             after_snapshot = _snapshot_facts(state)
             _emit_replan_signals(
@@ -2948,7 +2807,6 @@ async def node_post_foothold_enum(state: PentestState) -> PentestState:
     state.current_phase = "post_foothold_enum"
     _record_chain_visit(state, "post_foothold_enum")
 
-    # ── Plan Mode: 检查策略是否要求跳过该阶段 ─────────────────
     skip_plan, skip_plan_reason = _plan_should_skip_phase(state, "post_exploit")
     if skip_plan:
         state.log(f"[Plan] {skip_plan_reason}")
@@ -3020,15 +2878,12 @@ async def node_post_foothold_approval(state: PentestState) -> PentestState:
     state.current_phase = "post_foothold_approval"
     _record_chain_visit(state, "post_foothold_approval")
 
-    # 策略未包含 post_exploit → 跳过后渗透，保持 post_approved=False
-    # 使 edge_after_post_foothold_approval 直接路由到 objective_collect → report
     skip_plan, skip_plan_reason = _plan_should_skip_phase(state, "post_exploit")
     if skip_plan:
         state.post_approved = False
         state.log(f"[Plan] {skip_plan_reason}")
         return state
 
-    # 反馈/监督模式下，第二次及以后到达本节点时不再重新拉起人工审批
     if state.post_approved_once and not state.post_approved:
         state.post_approved = True
         state.log("✅ 反馈循环：立足后审批已在前序轮次通过，跳过人工审批")
@@ -3328,13 +3183,10 @@ async def node_report(state: PentestState) -> PentestState:
     _record_chain_visit(state, "report")
     state.log("开始生成报告...")
 
-    # 生成攻击时间线
     _build_attack_timeline(state)
 
-    # 生成面向管理层的执行摘要
     state.executive_summary = _build_executive_summary(state)
 
-    # 过滤日志，去除 stdout/stderr 原始输出
     state.filtered_log = _filter_phase_log(state.phase_log)
 
     prior_status = state.status
@@ -3415,7 +3267,6 @@ def _build_executive_summary(state: PentestState) -> str:
     shell_status = "成功获取" if state.got_shell else "未能获取"
     priv_level = state.privilege_level or "未获得"
 
-    # 确定整体风险评级
     if critical > 0:
         risk_level = "严重"
     elif high > 0:
@@ -3452,9 +3303,6 @@ def _build_executive_summary(state: PentestState) -> str:
     return "\n".join(lines)
 
 
-# ───────────────────────────────────────────────────────
-# 条件边
-# ───────────────────────────────────────────────────────
 
 def edge_should_exploit(state: PentestState) -> str:
     """
@@ -3468,10 +3316,8 @@ def edge_should_exploit(state: PentestState) -> str:
     """
     if state.status == TaskStatus.FAILED:
         return "report"
-    # ── 意图驱动：仅侦察模式 → 直接出报告，不进入利用阶段 ──
     parsed = state.parsed_intent or {}
     phases = parsed.get("pentest_phase", [])
-    # ★ 修复：只要 phases 非空且不包含 exploit/full_chain，就跳过利用阶段
     EXPLOIT_PHASES = {"exploit", "full_chain", "post_exploit"}
     if phases and not any(p in EXPLOIT_PHASES for p in phases):
         state.log(
@@ -3487,7 +3333,6 @@ def edge_should_exploit(state: PentestState) -> str:
         return "report"
     has_exploitable = any(f.exploitable for f in state.findings)
     if not has_exploitable:
-        # 策略明确要求利用 + 用户指定了漏洞类型 → 仍进入利用阶段
         plan = state.pentest_plan or {}
         has_exploit_plan = any(
             p.get("phase") == "exploit" for p in plan.get("phases", [])
@@ -3505,8 +3350,6 @@ def edge_after_approval(state: PentestState) -> str:
         return "report"
     if any(f.exploitable for f in state.findings):
         return "foothold_attempt"
-    # 与 edge_should_exploit 对齐：策略明确要求利用 + 用户指定了漏洞类型时,
-    # 即使没有工具确认的可利用 finding，也允许进入利用阶段
     plan = state.pentest_plan or {}
     has_exploit_plan = any(
         p.get("phase") == "exploit" for p in plan.get("phases", [])
@@ -3522,12 +3365,9 @@ def edge_after_foothold(state: PentestState) -> str:
         return "report"
     if state.got_shell:
         return "post_foothold_enum"
-    # File-read foothold: escalate LFI → RCE via secondary attack
     if state.foothold_status == "file_read":
         if not state.secondary_attack_done:
             return "secondary_attack"
-        # Secondary attack done but still file_read only — still run
-        # post_foothold_enum to process extracted creds/keys/configs
         return "post_foothold_enum"
     if not state.secondary_attack_done and any(f.exploitable for f in state.findings):
         return "secondary_attack"
@@ -3551,12 +3391,6 @@ def edge_after_privesc(state: PentestState) -> str:
     return "privesc_again"
 
 
-# ───────────────────────────────────────────────────────
-# Plan-aware 线性链路由
-#   当 pentest_plan 存在时，沿 recon → surface_enum → intel_harvest
-#   → vuln_scan → exploit_decision 链条向前走，跳过策略未覆盖的阶段，
-#   让执行流直达下一个策略内的阶段。
-# ───────────────────────────────────────────────────────
 
 _LINEAR_CHAIN_SUCCESSORS: dict[str, list[str]] = {
     "recon":         ["surface_enum", "intel_harvest", "vuln_scan", "exploit_decision"],
@@ -3587,11 +3421,6 @@ def _edge_after_intel_harvest(state: PentestState) -> str:
     return _edge_plan_forward(state, "intel_harvest")
 
 
-# ───────────────────────────────────────────────────────
-# Feedback 模式专用条件边（v2）
-#   读取 state.replan_signals + state.replan_count + state.phase_visit_count
-#   决定是否回上游重跑。每跳一次 replan_count++，触达 max_replan 后回退。
-# ───────────────────────────────────────────────────────
 
 def _can_replan(state: PentestState, target_phase: str) -> bool:
     if state.replan_count >= state.max_replan:
@@ -3628,12 +3457,10 @@ def edge_after_foothold_v2(state: PentestState) -> str:
     sig = state.replan_signals or {}
     if state.got_shell:
         return "post_foothold_enum"
-    # foothold 失败：若产生了新凭据/路径，回 vuln_scan 重跑
     if sig.get("re_vuln_scan_for_creds") and _can_replan(state, "vuln_scan"):
         return _do_replan(state, "vuln_scan", "re_vuln_scan_for_creds")
     if sig.get("re_surface_enum_for_paths") and _can_replan(state, "surface_enum"):
         return _do_replan(state, "surface_enum", "re_surface_enum_for_paths")
-    # File-read foothold: escalate via secondary attack
     if state.foothold_status == "file_read":
         if state.secondary_attack_count < state.max_secondary_attacks:
             return "secondary_attack"
@@ -3688,14 +3515,7 @@ def edge_after_privesc_v2(state: PentestState) -> str:
     return "privesc_again"
 
 
-# ───────────────────────────────────────────────────────
-# 构建图（按 ATTACK_CHAIN_MODE 分发）
-# ───────────────────────────────────────────────────────
 
-# linear / feedback 模式入口的可路由阶段集合: 操作员指令直跳的合法目标。
-# 不能直接跳到 ``human_approval`` / ``post_foothold_approval`` (那两个是审
-# 批节点, 必须由前置阶段触发); ``report`` 也不允许直跳, 防止"用户随口一
-# 句"就提前出报告。
 _LINEAR_ENTRY_PHASES: set[str] = {
     "recon", "surface_enum", "intel_harvest", "vuln_scan",
     "exploit_decision", "foothold_attempt", "secondary_attack",
@@ -3723,8 +3543,6 @@ def edge_initial_route(state: PentestState) -> str:
         getattr(plan, "consumed_by", None) or []
     ):
         nxt = (plan.next_phase or "").strip()
-        # rerun_current 比 next_phase 优先级低一档: next_phase 明确指了就听它,
-        # 否则再看是否要求重跑 source_phase。
         if not nxt and getattr(plan, "rerun_current", False):
             nxt = (plan.source_phase or "").strip()
         if nxt in _LINEAR_ENTRY_PHASES:
@@ -3789,8 +3607,6 @@ def _build_graph_linear(checkpointer=None):
     graph.add_node("objective_collect",   node_objective_collect)
     graph.add_node("report",              node_report)
 
-    # 入口: 默认 START → recon, 但带 operator_plan 时 plan-aware 路由
-    # 直跳到 plan.next_phase / plan.source_phase。
     graph.add_conditional_edges(
         START, edge_initial_route,
         {
@@ -3828,7 +3644,7 @@ def _build_graph_linear(checkpointer=None):
         "exploit_decision", edge_should_exploit,
         {
             "human_approval": "human_approval",
-            "foothold_attempt": "foothold_attempt",  # auto_approve 直通
+            "foothold_attempt": "foothold_attempt",
             "report": "report",
         },
     )
@@ -3901,7 +3717,6 @@ def _build_graph_feedback(checkpointer=None):
     graph.add_node("objective_collect",   node_objective_collect)
     graph.add_node("report",              node_report)
 
-    # 入口: 与 linear 一致, 默认 START → recon, plan-aware 时直跳。
     graph.add_conditional_edges(
         START, edge_initial_route,
         {
@@ -3946,8 +3761,6 @@ def _build_graph_feedback(checkpointer=None):
         {"foothold_attempt": "foothold_attempt", "report": "report"},
     )
 
-    # foothold 出口：除老分支外，反馈到 vuln_scan / surface_enum
-    # _can_replan 已加 plan 检查，策略外阶段不会被循环回
     graph.add_conditional_edges(
         "foothold_attempt", edge_after_foothold_v2,
         {
@@ -4044,7 +3857,6 @@ def _build_graph_supervisor(checkpointer=None):
     ]
     for p in PHASE_NODES:
         graph.add_edge(p, "supervisor")
-    # report 是终态，不回 supervisor
     graph.add_edge("report", END)
 
     routing = {p: p for p in PHASE_NODES + ["report"]}
@@ -4056,9 +3868,6 @@ def _build_graph_supervisor(checkpointer=None):
     )
 
 
-# ───────────────────────────────────────────────────────
-# Orchestrator 对外接口
-# ───────────────────────────────────────────────────────
 
 class Orchestrator:
     def __init__(self):
@@ -4143,7 +3952,6 @@ class Orchestrator:
             f"react_rounds={initial_state.max_react_rounds}, "
             f"explore_rounds={initial_state.max_explore_rounds}"
         )
-        # ★ 新增：将 parsed_intent 策略字段转换为 OperatorPlan
         _intent_to_operator_plan(initial_state)
         return initial_state
 
@@ -4152,8 +3960,6 @@ class Orchestrator:
     ) -> PentestState:
         await self._ensure_graph()
         initial_state = self._prepare_state(initial_state)
-        # ``thread_id`` 决定 LangGraph checkpoint 落地的位置。
-        # 默认 == task_id (旧任务兼容); 分支模式下传入 f"{task_id}:{branch_id}"。
         config = self._make_run_config(thread_id or initial_state.task_id)
         initial_state.log(f"任务启动,目标: {initial_state.target}")
         try:
@@ -4297,9 +4103,6 @@ class Orchestrator:
         if not snap or not snap.values:
             return False
 
-        # Combine existing snapshot values with the patch into a single payload
-        # written to the *new* thread. We use aupdate_state on the new thread
-        # which seeds its checkpoint history with this state.
         try:
             base = dict(snap.values)
         except Exception:
@@ -4308,23 +4111,12 @@ class Orchestrator:
         for k, v in (patch or {}).items():
             merged[k] = v
 
-        # ── 关键: 提取源 checkpoint 的"上一个执行节点"作为 as_node ──
-        # 不传 as_node 时, LangGraph 在新 thread 上无法推断 ``next``,
-        # 会把 next 计算为 [] (相当于"已结束"), 导致后续
-        # ``astream(None)`` / ``run_branch_from_checkpoint_stream`` 看到空
-        # next 直接返回 0 个事件。子分支立刻被 ``_resume_branch_bg``
-        # 错误地标记成 paused, 用户看到"刚分叉就暂停"。
-        #
-        # 解决方案: 把源 checkpoint 的最后一个 writes 节点名透传给
-        # ``aupdate_state(as_node=...)``, LangGraph 据此重建 next 队列,
-        # 让子线程从 *父分支当时的下一个待执行节点* 继续运行。
         effective_as_node = as_node
         if not effective_as_node:
             try:
                 meta = snap.metadata or {}
                 writes = meta.get("writes") if isinstance(meta, dict) else None
                 if isinstance(writes, dict) and writes:
-                    # writes 是 OrderedDict, 最后一个 key 是最近执行的节点
                     effective_as_node = list(writes.keys())[-1]
             except Exception as _exc:
                 logger.debug(
@@ -4421,9 +4213,6 @@ class Orchestrator:
         return None
 
 
-# ───────────────────────────────────────────────────────
-# 辅助函数
-# ───────────────────────────────────────────────────────
 
 def _stringify_dict_keys(obj: Any) -> Any:
     """

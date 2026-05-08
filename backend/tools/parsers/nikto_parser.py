@@ -6,7 +6,6 @@ from backend.agents.models import VulnFinding
 
 logger = logging.getLogger(__name__)
 
-# 这些关键词开头/包含的 Nikto 输出是纯信息噪音，不算漏洞
 NOISE_KEYWORDS = [
     "target ip:",
     "target hostname:",

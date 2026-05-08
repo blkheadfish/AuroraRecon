@@ -25,7 +25,6 @@ def _make_orchestrator(budget: float = 600.0) -> DirScanOrchestrator:
     return orch
 
 
-# ───────────────────── A1 ─────────────────────
 def test_should_consult_llm_high_value_hint_short_circuits():
     orch = _make_orchestrator()
     orch._round = 0
@@ -44,13 +43,12 @@ def test_should_consult_llm_lower_new_paths_threshold():
     orch = _make_orchestrator()
     orch._round = 1
     orch._recent_new_hints = set()
-    # 9 new paths should now trigger (old threshold was >15)
     assert orch._should_consult_llm(new_paths=9, tool_name="ferox", elapsed=10.0) is True
     assert orch._should_consult_llm(new_paths=8, tool_name="ferox", elapsed=10.0) is False
 
 
 def test_should_consult_llm_budget_gate_with_empty_round():
-    orch = _make_orchestrator(budget=100.0)  # < 180s left
+    orch = _make_orchestrator(budget=100.0)
     orch._round = 2
     orch._recent_new_hints = set()
     assert orch._should_consult_llm(new_paths=0, tool_name="ferox", elapsed=10.0) is True
@@ -58,7 +56,6 @@ def test_should_consult_llm_budget_gate_with_empty_round():
 
 def test_track_recent_hints_only_new_paths():
     orch = _make_orchestrator()
-    # Seed aggregator (paths get normalized to leading / no trailing slash)
     orch.aggregator.add_paths(["/old/foo"], source="seed", status=200)
     orch.aggregator.add_paths(["/admin", "/login.php"], source="ferox", status=200)
     new = ["/admin", "/login.php"]
@@ -75,7 +72,6 @@ def test_track_recent_hints_ignores_unknown_paths():
     assert "admin" in orch._recent_new_hints
 
 
-# ───────────────────── A2 ─────────────────────
 def test_find_deep_scan_candidates_scores_keyword_only_dir():
     orch = _make_orchestrator()
     paths = ["admin/", "backup", "random.html", "image.png"]
@@ -107,5 +103,4 @@ def test_find_deep_scan_candidates_non_dir_with_keyword_still_picks_up():
     orch = _make_orchestrator()
     orch.aggregator.add_paths(["config.bak"], source="ferox", status=200)
     out = orch._find_deep_scan_candidates(["config.bak"], already_scanned=set())
-    # keyword 'backup' (+3) alone is enough; plus high-value hint 'backup' (+2) = 5
     assert "config.bak" in out

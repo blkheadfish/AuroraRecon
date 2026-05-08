@@ -14,7 +14,6 @@ from fastapi import Request, HTTPException
 
 logger = logging.getLogger(__name__)
 
-# ── JWT 配置 ──────────────────────────────────────────────
 
 _MIN_SECRET_LEN = 32
 
@@ -43,7 +42,6 @@ def get_jwt_secret() -> str:
     return JWT_SECRET
 
 
-# ── JWT 编解码 ────────────────────────────────────────────
 
 from datetime import datetime, timedelta
 import jwt as _jwt
@@ -69,7 +67,6 @@ def decode_jwt(token: str) -> dict | None:
         return None
 
 
-# ── 依赖注入函数 ──────────────────────────────────────────
 
 async def get_current_user(request: Request) -> dict:
     """从 middleware 注入的 request.state 中提取认证信息。"""

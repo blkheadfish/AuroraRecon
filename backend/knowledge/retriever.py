@@ -45,10 +45,8 @@ def _substitute_target(template: str, target_placeholder: str) -> str:
         bare = m_scheme.group(2)
 
     if _SCHEME_BEFORE_TARGET_RE.search(template):
-        # 模板已有 scheme，{TARGET} 仅作 host:port
         result = template.replace("{TARGET}", bare)
     else:
-        # 模板无 scheme，{TARGET} 充当完整 URL
         result = template.replace("{TARGET}", target_placeholder)
 
     return result
@@ -68,7 +66,7 @@ def check_can_reverse(lhost: str) -> bool:
         if addr.is_private or addr.is_loopback or addr.is_link_local:
             return False
     except ValueError:
-        pass  # hostname/domain — assume reachable
+        pass
     return True
 
 
@@ -165,7 +163,6 @@ class KnowledgeRetriever:
         )
 
         if not entries:
-            # 向量检索没结果，降级关键词
             entries = self.kb.search(
                 vuln_name=vuln_name,
                 cve=cve,
@@ -240,7 +237,6 @@ class KnowledgeRetriever:
 
     def _format_entry(self, entry: ExploitEntry, target_url: str = "") -> str:
         """将知识条目格式化为 LLM 可读文本"""
-        # 推断 TARGET 占位符的替换值
         target_placeholder = target_url or "http://TARGET"
 
         lines = [
@@ -256,7 +252,6 @@ class KnowledgeRetriever:
         if entry.default_port:
             lines.append(f"默认端口: {entry.default_port}")
 
-        # 回连约束标注
         if entry.requires_callback:
             if self.env.can_reverse:
                 lines.append(f"⚠️ 此漏洞需要目标回连攻击机。攻击机IP: {self.env.lhost}")
@@ -267,20 +262,16 @@ class KnowledgeRetriever:
                 if entry.callback_note:
                     lines.append(f"   替代方案: {entry.callback_note}")
 
-        # 检测方法
         if entry.detection_method:
             lines.append(f"\n**漏洞检测方法:**")
             lines.append(f"  {entry.detection_method}")
 
-        # 派发到 Skill 的提示（已交给 Skill 引擎，KB 仅作为背景知识）
         if entry.dispatch_skill:
             lines.append(
                 f"\n**利用方法**: 已由 Skill `{entry.dispatch_skill}` 接管，"
                 f"KB 仅提供原理与回连约束，请勿依赖 KB 文本去拼命令。"
             )
 
-        # 利用步骤（仅在 KB 没有 dispatch_skill 时作为 LLM 兜底参考）
-        # 标记为 deprecated 的条目同样不再展开（避免与 Skill 双份维护）
         skip_exploit_steps = bool(entry.dispatch_skill or entry.exploit_steps_deprecated)
         if entry.exploit_steps and not skip_exploit_steps:
             lines.append(f"\n**利用步骤 ({len(entry.exploit_steps)} 步):**")
@@ -294,7 +285,6 @@ class KnowledgeRetriever:
                 if step.notes:
                     lines.append(f"  注意: {step.notes}")
 
-        # 验证命令
         if entry.verification_command:
             cmd = _substitute_target(entry.verification_command, target_placeholder)
             lines.append(f"\n**RCE验证命令:** {cmd}")

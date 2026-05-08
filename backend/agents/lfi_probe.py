@@ -46,7 +46,7 @@ _DEFAULT_MAX_PROBES = 40
 
 @dataclass
 class LfiProbeResult:
-    status: str                # "confirmed" | "unconfirmed" | "not_applicable"
+    status: str
     param: Optional[str] = None
     depth: Optional[str] = None
     style: Optional[str] = None

@@ -32,9 +32,6 @@ from backend.agents.prompt_utils import operator_guidance_block
 logger = logging.getLogger(__name__)
 
 
-# 与 ``backend.agents.supervisor.SUPERVISOR_PHASES`` + report 保持一致;
-# LLM 给出的 next_phase 必须落在这个集合内, 否则一律忽略, 防止 LLM 编造
-# "lateral_movement" 这种架构里不存在的阶段名导致 supervisor 路由失败。
 ALLOWED_PHASES: set[str] = {
     "recon", "surface_enum", "intel_harvest", "vuln_scan",
     "exploit_decision", "human_approval", "foothold_attempt",
@@ -42,9 +39,6 @@ ALLOWED_PHASES: set[str] = {
     "privesc_attempt", "objective_collect", "report",
 }
 
-# 对 preferred_tools 做软白名单: 不在表里的工具名仍会保留(允许用户提
-# 到 "metasploit module xxx" 这种自定义), 但会标记到 unknown_tool 列表里
-# 以便观测; 暂不强制丢弃, 避免误杀。
 KNOWN_TOOLS: set[str] = {
     "gobuster", "ffuf", "feroxbuster", "dirsearch", "wfuzz",
     "nuclei", "nikto", "hydra", "sqlmap", "nmap", "masscan",
@@ -55,9 +49,6 @@ KNOWN_TOOLS: set[str] = {
 }
 
 
-# ────────────────────────────────────────────────────────────────────────
-# Prompt
-# ────────────────────────────────────────────────────────────────────────
 
 REPLAN_SYSTEM_PROMPT = """你是 PentestAI 的实时战术重规划器(Operator Replanner)。
 
@@ -115,9 +106,6 @@ REPLAN_SYSTEM_PROMPT = """你是 PentestAI 的实时战术重规划器(Operator 
 }"""
 
 
-# ────────────────────────────────────────────────────────────────────────
-# 内部 helper
-# ────────────────────────────────────────────────────────────────────────
 
 
 def _summarize_state(state: PentestState) -> dict[str, Any]:
@@ -135,6 +123,7 @@ def _summarize_state(state: PentestState) -> dict[str, Any]:
     open_ports = [
         f"{p.port}/{p.service}" if p.service else str(p.port)
         for p in (state.open_ports or [])[:20]
+        if p.state == "open"
     ]
     web_paths_top = list((state.web_paths or [])[:20])
     return {
@@ -248,11 +237,6 @@ def _validate_plan(raw: dict[str, Any], state: PentestState, op_block: str) -> O
     )
     plan.derived_replan_signals = _derive_signals(plan, state)
 
-    # ── 前置数据护栏 ─────────────────────────────────────────
-    # LLM 偶尔会在没有基础数据时"冒进"到下游阶段(例如 surface_enum 需要
-    # open_ports 才有意义, 但 init 阶段还没跑 recon)。检测到前置数据缺失
-    # 时, 强制回退到 recon, 但把原计划保留在 target_phases 头部, 等 recon
-    # 补完后自然接续。
     _needs_ports = {"surface_enum", "vuln_scan", "intel_harvest"}
     has_ports = bool(state.open_ports)
     redirected = False
@@ -264,8 +248,6 @@ def _validate_plan(raw: dict[str, Any], state: PentestState, op_block: str) -> O
             plan.target_phases = [original] + list(plan.target_phases or [])
         redirected = True
 
-    # init 阶段 + 无端口数据 + plan 等于哑火(无 next_phase 也无 rerun)时,
-    # 默认填 recon, 至少保证流水线动起来。
     cur_phase = (state.current_phase or "").strip()
     if (
         not redirected
@@ -326,9 +308,6 @@ def _fallback_plan(
     return plan
 
 
-# ────────────────────────────────────────────────────────────────────────
-# 公开 API
-# ────────────────────────────────────────────────────────────────────────
 
 
 async def llm_replan(state: PentestState) -> Optional[OperatorPlan]:

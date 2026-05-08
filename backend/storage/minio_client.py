@@ -51,9 +51,7 @@ class StorageClient:
                     client.make_bucket(bucket)
                     logger.info(f"[MinIO] 创建 Bucket: {bucket}")
             except Exception:
-                # bucket 已存在，忽略
                 logger.info(f"bucket已存在")
-                # pass
 
     def upload_report(
         self,
@@ -160,7 +158,6 @@ class StorageClient:
         logger.info(f"[MinIO] 已删除任务文件: {task_id}")
 
 
-# ── 全局单例 ──────────────────────────────────────────────
 _storage: Optional[StorageClient] = None
 
 

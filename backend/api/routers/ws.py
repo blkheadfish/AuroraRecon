@@ -51,17 +51,12 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# 历史回放上限。前端首屏想看更多走 ``GET /tasks/{id}/events?after_id=&count=``
-# 翻页, 而不是用单帧 history_logs 把首包打爆。
 WS_HISTORY_DEFAULT = 1000
 WS_HISTORY_MAX = 5000
 
 
 @router.websocket("/ws/{task_id}")
 async def websocket_endpoint(websocket: WebSocket, task_id: str):
-    # 步骤 1: 先 accept, 不阻塞握手。所有失败路径走 ``send_json + close``,
-    # 比 close-with-reason 在浏览器里能稳定拿到 reason payload, 客户端
-    # 才能据此决定是去刷新 token 还是放弃重连。
     await websocket.accept()
 
     async def _send(payload: dict) -> bool:
@@ -78,7 +73,6 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
         except Exception:
             pass
 
-    # 步骤 2: 鉴权
     token = websocket.query_params.get("token", "")
     claims = decode_jwt(token) if token else None
     if not claims:
@@ -92,7 +86,6 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
 
     owner_id = claims.get("sub", "") or ""
 
-    # 客户端协议参数
     raw_after_id = websocket.query_params.get("after_id", "")
     after_id = (raw_after_id or "").strip()
     try:
@@ -101,7 +94,6 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
         log_tail_param = WS_HISTORY_DEFAULT
     log_tail_param = max(1, min(log_tail_param, WS_HISTORY_MAX))
 
-    # 步骤 3: 任务校验 (DB load 异步, 不影响 accept 时机)
     sm = get_state_manager()
     state = sm.get(task_id)
     if state is None and sm.db_available:
@@ -130,10 +122,8 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
         )
         return
 
-    # 步骤 4: 历史回放
     history: list[dict] = []
     if after_id:
-        # 协议 v2 增量重连: 只补客户端缺失的差量
         try:
             history = await event_stream.replay(
                 task_id, after_id=after_id, count=WS_HISTORY_MAX,
@@ -142,21 +132,17 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
             logger.warning(f"[WS] replay(after_id={after_id}) 失败: {exc}")
             history = []
     else:
-        # 首次连接: 拿最新 N 条 (replay 默认从最早开始, 这里用 xlen 估算切片)
         try:
             total = await event_stream.stream_length(task_id)
-            # 通过两次 replay: 先全量再切尾, count 上限 5000 已能覆盖大多数 demo
-            # 场景。真到 50k 事件的长任务时, 客户端首屏体验本来就要走分页。
             full = await event_stream.replay(task_id, after_id="0", count=WS_HISTORY_MAX)
             history = full[-log_tail_param:] if full else []
-            del total  # 不参与发送, 仅留作可观测信号
+            del total
         except Exception as exc:
             logger.warning(f"[WS] replay(initial tail) 失败: {exc}")
             history = []
 
     last_id = history[-1]["id"] if history else (after_id or "$")
 
-    # ``hello`` 控制帧: 客户端据此知道首包回放完了多少条
     if not await _send({
         "type": "hello",
         "protocol_version": 2,
@@ -168,8 +154,6 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
         return
 
     if history:
-        # 历史一次性下发 (一帧), 与 v1 ``history_events`` 兼容心智一致;
-        # 前端按 envelope.id 去重 + 落 IndexedDB。
         if not await _send({
             "type": "history",
             "events": history,
@@ -178,13 +162,7 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
         }):
             return
 
-    # 终态任务可以提前下发 done, 但仍然进订阅循环 -- Stream 里如果还有更早
-    # 没回放完的也能补到; 终态推送由 task_runner / cancel 路径在 Stream 上
-    # 写入 ``type=done``。
 
-    # 重连场景兼容: pending checkpoint 在 Stream 里其实已经有 ``checkpoint_request``
-    # 事件; 但首次连进来 + state 中已有 pending 而 Stream 里那条 event 已被
-    # MAXLEN 裁掉的极端情况下, 我们再补发一次, 让前端确认卡片不至于消失。
     if state and state.pending_checkpoint and not after_id:
         already_in_history = any(
             ev.get("type") == "decision_event"
@@ -222,7 +200,6 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
                 },
             })
 
-    # 步骤 5: 订阅 + heartbeat 节奏 (服务端主导)
     HEARTBEAT_GAP_S = 25.0
 
     async def _push_loop():
@@ -241,7 +218,6 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
                     return
                 if not await _send(ev):
                     return
-                # 终结事件后退出, 让客户端可以选择是否重连看历史
                 if ev.get("type") == "done":
                     return
         finally:
@@ -265,7 +241,6 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
                 if not await _send({"type": "pong"}):
                     return
                 continue
-            # 客户端可发 JSON 控制帧, 例如 ``{"ack":"<id>"}``。本期只 debug log。
             if data.startswith("{"):
                 logger.debug(f"[WS] client control frame task={task_id}: {data[:120]}")
 

@@ -22,7 +22,6 @@ MAX_TOOLS_PER_STAGE = int(os.getenv("MAX_TOOLS_PER_STAGE", "10"))
 MAX_TOOL_TIMEOUT = int(os.getenv("MAX_TOOL_TIMEOUT", "360"))
 MAX_STAGE_RUNTIME = int(os.getenv("MAX_STAGE_RUNTIME", "600"))
 
-# ── Tool catalog by category ─────────────────────────────
 
 _DIR_DISCOVERY_TOOLS: list[dict[str, Any]] = [
     {
@@ -47,10 +46,6 @@ _DIR_DISCOVERY_TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "dirb", "priority": 4, "must_run": False,
-        # 说明：
-        #   1) `-S` 静默模式只打 hit；`-r` 关闭递归；`-w` 忽略 WARN；`-z` = 毫秒级请求间隔
-        #   2) 先断言二进制与字典都存在，缺哪个就打明显的标记退出，避免壳子静默 0 命中
-        #   3) **stderr 合进 stdout**（原来 2>/dev/null 把关键失败吞了，导致只看到 "+0 条"）
         "script": (
             'set +e; '
             'command -v dirb >/dev/null 2>&1 || '
@@ -125,7 +120,7 @@ CATEGORY_MIN_COVERAGE = {
 class ToolExecRecord:
     name: str
     category: str
-    status: str = "pending"   # pending | executed | skipped | failed | timeout
+    status: str = "pending"
     skip_reason: str = ""
     paths_found: int = 0
     raw_output_len: int = 0
@@ -241,8 +236,6 @@ class ToolCoveragePlanner:
         """
         scan_strategy = scan_strategy or {}
 
-        # ── operator_plan 战术注入 (非破坏式: 仅做规范化提取) ────────────────
-        # 在外面单独处理 plan 字段, 后面循环再读, 避免 build 主流程被打断。
         preferred_tools_lc: set[str] = set()
         avoided_tools_lc: set[str] = set()
         plan_keyword_hints: list[str] = []
@@ -264,7 +257,6 @@ class ToolCoveragePlanner:
                     if str(k).strip()
                 ]
             except Exception:
-                # plan 字段读取失败也不能炸主流程
                 preferred_tools_lc = set()
                 avoided_tools_lc = set()
                 plan_keyword_hints = []
@@ -287,8 +279,6 @@ class ToolCoveragePlanner:
         else:
             extensions = self._build_extensions(tech_hints)
 
-        # 把 plan.keyword_hints 合并到 custom_wordlist_entries 里, 让用户的
-        # "重点扫 admin / backup / .env" 这种关键词真的进字典。
         self._custom_wordlist_path = ""
         custom_entries = list(scan_strategy.get("custom_wordlist_entries") or [])
         if plan_keyword_hints:
@@ -313,7 +303,6 @@ class ToolCoveragePlanner:
             tools = CATEGORY_TOOLS.get(cat, [])
             for t in sorted(tools, key=lambda x: x["priority"]):
                 tname_lc = t["name"].lower()
-                # 用户明确禁用的工具直接踢出, 从根上避免被执行 / 凑覆盖率。
                 if tname_lc in avoided_tools_lc:
                     logger.info(
                         "[Planner] operator_plan 排除工具 %s (avoided_tools)",
@@ -322,8 +311,6 @@ class ToolCoveragePlanner:
                     continue
 
                 is_preferred = tname_lc in preferred_tools_lc
-                # preferred 一律 must_run, 即便它原本是 optional, 也保证
-                # ``should_run`` 不会因 early-stop / 覆盖率达标而跳过它。
                 effective_must_run = bool(t["must_run"]) or is_preferred
 
                 script = t["script"].format(**fmt_vars)
@@ -339,13 +326,9 @@ class ToolCoveragePlanner:
                     "operator_preferred": is_preferred,
                 })
 
-        # preferred_tools 置顶: 同 category 内 preferred 排在前面, 跨 category
-        # 也把 preferred 移到队首, 这样万一被 max_tools / 时间预算砍掉, 也是
-        # 砍掉非 preferred 的尾巴, 而不是反过来。
         if preferred_tools_lc:
             plan.sort(key=lambda spec: (
                 0 if spec.get("operator_preferred") else 1,
-                # 同 preferred 内继续按 category 顺序保持稳定
                 self._categories.index(spec["category"])
                 if spec["category"] in self._categories else 999,
             ))
@@ -383,9 +366,6 @@ class ToolCoveragePlanner:
     @staticmethod
     def _inject_custom_wordlist(tool_name: str, script: str) -> str:
         """For tools that support multiple wordlists, append the custom one."""
-        # feroxbuster supports -w <file> -w <file2>; append via second -w
-        # gobuster/ffuf/dirb: append entries via cat pipe (complex), skip for now
-        # dirsearch: supports -w; we can add it
         return script
 
     @staticmethod

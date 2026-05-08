@@ -51,7 +51,6 @@ async def update_user_role(
     if not target:
         raise HTTPException(404, "用户不存在")
 
-    # 降级保护：不能把最后一个 admin 改成 user
     if (getattr(target, "role", "user") == "admin") and req.role != "admin":
         if await count_admins() <= 1:
             raise HTTPException(400, "至少需要保留一名管理员")
@@ -276,8 +275,6 @@ async def set_tool_timeout(
     return {"status": "ok", "tool": tool_name, "timeout": timeout}
 
 
-# Core containers that must not be stopped/restarted from the admin console.
-# They serve the admin console itself — killing them would lock the operator out.
 CORE_CONTAINERS = {
     "pentest_api",
     "pentest_frontend",
@@ -321,7 +318,7 @@ def _collect_host_metrics() -> dict:
             host_info["source"] = "host"
         if host_sys:
             try:
-                psutil.SYSFS_PATH = host_sys  # type: ignore[attr-defined]
+                psutil.SYSFS_PATH = host_sys
             except Exception:
                 pass
 

@@ -58,6 +58,27 @@ export interface PendingConfirmationResponse {
 /** POST /tasks 的联合响应类型 */
 export type TaskCreateResponse = TaskSummary | PendingConfirmationResponse
 
+export interface AttackGraphNode {
+  id: string
+  type: 'host' | 'service' | 'finding' | 'credential' | 'foothold' | 'loot' | 'objective' | 'path'
+  label?: string
+  facts?: Record<string, unknown>
+  discovered_at?: string
+  discovered_by?: string
+}
+
+export interface AttackGraphEdge {
+  src: string
+  dst: string
+  relation: 'enables' | 'leads_to' | 'exposes' | 'consumes' | 'discovers'
+  note?: string
+}
+
+export interface AttackGraphPayload {
+  nodes: AttackGraphNode[]
+  edges: AttackGraphEdge[]
+}
+
 export interface TaskDetail extends TaskSummary {
   findings?: Finding[]
   // 后端默认返回轻量快照: phase_log 留空, phase_log_tail 仅含最近 N 条,
@@ -118,6 +139,7 @@ export interface TaskDetail extends TaskSummary {
   pending_checkpoint?: CheckpointPayload | null
   checkpoint_history?: CheckpointPayload[]
   pending_user_prompt?: string
+  attack_graph?: AttackGraphPayload
 }
 
 export interface TaskLogsPage {

@@ -32,19 +32,14 @@ class DisclosureMatch:
     facts: dict[str, Any]
 
 
-# Ordered most-specific-first: Tomcat /manager/status must win over the nginx
-# fallback "status(.html)?" pattern.
 _PATH_HINTS: list[tuple[str, re.Pattern[str]]] = [
     ("php",      re.compile(r"(?:^|/)(?:phpinfo|info)(?:\.php)?(?:[?#]|$)", re.IGNORECASE)),
     ("apache",   re.compile(r"(?:^|/)(?:server-status|server-info)(?:[?#]|$)", re.IGNORECASE)),
     ("tomcat",   re.compile(r"(?:^|/)(?:manager|host-manager)(?:/|$)", re.IGNORECASE)),
     ("spring",   re.compile(r"(?:^|/)actuator(?:/|$)", re.IGNORECASE)),
-    # Spring Boot 1.x legacy flat endpoints (without the /actuator prefix)
     ("spring",   re.compile(r"^/(?:env|mappings|configprops|trace|heapdump|beans|health|autoconfig|dump)(?:[?#]|$)", re.IGNORECASE)),
     ("nginx",    re.compile(r"(?:^|/)(?:nginx_?status|stub_?status)(?:[?#]|$)", re.IGNORECASE)),
     ("env_file", re.compile(r"(?:^|/)\.env(?:\.[\w.-]+)?(?:[?#]|$)", re.IGNORECASE)),
-    # Generic /status, /status.html -> nginx fallback; run last so manager/status
-    # and other more specific hits are already consumed.
     ("nginx",    re.compile(r"^/status(?:\.html)?(?:[?#]|$)", re.IGNORECASE)),
 ]
 

@@ -20,7 +20,6 @@ import html as _html
 import re
 from typing import Any
 
-# ── Regex helpers ─────────────────────────────────────────
 
 _HTML_ROW_RE = re.compile(
     r'<tr[^>]*>\s*'
@@ -53,7 +52,6 @@ def _to_bool(value: str) -> bool:
 
 
 _KEY_NORMALISE = {
-    # section-scoped php runtime keys we care about
     "php version": "php_version",
     "system": "system",
     "server api": "sapi",
@@ -178,12 +176,10 @@ def parse_phpinfo(text: str) -> dict[str, Any]:
             value = _prefer_local(raw_val1, raw_val2)
             facts[key] = value
 
-    # Coerce booleans
     for bk in _BOOL_KEYS:
         if bk in facts:
             facts[bk] = _to_bool(str(facts[bk]))
 
-    # disable_functions → list
     if "disable_functions" in facts:
         raw = str(facts["disable_functions"])
         if raw.strip().lower() in ("no value", "none", "(none)", ""):
@@ -192,7 +188,6 @@ def parse_phpinfo(text: str) -> dict[str, Any]:
             items = [x.strip() for x in re.split(r'[,\s]+', raw) if x.strip()]
             facts["disable_functions"] = items
 
-    # disable_classes → list (same handling)
     if "disable_classes" in facts:
         raw = str(facts["disable_classes"])
         if raw.strip().lower() in ("no value", "none", "(none)", ""):
@@ -200,15 +195,11 @@ def parse_phpinfo(text: str) -> dict[str, Any]:
         else:
             facts["disable_classes"] = [x.strip() for x in re.split(r'[,\s]+', raw) if x.strip()]
 
-    # loaded extensions via secondary scan (h2 headers / CLI block)
     loaded = _extract_loaded_extensions(text)
     if loaded:
         facts["loaded_extensions"] = loaded
 
     if "php_version" not in facts:
-        # 兜底：HTML 排版可能把版本号放在 <h1>PHP Version 7.4.3</h1>（内联）
-        # 或 <td>PHP Version</td><td>7.4.3</td>（拆 cell），先剥标签再匹配
-        # 就能用同一条正则覆盖。CLI 的 "PHP Version => 7.4.33" 用第二条兜底。
         plain = _TAG_STRIP_RE.sub(" ", text)
         m = re.search(
             r'PHP\s+Version\s+([\d.]+(?:-[\w.]+)?)',

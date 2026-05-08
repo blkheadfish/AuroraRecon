@@ -26,7 +26,6 @@ from backend.api.state import get_state_manager
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── Auth 白名单 ───────────────────────────────────────────
 _AUTH_WHITELIST_PREFIXES = (
     "/health",
     "/auth/login",
@@ -37,12 +36,10 @@ _AUTH_WHITELIST_PREFIXES = (
 )
 
 
-# ── 生命周期 ──────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     sm = get_state_manager()
 
-    # PostgreSQL
     try:
         from backend.db.database import init_db
         await init_db()
@@ -51,7 +48,6 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"[启动] PostgreSQL 不可用，使用内存模式: {e}")
 
-    # Redis
     try:
         from backend.db.redis_cache import get_redis
         r = await get_redis()
@@ -61,7 +57,6 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"[启动] Redis 不可用，使用内存模式: {e}")
 
-    # MinIO
     try:
         from backend.storage.minio_client import get_storage
         get_storage()
@@ -69,7 +64,6 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"[启动] MinIO 不可用，使用本地文件: {e}")
 
-    # Metasploit RPC
     try:
         from backend.tools.msf_client import MsfClient
         _msf_client_probe = MsfClient()
@@ -81,7 +75,6 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"[启动] MSF RPC 不可用: {e}")
 
-    # 从数据库恢复任务
     if sm.db_available:
         try:
             from backend.db.database import list_tasks_from_db, load_task
@@ -94,7 +87,6 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"[启动] 恢复任务失败: {e}")
 
-    # Orphan container cleanup
     try:
         from backend.tools.executor import TaskContainerManager
         cleaned = await TaskContainerManager.cleanup_orphans()
@@ -114,7 +106,6 @@ async def lifespan(app: FastAPI):
         except ValueError:
             pass
 
-    # KB 向量索引
     try:
         from backend.knowledge.exploit_kb import ExploitKB
         _kb = ExploitKB()
@@ -134,10 +125,8 @@ async def lifespan(app: FastAPI):
     logger.info("[关闭] 服务已停止")
 
 
-# ── 创建 App ──────────────────────────────────────────────
 app = FastAPI(title="PentestAI", version="2.0.0", lifespan=lifespan)
 
-# ── 全局异常处理 ──────────────────────────────────────────
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
@@ -158,7 +147,6 @@ async def generic_exception_handler(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"detail": "服务器内部错误，请稍后重试"})
 
 
-# CORS（环境变量控制）
 ALLOWED_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
 app.add_middleware(
     CORSMiddleware,
@@ -168,7 +156,6 @@ app.add_middleware(
 )
 
 
-# ── 认证中间件 ────────────────────────────────────────────
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     request.state.trace_id = request.headers.get("x-trace-id", "") or uuid.uuid4().hex[:16]
@@ -199,7 +186,6 @@ async def auth_middleware(request: Request, call_next):
     return response
 
 
-# ── 挂载路由 ──────────────────────────────────────────────
 from backend.api.routers import (
     health, tasks, ws, auth, settings, skills, knowledge, team, prompts, admin,
     admin_terminal,

@@ -19,12 +19,10 @@ from backend.tools.deep_scan_coordinator import (
 from backend.tools.parsers.path_aggregator import PathAggregator
 
 
-# ─────────────────────── DeepScanCoordinator ───────────────────────
 
 def test_coordinator_dedupe_normalised_path():
     coord = DeepScanCoordinator()
     assert coord.enqueue(DeepScanTarget(path="/admin", reason="r1")) is True
-    # Same path without leading slash / with trailing slash should dedup.
     assert coord.enqueue(DeepScanTarget(path="admin", reason="r2")) is False
     assert coord.enqueue(DeepScanTarget(path="/admin/", reason="r3")) is False
     assert coord.pending_count() == 1
@@ -53,7 +51,6 @@ def test_coordinator_scanned_blocks_re_enqueue():
     coord = DeepScanCoordinator()
     coord.enqueue(DeepScanTarget(path="/foo"))
     coord.mark_scanned("/foo", elapsed_s=12.5)
-    # Re-enqueue should be rejected once marked scanned.
     assert coord.enqueue(DeepScanTarget(path="/foo")) is False
     assert coord.has_been_scanned("foo") is True
     assert coord.scanned_count() == 1
@@ -67,7 +64,6 @@ def test_coordinator_budget_exhaustion():
     coord.enqueue(DeepScanTarget(path="/c"))
     coord.mark_scanned("/a")
     coord.mark_scanned("/b")
-    # cap reached → pop_batch should be empty
     assert coord.pop_batch(5) == []
     assert coord.can_scan() is False
 
@@ -75,11 +71,10 @@ def test_coordinator_budget_exhaustion():
 def test_coordinator_wall_time_budget():
     coord = DeepScanCoordinator(max_total_scans=10, budget_seconds=30.0)
     coord.enqueue(DeepScanTarget(path="/x"))
-    coord.mark_scanned("/x", elapsed_s=35.0)  # blow the wall-time budget
+    coord.mark_scanned("/x", elapsed_s=35.0)
     assert coord.can_scan() is False
 
 
-# ─────────────────────── pick_followups ───────────────────────
 
 def test_pick_followups_matches_orchestrator_scoring():
     agg = PathAggregator()
@@ -102,7 +97,6 @@ def test_pick_followups_matches_orchestrator_scoring():
 def test_pick_followups_respects_scanned_normalized():
     agg = PathAggregator()
     agg.add_paths(["/admin/", "/api"], source="ferox", status=200)
-    # scanned uses no trailing slash; pick_followups should normalise.
     out = pick_followups(
         ["/admin/", "/api"], agg, scanned={"/admin"},
     )
@@ -118,7 +112,6 @@ def test_pick_followups_cap():
     assert len(out) == 10
 
 
-# ──────────────────── Integration: drain roundtrip ────────────────────
 
 class _StubExecResult:
     def __init__(self, stdout: str) -> None:
@@ -154,12 +147,10 @@ async def test_drain_queue_executes_in_priority_order_and_feeds_back():
 
     agent = ReconAgent.__new__(ReconAgent)
     stub = _StubExecutor()
-    # Simulated feroxbuster output for /admin root
     stub.scripted_outputs["/admin"] = (
         "200      GET     1l        4w      100c http://t/admin/users/\n"
         "200      GET     1l        4w      100c http://t/admin/config/\n"
     )
-    # Simulated output for /api root — no dir-like new findings
     stub.scripted_outputs["/api"] = (
         "200      GET     1l        4w      50c http://t/api/status.json\n"
     )
@@ -180,14 +171,10 @@ async def test_drain_queue_executes_in_priority_order_and_feeds_back():
         batch_size=5,
     )
 
-    # Both roots were scanned exactly once
     assert coord.has_been_scanned("/admin")
     assert coord.has_been_scanned("/api")
-    # High-priority /api came first
     assert "/api" in stub.runs[0]
     assert "/admin" in stub.runs[1]
-    # Followups /admin/users, /admin/config were scored and re-scanned
-    # (they are dir-like + keyword hit, so pick_followups must include them).
     scanned_paths = [p for p in coord._scanned]
     assert "/admin/users" in scanned_paths
     assert "/admin/config" in scanned_paths

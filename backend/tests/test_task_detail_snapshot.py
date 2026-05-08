@@ -67,7 +67,6 @@ class TestSnapshotShape:
     def test_snapshot_drops_tool_records_but_keeps_count(self):
         sm = TaskStateManager()
         state = _build_state()
-        # tool_records 在快照里只剩 count, 完整数据走 ?full=true
         from backend.agents.models import CommandExecutionRecord
         for i in range(10):
             state.tool_records.append(CommandExecutionRecord(
@@ -106,7 +105,6 @@ class TestSnapshotShape:
 
         assert snap["decision_events_total"] == 0
         assert snap["decision_events_tail"] == []
-        # 兼容字段: 旧前端 read decision_events
         assert snap["decision_events"] == []
 
 

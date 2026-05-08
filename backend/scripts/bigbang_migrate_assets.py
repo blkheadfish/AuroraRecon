@@ -15,7 +15,6 @@ KB_DIR = ROOT / "backend" / "knowledge" / "kb_data"
 async def migrate_global_templates() -> None:
     await init_db()
 
-    # Global skill templates
     for yaml_file in SKILLS_DIR.rglob("*.yaml"):
         skill_id = yaml_file.stem
         content = yaml_file.read_text(encoding="utf-8")
@@ -28,7 +27,6 @@ async def migrate_global_templates() -> None:
             content=json.dumps({"skill_id": skill_id, "yaml": content}, ensure_ascii=False),
         )
 
-    # Global KB raw templates
     if KB_DIR.exists():
         for kb_file in KB_DIR.glob("*.json"):
             vuln_id = kb_file.stem
@@ -42,7 +40,6 @@ async def migrate_global_templates() -> None:
                 content=json.dumps({"vuln_id": vuln_id, "json": content}, ensure_ascii=False),
             )
 
-    # Global prompt template
     default_prompts = [
         {"id": "vuln", "name": "漏洞分析 Prompt", "version": "v1.4", "active": True, "content": "你是漏洞分析助手，请严格基于证据输出。"},
         {"id": "exploit", "name": "利用决策 Prompt", "version": "v1.7", "active": True, "content": "你是利用决策助手，优先输出可审计 payload。"},

@@ -11,18 +11,32 @@ _CVE_RE = re.compile(r"(CVE-\d{4}-\d{4,})", re.IGNORECASE)
 
 
 class NmapParser:
-	def extract_open_ports(self, xml_output: str) -> list[int]:
-		"""从 XML 中快速提取开放端口号列表"""
-		ports = []
+	def extract_open_ports(self, xml_output: str) -> tuple[list[int], list[int]]:
+		"""从 XML 中快速提取端口号，区分 open 与 filtered。
+
+		Returns:
+		    (open_ports, filtered_ports)
+		    - open_ports: state="open" 的端口，确认可达
+		    - filtered_ports: state="filtered" 的端口，nmap 无法判断（防火墙/丢包/主机离线）
+		      这些端口必须经过 TCP connect 二次验证才能视为可达
+		"""
+		open_ports: list[int] = []
+		filtered_ports: list[int] = []
 		try:
 			root = ET.fromstring(xml_output)
 			for port_elem in root.iter("port"):
 				state_elem = port_elem.find("state")
-				if state_elem is not None and state_elem.get("state") == "open":
-					ports.append(int(port_elem.get("portid", 0)))
+				if state_elem is None:
+					continue
+				s = state_elem.get("state", "")
+				port_id = int(port_elem.get("portid", 0))
+				if s == "open":
+					open_ports.append(port_id)
+				elif s == "filtered":
+					filtered_ports.append(port_id)
 		except ET.ParseError as e:
 			logger.warning(f"Nmap XML 解析失败（快速模式）: {e}")
-		return ports
+		return open_ports, filtered_ports
 	
 	def parse_xml(self, xml_output: str) -> list[PortInfo]:
 		"""解析 XML，返回基础 PortInfo 列表"""
@@ -49,32 +63,43 @@ class NmapParser:
 			return ports, os_info
 		
 		for host in root.iter("host"):
-			# 解析端口
 			for port_elem in host.iter("port"):
 				state_elem = port_elem.find("state")
-				if state_elem is None or state_elem.get("state") != "open":
+				if state_elem is None:
 					continue
-				
+				port_state = state_elem.get("state", "")
+				if port_state == "closed":
+					continue
+				if port_state not in ("open", "filtered"):
+					continue
+				port_reason = state_elem.get("reason", "")
+
 				service_elem = port_elem.find("service")
 				service_name = ""
 				service_version = ""
 				banner = ""
-				
+
 				if service_elem is not None:
 					service_name = service_elem.get("name", "")
 					product = service_elem.get("product", "")
 					version = service_elem.get("version", "")
 					extra_info = service_elem.get("extrainfo", "")
 					service_version = f"{product} {version} {extra_info}".strip()
-					
-					# 收集 script 输出作为 banner
+
 					for script in port_elem.iter("script"):
 						if script.get("id") in ("banner", "http-title", "ssh-hostkey"):
 							banner += f"{script.get('id')}: {script.get('output', '')[:100]} "
-				
-				ports.append(PortInfo(port=int(port_elem.get("portid", 0)), protocol=port_elem.get("protocol", "tcp"), state="open", service=service_name, version=service_version, banner=banner.strip(), ))
+
+				ports.append(PortInfo(
+					port=int(port_elem.get("portid", 0)),
+					protocol=port_elem.get("protocol", "tcp"),
+					state=port_state,
+					reason=port_reason,
+					service=service_name,
+					version=service_version,
+					banner=banner.strip(),
+				))
 			
-			# 解析 OS 指纹
 			os_elem = host.find("os")
 			if os_elem is not None:
 				osmatch = os_elem.find("osmatch")
@@ -111,7 +136,10 @@ class NmapParser:
 		for host in root.iter("host"):
 			for port_elem in host.iter("port"):
 				state_elem = port_elem.find("state")
-				if state_elem is None or state_elem.get("state") != "open":
+				if state_elem is None:
+					continue
+				port_state = state_elem.get("state", "")
+				if port_state != "open":
 					continue
 				port_id = int(port_elem.get("portid", 0))
 				for script in port_elem.iter("script"):
@@ -152,7 +180,6 @@ class NmapParser:
 		if "not vulnerable" in out_lower and "vulnerable" not in out_lower.replace("not vulnerable", ""):
 			return None
 
-		# Discard scripts that failed to execute — these are NOT vulnerability evidence
 		has_failure = any(m in out_lower for m in NmapParser._VULN_FAIL_MARKERS)
 		if has_failure and not has_vuln_signal:
 			return None

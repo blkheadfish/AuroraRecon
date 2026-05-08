@@ -15,34 +15,27 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, Field, PrivateAttr, field_validator
 
 
-# ───────────────────────────────────────────────────────
-# 工作流模式(workflow_mode)常量与默认值矩阵
-# 说明:
-#   一次任务只携带一个 workflow_mode,它决定默认的审批策略 / 证据门槛 /
-#   风险预算 / 轮次上限 / Skill 匹配阈值。用户也可以在创建任务时对单项
-#   进行覆盖,覆盖值会被 `apply_mode_defaults` 保留。
-# ───────────────────────────────────────────────────────
 
 WorkflowMode = Literal["pentest_engineer", "ctf_expert"]
 
 _MODE_DEFAULTS: dict[str, dict[str, Any]] = {
 	"pentest_engineer": {
-		"auto_approve":        False,      # 企业渗透默认强制人工审批
-		"success_gate_level":  "strict",   # 严格证据门槛,避免误报
-		"risk_budget":         3,          # 高风险操作额度
-		"max_react_rounds":    25,         # ReAct 单漏洞最大轮次
-		"max_explore_rounds":  15,         # 探索阶段最大轮次
-		"skill_min_score":     20,         # Skill 匹配下限(需要较强信号)
-		"skill_weak_boost":    0,          # 不额外加权弱信号
+		"auto_approve":        False,
+		"success_gate_level":  "strict",
+		"risk_budget":         3,
+		"max_react_rounds":    25,
+		"max_explore_rounds":  15,
+		"skill_min_score":     20,
+		"skill_weak_boost":    0,
 	},
 	"ctf_expert": {
-		"auto_approve":        True,       # CTF/靶场跳过审批,一把梭
-		"success_gate_level":  "lenient",  # 放宽证据门槛(拿 flag 优先)
+		"auto_approve":        True,
+		"success_gate_level":  "lenient",
 		"risk_budget":         10,
 		"max_react_rounds":    40,
 		"max_explore_rounds":  25,
-		"skill_min_score":     5,          # 接受弱信号匹配
-		"skill_weak_boost":    10,         # 对弱信号命中额外加权
+		"skill_min_score":     5,
+		"skill_weak_boost":    10,
 	},
 }
 
@@ -84,24 +77,6 @@ class TaskStatus(str, Enum):
 	FAILED = "failed"
 
 
-# ───────────────────────────────────────────────────────
-# OperatorPlan — 操作员实时重规划计划
-#
-# 设计:
-#   用户在任务执行过程中给出新指令时, Operator Replanner 一次 LLM 调用把
-#   "用户的话 + 当前事实"翻译成一份**结构化战术计划**, 沿 PentestState
-#   透传到 supervisor / 各阶段节点 / ToolCoveragePlanner, 让下游确定性逻辑
-#   按计划执行, 而不是各自再去解读一遍 pending_user_prompt 字符串。
-#
-# 字段语义:
-#   - 阶段层(`next_phase` / `target_phases` / `skip_phases` / `rerun_current`)
-#     由 supervisor / linear-edge 直接消费, 决定路由
-#   - 战术层(`focus_targets` / `preferred_tools` / `avoided_tools` /
-#     `keyword_hints` / `extra_constraints`)由节点内 planner 消费, 影响工具
-#     选择 / 路径过滤 / 字典生成
-#   - 安全层(`needs_human_approval`)由 human_approval / privesc 节点消费,
-#     用户明确授权时才允许跳过审批
-# ───────────────────────────────────────────────────────
 
 
 class OperatorFocusTarget(BaseModel):
@@ -114,38 +89,27 @@ class OperatorPlan(BaseModel):
 	plan_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:8])
 	created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
 
-	# 触发本次重规划时的"原始用户指令"(operator_guidance_block 的拼接产物),
-	# 仅作审计 / 回放用, 不应直接喂给下游节点。
 	user_request: str = ""
 
-	# 触发时的当前阶段, 用于 rerun_current / 派生 re_<phase>_for_operator 信号。
 	source_phase: str = ""
 
-	# ── LLM 输出的语义层 ─────────────────────────────────────
-	intent_summary: str = ""    # 一句话回放你听到的核心意图(给前端展示)
-	rationale: str = ""         # 2~4 句解释为什么这么规划
+	intent_summary: str = ""
+	rationale: str = ""
 
-	# ── 阶段层 ────────────────────────────────────────────────
-	next_phase: Optional[str] = None       # 强烈建议下一阶段(supervisor 优先采纳)
+	next_phase: Optional[str] = None
 	target_phases: list[str] = Field(default_factory=list)
 	skip_phases: list[str] = Field(default_factory=list)
-	rerun_current: bool = False            # 当前阶段是否要求重跑
+	rerun_current: bool = False
 
-	# ── 战术层 ────────────────────────────────────────────────
 	focus_targets: list[OperatorFocusTarget] = Field(default_factory=list)
 	preferred_tools: list[str] = Field(default_factory=list)
 	avoided_tools: list[str] = Field(default_factory=list)
 	keyword_hints: list[str] = Field(default_factory=list)
 	extra_constraints: dict[str, Any] = Field(default_factory=dict)
 
-	# ── 安全层 ────────────────────────────────────────────────
 	needs_human_approval: bool = True
 
-	# ── 协同 / 衍生 ──────────────────────────────────────────
-	# 已经被哪些节点 / 路由消费过, 用于"一次性指令"语义和过期判断。
 	consumed_by: list[str] = Field(default_factory=list)
-	# 由 _derive_signals 计算, 写到 state.replan_signals 让 feedback DAG 复用
-	# 现有的 re_recon_for_hosts / re_vuln_scan_for_creds 等信号通路。
 	derived_replan_signals: dict[str, int] = Field(default_factory=dict)
 
 	@field_validator("focus_targets", mode="before")
@@ -166,9 +130,6 @@ class OperatorPlan(BaseModel):
 		return out
 
 
-# ───────────────────────────────────────────────────────
-# 分支(branch)模型 — 见 conversation_branching_like_claude_kimi 计划
-# ───────────────────────────────────────────────────────
 
 BranchStatus = Literal["running", "paused", "completed", "failed"]
 
@@ -186,19 +147,18 @@ class TaskBranch(BaseModel):
 	branch_id: str
 	task_id: str
 	parent_branch_id: Optional[str] = None
-	fork_event_id: Optional[str] = None     # 父分支 timeline 上的 decision_event.id
+	fork_event_id: Optional[str] = None
 	fork_phase: str = ""
 	fork_round: Optional[int] = None
-	thread_id: str = ""                     # f"{task_id}:{branch_id}"
+	thread_id: str = ""
 	status: BranchStatus = "running"
 	created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
 	updated_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
-	label: str = ""                         # 自动从 prompt 截 30 字
-	initiating_prompt: str = ""             # 触发本分支的 user_prompt(root 为空)
-	is_root: bool = False                   # 兼容老任务: 第一个 branch 标 is_root=True
+	label: str = ""
+	initiating_prompt: str = ""
+	is_root: bool = False
 
 
-# ── 意图解析与安全卡口 ──────────────────────────────────
 
 TargetType = Literal["ip", "cidr", "domain", "hostname_pattern", "unknown"]
 AmbiguityLevel = Literal["clear", "partial", "vague"]
@@ -213,13 +173,12 @@ class ParsedIntent(BaseModel):
 	"""
 	target_type: TargetType = "unknown"
 	targets: list[str] = Field(default_factory=list)
-	scope_hint: Optional[str] = None       # "intranet", "dmz", "specific_host"
-	task_focus: list[str] = Field(default_factory=list)    # ["web", "database"]
-	pentest_phase: list[str] = Field(default_factory=list)  # ["recon", "exploit"]
-	priority_vulns: list[str] = Field(default_factory=list) # ["shiro", "fastjson"]
-	# ★ 新增：LLM 语义意图标签（来自 parse-intent 接口），如 stealth / low_noise / prefer_msf 等
+	scope_hint: Optional[str] = None
+	task_focus: list[str] = Field(default_factory=list)
+	pentest_phase: list[str] = Field(default_factory=list)
+	priority_vulns: list[str] = Field(default_factory=list)
 	intents: list[str] = Field(default_factory=list)
-	requires_discovery: bool = False  # 是否需要先做主机发现（masscan 存活扫描）
+	requires_discovery: bool = False
 	ambiguity_level: AmbiguityLevel = "vague"
 	clarification_needed: list[str] = Field(default_factory=list)
 	raw_prompt: str = ""
@@ -244,6 +203,7 @@ class PortInfo(BaseModel):
 	port: int
 	protocol: str = "tcp"
 	state: str = "open"
+	reason: str = ""
 	service: str = ""
 	version: str = ""
 	banner: str = ""
@@ -271,12 +231,11 @@ class VulnFinding(BaseModel):
 	verification_status: VerificationStatus = "unverified"
 	verification_reasons: list[str] = Field(default_factory=list)
 	evidence_snippets: list[dict[str, str]] = Field(default_factory=list)
-	# 报告增强字段
-	remediation: str = ""          # LLM 生成的具体修复建议
-	impact: str = ""               # 实际业务危害描述
-	cvss_score: Optional[float] = None  # CVSS 3.1 评分
-	cvss_vector: str = ""          # CVSS 向量字符串，如 AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H
-	cwe: str = ""                  # CWE 编号，如 CWE-98
+	remediation: str = ""
+	impact: str = ""
+	cvss_score: Optional[float] = None
+	cvss_vector: str = ""
+	cwe: str = ""
 
 
 class CommandExecutionRecord(BaseModel):
@@ -294,7 +253,7 @@ class CommandExecutionRecord(BaseModel):
 	runtime_command: str = ""
 	round: Optional[int] = None
 	purpose: str = ""
-	timestamp: str = ""  # ISO8601
+	timestamp: str = ""
 	command: str = ""
 	stdout: str = ""
 	stderr: str = ""
@@ -332,14 +291,12 @@ class ExploitResult(BaseModel):
 	vuln_id: str
 	success: bool
 	shell_type: str = ""
-	exploit_level: str = ""  # "rce" | "file_read" | "source_read" | "info_leak" | ""
+	exploit_level: str = ""
 	session_info: dict = Field(default_factory=dict)
 	evidence: str = ""
 	commands_run: list[str] = Field(default_factory=list)
-	# 每条命令对应的执行结果（命令→输出 配对）
 	command_results: list[CommandExecutionRecord] = Field(default_factory=list)
-	# command_results 格式: [{"command": "...", "stdout": "...", "stderr": "...", "exit_code": 0, "elapsed": 1.2}, ...]
-	command_records: list[CommandExecutionRecord] = Field(default_factory=list)  # 兼容旧字段名
+	command_records: list[CommandExecutionRecord] = Field(default_factory=list)
 
 	@field_validator("command_results", "command_records", mode="before")
 	@classmethod
@@ -364,17 +321,14 @@ class ExploitResult(BaseModel):
 		return normalized
 
 
-# ───────────────────────────────────────────────────────
-# 目标地址解析工具
-# ───────────────────────────────────────────────────────
 
 class ParsedTarget(BaseModel):
 	"""parse_target() 的返回值"""
-	host: str          # 纯主机名或 IP（不含端口、协议）
-	port: Optional[int] = None   # 显式指定的端口，None 表示用户未指定
-	scheme: str = ""   # http / https / ""（空 = 用户未指定协议）
-	path: str = ""     # URL 路径（用户传完整 URL 时保留）
-	raw: str = ""      # 原始输入，原样保留
+	host: str
+	port: Optional[int] = None
+	scheme: str = ""
+	path: str = ""
+	raw: str = ""
 
 
 class TaskFact(BaseModel):
@@ -409,16 +363,14 @@ def parse_target(raw: str) -> ParsedTarget:
 	if not raw:
 		return ParsedTarget(raw=raw, host="")
 
-	# ── 尝试按 URL 解析（带协议头的情况）──────────────
 	if re.match(r'^https?://', raw, re.IGNORECASE):
 		parsed = urlparse(raw)
 		host = parsed.hostname or ""
-		port = parsed.port  # None if not explicit
+		port = parsed.port
 		scheme = (parsed.scheme or "").lower()
 		path = parsed.path or ""
 		return ParsedTarget(raw=raw, host=host, port=port, scheme=scheme, path=path)
 
-	# ── 无协议头：host 或 host:port ──────────────────
 	match = re.match(r'^(.+?):(\d{1,5})$', raw)
 	if match:
 		host = match.group(1)
@@ -426,16 +378,11 @@ def parse_target(raw: str) -> ParsedTarget:
 		port = int(port_str)
 		if 1 <= port <= 65535:
 			return ParsedTarget(raw=raw, host=host, port=port)
-		# 端口越界，当作纯 host
 		return ParsedTarget(raw=raw, host=raw)
 
-	# ── 纯 host ──────────────────────────────────────
 	return ParsedTarget(raw=raw, host=raw)
 
 
-# ───────────────────────────────────────────────────────
-# AttackGraph — 结构化的攻击图模型
-# ───────────────────────────────────────────────────────
 
 AttackNodeType = Literal[
 	"host", "service", "finding", "credential", "foothold", "loot",
@@ -504,7 +451,6 @@ class AttackGraph(BaseModel):
 				existing.discovered_by = discovered_by
 			return existing
 		if len(self.nodes) >= self.max_nodes:
-			# 简单保护：到达上限后丢弃最旧的非 host/objective 节点
 			drop_at: Optional[int] = None
 			for i, n in enumerate(self.nodes):
 				if n.type not in ("host", "objective"):
@@ -533,12 +479,10 @@ class AttackGraph(BaseModel):
 	) -> Optional[AttackGraphEdge]:
 		if not src or not dst or src == dst:
 			return None
-		# 去重
 		for e in self.edges:
 			if e.src == src and e.dst == dst and e.relation == relation:
 				return e
 		if len(self.edges) >= self.max_edges:
-			# 简单保护：丢弃最旧的非 enables 类型边
 			drop_at: Optional[int] = None
 			for i, ee in enumerate(self.edges):
 				if ee.relation != "enables":
@@ -564,35 +508,26 @@ class PentestState(BaseModel):
 	scope_note: str = ""
 	extra_hint: str = ""
 	user_prompt: str = ""
-	# ── 意图解析 + 安全卡口（新增）─────────────────
-	# raw_prompt: 用户自然语言描述（兼容旧 target 字段）
 	raw_prompt: str = ""
-	# parsed_intent: 意图解析器产出的结构化结果
 	parsed_intent: Optional[dict[str, Any]] = None
-	# safety_check_result: 安全卡口的校验结果
 	safety_check_result: Optional[dict[str, Any]] = None
-	# authorization_token: 用户提供的授权证明
 	authorization_token: Optional[str] = None
-	# ── 工作流模式 + per-task 运行时策略 ───────────────
-	# workflow_mode 决定一组默认值(见 _MODE_DEFAULTS),
-	# 其余字段允许在创建任务时显式覆盖,不再依赖全局环境变量。
 	workflow_mode: WorkflowMode = "pentest_engineer"
-	auto_approve: bool = False                        # 自动通过审批(CTF 模式默认 True)
-	success_gate_level: str = "strict"                # strict | medium | lenient
-	risk_budget: int = 3                              # 允许的高风险操作次数
-	risk_budget_used: int = 0                         # 已消耗的高风险操作次数
-	max_react_rounds: int = 25                        # ReAct 单漏洞最大轮次
-	max_explore_rounds: int = 15                      # 探索阶段最大轮次
-	skill_min_score: int = 20                         # SkillRegistry 匹配下限
-	skill_weak_boost: int = 0                         # 弱信号命中的额外加权
+	auto_approve: bool = False
+	success_gate_level: str = "strict"
+	risk_budget: int = 3
+	risk_budget_used: int = 0
+	max_react_rounds: int = 25
+	max_explore_rounds: int = 15
+	skill_min_score: int = 20
+	skill_weak_boost: int = 0
 	created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
 
-	# ── 解析后的目标信息（parse_target 写入）──────────
-	target_host: str = ""          # 纯 host/IP，各 agent 统一使用
-	target_port: Optional[int] = None  # 用户显式指定的端口，None = 未指定
-	target_scheme: str = ""        # http/https/""
-	target_path: str = ""          # URL 路径
-	target_raw: str = ""           # 原始用户输入（= target，留作对照）
+	target_host: str = ""
+	target_port: Optional[int] = None
+	target_scheme: str = ""
+	target_path: str = ""
+	target_raw: str = ""
 
 	owner_id: str = ""
 	tenant_id: str = "default"
@@ -610,54 +545,21 @@ class PentestState(BaseModel):
 	dirlist_tree: str = ""
 	dirlist_interesting_files: list[str] = Field(default_factory=list)
 
-	# ── LLM 自适应目录探测引擎产出 ──────────────────────
 	dir_scan_strategy: dict = Field(default_factory=dict)
 	dir_intel: dict = Field(default_factory=dict)
 	supplementary_dir_scan_done: bool = False
 
-	# ── intel_harvest 阶段产出 ──────────────────────────
-	# 通用 service-info 事实桶（per-service）：
-	#   runtime_facts["php"]    -> phpinfo_parser 抽取结果（等价于旧 php_runtime）
-	#   runtime_facts["apache"] -> server-status/server-info
-	#   runtime_facts["nginx"]  -> stub_status + Server 头
-	#   runtime_facts["tomcat"] -> manager/status + manager/serverinfo
-	#   runtime_facts["spring"] -> actuator/env|mappings|info|health|configprops
-	#   runtime_facts["env_file"] -> .env 类配置文件抽取
-	# 每个桶内都带 ``_attack_surface`` 子字段作为高层约束提示。
 	runtime_facts: dict[str, dict[str, Any]] = Field(default_factory=dict)
-	# 结构化的 PHP 运行时事实 (phpinfo_parser 输出)，保留为 ``runtime_facts['php']``
-	# 的兼容别名，旧代码/测试仍能访问：
-	#   php_version, sapi, doc_root, disable_functions(list),
-	#   allow_url_include(bool), allow_url_fopen(bool), open_basedir,
-	#   session_save_path, upload_tmp_dir, loaded_extensions(list), ...
 	php_runtime: dict[str, Any] = Field(default_factory=dict)
-	# 利用阶段可复用的「已确认事实」：
-	#   {"lfi": {"param": ..., "depth": ..., "style": ...,
-	#             "readable_files": [...]},
-	#    "services": {"ssh_port": 22, "log_readable": [...]},
-	#    "creds": [{"user":..., "source":..., "value":...}]}
 	confirmed_facts: dict[str, Any] = Field(default_factory=dict)
-	# 统一事实仓（强一致主存储）；confirmed_facts 为兼容投影视图
 	task_facts: dict[str, TaskFact] = Field(default_factory=dict)
 	fact_version: int = 0
 	last_fact_normalized_at: str = ""
-	# 每个 finding.id 首轮产出的原始 Skill 探测变量（如 lfi_param/lfi_depth…）
 	exploit_probe_variables: dict[str, dict[str, Any]] = Field(default_factory=dict)
-	# 每个 finding.id 已知失败的命令集合，二次利用避开
 	failed_commands_by_vuln: dict[str, list[str]] = Field(default_factory=dict)
-	# 文件情报提取结果: [{"path": "/backup/db.sql", "content_snippet": "...", "intel": {LLM结果}}]
 	intel_files: list[dict[str, Any]] = Field(default_factory=list)
-	# 页面参数发现+验证: [{"url": "http://x/info.php?file=", "param_name": "file",
-	#   "method": "GET", "vuln_type": "lfi", "verified": True, "evidence": "..."}]
 	page_params: list[dict[str, Any]] = Field(default_factory=list)
-	# Paths discovered from file content analysis (new_paths from FILE_INTEL_EXTRACT),
-	# consumed by vuln_scan to expand the attack surface
 	intel_discovered_paths: list[str] = Field(default_factory=list)
-	# KB 探针扫描命中：在 intel_harvest 阶段由 ProbeScanner 产出
-	# 结构：[{"vuln_id": "shiro_cve2016_4437", "dispatch_skill": "shiro_rce",
-	#         "confidence": 0.95, "base_url": "http://10.0.0.5:8080",
-	#         "port": 8080, "evidence": "...", "cves": [...]}]
-	# 后续 SkillRegistry.match() 会读取此字段加权对应 Skill。
 	kb_probe_hits: list[dict[str, Any]] = Field(default_factory=list)
 
 	subdomains: list[str] = Field(default_factory=list)
@@ -665,51 +567,38 @@ class PentestState(BaseModel):
 
 	findings: list[VulnFinding] = Field(default_factory=list)
 	raw_vuln: dict = Field(default_factory=dict)
-	# VulnAgent 指纹识别结果：{port: {summary, whatweb, httpx, json_probe, ...}}
 	fingerprints: dict = Field(default_factory=dict)
 
 	exploit_results: list[ExploitResult] = Field(default_factory=list)
-	# 全阶段（recon/vuln/exploit）结构化命令执行记录，供 DecisionChat 展示
 	tool_records: list[CommandExecutionRecord] = Field(default_factory=list)
 	got_shell: bool = False
 	privilege_level: str = ""
-	# 利用阶段首轮全部失败后，是否已执行过二次攻击重试
-	# 注：feedback / supervisor 模式下改为按计数判断（见 secondary_attack_count）
 	secondary_attack_done: bool = False
-	# 首轮即拿到立足点，未进入二次利用节点（供 UI 标记跳过）
 	secondary_elided: bool = False
-	# 二次攻击执行次数（feedback 模式可重入，linear 模式仍兼容 secondary_attack_done）
 	secondary_attack_count: int = 0
 	max_secondary_attacks: int = 2
 
-	# ── 主机攻链状态（VulnHub / 靶机向）：与 findings 并存，策略以攻链为主 ──
-	# foothold: none | web_rce | shell | ssh | meterpreter
 	foothold_status: str = "none"
 	credential_store: list[dict[str, Any]] = Field(default_factory=list)
 	loot_store: list[dict[str, Any]] = Field(default_factory=list)
 
-	# ── 横向移动 / 持久化 / 内网扫描 ────────────────────
 	lateral_results: dict[str, Any] = Field(default_factory=dict)
 	persistence_entries: list[dict[str, Any]] = Field(default_factory=list)
 	internal_network: dict[str, Any] = Field(default_factory=dict)
 
 	privesc_hypotheses: list[dict[str, Any]] = Field(default_factory=list)
-	# user_proof / root_proof / report_ready 等
 	objective_status: dict[str, Any] = Field(default_factory=dict)
-	# Agent 给出的结构化「下一步」建议（供编排与前端展示）
 	attack_next_steps: list[dict[str, Any]] = Field(default_factory=list)
 	privesc_attempt_count: int = 0
 	max_privesc_rounds: int = Field(
 		default_factory=lambda: max(1, int(os.getenv("MAX_PRIVESC_ROUNDS", "3")))
 	)
 	chain_summary: str = ""
-	# 实际执行过的攻链阶段（有序），供前端进度条精确展示
 	chain_visited: list[str] = Field(default_factory=list)
 
-	# 报告增强字段
-	executive_summary: str = ""       # 面向管理层的非技术性总结
-	attack_timeline: list[dict[str, str]] = Field(default_factory=list)  # 攻击时间线 [{phase, summary}]
-	filtered_log: list[str] = Field(default_factory=list)  # 过滤后的关键事件日志
+	executive_summary: str = ""
+	attack_timeline: list[dict[str, str]] = Field(default_factory=list)
+	filtered_log: list[str] = Field(default_factory=list)
 
 	post_findings: dict = Field(default_factory=dict)
 
@@ -717,56 +606,31 @@ class PentestState(BaseModel):
 	report_md: str = ""
 	report_error: str = ""
 
-	# 人工审批标志（由 resume() 注入，默认 False）
 	approved: bool = False
-	# 后渗透阶段独立审批标志，与 approved 互不干扰
 	post_approved: bool = False
 
-	# ── 通用决策 checkpoint 协议 ─────────────────────────
-	# pending_checkpoint: 当前正在等待用户响应的 checkpoint(若有),
-	#   结构见 CheckpointPayload(下方),为 None 表示当前无人工干预需求。
-	# checkpoint_history:  已经完成的 checkpoint(含用户响应),用于审计和
-	#   断线重连后的回放;新条目追加在末尾,前端按 checkpoint_id 去重。
-	# pending_user_prompt: 上一轮 checkpoint 的 user_prompt,会拼接到
-	#   下一阶段的 LLM system prompt 末尾,做软引导。
 	pending_checkpoint: Optional[dict[str, Any]] = None
 	checkpoint_history: list[dict[str, Any]] = Field(default_factory=list)
 	pending_user_prompt: str = ""
 
-	# 用户-代理对话（决策视图交互式对话）
 	user_messages: list[dict] = Field(default_factory=list)
 	agent_replies: list[dict] = Field(default_factory=list)
 
-	# ── 操作员实时重规划(Operator Replanner)───────────────────
-	# 由 backend.agents.operator_replanner.llm_replan() 在 chat 触发 fork 时
-	# 同步生成一份结构化战术计划; supervisor / 各阶段节点 / ToolCoveragePlanner
-	# 统一从这里取数, 避免每个节点各自再去解读 pending_user_prompt 字符串。
-	# 计划是 sticky 的, 直到下一次新指令产生新的 OperatorPlan 才被覆盖。
 	operator_plan: Optional[OperatorPlan] = None
-	# 用户确认的渗透策略（Plan Mode，类似 Cursor Plan 模式）
 	pentest_plan: Optional[dict[str, Any]] = None
-	# 历史计划(末尾追加, 限长 20), 用于审计 / 调试 / 回放。
 	operator_plan_history: list[OperatorPlan] = Field(default_factory=list)
 
-	# guard_stats 记录每类拦截 (preflight reject / repeat failed / reprobe) 的累计次数,
-	# 走 ``health.metrics_overview`` 透出, 并不依赖事件流。
 	guard_stats: dict[str, int] = Field(default_factory=dict)
 	trace_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:16])
 
-	# ── 攻击链反馈循环（feedback / supervisor 模式共用）────────────
-	# 待消费的"种子"事实：在反馈/监督模式下，下游节点（如 post_foothold_enum）
-	# 发现新事实后，写入对应 bucket，上游节点（recon/surface_enum/vuln_scan）
-	# 重新进入时把它们并入本次输入再执行。
 	pending_seeds: dict[str, list[Any]] = Field(default_factory=lambda: {
 		"hosts": [],
 		"ports": [],
 		"web_paths": [],
 		"credentials": [],
 	})
-	# 每个阶段的进入次数与上次输入签名（避免相同输入重复执行）
 	phase_visit_count: dict[str, int] = Field(default_factory=dict)
 	phase_signature: dict[str, str] = Field(default_factory=dict)
-	# 各阶段的访问次数上限（防止反馈循环里某阶段被无限拉起）
 	max_phase_visits: dict[str, int] = Field(default_factory=lambda: {
 		"recon": 3,
 		"surface_enum": 2,
@@ -777,52 +641,28 @@ class PentestState(BaseModel):
 		"post_foothold_enum": 3,
 		"privesc_attempt": 3,
 	})
-	# 信号驱动的"重新规划"信号桶：见 fact_hooks.emit_replan_signals
 	replan_signals: dict[str, int] = Field(default_factory=dict)
-	# 已执行的反馈跳数（保护：超过 max_replan 后强制走默认分支）
 	replan_count: int = 0
 	max_replan: int = 3
 
-	# ── Supervisor 模式状态字段 ──────────────────────────────
-	# supervisor 路由出的"下一阶段"
 	next_phase: str = ""
-	# supervisor 已进入的轮次（防 LLM 路由失控）
 	supervisor_round: int = 0
 	supervisor_round_limit: int = 30
-	# supervisor 决策历史尾部（用于"连续 3 轮选同 phase 且无新 fact → 强制 report"）
 	supervisor_history: list[dict[str, Any]] = Field(default_factory=list)
-	# 给 foothold/privesc 接力使用：审批是否已通过一次（避免 supervisor
-	# 模式下星形拓扑反复在 interrupt_before 暂停）
 	approved_once: bool = False
 	post_approved_once: bool = False
 
-	# ── AttackGraph（结构化的攻击图，可视化用）────────────────
-	# 单点写入入口：fact_sink / apply_service_info_extraction 中产生新事实时
-	# 顺手 upsert 进来。非 supervisor 模式也会被填充，前端可以独立展示。
 	attack_graph: AttackGraph = Field(default_factory=AttackGraph)
 
-	# ── 对话分支(Claude/Kimi 风格) ──────────────────────────
-	# 每个 task 是一棵以 root branch 为根的分支森林。BranchManager 维护
-	# task_branches 表 + 每个 branch 一个 LangGraph thread_id;
-	# active_branch_id 在切换时更新, 写到 PentestState 仅为前端 / API 回显。
-	# root_branch_id 在第一次 fork 之前, 由 lazy_init_root 写入。
 	active_branch_id: str = ""
 	root_branch_id: str = ""
 
-	# ── log seq 持久化(与 ``phase_log`` 等长) ─────────────────
-	# 每条日志在 task 维度上的单调 seq, 由 ``TaskStateManager.next_log_seq``
-	# 分配。fork 出的子分支会拷贝父分支的 phase_log + phase_log_seqs, 后续
-	# 各自向前推进时 seq 仍然由 task 级 counter 给, 因此跨分支重连用 bisect
-	# 定位 ``after_log_seq=K`` 的 start_idx, 不会再因为分支切换导致 seq 回退
-	# 让前端误以为"已经看过了, 跳过补丁"。
 	phase_log_seqs: list[int] = Field(default_factory=list)
 
 	def log(self, msg: str) -> None:
 		import logging
 		ts = datetime.utcnow().strftime("%H:%M:%S")
 		entry = f"[{ts}] [{self.current_phase}] {msg}"
-		# 先拿 seq 再 append: ``next_log_seq`` 内部加锁, 与 phase_log 自身
-		# 写入保持顺序对齐(seqs 与 phase_log 等长)。
 		try:
 			from backend.api.state import get_state_manager
 			anchor = self.phase_log_seqs[-1] if self.phase_log_seqs else None
@@ -831,30 +671,16 @@ class PentestState(BaseModel):
 			seq = len(self.phase_log)
 		self.phase_log.append(entry)
 		self.phase_log_seqs.append(int(seq))
-		# 滚动淘汰: 反馈/监督模式下 phase_log 会随循环爆炸增长,
-		# 超过 5000 行截留最近 2500 行 (phase_log 主要供 DB 持久化与 logs 接口
-		# 翻页回看, 实时推送已经走 Redis Stream, 不依赖这块内存)。
-		# phase_log_seqs 必须与 phase_log 等长一起裁。
 		if len(self.phase_log) > 5000:
 			self.phase_log = self.phase_log[-2500:]
 			self.phase_log_seqs = self.phase_log_seqs[-2500:]
 		logging.getLogger(__name__).info(entry)
-		# 实时广播: 普通 phase_log 行也通过 EventBus 立刻送到 WS,
-		# 不再等下一次节点 yield 才随 phase_update 批量下发,
-		# 这样前端聊天流不会出现"卡半天突然涌一堆日志"的体感。
-		# 主协程线程: ``get_running_loop`` + ``create_task`` 直接派发;
-		# worker 线程(LLM 同步调用 / 阻塞 IO 线程池)走 ``set_task_loop``
-		# 注册的主 loop + ``run_coroutine_threadsafe`` 投递, 避免被
-		# ``RuntimeError: no running event loop`` 静默吞掉。
 		try:
 			import asyncio
 			from backend.api.event_bus import get_log_sink, get_task_loop
 			sink = get_log_sink(self.task_id)
 			if not sink:
 				return
-			# 直接复用刚刚分配的真实 seq(已写入 phase_log_seqs),
-			# 不再 ``len(phase_log)-1``: fork 后两条分支独立增长,
-			# 局部下标对 task 级 WS 客户端没有意义。
 			seq_emit = self.phase_log_seqs[-1] if self.phase_log_seqs else (len(self.phase_log) - 1)
 			try:
 				loop = asyncio.get_running_loop()
@@ -876,9 +702,6 @@ class PentestState(BaseModel):
 		except Exception:
 			pass
 
-	# 进程级单调计数器, 用于给 push_decision 生成 client 级业务 id;
-	# 真正的 transport id 由 Redis Stream 在 XADD 时分配, 这里只是兜底
-	# 让 WS 不可用 / sink 未注册时事件结构里仍然有可读的 id 字段。
 	_push_decision_idx: int = PrivateAttr(default=0)
 
 	def push_decision(self, event: dict) -> None:
@@ -899,8 +722,6 @@ class PentestState(BaseModel):
 			event["timestamp"] = now.isoformat(timespec="microseconds")
 		if "branch_id" not in event:
 			event["branch_id"] = self.active_branch_id or ""
-		# 跨线程 fallback 同 ``log()``: worker 线程拿不到 running loop 时,
-		# 退到 BranchManager / task_runner 入口 ``set_task_loop`` 注册的主 loop。
 		try:
 			import asyncio
 			from backend.api.event_bus import get_task_sink, get_task_loop
@@ -929,7 +750,6 @@ class PentestState(BaseModel):
 		except Exception:
 			pass
 
-	# ── 通用 checkpoint 协议(Plan 模式确认框)──────────────
 	def open_checkpoint(self, payload: dict[str, Any]) -> dict[str, Any]:
 		"""Register a pending checkpoint and broadcast it to the frontend.
 
@@ -959,7 +779,6 @@ class PentestState(BaseModel):
 			"context": payload.get("context", {}),
 		}
 		self.pending_checkpoint = ckpt
-		# 决策事件流里也广播一份,方便前端时间线统一展示
 		self.push_decision({
 			"action": "checkpoint_request",
 			"phase": ckpt["phase"],
@@ -1003,15 +822,12 @@ class PentestState(BaseModel):
 			},
 		})
 		self.checkpoint_history.append(archived)
-		# 限长,避免 checkpoint payload 在 LangGraph snapshot 里无限增长
 		if len(self.checkpoint_history) > 200:
 			self.checkpoint_history = self.checkpoint_history[-100:]
 		self.pending_checkpoint = None
 
 		user_prompt = (response.get("user_prompt") or "").strip()
 		if user_prompt:
-			# 软引导:拼到 pending_user_prompt 末尾,下一节点的 prompt builder
-			# 可以读取这个字段把它注入 system prompt。
 			joined = (self.pending_user_prompt or "").strip()
 			self.pending_user_prompt = (
 				f"{joined}\n{user_prompt}" if joined else user_prompt

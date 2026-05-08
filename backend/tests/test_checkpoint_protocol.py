@@ -52,7 +52,7 @@ class _DecisionCapture:
     用法::
 
         with _DecisionCapture(state) as cap:
-            asyncio.run(...)  # 同一个 event loop 里跑
+            asyncio.run(...)
         assert cap.events[-1]["action"] == ...
 
     必须在 ``asyncio.run`` 里调用 ``state.push_decision`` (或调用方法间接触发),
@@ -77,7 +77,6 @@ class _DecisionCapture:
     def __exit__(self, *exc) -> None:
         clear_task_sink(self.state.task_id)
         clear_task_loop(self.state.task_id)
-        # 让所有 pending sink 任务跑完再关 loop
         try:
             pending = asyncio.all_tasks(self._loop)
             if pending:
@@ -157,9 +156,7 @@ class TestCheckpointHelpers:
         assert archived["response"]["user_prompt"] == "先验证 LFI 再尝试 RCE"
         assert state.pending_checkpoint is None
         assert state.checkpoint_history[-1]["checkpoint_id"] == ckpt["checkpoint_id"]
-        # Soft-guidance: pending_user_prompt should now carry the modify text
         assert "先验证 LFI 再尝试 RCE" in state.pending_user_prompt
-        # The user prompt should also be appended to user_messages timeline
         assert state.user_messages[-1]["text"] == "先验证 LFI 再尝试 RCE"
 
         emitted = [
@@ -168,7 +165,7 @@ class TestCheckpointHelpers:
         ]
         assert len(emitted) == 1
         assert emitted[0]["response"]["user_prompt"] == "先验证 LFI 再尝试 RCE"
-        assert emitted[0]["tone"] == "info"  # modify → info tone
+        assert emitted[0]["tone"] == "info"
 
     def test_resolve_checkpoint_no_pending_returns_none(self):
         state = _build_state()
@@ -231,7 +228,6 @@ class TestNodeHumanApprovalCheckpoint:
         await node_human_approval(state)
         assert state.pending_checkpoint is not None
         assert state.pending_checkpoint["checkpoint_type"] == "exploit_gate"
-        # 选项 + 默认动作 + 上下文都应该存在
         assert any(opt.get("action") == "approve" for opt in state.pending_checkpoint["options"])
         ctx = state.pending_checkpoint["context"]
         assert ctx["exploitable_count"] == 1
@@ -240,10 +236,8 @@ class TestNodeHumanApprovalCheckpoint:
     @pytest.mark.asyncio
     async def test_router_approve_then_node_clears_checkpoint(self):
         state = _build_state(auto_approve=False)
-        # 第一遍:节点产生 pending checkpoint
         await node_human_approval(state)
         assert state.pending_checkpoint is not None
-        # 模拟 router 通过 /checkpoint/respond 把 approved=True 写回, 再 resume
         state.approved = True
         state.resolve_checkpoint({"action": "approve"})
         await node_human_approval(state)

@@ -20,7 +20,7 @@ def pytest_configure(config):
 
 
 try:
-    import pytest_asyncio  # noqa: F401
+    import pytest_asyncio
     _HAS_PYTEST_ASYNCIO = True
 except Exception:
     _HAS_PYTEST_ASYNCIO = False

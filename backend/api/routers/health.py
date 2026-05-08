@@ -104,8 +104,6 @@ def _build_tool_invocation_overview(tasks: list[PentestState]) -> dict:
     total_elapsed = 0.0
     done_count = 0
 
-    # 协议 v2: 工具调用统计直接从 ``tool_records`` 读, 不再走 phase_log 字符串
-    # 反推。``display_tool`` 已经由 executor 写入, 没有的话兜底到 ``tool``。
     for state in tasks:
         for rec in state.tool_records or []:
             payload = rec.model_dump() if hasattr(rec, "model_dump") else dict(rec or {})
@@ -175,8 +173,6 @@ def _build_guard_overview(tasks: list[PentestState]) -> dict:
     for state in tasks:
         for k, v in (state.guard_stats or {}).items():
             guard_totals[k] += int(v or 0)
-    # 协议 v2: ``llm_preflight_reject`` 也走 ``guard_stats`` 累计 (节点侧
-    # 已经把 LLM 拒判的次数计入对应 guard code), 不再扫 ``live_decision_events``。
     llm_rejects = sum(
         v for k, v in guard_totals.items()
         if "preflight" in k or "llm_reject" in k

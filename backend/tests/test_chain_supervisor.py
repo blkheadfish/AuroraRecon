@@ -51,7 +51,6 @@ def _attack_mode(value: str):
             os.environ["ATTACK_CHAIN_MODE"] = prev
 
 
-# ─── 模式分发 + 编译 ──────────────────────────────────────
 
 def test_supervisor_mode_resolves():
     with _attack_mode("supervisor"):
@@ -75,13 +74,11 @@ def test_supervisor_recursion_limit_doubled():
         assert cfg["recursion_limit"] >= 200
 
 
-# ─── 星形拓扑：每个 phase 都回 supervisor ────────────────
 
 def test_supervisor_topology_is_star():
     compiled = _build_graph_supervisor(checkpointer=None)
     drawn = compiled.get_graph()
     edge_pairs = {(e.source, e.target) for e in drawn.edges}
-    # report 是终态, 不回 supervisor
     expected_back = [
         ("recon", "supervisor"),
         ("surface_enum", "supervisor"),
@@ -97,7 +94,6 @@ def test_supervisor_topology_is_star():
     assert not missing, f"supervisor 模式缺失回流边: {missing}"
 
 
-# ─── _rule_decide 优先级 ────────────────────────────────
 
 def test_rule_decide_failed_status_short_circuits_to_report():
     state = PentestState(target="x")
@@ -119,7 +115,6 @@ def test_rule_decide_round_limit_short_circuits():
 def test_rule_decide_replan_creds_takes_precedence():
     """replan_signals 的优先级必须高于阶段递推。"""
     state = PentestState(target="x")
-    # 第一次 recon 已访问，照阶段递推应该走 surface_enum，但 signals 优先
     state.phase_visit_count = {"recon": 1, "surface_enum": 1}
     state.open_ports.append(PortInfo(port=80, service="http"))
     state.replan_signals = {"re_vuln_scan_for_creds": 1}
@@ -228,17 +223,14 @@ def test_rule_decide_report_ready_routes_to_report():
     assert decision and decision["next"] == "report"
 
 
-# ─── 收敛保护：连续 3 轮无新 fact 强制 report ─────────────
 
 def test_rule_decide_no_new_facts_forces_report():
     """模拟连续 3 轮 supervisor 决策 fact_signature 完全相同 → 强制 report。"""
     state = PentestState(target="x")
-    # 让先前的"阶段递推优先级"全部失效, 强制走到 _no_new_facts 分支
     state.phase_visit_count = {
         "recon": 1, "surface_enum": 1, "intel_harvest": 1,
         "vuln_scan": 1, "exploit_decision": 1, "objective_collect": 1,
     }
-    # 连续 3 轮 fact_signature 一致
     state.supervisor_history = [
         {"round": i, "next": "objective_collect", "rule": "x", "fact_signature": "same"}
         for i in range(3)
@@ -248,13 +240,12 @@ def test_rule_decide_no_new_facts_forces_report():
     assert "no_new_facts" in decision["rule"]
 
 
-# ─── node_supervisor 写入状态 ────────────────────────────
 
 def test_node_supervisor_increments_round_and_history():
     state = PentestState(target="x")
     state2 = asyncio.run(node_supervisor(state))
     assert state2.supervisor_round == 1
-    assert state2.next_phase  # 必须给出一个决策
+    assert state2.next_phase
     assert len(state2.supervisor_history) == 1
     entry = state2.supervisor_history[0]
     assert entry["round"] == 1
@@ -282,7 +273,6 @@ def test_node_supervisor_emits_decision_event():
         set_task_sink(state.task_id, _sink)
         try:
             await node_supervisor(state)
-            # 给 ``loop.create_task(sink(...))`` 一次回到 loop 的机会
             await asyncio.sleep(0)
             await asyncio.sleep(0)
         finally:
@@ -302,7 +292,6 @@ def test_node_supervisor_round_limit_forces_report():
     assert state2.next_phase == "report"
 
 
-# ─── supervisor_route 路由函数 ──────────────────────────
 
 def test_supervisor_route_returns_next_phase():
     state = PentestState(target="x")

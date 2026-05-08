@@ -41,7 +41,6 @@ def _attack_mode(value: str):
             os.environ["ATTACK_CHAIN_MODE"] = prev
 
 
-# ─── 模式分发 ───────────────────────────────────────────────
 
 def test_default_mode_is_linear():
     with _attack_mode(None):
@@ -65,7 +64,6 @@ def test_direct_linear_builder_compiles():
     assert compiled is not None
 
 
-# ─── linear 模式 recursion_limit 较低 ──────────────────────
 
 def test_linear_run_config_has_low_recursion():
     with _attack_mode("linear"):
@@ -74,7 +72,6 @@ def test_linear_run_config_has_low_recursion():
         assert cfg["configurable"]["thread_id"] == "task-1"
 
 
-# ─── 老 edge 函数行为：linear 模式下完全保持原有逻辑 ──────
 
 def test_edge_after_foothold_with_shell_goes_to_post():
     state = PentestState(target="x")
@@ -137,16 +134,12 @@ def test_edge_after_privesc_stops_when_cap_reached():
     assert edge_after_privesc(state) == "objective_collect"
 
 
-# ─── linear 模式下 graph 不应包含反馈回流目标 ──────────────
 
 def test_linear_graph_topology_excludes_replan_targets():
     """linear 模式编译后的图结构里，secondary_attack 不应路由到 vuln_scan。"""
     compiled = _build_graph_linear(checkpointer=None)
-    # langgraph compiled graph 暴露 .get_graph()，其 edges/branches 反映拓扑
     drawn = compiled.get_graph()
     edge_pairs = {(e.source, e.target) for e in drawn.edges}
-    # 老边: secondary_attack -> post_foothold_enum / report (经条件边/分支)
-    # 反馈边 secondary_attack -> vuln_scan / surface_enum 必须不存在
     assert ("secondary_attack", "vuln_scan") not in edge_pairs
     assert ("secondary_attack", "surface_enum") not in edge_pairs
     assert ("post_foothold_enum", "vuln_scan") not in edge_pairs

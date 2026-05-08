@@ -66,23 +66,19 @@ class TestNodeHumanApproval:
         result = await node_human_approval(state)
         assert result.approved is True
         assert result.current_phase == "awaiting_approval"
-        # Exploitable flags must remain untouched under auto_approve.
         assert all(f.exploitable for f in result.findings)
 
     @pytest.mark.asyncio
     async def test_manual_pending_keeps_approved_false(self):
         state = _make_state(auto_approve=False)
-        # Simulate the engine stopping here before the router flips `approved`.
         result = await node_human_approval(state)
         assert result.approved is False
-        # When not approved the node disables the remaining exploitable
-        # findings so the graph can route straight to `report`.
         assert all(not f.exploitable for f in result.findings)
 
     @pytest.mark.asyncio
     async def test_manual_approved_by_router_keeps_exploitable(self):
         state = _make_state(auto_approve=False)
-        state.approved = True  # router set this before we resumed the graph
+        state.approved = True
         result = await node_human_approval(state)
         assert result.approved is True
         assert any(f.exploitable for f in result.findings)

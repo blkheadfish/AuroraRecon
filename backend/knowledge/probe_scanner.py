@@ -27,41 +27,36 @@ from backend.knowledge.exploit_kb import ExploitEntry, ExploitKB
 logger = logging.getLogger(__name__)
 
 
-# ── 输入：每次探测一个 base_url ────────────────────────────
 
 @dataclass
 class ProbeTarget:
     """一次探测的目标 + 默认上下文"""
-    base_url: str          # e.g. "http://10.0.0.5:8080"
-    host: str              # e.g. "10.0.0.5"
-    port: int              # e.g. 8080
-    scheme: str = "http"   # http | https
+    base_url: str
+    host: str
+    port: int
+    scheme: str = "http"
 
 
-# ── 输出：探针命中记录 ───────────────────────────────────
 
 @dataclass
 class ProbeHit:
     """探针命中：一个 KB 条目被成功识别。"""
-    vuln_id: str            # 命中的 KB 条目 vuln_id
-    probe_id: str           # 触发命中的具体 probe id
-    dispatch_skill: str     # 指向利用 Skill 的 ID（可为空）
-    confidence: float       # 0.0~1.0
-    evidence: str           # 简短证据片段（响应头/正文摘要）
-    base_url: str           # 命中的 base_url
-    port: int               # 命中的端口
+    vuln_id: str
+    probe_id: str
+    dispatch_skill: str
+    confidence: float
+    evidence: str
+    base_url: str
+    port: int
     cves: list[str] = field(default_factory=list)
     description: str = ""
 
 
-# ── 工具执行接口（避免硬依赖具体 ToolExecutor 实现）─────
 
 ScriptRunner = Callable[..., Awaitable[Any]]
 
 
-# ── 探针扫描器主体 ────────────────────────────────────
 
-# 默认用于 HTTP 探针扫描的 web 端口（若 finding 里没明确）
 DEFAULT_WEB_PORTS = (80, 443, 8000, 8080, 8081, 8090, 8161, 8443, 8888, 7001, 9000, 9090, 9200)
 
 
@@ -90,7 +85,6 @@ class ProbeScanner:
         self.max_concurrent = max_concurrent
         self.per_probe_timeout = per_probe_timeout
 
-    # ── 主入口 ─────────────────────────────────────────
 
     async def scan(
         self,
@@ -152,7 +146,6 @@ class ProbeScanner:
 
         results = await asyncio.gather(*[_run_one(e, p, t) for e, p, t in plans])
 
-        # 同一 vuln_id+base_url 可能多个 probe 都命中：保留最高 confidence 的那条
         best: dict[tuple[str, str], ProbeHit] = {}
         for hit in results:
             if hit is None:
@@ -173,7 +166,6 @@ class ProbeScanner:
 
         return hits
 
-    # ── 单次探针执行 ───────────────────────────────────
 
     async def _execute_probe(
         self,
@@ -190,7 +182,6 @@ class ProbeScanner:
         if method == "RAW_TCP":
             return await self._execute_tcp_probe(entry, probe, tgt, task_id=task_id)
 
-        # 默认走 HTTP 路径
         return await self._execute_http_probe(
             entry, probe, tgt,
             task_id=task_id,
@@ -214,7 +205,6 @@ class ProbeScanner:
         body = probe.get("body") or ""
         timeout = int(probe.get("timeout") or self.per_probe_timeout)
 
-        # 拼出最终 URL（path 已经是 /xxx 或 /a?b=c 格式）
         url = tgt.base_url.rstrip("/") + (path if path.startswith("/") else f"/{path}")
 
         script = _build_curl_script(
@@ -306,7 +296,6 @@ class ProbeScanner:
         )
 
 
-# ── 辅助函数 ─────────────────────────────────────────
 
 def _shell_quote(value: str) -> str:
     """简单 shell 单引号包裹。"""
@@ -340,7 +329,7 @@ def _build_curl_script(
     ]
 
     cmd = [
-        "curl", "-sS", "-i" if False else "",  # we capture headers via -D
+        "curl", "-sS", "-i" if False else "",
         "-o", '"$TMP_B"',
         "-D", '"$TMP_H"',
         "-w", '"%{http_code}"',
@@ -407,35 +396,29 @@ def _evaluate_success(success_signs: dict, status_code: int, headers: str, body:
     body_lower = (body or "").lower()
     combined_lower = headers_lower + "\n" + body_lower
 
-    # 1. status_codes
     status_codes = success_signs.get("status_codes") or []
     if status_codes:
         if status_code not in status_codes:
             return False
 
-    # 2. body_contains_any
     body_any = success_signs.get("body_contains_any") or []
     if body_any:
         if not any(sub.lower() in body_lower for sub in body_any):
             return False
 
-    # 3. body_contains_all
     body_all = success_signs.get("body_contains_all") or []
     if body_all:
         if not all(sub.lower() in body_lower for sub in body_all):
             return False
 
-    # 4. header_contains: list of [name, substring]
     header_contains = success_signs.get("header_contains") or []
     for item in header_contains:
         if not isinstance(item, (list, tuple)) or len(item) < 2:
             continue
         name, sub = str(item[0]).lower(), str(item[1]).lower()
-        # 匹配 "set-cookie: rememberMe=deleteMe" 风格
         if not _header_contains(headers_lower, name, sub):
             return False
 
-    # 5. regex
     pat = success_signs.get("regex") or ""
     if pat:
         try:
@@ -444,7 +427,6 @@ def _evaluate_success(success_signs: dict, status_code: int, headers: str, body:
         except re.error:
             return False
 
-    # 至少有一条规则被检验过才算成功
     has_rule = any([
         status_codes, body_any, body_all, header_contains, pat,
     ])
@@ -471,7 +453,6 @@ def _extract_evidence(headers: str, body: str, *, max_chars: int = 300) -> str:
     return h or b
 
 
-# ── orchestrator 适配辅助：把 PentestState 端口转 ProbeTarget ──
 
 def build_probe_targets_from_ports(
     *, host: str, ports: list, scheme_for_port: Optional[Callable[[int], str]] = None

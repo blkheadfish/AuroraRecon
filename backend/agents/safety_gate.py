@@ -27,9 +27,6 @@ from backend.agents.intent_parser import _is_valid_ip, _is_private_ip
 
 logger = logging.getLogger(__name__)
 
-# ══════════════════════════════════════════════════════════════
-# 配置加载
-# ══════════════════════════════════════════════════════════════
 
 _CONFIG_PATH = os.getenv(
     "SAFETY_RULES_PATH",
@@ -51,9 +48,6 @@ def _load_rules() -> dict:
         return {}
 
 
-# ══════════════════════════════════════════════════════════════
-# IP / CIDR 判断工具（纯确定性运算）
-# ══════════════════════════════════════════════════════════════
 
 
 def _get_cidr_prefix(cidr_str: str) -> int:
@@ -99,9 +93,6 @@ def _cidr_overlaps(cidr_str: str, cidr_list: list[str]) -> bool:
     return False
 
 
-# ══════════════════════════════════════════════════════════════
-# SafetyGate 核心
-# ══════════════════════════════════════════════════════════════
 
 
 class PentestSafetyGate:
@@ -138,7 +129,6 @@ class PentestSafetyGate:
               authorization_token: Optional[str] = None,
               user_id: str = "") -> SafetyCheckResult:
         """执行安全校验。"""
-        # ── 第一层：有授权 token → 全量放行 ──────────────
         if authorization_token:
             logger.info(
                 f"[SafetyGate] 授权令牌通过: user={user_id}, "
@@ -150,14 +140,12 @@ class PentestSafetyGate:
                 warnings=[f"已记录授权令牌: {authorization_token[:6]}***"],
             )
 
-        # ── 第二层：白名单检查 ────────────────────────────
         if self._check_allowlist(intent):
             logger.info(
                 f"[SafetyGate] 白名单通过: targets={intent.targets}"
             )
             return SafetyCheckResult(passed=True, risk_level="safe")
 
-        # ── 第三层：黑名单检查 ────────────────────────────
         blocked, block_reason = self._check_blocklist(intent)
         if blocked:
             self._audit_log("BLOCK", intent, block_reason, user_id,
@@ -168,7 +156,6 @@ class PentestSafetyGate:
                 block_reason=block_reason,
             )
 
-        # ── 第四层：灰名单检查（WARNING）──────────────────
         warnings, confirmations = self._check_warnlist(intent)
         if warnings:
             self._audit_log("WARNING", intent, "; ".join(warnings),
@@ -182,7 +169,6 @@ class PentestSafetyGate:
 
         return SafetyCheckResult(passed=True, risk_level="safe")
 
-    # ── 白名单 ─────────────────────────────────────────
 
     def _check_allowlist(self, intent: ParsedIntent) -> bool:
         authorized_cidrs = self.allow_rules.get("authorized_cidrs", []) or []
@@ -199,13 +185,11 @@ class PentestSafetyGate:
                 elif target in authorized_hosts:
                     return True
 
-        # scope_hint 为 ctf_lab 时额外放行
         if intent.scope_hint == "ctf_lab":
             return True
 
         return False
 
-    # ── 黑名单 ─────────────────────────────────────────
 
     def _check_blocklist(self, intent: ParsedIntent) -> tuple[bool, Optional[str]]:
         cloud_cidrs = self.block_rules.get("cloud_provider_cidrs", []) or []
@@ -213,32 +197,27 @@ class PentestSafetyGate:
         keywords = self.block_rules.get("unauthorized_keywords", []) or []
         max_prefix = self.block_rules.get("max_cidr_prefix", 8)
 
-        # 1. 恶意意图关键词
         prompt_lower = intent.raw_prompt.lower()
         for kw in keywords:
             if kw.lower() in prompt_lower:
                 return True, f"检测到未授权意图关键词: '{kw}'"
 
-        # 2. CIDR 前缀过大
         for target in intent.targets:
             if "/" in target:
                 prefix = _get_cidr_prefix(target)
                 if prefix <= max_prefix:
                     return True, f"CIDR 范围过大 (/{prefix} <= /{max_prefix})，拒绝执行"
 
-        # 3. 云服务商 metadata IP 段
         for target in intent.targets:
             if _is_valid_ip(target) and _ip_in_cidrs(target, cloud_cidrs):
                 return True, f"目标 {target} 属于云服务商 metadata IP 段，拒绝执行"
 
-        # 4. 政府/关基 IP 段
         for target in intent.targets:
             if _is_valid_ip(target) and _ip_in_cidrs(target, gov_cidrs):
                 return True, f"目标 {target} 属于政府/关基 IP 段，拒绝执行"
 
         return False, None
 
-    # ── 灰名单 ─────────────────────────────────────────
 
     def _check_warnlist(self, intent: ParsedIntent) -> tuple[list[str], list[str]]:
         warnings: list[str] = []
@@ -249,7 +228,6 @@ class PentestSafetyGate:
         public_ip_no_auth = warn_rules.get("public_ip_no_auth", True)
         exploit_without_target = warn_rules.get("exploit_without_clear_target", True)
 
-        # 1. CIDR 范围警告
         for target in intent.targets:
             if "/" in target:
                 prefix = _get_cidr_prefix(target)
@@ -260,7 +238,6 @@ class PentestSafetyGate:
                     )
                     confirmations.append("confirm_large_cidr")
 
-        # 2. 公网 IP 无授权警告
         if public_ip_no_auth:
             for target in intent.targets:
                 if _is_valid_ip(target) and not _is_private_ip(target):
@@ -270,7 +247,6 @@ class PentestSafetyGate:
                     confirmations.append("confirm_public_ip_authorization")
                     break
 
-        # 3. exploit 阶段但目标不明确
         if exploit_without_target and "exploit" in intent.pentest_phase:
             if intent.ambiguity_level in ("partial", "vague"):
                 warnings.append(
@@ -278,7 +254,6 @@ class PentestSafetyGate:
                 )
                 confirmations.append("confirm_exploit_target")
 
-        # 4. 需要发现但无明确网段
         if intent.requires_discovery and intent.ambiguity_level == "vague":
             warnings.append(
                 "需要主机发现但没有指定目标网段，请提供具体扫描范围"
@@ -286,7 +261,6 @@ class PentestSafetyGate:
 
         return warnings, confirmations
 
-    # ── 审计日志 ────────────────────────────────────────
 
     def _audit_log(self, level: str, intent: ParsedIntent,
                    reason: str, user_id: str,
@@ -305,7 +279,6 @@ class PentestSafetyGate:
         else:
             logger.info(log_msg)
 
-        # 异步写入 DB 审计日志（最佳努力，不阻塞主流程）
         try:
             import asyncio
             from datetime import datetime
@@ -335,9 +308,6 @@ async def _write_audit_db(entry: dict) -> None:
         logger.debug(f"[SafetyGate] 审计日志 DB 写入失败: {e}")
 
 
-# ══════════════════════════════════════════════════════════════
-# 单例
-# ══════════════════════════════════════════════════════════════
 
 _safety_gate: Optional[PentestSafetyGate] = None
 

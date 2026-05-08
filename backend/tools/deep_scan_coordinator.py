@@ -28,9 +28,6 @@ from typing import Any, Iterable, Optional
 logger = logging.getLogger(__name__)
 
 
-# Mirror of DirScanOrchestrator._HIGH_VALUE_HINTS / _DEEP_KEYWORDS so that
-# pick_followups produces identical scoring regardless of who calls it
-# (orchestrator-internal vs Phase 3 _deep_recursive_scan回流).
 _HIGH_VALUE_HINTS = frozenset({
     "admin", "login", "backup", "config", "upload", "api",
     "leak", "info_disclosure",
@@ -116,8 +113,6 @@ class DeepScanTarget:
     reason: str = ""
     wordlist: str = "small"
     priority: int = 0
-    # Optional per-target base URL override. When unset, the drain caller
-    # decides the base (typically the primary Web port).
     base_url: str = ""
 
 
@@ -157,7 +152,6 @@ class DeepScanCoordinator:
         self._elapsed = 0.0
         self._enqueued_total = 0
 
-    # ─── enqueue / dedup ──────────────────────────────────────────
     def enqueue(self, target: DeepScanTarget) -> bool:
         """Add target if new. Returns True if actually enqueued."""
         norm = _norm(target.path)
@@ -167,7 +161,6 @@ class DeepScanCoordinator:
             return False
         existing = self._queue.get(norm)
         if existing is not None:
-            # Upgrade priority if new entry says it's more interesting
             if target.priority > existing.priority:
                 existing.priority = target.priority
                 existing.reason = target.reason or existing.reason
@@ -183,7 +176,6 @@ class DeepScanCoordinator:
                 count += 1
         return count
 
-    # ─── pop / scheduling ────────────────────────────────────────
     def pop_batch(self, n: int = 5) -> list[DeepScanTarget]:
         """Pop up to n highest-priority items. Returns [] when budget exhausted."""
         if not self.can_scan() or not self._queue:
@@ -191,7 +183,6 @@ class DeepScanCoordinator:
         items = list(self._queue.values())
         items.sort(key=lambda t: (-int(t.priority), t.path))
         cap = max(1, int(n))
-        # also respect remaining scan budget
         remaining = self._max_total_scans - len(self._scanned)
         cap = min(cap, max(0, remaining))
         batch = items[:cap]
@@ -210,7 +201,6 @@ class DeepScanCoordinator:
         except (TypeError, ValueError):
             pass
 
-    # ─── budget / state ──────────────────────────────────────────
     def can_scan(self) -> bool:
         return (
             len(self._scanned) < self._max_total_scans

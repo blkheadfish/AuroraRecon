@@ -24,7 +24,6 @@ from backend.api.event_bus import (
 
 logger = logging.getLogger(__name__)
 
-# ── Orchestrator 单例 ─────────────────────────────────────
 _orchestrator: Orchestrator | None = None
 
 
@@ -35,7 +34,6 @@ def get_orchestrator() -> Orchestrator:
     return _orchestrator
 
 
-# ── DB 节流写入 ───────────────────────────────────────────
 _last_db_save: dict[str, float] = {}
 DB_SAVE_INTERVAL = 5.0
 
@@ -61,7 +59,6 @@ async def _save_db_fire_and_forget(state: PentestState):
         logger.warning(f"[DB] 异步保存失败: {e}")
 
 
-# ── Redis 增量日志 ────────────────────────────────────────
 _redis_log_cursor: dict[str, int] = {}
 
 
@@ -86,7 +83,6 @@ async def _cache_redis_incremental(task_id: str, state: PentestState):
         pass
 
 
-# ── 通用: LangGraph interrupt_before 暂停检测 + 审批上下文 ───
 
 
 async def _auto_resume_task(task_id: str) -> None:
@@ -118,8 +114,6 @@ async def _handle_graph_interrupt(task_id: str, state: PentestState) -> bool:
 
     sm = get_state_manager()
 
-    # 推断被中断的阶段: 根据 chain_visited 最后一项在 _CHAIN_PHASE_ORDER
-    # 中的位置, 下一个就是被 interrupt_before 挡住的阶段。
     visited = list(state.chain_visited or [])
     last_visited = visited[-1] if visited else ""
     interrupted_phase = ""
@@ -130,7 +124,6 @@ async def _handle_graph_interrupt(task_id: str, state: PentestState) -> bool:
     if not interrupted_phase:
         interrupted_phase = state.current_phase or "unknown"
 
-    # auto_approve: 自动通过审批暂停，后台恢复执行
     if state.auto_approve:
         state.approved = True
         state.post_approved = True
@@ -150,7 +143,6 @@ async def _handle_graph_interrupt(task_id: str, state: PentestState) -> bool:
     }
     phase_label = PHASE_LABELS.get(interrupted_phase, interrupted_phase)
 
-    # 构建摘要 —— 汇总当前已知事实, 让用户知道"走到哪了"
     summary_parts: list[str] = []
     open_ports_count = len(state.open_ports or [])
     if open_ports_count:
@@ -169,7 +161,6 @@ async def _handle_graph_interrupt(task_id: str, state: PentestState) -> bool:
         else f"即将进入「{phase_label}」阶段，请确认是否继续。"
     )
 
-    # 构建 thinking 行 (漏洞详情)
     thinking_lines: list[str] = []
     if open_ports_count:
         thinking_lines.append(f"- 开放端口: {open_ports_count} 个")
@@ -185,9 +176,6 @@ async def _handle_graph_interrupt(task_id: str, state: PentestState) -> bool:
     state.log(f"⏸ 暂停在 {phase_label} 阶段前，等待确认继续")
     sm.set(task_id, state)
 
-    # 如果已经有 pending_checkpoint (来自 node_human_approval 的 exploit_gate
-    # 或 node_post_foothold_approval 的 post_foothold_gate), 不创建新的, 避免
-    # 覆盖更丰富的审批上下文。
     has_existing_checkpoint = bool(
         state.pending_checkpoint
         and state.pending_checkpoint.get("checkpoint_type")
@@ -230,7 +218,6 @@ async def _handle_graph_interrupt(task_id: str, state: PentestState) -> bool:
             },
         })
 
-    # 兼容旧版前端: 仍然推送 approval_required 事件
     risk_note = (
         "高风险" if any(f.severity in ("critical", "high") for f in exploitable_findings)
         else ("中等风险" if exploitable_findings else "低风险")
@@ -262,7 +249,6 @@ async def _handle_graph_interrupt(task_id: str, state: PentestState) -> bool:
     return True
 
 
-# ── 主任务执行 ────────────────────────────────────────────
 
 async def run_task(
     task_id: str,
@@ -283,18 +269,8 @@ async def run_task(
     sm = get_state_manager()
     sm.mark_running(task_id)
     orchestrator = get_orchestrator()
-    # Ownership token: BranchManager.fork_from_active swaps in a new
-    # coroutine handle on ``sm._bg_tasks[task_id]`` to claim ownership of
-    # the task. We compare against this in ``finally`` so that, when fork
-    # has already taken over, we skip the cleanup tail (publish ``done`` /
-    # stop container / clear sinks) — otherwise we'd silently tear down
-    # the new branch's resources and the user would only see "branch
-    # forked, no further logs".
     my_task = asyncio.current_task()
 
-    # 协议 v2: sink 直接把事件写进 Stream。前端不再依赖 phase_log 派生事件,
-    # 因此 ``state.log()`` 触发的也走 ``type=log`` 单独 envelope, 而不是
-    # 依附在 phase_update 里。
     async def _decision_sink(ev: dict):
         cur = sm.get(task_id)
         bid = (
@@ -317,10 +293,6 @@ async def run_task(
 
     set_task_sink(task_id, _decision_sink)
     set_log_sink(task_id, _log_sink)
-    # 跨线程 sink fallback: 把当前 main loop 登记进 _TASK_LOOP, 让
-    # ``PentestState.log / push_decision`` 在 worker 线程命中时
-    # 能 ``run_coroutine_threadsafe`` 把事件投递回这里, 避免
-    # ``RuntimeError: no running event loop`` 让事件被静默吞掉。
     try:
         set_task_loop(task_id, asyncio.get_running_loop())
     except RuntimeError:
@@ -331,7 +303,6 @@ async def run_task(
         async for node_name, raw_state in orchestrator.run_stream(
             initial_state, thread_id=thread_id,
         ):
-            # 检查取消
             if sm.redis_available:
                 try:
                     from backend.db.redis_cache import is_cancelled
@@ -352,13 +323,10 @@ async def run_task(
 
             sm.set(task_id, state)
 
-            # 异步 Redis（增量）
             asyncio.create_task(_cache_redis_incremental(task_id, state))
 
-            # 异步 DB（节流）
             await _maybe_save_db(task_id, state)
 
-            # 即时事件推送 (协议 v2: phase_update envelope)
             payload = sm.ws_phase_payload(state, log_tail=5)
             await event_stream.publish(
                 task_id, type="phase_update",
@@ -377,12 +345,6 @@ async def run_task(
             await _maybe_save_db(task_id, state, force=True)
     finally:
         sm.mark_stopped(task_id)
-        # Ownership check: BranchManager.fork_from_active replaces the
-        # value of ``sm._bg_tasks[task_id]`` with the child branch's
-        # coroutine before we get here. If we're no longer the owner,
-        # someone else (the new branch) has claimed the task_id-scoped
-        # resources (sink / docker container) and we MUST NOT proceed
-        # with the cleanup tail below.
         is_owner = sm._bg_tasks.get(task_id) is my_task
         if is_owner:
             sm.unregister_bg_task(task_id)
@@ -393,15 +355,12 @@ async def run_task(
         )
         return
 
-    # 检测 LangGraph interrupt 暂停 (human_approval / post_foothold_approval)。
-    # auto_approve=True 时 _handle_graph_interrupt 会自动恢复执行。
     state = sm.get(task_id)
     if await _handle_graph_interrupt(task_id, state):
         await _maybe_save_db(task_id, state, force=True)
         logger.info(f"[API] 任务 {task_id} 等待审批/自动恢复 (phase={state.current_phase})")
         return
 
-    # 正常完成 / 失败 / 取消 → 统一关容器
     try:
         from backend.tools.executor import TaskContainerManager
         await TaskContainerManager.stop(task_id)
@@ -428,7 +387,6 @@ async def run_task(
     logger.info(f"[API] 任务 {task_id} 完成")
 
 
-# ── 审批后恢复执行 ────────────────────────────────────────
 
 async def resume_task(
     task_id: str,
@@ -439,9 +397,6 @@ async def resume_task(
     sm = get_state_manager()
     sm.mark_running(task_id)
     orchestrator = get_orchestrator()
-    # See ``run_task`` for why we capture ownership: when a chat message
-    # forks mid-resume, the new branch claims ``sm._bg_tasks[task_id]``;
-    # cleanup logic below must be skipped in that case.
     my_task = asyncio.current_task()
 
     async def _decision_sink(ev: dict):
@@ -510,9 +465,6 @@ async def resume_task(
     finally:
         sm.mark_stopped(task_id)
         sm.clear_approval_inflight(task_id)
-        # Ownership-aware cleanup: don't tear down task_id-scoped
-        # resources (container, sinks, bg slot) when a fork has already
-        # claimed them.
         is_owner = sm._bg_tasks.get(task_id) is my_task
         if is_owner:
             sm.unregister_bg_task(task_id)
@@ -523,21 +475,18 @@ async def resume_task(
         )
         return
 
-    # 检测 resume 后图是否再次暂停 (例如 post_foothold_approval 的 interrupt_before)
     state = sm.get(task_id)
     if await _handle_graph_interrupt(task_id, state):
         await _maybe_save_db(task_id, state, force=True)
         logger.info(f"[API] 任务 {task_id} resume 后再次等待审批 (phase={state.current_phase})")
         return
 
-    # Stop container only when we're the legitimate lifecycle owner.
     try:
         from backend.tools.executor import TaskContainerManager
         await TaskContainerManager.stop(task_id)
     except Exception:
         pass
 
-    # 最终持久化
     state = sm.get(task_id)
     if state:
         await _maybe_save_db(task_id, state, force=True)

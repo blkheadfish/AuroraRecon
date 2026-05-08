@@ -40,25 +40,21 @@ def load_and_validate():
 
         skills.append((rel, data))
 
-    # ── 逐个验证 ────────────────────────────────────────
     print("[1] 结构完整性检查\n")
 
     for rel, data in skills:
         sid = data.get("skill_id", "???")
         issues = []
 
-        # 顶层必填字段
         for field in REQUIRED_TOP_FIELDS:
             if field not in data:
                 issues.append(f"缺少顶层字段: {field}")
 
-        # match 规则
         match = data.get("match", {})
         rules = match.get("rules", [])
         if not rules:
             issues.append("无匹配规则 (match.rules 为空)")
 
-        # probes
         probes = data.get("probes", [])
         for probe in probes:
             if not probe.get("id"):
@@ -66,7 +62,6 @@ def load_and_validate():
             if not probe.get("command") and not probe.get("steps"):
                 issues.append(f"探测 {probe.get('id', '?')} 无 command 也无 steps")
 
-        # exploit_paths
         paths = data.get("exploit_paths", [])
         has_freeform = False
         total_steps = 0
@@ -89,25 +84,21 @@ def load_and_validate():
                 if not step.get("command"):
                     issues.append(f"路径 {pid} 步骤 {step.get('id','?')} 缺少 command")
 
-                # 检查 on_success/on_fail 引用的 step_id 是否存在
                 step_ids = {s.get("id") for s in steps}
                 valid_jumps = {"next_step", "next_path", "conclude_success", "conclude_fail"} | step_ids
                 for jump_field in ("on_success", "on_fail"):
                     jump = step.get(jump_field, "")
                     if jump and jump not in valid_jumps:
-                        # 可能引用其他路径的 step，不算错
                         pass
 
         if not has_freeform:
             issues.append("无 LLM 兜底路径 (mode=react_freeform)")
 
-        # 原理和修复建议
         if not data.get("principle"):
             issues.append("缺少漏洞原理 (principle)")
         if not data.get("remediation"):
             issues.append("缺少修复建议 (remediation)")
 
-        # 输出
         status = "✅" if not issues else "⚠ "
         print(
             f"  {status} {sid:25s} "
@@ -123,7 +114,6 @@ def load_and_validate():
                 print(f"      ⚠  {issue}")
             all_ok = False
 
-    # ── 匹配模拟测试 ────────────────────────────────────
     print(f"\n[2] 匹配模拟测试\n")
 
     test_cases = [
@@ -174,7 +164,6 @@ def load_and_validate():
         if ok:
             match_passed += 1
 
-    # ── 变量占位符检查 ────────────────────────────────────
     print(f"\n[3] 变量占位符检查\n")
 
     allowed_vars = {"{ENDPOINT}", "{TARGET_IP}", "{TARGET_PORT}", "{LHOST}", "{EXPLOIT_CMD}"}
@@ -199,14 +188,12 @@ def load_and_validate():
         for loc, cmd in all_commands:
             vars_found = set(custom_var_re.findall(cmd))
             unknown = vars_found - allowed_vars
-            # Filter out shell variables like ${param}, common false positives
             unknown = {v for v in unknown if not v.startswith("{#") and "§" not in v}
             if unknown:
                 print(f"  ⚠  {sid}/{loc}: 未知变量 {unknown}")
 
     print(f"  ✅ 变量检查完成")
 
-    # ── 探测-条件变量一致性检查 ────────────────────────────
     print(f"\n[4] 探测-条件变量一致性检查\n")
 
     env_vars = {"env.can_reverse", "env.lhost", "env.target_os"}
@@ -250,7 +237,6 @@ def load_and_validate():
     if not var_issues_found:
         print(f"  ✅ 所有条件变量均有对应的探测来源")
 
-    # ── 总结 ─────────────────────────────────────────────
     print(f"\n{'='*60}")
     print(f"加载: {len(skills)} 个 Skill")
     print(f"匹配测试: {match_passed}/{len(test_cases)} 通过")

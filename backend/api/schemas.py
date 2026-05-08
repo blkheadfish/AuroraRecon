@@ -10,7 +10,6 @@ from pydantic import BaseModel, Field, field_validator
 from backend.agents.models import WorkflowMode, parse_target
 
 
-# ── 任务相关 ──────────────────────────────────────────────
 
 class CreateTaskRequest(BaseModel):
     """
@@ -29,17 +28,15 @@ class CreateTaskRequest(BaseModel):
     不会写回全局环境变量。
     """
 
-    target: str = ""              # 兼容旧接口，raw_prompt 提供时可为空
-    raw_prompt: str = ""          # 自然语言任务描述（新增）
+    target: str = ""
+    raw_prompt: str = ""
     scope_note: str = "CTF/授权靶场测试"
     extra_hint: str = ""
     user_prompt: str = ""
     workflow_mode: WorkflowMode = "pentest_engineer"
-    # 安全卡口相关字段（新增）
-    authorization_token: Optional[str] = None    # 授权证明
-    user_confirmed_risks: list[str] = []          # 用户已确认的风险项 ID
+    authorization_token: Optional[str] = None
+    user_confirmed_risks: list[str] = []
 
-    # 以下字段为可选覆盖项,不传则沿用 workflow_mode 的默认值
     auto_approve: Optional[bool] = None
     success_gate_level: Optional[Literal["strict", "medium", "lenient"]] = None
     risk_budget: Optional[int] = None
@@ -48,11 +45,8 @@ class CreateTaskRequest(BaseModel):
     skill_min_score: Optional[int] = None
     skill_weak_boost: Optional[int] = None
 
-    # ── Plan Mode: 用户确认的策略 ───────────────────────
-    confirmed_plan: Optional[dict] = None  # PentestPlan 的 dict 形式
+    confirmed_plan: Optional[dict] = None
 
-    # ★ 新增：前端在 /tasks/parse-intent 后缓存的完整 LLM 解析结果，
-    # 用于把 intents / extra_hint / scope_note 传回后端
     parsed_intent_extra: dict | None = None
 
     @field_validator("target")
@@ -65,7 +59,7 @@ class CreateTaskRequest(BaseModel):
         """
         raw = v.strip()
         if not raw:
-            return raw  # 空 target 允许通过，路由层与 raw_prompt 联动校验
+            return raw
 
         if re.search(r'[;\|`$&<>(){}\[\]!]', raw):
             raise ValueError("目标地址包含非法字符")
@@ -130,7 +124,6 @@ class PendingConfirmationResponse(BaseModel):
     message: str = ""
 
 
-# POST /tasks 的联合响应：成功创建 → TaskSummary，待确认 → PendingConfirmationResponse
 TaskCreateResponse = Union[TaskSummary, PendingConfirmationResponse]
 
 
@@ -148,10 +141,8 @@ class TaskDetail(TaskSummary):
     post_findings: dict = {}
     report_md: str = ""
     phase_log: list = []
-    # ★ 新增：意图解析结果 + 用户确认的策略计划
     parsed_intent: dict = Field(default_factory=dict)
     pentest_plan: dict = Field(default_factory=dict)
-    # per-task 运行时参数(用于回显与调试,不允许中途修改)
     success_gate_level: str = "strict"
     risk_budget: int = 3
     max_react_rounds: int = 25
@@ -169,7 +160,6 @@ class TaskStats(BaseModel):
     total_findings: int = 0
 
 
-# ── 认证相关 ──────────────────────────────────────────────
 
 class AuthRegisterRequest(BaseModel):
     username: str
@@ -207,7 +197,6 @@ class AuthUpdateMeRequest(BaseModel):
     new_password: str = ""
 
 
-# ── 审批相关 ──────────────────────────────────────────────
 
 class ApproveRequest(BaseModel):
     approved: bool = True
@@ -229,10 +218,9 @@ class CheckpointDecisionRequest(BaseModel):
     selected_option: str = ""
     user_prompt: str = ""
     note: str = ""
-    next_action: str = ""  # "continue" | "skip" | "finish" — 交互式流程用
+    next_action: str = ""
 
 
-# ── 设置相关 ──────────────────────────────────────────────
 
 class ProfileUpdateRequest(BaseModel):
     nickname: str
@@ -244,7 +232,6 @@ class PasswordChangeRequest(BaseModel):
     new_password: str
 
 
-# ── 管理员相关 ────────────────────────────────────────────
 
 class AdminUpdateRoleRequest(BaseModel):
     role: Literal["admin", "user"]
@@ -261,13 +248,11 @@ class AdminResetPasswordRequest(BaseModel):
         return v
 
 
-# ── Skill 相关 ────────────────────────────────────────────
 
 class SkillRawUpdateRequest(BaseModel):
     yaml: str
 
 
-# ── Knowledge 相关 ────────────────────────────────────────
 
 class KnowledgeSourceCreateRequest(BaseModel):
     vuln_id: str
@@ -312,21 +297,13 @@ class KnowledgeRawRequest(BaseModel):
     json_content: str
 
 
-# ── Chat 相关 ─────────────────────────────────────────────
 
 class ChatMessageRequest(BaseModel):
     text: str
-    # 可选: 让前端在某条历史 ``decision_event`` / 聊天气泡处右键"在此分叉"
-    # 时, 把对应事件的 ``id`` 与 ``timestamp`` 一并送回。
-    # ``from_event_id`` 仅作为 ``TaskBranch.fork_event_id`` 元数据落库, 让
-    # 树形分支视图能高亮"在哪条事件处分叉"。
-    # ``from_event_ts`` 才是真正用来定位 LangGraph checkpoint 的时间锚点
-    # (走 ``find_checkpoint_at_or_before`` 取该时间之前最近的 checkpoint)。
     from_event_id: str | None = None
     from_event_ts: str | None = None
 
 
-# ── 意图解析（LLM 驱动） ─────────────────────────────────
 
 class ParseIntentRequest(BaseModel):
     """前端在用户输入自然语言任务描述时调用,
@@ -342,7 +319,6 @@ class ParseIntentRequest(BaseModel):
         v = v.strip()
         if not v:
             raise ValueError("user_prompt 不能为空")
-        # 防止把整篇文章塞进来打爆 LLM 上下文
         return v[:2000]
 
 
@@ -365,25 +341,24 @@ class ParseIntentResponse(BaseModel):
     error: str = ""
 
 
-# ── 策略规划（Plan Mode — 类似 Cursor Plan 模式）─────────
 
 class PlanStep(BaseModel):
     """单个策略步骤"""
-    tool: str = ""               # 工具名（仅 recon/vuln_scan 阶段）
-    skill: str = ""              # Skill 名（仅 exploit/post_exploit 阶段）
-    purpose: str = ""            # 为什么用这个工具/Skill
-    command_hint: str = ""       # 大致的命令参数方向
-    expected_output: str = ""    # 预期能得到什么信息
-    trigger_condition: str = ""  # Skill 触发条件
-    expected_impact: str = ""    # 预期影响
-    fallback: str = ""           # 失败后的兜底策略
-    depends_on: str = ""         # 依赖的前序产出
-    enabled: bool = True         # 用户可禁用该步骤
+    tool: str = ""
+    skill: str = ""
+    purpose: str = ""
+    command_hint: str = ""
+    expected_output: str = ""
+    trigger_condition: str = ""
+    expected_impact: str = ""
+    fallback: str = ""
+    depends_on: str = ""
+    enabled: bool = True
 
 
 class PlanPhase(BaseModel):
     """策略中的单个阶段"""
-    phase: str = ""              # recon / vuln_scan / exploit / post_exploit
+    phase: str = ""
     description: str = ""
     steps: list[PlanStep] = []
 
@@ -421,6 +396,6 @@ class ConfirmPlanRequest(BaseModel):
     """用户确认/修改后的策略提交"""
     plan_id: str
     plan: PentestPlan
-    user_note: str = ""          # 用户补充备注
-    target: str = ""             # 目标地址
+    user_note: str = ""
+    target: str = ""
     workflow_mode: WorkflowMode = "pentest_engineer"

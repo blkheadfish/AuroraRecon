@@ -23,7 +23,6 @@ class NucleiParser:
                 info = data.get("info", {})
                 severity = SEVERITY_MAP.get(info.get("severity", "low").lower(), "low")
 
-                # 提取 CVE
                 cve = None
                 for tag in info.get("tags", []):
                     if tag.upper().startswith("CVE-"):

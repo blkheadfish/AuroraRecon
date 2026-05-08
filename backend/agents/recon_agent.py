@@ -85,12 +85,7 @@ class ReconAgent:
 	def __init__(self):
 		self.executor = ToolExecutor()
 		self.nmap_parser = NmapParser()
-		# 操作员实时指令(由 node_recon 从 PentestState 计算后传入), 让本 agent
-		# 内部所有 LLM 调用都能感知用户在对话视图发出的指示。空字符串等价于无指令。
 		self._operator_block: str = ""
-		# 结构化战术计划 (operator_replanner 产出的 OperatorPlan 实例或 None);
-		# _dir_scan 透传给 planner, 实现"用户偏好工具/关键词字典"在目录爆破阶段
-		# 的直接落地。
 		self._operator_plan: Any = None
 
 	async def run(
@@ -203,7 +198,6 @@ class ReconAgent:
 				"message": f"Nmap 扫描完成: 发现 {len(ports)} 个开放端口 ({ports_summary})",
 			})
 
-		# 4th pass: targeted per-service nmap vuln scripts
 		nmap_vuln_hints: list = []
 		llm_recon_hints: dict = {}
 		if _run_nmap_vuln:
@@ -234,8 +228,6 @@ class ReconAgent:
 		elif plan_tools and log_callback:
 			await log_callback(f"[ReconAgent] [Plan] 跳过 nmap 漏洞脚本/LLM 分析 (plan_tools={plan_tools})")
 
-		# fast mode: no -sV so service fields are empty, run whatweb on ALL open ports
-		# normal mode: filter by service field or standard web ports + extra Java ports
 		web_ports = [
 			p for p in ports
 			if _fast_scan
@@ -279,7 +271,6 @@ class ReconAgent:
 					primary_target, task_id, log_callback,
 				)
 
-				# ── Phase 1: LLM Pre-Scan Strategy ──
 				scan_strategy = await self._llm_plan_dir_strategy(
 					primary_target, tech_hints, ports, has_waf, log_callback,
 				)
@@ -316,7 +307,6 @@ class ReconAgent:
 						else:
 							aggregator._entries[p_entry.path] = p_entry
 
-				# ── Phase 3: Post-Scan Deep Dive ──
 				await self._llm_deep_dive(
 					primary_target, tech_hints, aggregator,
 					task_id, log_callback, record_callback,
@@ -324,7 +314,6 @@ class ReconAgent:
 					deep_coord=deep_coord,
 				)
 
-				# ── Phase 3-drain: exhaust the shared deep-scan queue ──
 				await self._drain_deep_scan_queue(
 					base_url=primary_target,
 					aggregator=aggregator,
@@ -384,8 +373,6 @@ class ReconAgent:
 		log_callback: LogCallback = None,
 		fast: bool = False,
 	) -> tuple[list[PortInfo], dict, str]:
-		# 短路分支：用户已显式指定端口 → 只精细扫描该端口，
-		# 跳过常用/全端口扩散（避免分散精力，加快进入利用阶段）
 		if target_port:
 			logger.info(
 				f"[ReconAgent] 用户已指定端口 {target_port}，"
@@ -412,7 +399,6 @@ class ReconAgent:
 			ports, os_info = self.nmap_parser.parse_xml_full(detail_result.stdout)
 			return ports, os_info, detail_result.stdout
 
-		# 常用端口列表
 		common_ports_list = [
 			21, 22, 23, 25, 53, 80, 81, 110, 135, 139, 143, 443, 445, 993, 995,
 			1433, 1521, 2049, 2181, 3000, 3306, 3389, 5432, 5900, 5985, 6379,
@@ -420,13 +406,11 @@ class ReconAgent:
 			9001, 9090, 9200, 9443, 10000, 27017, 61616,
 		]
 
-		# 如果用户显式指定了端口，确保它在常用端口列表中
 		if target_port and target_port not in common_ports_list:
 			common_ports_list.append(target_port)
 
 		common_ports = ",".join(str(p) for p in sorted(common_ports_list))
 
-		# 第一轮：常用端口 SYN 扫描（快速、稳定）
 		precise_result: ExecuteResult = await self.executor.run(
 			tool="nmap",
 			args=["-sS", "-T4", "-Pn", "--open", "--reason",
@@ -443,14 +427,11 @@ class ReconAgent:
 
 
 		if fast and precise_ports:
-			# fast mode: common ports 命中 → 跳过全端口扫描和 -sV 版本探测
-			# 直接返回常用端口结果，节省 5-10 分钟
 			fast_ports_result = self.nmap_parser.parse_xml(precise_result.stdout)
 			logger.info(f"[ReconAgent] fast scan done: {len(fast_ports_result)} open ports (common ports hit)")
 			return fast_ports_result, {}, precise_result.stdout or ""
 		if fast and not precise_ports:
 			logger.info("[ReconAgent] fast mode but no common ports open, falling back to full scan")
-		# 第二轮：全端口 SYN 扫描（覆盖所有 65535 端口）
 		fast_result: ExecuteResult = await self.executor.run(
 			tool="nmap",
 			args=["-sS", "-T4", "-Pn", "--open", "--reason",
@@ -466,7 +447,6 @@ class ReconAgent:
 		if fast_result.success:
 			fast_open, fast_filtered = self.nmap_parser.extract_open_ports(fast_result.stdout)
 
-		# 合并两轮结果（open 直接合并；filtered 暂存待 TCP 验证）
 		all_ports = list(set(precise_ports + fast_open))
 		if not all_ports:
 			logger.warning("两轮扫描均未发现开放端口")
@@ -499,7 +479,6 @@ class ReconAgent:
 
 		ports, os_info = self.nmap_parser.parse_xml_full(detail_result.stdout)
 
-		# TCP connect 二次验证 filtered 端口
 		verified_filtered = await self._tcp_verify_filtered_ports(
 			target, fast_filtered, task_id, log_callback
 		)
@@ -522,7 +501,6 @@ class ReconAgent:
 		if not filtered_ports:
 			return []
 
-		# 最多验证 200 个 filtered 端口，避免超时
 		verify_ports = filtered_ports[:200]
 		port_str = ",".join(str(p) for p in verify_ports)
 
@@ -929,10 +907,6 @@ class ReconAgent:
 			max_tools=6,
 			max_stage_runtime=480,
 		)
-		# operator_plan 透传到 build_plan: ``preferred_tools`` 强制置顶且
-		# must_run, ``avoided_tools`` 直接踢掉, ``keyword_hints`` 加入自定义
-		# 字典 — 这样用户那句"重点用 gobuster 加 admin/backup 字典"在目录
-		# 爆破阶段才是真的发生作用, 而不是只在 supervisor 路由层闪一下。
 		plan = planner.build_plan(
 			web_target, has_waf=has_waf, tech_hints=tech_hints,
 			scan_strategy=scan_strategy,
@@ -957,7 +931,6 @@ class ReconAgent:
 
 		return result.paths, result.raw_output, result.coverage_report, result.aggregator
 
-	# ── Phase 1: LLM Pre-Scan Strategy ──────────────────────
 
 	async def _llm_plan_dir_strategy(
 		self,
@@ -1020,7 +993,6 @@ class ReconAgent:
 				)
 			return {}
 
-	# ── Phase 3: Post-Scan Deep Dive ────────────────────────
 
 	async def _llm_deep_dive(
 		self,
@@ -1111,9 +1083,6 @@ class ReconAgent:
 			if log_callback:
 				await log_callback(f"[ReconAgent] {msg}")
 
-		# Recursive subdirectory scans — enqueue into shared coordinator when
-		# available; fall back to direct fan-out for backwards compatibility
-		# (stand-alone recon, tests).
 		queued_recursive = 0
 		for scan in deep_plan.get("recursive_scans", [])[:3]:
 			sub_base = scan.get("base", "")
@@ -1127,7 +1096,7 @@ class ReconAgent:
 					path=sub_base,
 					reason=reason or "LLM 深挖规划",
 					wordlist=wl if wl in ("small", "medium", "large") else "small",
-					priority=60,  # LLM deep-dive outranks orchestrator-fallout followups
+					priority=60,
 					base_url=base_url,
 				))
 				if enqueued:
@@ -1143,7 +1112,6 @@ class ReconAgent:
 					)
 				continue
 
-			# Fallback: no coordinator → direct fan-out (legacy path)
 			label = (
 				f"深挖子任务 [递归目录爆破] base={sub_base} depth={depth}"
 				f"{f' wordlist={wl}' if wl else ''}"
@@ -1164,7 +1132,6 @@ class ReconAgent:
 				f" | {deep_coord.budget_report()}"
 			)
 
-		# Info source actions (robots, sitemap, git, api schema)
 		for action in deep_plan.get("info_source_actions", []):
 			if not isinstance(action, dict):
 				continue
@@ -1200,7 +1167,6 @@ class ReconAgent:
 					)
 				))
 
-		# API schema discovery
 		api_checks = deep_plan.get("api_schema_checks", [])
 		if api_checks:
 			preview = ", ".join(str(p) for p in api_checks[:8] if p)
@@ -1220,7 +1186,6 @@ class ReconAgent:
 			)
 			for i, line in enumerate(task_labels, 1):
 				await _emit_deep_detail(f"  ({i}/{len(task_labels)}) {line}")
-			# 攻击链提示（仅日志，不额外跑工具）
 			for hint in (deep_plan.get("attack_chain_hints") or [])[:5]:
 				if isinstance(hint, dict):
 					paths = hint.get("paths") or []
@@ -1332,10 +1297,8 @@ class ReconAgent:
 					f"[ReconAgent] 深扫根 {root_norm} ferox 样本:\n{sample}"
 				)
 
-			# ── 回流：把新发现的 dir-like 子路径推回 coordinator ──────────
 			if deep_coord is not None:
 				scanned_snapshot = {root_norm}
-				# under_root 是绝对路径集合，更适合做回流候选
 				followup_pool = under_root or new_paths
 				followups = _pick_followups(
 					followup_pool, aggregator, scanned_snapshot,
@@ -1793,7 +1756,6 @@ EOF_PATHS
 				f"[ReconAgent] 路径内容探测完成: 采集 {len(probed)} 条, 新增候选路径 {new_paths} 条"
 			)
 
-		# Deep-crawl any discovered directory listing pages
 		dirlist_paths = [item["path"] for item in probed if item.get("dir_listing")]
 		if dirlist_paths:
 			logger.info(

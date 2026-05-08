@@ -96,6 +96,7 @@ services:
       # Docker（工具沙箱）
       - DOCKER_NETWORK=pentest_net
       - TOOLBOX_IMAGE=pentest-toolbox:latest
+      - SKILLS_BASE_DIR=/opt/skills
       - MAX_TOOL_TIMEOUT=${MAX_TOOL_TIMEOUT:-360}
       - MAX_STAGE_RUNTIME=${MAX_STAGE_RUNTIME:-900}
       - REPORTS_DIR=/reports
@@ -124,6 +125,10 @@ services:
       - /proc:/host/proc:ro
       - /sys:/host/sys:ro
       - /:/host/rootfs:ro
+    dns:
+      # AI辅助生成：DeepSeek-V4-Pro,2026-05-03
+      - 8.8.8.8
+      - 114.114.114.114
     depends_on:
       postgres:
         condition: service_healthy

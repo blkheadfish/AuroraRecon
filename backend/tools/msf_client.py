@@ -23,14 +23,12 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-# MSF RPC 连接配置（从环境变量读取）
 MSF_HOST = os.getenv("MSF_HOST", "127.0.0.1")
 MSF_PORT = int(os.getenv("MSF_PORT", "55553"))
 MSF_PASSWORD = os.getenv("MSF_PASSWORD", "your_msf_password")
 MSF_SSL = os.getenv("MSF_SSL", "false").lower() == "true"
 
-# 监听地址（用于反弹 Shell 接收）
-LHOST = os.getenv("LHOST", "")           # 必须设置为攻击机 IP
+LHOST = os.getenv("LHOST", "")
 
 
 @dataclass
@@ -53,9 +51,9 @@ class MsfClient:
     """
 
     def __init__(self):
-        self._client = None                 # pymetasploit3 MsfRpcClient 实例
+        self._client = None
         self._connected = False
-        self._job_poll_interval = 2         # 轮询 job 状态间隔（秒）
+        self._job_poll_interval = 2
 
     async def connect(self) -> None:
         """连接到 MSF RPC 服务（同步操作包装为 async）"""
@@ -107,7 +105,6 @@ class MsfClient:
         if not self._connected:
             await self.connect()
 
-        # 注入 LHOST（反弹 Shell 需要）
         if LHOST and "PAYLOAD" in options and "reverse" in options.get("PAYLOAD", ""):
             options.setdefault("LHOST", LHOST)
             options.setdefault("LPORT", "4444")
@@ -132,7 +129,6 @@ class MsfClient:
     ) -> tuple[Optional[str], str]:
         """同步执行模块（在线程池内运行）"""
         try:
-            # 获取模块对象
             if module_type == "exploit":
                 mod = self._client.modules.use("exploit", module_path)
             elif module_type == "auxiliary":
@@ -142,13 +138,10 @@ class MsfClient:
             else:
                 return None, f"未知模块类型: {module_type}"
 
-            # 设置选项
             for k, v in options.items():
                 mod[k] = v
 
-            # 执行
             result = mod.execute(payload=options.get("PAYLOAD", ""))
-            # pymetasploit3 某些版本在模块执行后返回 True 而非字典
             if not isinstance(result, dict):
                 result = {}
             job_id = result.get("job_id")
@@ -157,12 +150,10 @@ class MsfClient:
             output_lines: list[str] = []
             session_id: Optional[str] = None
 
-            # 轮询等待 job 完成并收集输出
             deadline = time.time() + timeout
             while time.time() < deadline:
                 time.sleep(self._job_poll_interval)
 
-                # 检查是否有新 session
                 sessions = self._client.sessions.list
                 for sid, sinfo in sessions.items():
                     if sinfo.get("via_exploit", "") in module_path:
@@ -170,14 +161,12 @@ class MsfClient:
                         output_lines.append(f"[+] 获得 Session {sid}: {sinfo}")
                         break
 
-                # 检查 job 是否结束
                 if job_id and str(job_id) not in [str(j) for j in self._client.jobs.list]:
                     break
 
                 if session_id:
                     break
 
-            # 尝试收集 console 输出
             try:
                 console_output = self._get_console_output(uuid)
                 if console_output:
@@ -223,12 +212,10 @@ class MsfClient:
         try:
             session = self._client.sessions.session(session_id)
 
-            # Meterpreter session
             if hasattr(session, "run_with_output"):
                 output = session.run_with_output(command, timeout=timeout)
                 return output or ""
 
-            # Shell session
             session.write(command + "\n")
             time.sleep(min(timeout, 3))
             data = session.read()

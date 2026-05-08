@@ -37,7 +37,6 @@ def _strip(text: str) -> str:
     return _html.unescape(_TAG_STRIP_RE.sub(" ", text or "")).strip()
 
 
-# ── Signature detection ──────────────────────────────────────────
 
 _APACHE_SIG_RE = re.compile(
     r"(?:Apache Server Status|Apache Server Information|"
@@ -54,7 +53,6 @@ def is_apache_status_content(text: str) -> bool:
     return bool(_APACHE_SIG_RE.search(text))
 
 
-# ── Field regex helpers ──────────────────────────────────────────
 
 _FIELD_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("server_version",  re.compile(r"Server Version:\s*([^\n<]+?)(?:<|\n)", re.IGNORECASE)),
@@ -106,7 +104,6 @@ def _parse_auto_block(text: str, out: dict[str, Any]) -> None:
             out[key] = val
 
 
-# ── Module / vhost extraction (server-info) ─────────────────────
 
 _MODULE_HEADER_RE = re.compile(
     r"Module Name:\s*<?/?[a-z]*?>?\s*([A-Za-z0-9_./-]+)", re.IGNORECASE

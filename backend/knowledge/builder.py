@@ -4,7 +4,6 @@ knowledge/builder.py
 
 使用方式（在项目根目录）：
     python -m backend.knowledge.builder
-    # 或
     python build_kb.py
 
 流程：
@@ -35,39 +34,30 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# 构建产物目录
 KB_DATA_DIR = Path(__file__).parent / "kb_data"
 
-# LLM 配置（复用主项目的环境变量）
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.deepseek.com")
 LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-v4-flash")
 
 
-# ══════════════════════════════════════════════════════════
-# 数据源定义
-# ══════════════════════════════════════════════════════════
 
 @dataclass
 class VulnSource:
     """一个漏洞的知识数据源"""
-    vuln_id: str                          # 唯一标识，也是输出 JSON 文件名
-    name: str                             # 漏洞简称
-    urls: list[str] = field(default_factory=list)  # 要抓取的 URL 列表
-    extra_context: str = ""               # 人工补充的额外提示（可选）
-    fallback_content: str = ""            # URL全部失败时的兜底内容（嵌入的README核心信息）
+    vuln_id: str
+    name: str
+    urls: list[str] = field(default_factory=list)
+    extra_context: str = ""
+    fallback_content: str = ""
 
 
-# ── 赛题指定的 20 个靶场 ──
-# 每个条目都有 fallback_content，即使URL全挂也能构建知识库
-# URL 同时提供 raw.githubusercontent.com 和 GitHub 页面两种
 
 def _gh_urls(path: str) -> list[str]:
     """为一个 Vulhub 路径生成多个备用URL"""
     return [
         f"https://raw.githubusercontent.com/vulhub/vulhub/master/{path}/README.md",
         f"https://raw.githubusercontent.com/vulhub/vulhub/master/{path}/README.zh-cn.md",
-        # GitHub 页面（raw 被墙时备用）
         f"https://github.com/vulhub/vulhub/blob/master/{path}/README.md",
     ]
 
@@ -416,7 +406,6 @@ curl "http://your-ip:8080/geoserver/ows?service=WFS&version=2.0.0&request=GetPro
 """,
     ),
 
-    # ---- Vulnhub 中等/困难靶场 ----
     VulnSource(
         vuln_id="vulnhub_tomato",
         name="Vulnhub Tomato",
@@ -450,9 +439,6 @@ curl "http://your-ip:8080/geoserver/ows?service=WFS&version=2.0.0&request=GetPro
 ]
 
 
-# ══════════════════════════════════════════════════════════
-# URL 抓取
-# ══════════════════════════════════════════════════════════
 
 async def fetch_url(client: httpx.AsyncClient, url: str) -> str:
     """抓取单个 URL，返回文本内容"""
@@ -474,7 +460,6 @@ async def fetch_all_sources(source: VulnSource) -> str:
     """抓取一个漏洞的所有数据源，合并为一个文本。URL失败时使用fallback_content。"""
     parts = []
 
-    # 尝试抓取URL
     if source.urls:
         async with httpx.AsyncClient(
             headers={"User-Agent": "Mozilla/5.0 PentestAI-KBBuilder/1.0"},
@@ -490,7 +475,6 @@ async def fetch_all_sources(source: VulnSource) -> str:
 
     combined = "\n\n".join(parts)
 
-    # URL 全部失败时使用 fallback_content
     if not combined.strip() and source.fallback_content:
         logger.info(f"  📦 所有URL失败，使用内嵌兜底内容")
         combined = f"--- 内嵌知识 ---\n{source.fallback_content}"
@@ -498,16 +482,12 @@ async def fetch_all_sources(source: VulnSource) -> str:
         logger.warning(f"[{source.vuln_id}] 无任何内容来源")
         return ""
 
-    # 如果URL抓到了内容，也把 fallback_content 作为补充（提高LLM提取质量）
     if source.fallback_content and parts:
         combined += f"\n\n--- 补充信息（来自内嵌知识）---\n{source.fallback_content}"
 
     return combined
 
 
-# ══════════════════════════════════════════════════════════
-# LLM 知识提取
-# ══════════════════════════════════════════════════════════
 
 EXTRACT_PROMPT = """你是一名资深渗透测试工程师，需要从以下漏洞资料中提取结构化的利用知识。
 
@@ -567,7 +547,6 @@ async def extract_knowledge(
         logger.error("LLM_API_KEY 未设置！请设置环境变量后重试。")
         return None
 
-    # 截断过长内容（防止超出 context window）
     if len(raw_content) > 12000:
         raw_content = raw_content[:12000] + "\n\n... [内容过长已截断] ..."
 
@@ -616,9 +595,6 @@ async def extract_knowledge(
         return None
 
 
-# ══════════════════════════════════════════════════════════
-# 保存 JSON
-# ══════════════════════════════════════════════════════════
 
 def save_entry(vuln_id: str, data: dict) -> Path:
     """保存一个知识条目到 JSON 文件"""
@@ -629,9 +605,6 @@ def save_entry(vuln_id: str, data: dict) -> Path:
     return filepath
 
 
-# ══════════════════════════════════════════════════════════
-# 构建主流程
-# ══════════════════════════════════════════════════════════
 
 async def build_one(source: VulnSource) -> bool:
     """构建单个漏洞的知识条目"""
@@ -639,21 +612,18 @@ async def build_one(source: VulnSource) -> bool:
     logger.info(f"构建: {source.vuln_id} ({source.name})")
     logger.info(f"{'='*60}")
 
-    # 1. 抓取
     logger.info("📥 抓取数据源...")
     raw_content = await fetch_all_sources(source)
     if not raw_content:
         logger.error(f"❌ {source.vuln_id}: 无数据源内容")
         return False
 
-    # 2. LLM 提取
     logger.info("🤖 LLM 提取结构化知识...")
     data = await extract_knowledge(source, raw_content)
     if not data:
         logger.error(f"❌ {source.vuln_id}: LLM提取失败")
         return False
 
-    # 3. 生成向量索引（可选，embedding API 不可用则跳过）
     try:
         from backend.knowledge.exploit_kb import build_search_text, get_embedding_sync
         search_text = build_search_text(data)
@@ -669,7 +639,6 @@ async def build_one(source: VulnSource) -> bool:
     except Exception as e:
         logger.warning(f"  ⚠️ 向量索引生成失败: {e}")
 
-    # 4. 保存
     filepath = save_entry(source.vuln_id, data)
     logger.info(f"💾 已保存: {filepath}")
     return True
@@ -697,15 +666,12 @@ async def build_all(
     logger.info(f"   输出: {KB_DATA_DIR}")
     logger.info("")
 
-    # 串行构建（避免 LLM API 限速）
-    # 如果 API 限速宽松可以改成 semaphore 并发
     for source in sources:
         ok = await build_one(source)
         results[source.vuln_id] = ok
         if ok:
-            await asyncio.sleep(1)  # 友好间隔
+            await asyncio.sleep(1)
 
-    # 汇总
     success = sum(1 for v in results.values() if v)
     failed = sum(1 for v in results.values() if not v)
     logger.info(f"\n{'='*60}")
@@ -729,7 +695,6 @@ async def build_single(vuln_id: str) -> bool:
     return await build_one(source)
 
 
-# ── 添加自定义数据源 ─────────────────────────────────────
 
 def add_source(
     vuln_id: str,
@@ -754,9 +719,6 @@ def add_source(
     logger.info(f"[Builder] 已添加数据源: {vuln_id}")
 
 
-# ══════════════════════════════════════════════════════════
-# CLI 入口
-# ══════════════════════════════════════════════════════════
 
 def main():
     import argparse

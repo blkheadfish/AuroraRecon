@@ -114,7 +114,7 @@ def test_is_lfi_finding_heuristic():
 
 def test_depth_order_from_doc_root():
     order = _depth_order_from_doc_root("/var/www/html/a/b")
-    assert order[0] == 4  # theory-1=4 when theory=5
+    assert order[0] == 4
 
 
 @pytest.mark.asyncio

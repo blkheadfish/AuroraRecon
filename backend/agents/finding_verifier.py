@@ -24,7 +24,6 @@ from backend.agents.models import VulnFinding, CONFIDENCE_THRESHOLD_EXPLOIT
 
 logger = logging.getLogger(__name__)
 
-# ── 强否定标记 ────────────────────────────────────────────
 _HARD_NEGATIVE_MARKERS = (
     "script execution failed",
     "error: script execution failed",
@@ -41,7 +40,6 @@ _HTTP_ERROR_STATUS_RE = re.compile(
     re.IGNORECASE,
 )
 
-# ── 强正向标记 ────────────────────────────────────────────
 _UID_RE = re.compile(
     r"uid=\d+\([a-z0-9_.-]+\)\s+gid=\d+\([a-z0-9_.-]+\)",
     re.IGNORECASE,
@@ -56,7 +54,6 @@ _RCE_CONFIRMED_KEYWORDS = (
     "uid=0(root)",
 )
 
-# description 里常见的指纹要求关键词 → evidence 里需要出现
 _FINGERPRINT_REQUIREMENTS: dict[str, list[str]] = {
     "activemq": ["activemq", "amq-"],
     "tomcat":   ["tomcat", "catalina", "coyote"],
@@ -91,7 +88,6 @@ class FindingVerifier:
         name_lower = (finding.name or "").lower()
         fp_summary = (fingerprint or {}).get("summary", "").lower() if fingerprint else ""
 
-        # ── Pass 1: 强否定 ──────────────────────────────────
         rejected = self._check_hard_negative(
             finding, evidence_lower, desc_lower, name_lower, fp_summary, reasons,
         )
@@ -106,7 +102,6 @@ class FindingVerifier:
             )
             return finding
 
-        # ── Pass 2: 强正向 ──────────────────────────────────
         confirmed = self._check_hard_positive(
             finding, evidence_lower, reasons,
         )
@@ -120,10 +115,8 @@ class FindingVerifier:
             )
             return finding
 
-        # ── Pass 3: 工具/来源加权 ───────────────────────────
         self._apply_tool_weight(finding, evidence_lower, reasons)
 
-        # ── Pass 4: exploitable 门控 ────────────────────────
         if finding.exploitable and finding.confidence < CONFIDENCE_THRESHOLD_EXPLOIT:
             finding.exploitable = False
             reasons.append(
@@ -141,7 +134,6 @@ class FindingVerifier:
         finding.verification_reasons = reasons
         return finding
 
-    # ── 强否定逻辑 ────────────────────────────────────────
 
     @staticmethod
     def _check_hard_negative(
@@ -152,13 +144,11 @@ class FindingVerifier:
         fp_summary: str,
         reasons: list[str],
     ) -> bool:
-        # Rule N1: evidence 含明确的执行失败/连接失败标记
         for marker in _HARD_NEGATIVE_MARKERS:
             if marker in evidence_lower:
                 reasons.append(f"evidence contains failure marker: '{marker}'")
                 return True
 
-        # Rule N2: evidence 含 HTTP 错误状态且 description 要求 200
         if "200" in desc_lower or "返回200" in desc_lower or "如果返回" in desc_lower:
             m = _HTTP_ERROR_STATUS_RE.search(finding.evidence or "")
             if m:
@@ -167,7 +157,6 @@ class FindingVerifier:
                 )
                 return True
 
-        # Rule N3: description/name 声称需要特定技术栈，但同端口指纹完全不匹配
         if fp_summary and fp_summary != "unknown":
             for tech, keywords in _FINGERPRINT_REQUIREMENTS.items():
                 tech_in_claim = tech in name_lower or tech in desc_lower
@@ -176,15 +165,12 @@ class FindingVerifier:
                 tech_in_evidence = any(kw in evidence_lower for kw in keywords)
                 tech_in_fingerprint = any(kw in fp_summary for kw in keywords)
                 if not tech_in_evidence and not tech_in_fingerprint:
-                    # description claims ActiveMQ but neither evidence nor fingerprint shows it
                     reasons.append(
                         f"description claims '{tech}' but neither evidence "
                         f"nor fingerprint ('{fp_summary[:80]}') confirms it"
                     )
                     return True
 
-        # Rule N4: description 要求 "200 + 特定关键词" 但 evidence 只有 200，
-        # 缺少那个关键词
         if "如果" in desc_lower and "包含" in desc_lower:
             import re as _re
             m = _re.search(r"包含(.{2,20}?)(?:内容|字符|关键)", desc_lower)
@@ -200,7 +186,6 @@ class FindingVerifier:
 
         return False
 
-    # ── 强正向逻辑 ────────────────────────────────────────
 
     @staticmethod
     def _check_hard_positive(
@@ -223,7 +208,6 @@ class FindingVerifier:
 
         return False
 
-    # ── 工具/来源加权 ─────────────────────────────────────
 
     @staticmethod
     def _apply_tool_weight(

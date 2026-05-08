@@ -27,7 +27,6 @@ router = APIRouter(tags=["knowledge"])
 KB_SOURCES_FILE = Path(os.getenv("REPORTS_DIR", "/tmp/pentest_reports")) / "kb_sources.json"
 
 
-# ── 辅助函数 ──────────────────────────────────────────────
 
 def _load_custom_kb_sources() -> list[dict]:
     if not KB_SOURCES_FILE.exists():
@@ -221,7 +220,6 @@ def _upsert_custom_source(vuln_id: str, data: dict) -> None:
     _save_custom_kb_sources(custom_rows)
 
 
-# ── 知识库条目列表 ────────────────────────────────────────
 
 @router.get("/knowledge/entries")
 @router.get("/api/knowledge/entries")
@@ -242,7 +240,6 @@ async def list_knowledge_entries():
     return {"entries": entries, "total": len(entries)}
 
 
-# ── 知识源 CRUD ───────────────────────────────────────────
 
 @router.get("/knowledge/sources")
 @router.get("/api/knowledge/sources")
@@ -303,7 +300,6 @@ async def add_knowledge_source(req: KnowledgeSourceCreateRequest, request: Reque
     return {"status": "saved", "source": upsert}
 
 
-# ── 单条知识来源 CRUD ─────────────────────────────────────
 
 @router.get("/knowledge/{vuln_id}/sources")
 @router.get("/api/knowledge/{vuln_id}/sources")
@@ -433,7 +429,6 @@ async def create_knowledge_source(req: KnowledgeSourceCreateRequest, request: Re
     return {"status": "created", "source": data}
 
 
-# ── 构建 ──────────────────────────────────────────────────
 
 @router.post("/knowledge/build")
 @router.post("/api/knowledge/build")
@@ -481,7 +476,6 @@ async def build_one_knowledge(vuln_id: str, request: Request):
     return await build_knowledge(request, KnowledgeBuildRequest(vuln_id=vuln_id))
 
 
-# ── 原始 JSON 读写 ────────────────────────────────────────
 
 @router.get("/knowledge/{vuln_id}/raw")
 @router.get("/api/knowledge/{vuln_id}/raw")

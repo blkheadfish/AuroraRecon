@@ -32,7 +32,6 @@ class TestSummaryAndDetailFields:
         assert summary["task_id"] == "t1"
         assert summary["workflow_mode"] == "ctf_expert"
         assert summary["auto_approve"] is True
-        # Legacy field must not leak back in.
         assert "operator_role" not in summary
 
     def test_detail_exposes_per_task_runtime_params(self):
@@ -76,7 +75,6 @@ class TestBackgroundTaskRegistry:
         assert sm.cancel_bg_task("t1") is True, (
             "cancel_bg_task must return True when the task is live"
         )
-        # Give the loop a tick to actually deliver the cancellation.
         with pytest.raises(asyncio.CancelledError):
             await task
         assert task.cancelled()
@@ -99,13 +97,11 @@ class TestBackgroundTaskRegistry:
         second = asyncio.create_task(_hold())
         sm.register_bg_task("same", second)
 
-        # The first handle should be cancelled automatically.
         with pytest.raises(asyncio.CancelledError):
             await first
         assert first.cancelled()
         assert not second.done()
 
-        # Cleanup: cancel the survivor so the loop stays clean.
         sm.cancel_bg_task("same")
         with pytest.raises(asyncio.CancelledError):
             await second
@@ -121,7 +117,6 @@ class TestBackgroundTaskRegistry:
         sm.register_bg_task("t2", task)
         await task
 
-        # Task finished naturally; cancel must now return False.
         assert sm.cancel_bg_task("t2") is False
         sm.unregister_bg_task("t2")
-        sm.unregister_bg_task("t2")  # second call must not raise
+        sm.unregister_bg_task("t2")

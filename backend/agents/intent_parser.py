@@ -22,36 +22,25 @@ from backend.agents.models import ParsedIntent, TargetType, AmbiguityLevel
 
 logger = logging.getLogger(__name__)
 
-# ══════════════════════════════════════════════════════════════
-# 正则集合——确定性提取，不依赖 LLM
-# ══════════════════════════════════════════════════════════════
 
-# CIDR 格式: x.x.x.x/N
 _CIDR_RE = re.compile(
     r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2})\b"
 )
 
-# IPv4 地址（非 CIDR）
 _IP_RE = re.compile(
     r"\b(?<!/)(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})(?::\d{1,5})?\b"
 )
 
-# URL 格式
 _URL_RE = re.compile(
     r"https?://[^\s,;'\"，。、）)]+", re.IGNORECASE
 )
 
-# 域名（含端口）
 _DOMAIN_RE = re.compile(
     r"(?<![./@\w])(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
     r"[A-Za-z]{2,}(?::\d{1,5})?(?![\w./])"
 )
 
-# ══════════════════════════════════════════════════════════════
-# 关键词映射表——同样不依赖 LLM
-# ══════════════════════════════════════════════════════════════
 
-# 范围提示词 → scope_hint
 _SCOPE_HINT_KEYWORDS: dict[str, str] = {
     "内网": "intranet",
     "局域网": "intranet",
@@ -68,9 +57,7 @@ _SCOPE_HINT_KEYWORDS: dict[str, str] = {
     "tryhackme": "ctf_lab",
 }
 
-# 漏洞类型关键词 → priority_vulns 标签
 _VULN_KEYWORDS: dict[str, list[str]] = {
-    # Web 框架漏洞
     "shiro": ["shiro", "deserialization"],
     "fastjson": ["fastjson", "deserialization"],
     "log4j": ["log4j", "rce"],
@@ -81,7 +68,6 @@ _VULN_KEYWORDS: dict[str, list[str]] = {
     "weblogic": ["weblogic", "deserialization"],
     "jboss": ["jboss", "deserialization"],
     "tomcat": ["tomcat", "default_creds"],
-    # 通用漏洞类型
     "弱口令": ["weak_password"],
     "弱密码": ["weak_password"],
     "默认口令": ["default_creds"],
@@ -103,7 +89,6 @@ _VULN_KEYWORDS: dict[str, list[str]] = {
     "敏感信息": ["info_leak"],
 }
 
-# 渗透阶段关键词
 _PHASE_KEYWORDS: dict[str, list[str]] = {
     "recon": ["扫一扫", "扫描", "探测", "侦察", "发现", "收集信息", "信息收集",
                "看看", "看一下", "检查一下", "有哪些", "存活"],
@@ -113,14 +98,12 @@ _PHASE_KEYWORDS: dict[str, list[str]] = {
     "full_chain": ["完整测试", "完整渗透", "渗透测试", "红队", "攻防"],
 }
 
-# 主机发现触发关键词
 _DISCOVERY_KEYWORDS = [
     "有哪些主机", "存活主机", "发现主机", "资产发现", "存活扫描",
     "内网里有哪些", "网段里有哪些", "C段里有哪些",
     "扫描网段", "内网扫描", "资产探测",
 ]
 
-# Web 相关焦点关键词
 _WEB_FOCUS_KEYWORDS = ["web", "网站", "网页", "http", "https", "Web",
                          "Web 服务", "web服务", "web 应用"]
 
@@ -148,13 +131,10 @@ def _is_private_ip(ip: str) -> bool:
         return False
     parts = [int(p) for p in ip.split(".")]
     first, second = parts[0], parts[1]
-    # 10.0.0.0/8
     if first == 10:
         return True
-    # 172.16.0.0/12
     if first == 172 and 16 <= second <= 31:
         return True
-    # 192.168.0.0/16
     if first == 192 and second == 168:
         return True
     return False
@@ -168,7 +148,6 @@ def _extract_targets_by_regex(prompt: str) -> tuple[list[str], TargetType]:
     targets: list[str] = []
     target_type: TargetType = "unknown"
 
-    # 1. 优先匹配 CIDR
     cidr_matches = _CIDR_RE.findall(prompt)
     if cidr_matches:
         for m in cidr_matches:
@@ -176,17 +155,13 @@ def _extract_targets_by_regex(prompt: str) -> tuple[list[str], TargetType]:
             if candidate not in targets:
                 targets.append(candidate)
         target_type = "cidr"
-        # CIDR 内可能也包含单个 IP，继续提取供参考
-        # （例如 "192.168.1.0/24 里重点看 .50"）
 
-    # 2. 提取独立 IP（排除已在 CIDR 中的）
     ip_matches = _IP_RE.findall(prompt)
     if ip_matches:
         for m in ip_matches:
             candidate = m.strip()
             if candidate in targets:
                 continue
-            # 检查这个 IP 是否已在某个 CIDR 范围内
             in_cidr = False
             for cidr in targets:
                 try:
@@ -200,9 +175,7 @@ def _extract_targets_by_regex(prompt: str) -> tuple[list[str], TargetType]:
                 targets.append(candidate)
         if not targets or target_type == "unknown":
             target_type = "ip" if targets else target_type
-        # 如果 CIDR 和 IP 共存，保持 target_type=cidr（更宏观的视角）
 
-    # 3. 提取 URL
     url_matches = _URL_RE.findall(prompt)
     for m in url_matches:
         candidate = m.strip().rstrip(".,;'\"，。、)）")
@@ -211,11 +184,9 @@ def _extract_targets_by_regex(prompt: str) -> tuple[list[str], TargetType]:
         if target_type == "unknown":
             target_type = "domain"
 
-    # 4. 提取纯域名（排除 IP 和 URL）
     domain_matches = _DOMAIN_RE.findall(prompt)
     for m in domain_matches:
         candidate = m.strip().rstrip(".,;'\"，。、)）")
-        # 排除 IP 格式
         if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d{1,5})?$", candidate):
             continue
         if candidate not in targets:
@@ -275,7 +246,7 @@ def _extract_phases(prompt: str) -> list[str]:
                 if phase not in phases:
                     phases.append(phase)
                 break
-    return phases if phases else ["recon"]  # 默认至少做侦察
+    return phases if phases else ["full_chain"]
 
 
 def _check_requires_discovery(prompt: str, targets: list[str],
@@ -287,11 +258,9 @@ def _check_requires_discovery(prompt: str, targets: list[str],
     2. CIDR 目标且没有额外指定具体 IP
     """
     prompt_lower = prompt.lower()
-    # 关键词匹配
     for kw in _DISCOVERY_KEYWORDS:
         if kw.lower() in prompt_lower:
             return True
-    # CIDR 目标天然需要发现
     if target_type == "cidr":
         return True
     return False
@@ -340,9 +309,6 @@ def _generate_clarification_needed(targets: list[str],
     return questions
 
 
-# ══════════════════════════════════════════════════════════════
-# Public API
-# ══════════════════════════════════════════════════════════════
 
 
 def parse_intent_deterministic(raw_prompt: str) -> ParsedIntent:
@@ -384,10 +350,8 @@ def parse_intent_with_llm(raw_prompt: str) -> ParsedIntent:
     - LLM 仅补充 scope_hint/task_focus/pentest_phase 等语义字段。
     - LLM 输出会经过严格校验，不会覆盖确定性结果。
     """
-    # 先做确定性解析
     base = parse_intent_deterministic(raw_prompt)
 
-    # 仅在没有 scope_hint 或没有 task_focus 时调用 LLM
     needs_llm = not base.scope_hint or not base.task_focus or not base.priority_vulns
     if not needs_llm:
         return base
@@ -425,7 +389,6 @@ def _call_llm_for_intent(raw_prompt: str) -> Optional[dict]:
     try:
         loop = asyncio.get_event_loop()
         if loop.is_running():
-            # 在已有事件循环中，使用同步方式（用 run_coroutine_threadsafe 投递）
             import concurrent.futures
             future = asyncio.run_coroutine_threadsafe(_invoke(), loop)
             raw = future.result(timeout=5.0)
@@ -438,7 +401,6 @@ def _call_llm_for_intent(raw_prompt: str) -> Optional[dict]:
     if not raw:
         return None
 
-    # 安全反序列化
     try:
         data = json.loads(raw if isinstance(raw, str) else str(raw))
         if not isinstance(data, dict):
@@ -454,20 +416,17 @@ def _merge_llm_result(base: ParsedIntent,
 
     核心原则：LLM 不覆盖确定性字段（targets/target_type/ambiguity_level）。
     """
-    # scope_hint: 仅在确定性结果为空时采纳 LLM
     if not base.scope_hint:
         llm_scope = str(llm_data.get("scope_hint") or "").strip()[:64]
         if llm_scope:
             base.scope_hint = llm_scope
 
-    # task_focus: 合并去重
     llm_focus = llm_data.get("task_focus")
     if isinstance(llm_focus, list):
         for f in llm_focus:
             if isinstance(f, str) and f.strip().lower() not in base.task_focus:
                 base.task_focus.append(f.strip().lower())
 
-    # pentest_phase: 仅在确定性结果为空时采纳
     if not base.pentest_phase or base.pentest_phase == ["recon"]:
         llm_phases = llm_data.get("pentest_phases") or llm_data.get("pentest_phase")
         if isinstance(llm_phases, list):
@@ -475,14 +434,12 @@ def _merge_llm_result(base: ParsedIntent,
             if phases:
                 base.pentest_phase = phases
 
-    # priority_vulns: 合并去重（LLM 可能识别出关键词未命中的 CVE）
     llm_vulns = llm_data.get("priority_vulns")
     if isinstance(llm_vulns, list):
         for v in llm_vulns:
             if isinstance(v, str) and v.strip().lower() not in base.priority_vulns:
                 base.priority_vulns.append(v.strip().lower())
 
-    # ★ 新增：intents 合并（LLM 语义标签，如 stealth / low_noise / prefer_msf）
     llm_intents = llm_data.get("intents")
     if isinstance(llm_intents, list):
         for tag in llm_intents:
@@ -492,7 +449,6 @@ def _merge_llm_result(base: ParsedIntent,
     return base
 
 
-# ── 便捷函数：外部模块调用入口 ──────────────────────────
 
 
 def parse_target_from_prompt(prompt: str) -> str:

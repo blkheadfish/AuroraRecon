@@ -54,7 +54,6 @@ def request_interrupt(
     that observers can detect repeated taps. This is the typical fire-and-
     forget HTTP path::
 
-        # router
         request_interrupt(task_id, reason="operator_chat", payload={"text": "..."})
 
     Returns the stored entry (after coalescing).
