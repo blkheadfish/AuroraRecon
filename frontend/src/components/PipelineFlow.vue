@@ -105,6 +105,43 @@
 <script setup>
 import { computed } from 'vue'
 
+const DEFAULT_STEPS = [
+  { key: 'recon',            label: '信息侦察' },
+  { key: 'vuln_scan',        label: '漏洞扫描' },
+  { key: 'exploit_decision', label: 'AI 决策'  },
+  { key: 'exploit',          label: '漏洞利用' },
+  { key: 'post_exploit',     label: '后渗透'   },
+  { key: 'report',           label: '报告生成' },
+]
+
+// 将后端细粒度 phase 映射到 Pipeline 粗粒度步骤
+const PHASE_TO_PIPELINE_STEP: Record<string, string> = {
+  init:              'init',
+  recon:             'recon',
+  surface_enum:      'recon',
+  intel_harvest:     'recon',
+  smb_enum:          'recon',
+  ldap_enum:         'recon',
+  cloud_enum:        'recon',
+  vuln_scan:         'vuln_scan',
+  exploit_decision:  'exploit_decision',
+  awaiting_approval: 'exploit_decision',
+  human_approval:    'exploit_decision',
+  foothold_attempt:  'exploit',
+  exploit:           'exploit',
+  secondary_attack:  'exploit',
+  kerberos_attack:   'exploit',
+  cloud_exploit:     'exploit',
+  post_foothold_enum:    'post_exploit',
+  post_foothold_approval:'post_exploit',
+  internal_scan:     'post_exploit',
+  privesc_attempt:   'post_exploit',
+  lateral_movement:  'post_exploit',
+  persistence:       'post_exploit',
+  objective_collect: 'post_exploit',
+  report:            'report',
+}
+
 const props = defineProps({
   currentPhase:    { type: String,  default: 'init' },
   status:          { type: String,  default: 'pending' },
@@ -114,41 +151,46 @@ const props = defineProps({
   needsApproval:   { type: Boolean, default: false },
   approving:       { type: Boolean, default: false },
   showLegend:      { type: Boolean, default: true },
+  chainTemplate:   { type: Object,  default: null },
 })
 
 defineEmits(['approve', 'reject'])
 
-const steps = [
-  { key: 'recon',            label: '信息侦察' },
-  { key: 'vuln_scan',        label: '漏洞扫描' },
-  { key: 'exploit_decision', label: 'AI 决策'  },
-  { key: 'exploit',          label: '漏洞利用' },
-  { key: 'post_exploit',     label: '后渗透'   },
-  { key: 'report',           label: '报告生成' },
-]
+const steps = computed(() => {
+  const tpl = props.chainTemplate
+  if (tpl && Array.isArray(tpl.pipeline_steps) && tpl.pipeline_steps.length > 0) {
+    return tpl.pipeline_steps.map((s: { key: string; label: string }) => ({ key: s.key, label: s.label }))
+  }
+  return DEFAULT_STEPS
+})
 
-const phaseOrder = steps.map(s => s.key)
+const phaseOrder = computed(() => steps.value.map(s => s.key))
 
-const currentIdx = computed(() => phaseOrder.indexOf(props.currentPhase))
+const mappedCurrentStep = computed(() => PHASE_TO_PIPELINE_STEP[props.currentPhase] || props.currentPhase)
+
+const currentIdx = computed(() => phaseOrder.value.indexOf(mappedCurrentStep.value))
 
 const overallProgress = computed(() => {
   if (props.status === 'completed') return 100
+  if (props.status === 'failed') return 100
   if (currentIdx.value < 0) return 0
-  return Math.round((currentIdx.value / phaseOrder.length) * 100)
+  return Math.round(((currentIdx.value + 1) / phaseOrder.value.length) * 100)
 })
 
 const phaseDisplayText = computed(() => {
   if (props.status === 'completed') return '测试完成'
   if (props.status === 'failed')    return '执行失败'
   if (props.currentPhase === 'awaiting_approval') return '等待授权确认...'
-  const s = steps.find(s => s.key === props.currentPhase)
+  const mappedKey = mappedCurrentStep.value
+  const s = steps.value.find(s => s.key === mappedKey)
   return s ? `${s.label}中...` : '准备中...'
 })
 
 function getStepClass(key, i) {
+  const mapped = mappedCurrentStep.value
   if (props.status === 'completed') return 'done'
-  if (props.status === 'failed' && key === props.currentPhase) return 'failed'
-  if (key === props.currentPhase) return 'active'
+  if (props.status === 'failed' && key === mapped) return 'failed'
+  if (key === mapped) return 'active'
   // awaiting_approval 时 exploit 节点显示为 waiting
   if (props.currentPhase === 'awaiting_approval' && key === 'exploit') return 'waiting'
   if (i < currentIdx.value) return 'done'
@@ -156,14 +198,14 @@ function getStepClass(key, i) {
 }
 
 function getConnectorClass(i) {
-  const leftKey = steps[i - 1]?.key
+  const leftKey = steps.value[i - 1]?.key
   const s = getStepClass(leftKey, i - 1)
   return `conn-${s}`
 }
 
 function isFlowing(i) {
-  const leftKey  = steps[i - 1]?.key
-  const rightKey = steps[i]?.key
+  const leftKey  = steps.value[i - 1]?.key
+  const rightKey = steps.value[i]?.key
   return getStepClass(leftKey, i - 1) === 'done'
       && (getStepClass(rightKey, i) === 'active' || getStepClass(rightKey, i) === 'waiting')
 }

@@ -7,6 +7,7 @@
     :got-shell="gotShell"
     :needs-approval="needsApproval"
     :approving="approving"
+    :chain-template="chainTemplate"
     @approve="$emit('approve')"
     @reject="$emit('reject')"
   />
@@ -23,6 +24,7 @@ defineProps({
   gotShell: { type: Boolean, default: false },
   needsApproval: { type: Boolean, default: false },
   approving: { type: Boolean, default: false },
+  chainTemplate: { type: Object, default: () => ({ id: 'web', pipeline_steps: [] }) },
 })
 
 defineEmits(['approve', 'reject'])

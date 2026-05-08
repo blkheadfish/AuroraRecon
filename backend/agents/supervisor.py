@@ -28,8 +28,9 @@ logger = logging.getLogger(__name__)
 
 
 SUPERVISOR_PHASES: list[str] = [
-    "recon", "surface_enum", "intel_harvest", "vuln_scan",
-    "exploit_decision", "human_approval", "foothold_attempt",
+    "recon", "surface_enum", "intel_harvest", "smb_enum",
+    "ldap_enum", "kerberos_attack", "cloud_enum", "cloud_exploit",
+    "vuln_scan", "exploit_decision", "human_approval", "foothold_attempt",
     "secondary_attack", "post_foothold_enum", "post_foothold_approval",
     "privesc_attempt", "objective_collect",
 ]

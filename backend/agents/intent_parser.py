@@ -55,6 +55,23 @@ _SCOPE_HINT_KEYWORDS: dict[str, str] = {
     "vulnhub": "ctf_lab",
     "hackthebox": "ctf_lab",
     "tryhackme": "ctf_lab",
+    # cloud / 云环境
+    "云环境": "cloud",
+    "云上": "cloud",
+    "aws": "cloud",
+    "azure": "cloud",
+    "gcp": "cloud",
+    "k8s": "cloud",
+    "kubernetes": "cloud",
+    "阿里云": "cloud",
+    "腾讯云": "cloud",
+    "华为云": "cloud",
+    # AD 域
+    "域控": "ad_domain",
+    "域环境": "ad_domain",
+    "AD域": "ad_domain",
+    "AD 域": "ad_domain",
+    "活动目录": "ad_domain",
 }
 
 _VULN_KEYWORDS: dict[str, list[str]] = {

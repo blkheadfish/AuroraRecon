@@ -580,6 +580,7 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
         // 必须在这里取出, 否则前端攻击图永远停留在初始 REST 快照, 不会
         // 随漏洞发现/凭据收集等增量事实更新。
         attack_graph: p.attack_graph as TaskDetail['attack_graph'] | undefined,
+        chain_template: p.chain_template as TaskDetail['chain_template'] | undefined,
       }
 
       const updateBid = patch.branch_id
@@ -611,6 +612,7 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
           attack_next_steps: patch.attack_next_steps ?? state.task.attack_next_steps,
           privesc_attempt_count: patch.privesc_attempt_count ?? state.task.privesc_attempt_count,
           attack_graph: (patch.attack_graph as TaskDetail['attack_graph']) ?? state.task.attack_graph,
+          chain_template: (patch.chain_template as TaskDetail['chain_template']) ?? state.task.chain_template,
         }
         if (prevPhase !== 'awaiting_approval' && patch.phase === 'awaiting_approval') {
           state.approvalState = 'idle'

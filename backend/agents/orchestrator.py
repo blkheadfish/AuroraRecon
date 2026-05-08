@@ -126,6 +126,12 @@ def _consume_risk_budget(state: PentestState, cost: int = 1) -> bool:
 
 
 
+def _phase_in_template(state: PentestState, phase_name: str) -> bool:
+    from backend.agents.chain_templates import get_template
+    tpl = get_template(getattr(state, "chain_template_id", "web"))
+    return phase_name in tpl.phase_set()
+
+
 def _apply_parsed_target(state: PentestState) -> None:
     """
     在任务创建后、recon 前，将用户原始 target 统一解析并写回 state。
@@ -271,8 +277,26 @@ def _intent_to_operator_plan(state: PentestState) -> None:
             else:
                 next_phase = last_phase
 
+    # ── 动态攻击链模板选择 ──────────────────────────────────────
+    from backend.agents.chain_templates import select_template
+
+    scope_hint_val: str | None = parsed.get("scope_hint")
+    template = select_template(scope_hint_val)
+    state.chain_template_id = template.template_id
+    state.log(
+        f"[链模板] scope_hint={scope_hint_val or '无'} → "
+        f"template={template.template_id} ({template.label})"
+    )
+
     has_constraints = preferred or avoided or keyword_hints or next_phase or extra_hint
     if not has_constraints:
+        # 即使没有策略约束，也要保证链模板已设置（默认 web）
+        if not state.operator_plan:
+            state.operator_plan = OperatorPlan(
+                source_phase="init",
+                intent_summary=f"链模板: {template.label}",
+                next_phase=template.phases[0] if template.phases else "recon",
+            )
         return
 
     summary_parts: list[str] = []
@@ -1433,6 +1457,10 @@ async def node_surface_enum(state: PentestState) -> PentestState:
     state.current_phase = "surface_enum"
     _record_chain_visit(state, "surface_enum")
 
+    if not _phase_in_template(state, "surface_enum"):
+        state.log(f"[链模板] 跳过 surface_enum（模板={state.chain_template_id}）")
+        return state
+
     skip_plan, skip_plan_reason = _plan_should_skip_phase(state, "surface_enum")
     if skip_plan:
         state.log(f"[Plan] {skip_plan_reason}")
@@ -2028,6 +2056,10 @@ async def node_intel_harvest(state: PentestState) -> PentestState:
 
     state.current_phase = "intel_harvest"
     _record_chain_visit(state, "intel_harvest")
+
+    if not _phase_in_template(state, "intel_harvest"):
+        state.log(f"[链模板] 跳过 intel_harvest（模板={state.chain_template_id}）")
+        return state
 
     skip_plan, skip_plan_reason = _plan_should_skip_phase(state, "intel_harvest")
     if skip_plan:
@@ -3177,6 +3209,96 @@ async def node_objective_collect(state: PentestState) -> PentestState:
     return state
 
 
+# ── 动态链模板 stub 节点 ─────────────────────────────────────────
+
+async def node_smb_enum(state: PentestState) -> PentestState:
+    state.current_phase = "smb_enum"
+    _record_chain_visit(state, "smb_enum")
+    if not _phase_in_template(state, "smb_enum"):
+        state.log(f"[链模板] 跳过 smb_enum（模板={state.chain_template_id}）")
+        return state
+    from backend.tools.executor import ToolExecutor
+    state.log("SMB 枚举: 使用 netexec/crackmapexec 探测 SMB 共享与签名")
+    try:
+        executor = ToolExecutor(state)
+        result = await executor.run("netexec", ["smb", state.target_host or state.target, "--shares"])
+        state.log(f"SMB 枚举完成: {result.stdout[:300] if result and result.stdout else '无结果'}"[:500])
+    except Exception as e:
+        state.log(f"SMB 枚举异常: {e}")
+    return state
+
+
+async def node_ldap_enum(state: PentestState) -> PentestState:
+    state.current_phase = "ldap_enum"
+    _record_chain_visit(state, "ldap_enum")
+    if not _phase_in_template(state, "ldap_enum"):
+        state.log(f"[链模板] 跳过 ldap_enum（模板={state.chain_template_id}）")
+        return state
+    from backend.tools.executor import ToolExecutor
+    state.log("LDAP 枚举: 使用 ldapsearch 探测 AD 域信息")
+    try:
+        executor = ToolExecutor(state)
+        result = await executor.run("ldapsearch", ["-x", "-H", f"ldap://{state.target_host or state.target}", "-s", "base"])
+        state.log(f"LDAP 枚举完成: {result.stdout[:300] if result and result.stdout else '无结果'}"[:500])
+    except Exception as e:
+        state.log(f"LDAP 枚举异常: {e}")
+    return state
+
+
+async def node_kerberos_attack(state: PentestState) -> PentestState:
+    state.current_phase = "kerberos_attack"
+    _record_chain_visit(state, "kerberos_attack")
+    if not _phase_in_template(state, "kerberos_attack"):
+        state.log(f"[链模板] 跳过 kerberos_attack（模板={state.chain_template_id}）")
+        return state
+    from backend.tools.executor import ToolExecutor
+    state.log("Kerberos 攻击: AS-REP Roasting / Kerberoasting")
+    try:
+        executor = ToolExecutor(state)
+        result = await executor.run("impacket-GetNPUsers", [f"{state.target_host or state.target}/", "-no-pass"])
+        state.log(f"Kerberos 攻击完成: {result.stdout[:300] if result and result.stdout else '无结果'}"[:500])
+    except Exception as e:
+        state.log(f"Kerberos 攻击异常: {e}")
+    return state
+
+
+async def node_cloud_enum(state: PentestState) -> PentestState:
+    state.current_phase = "cloud_enum"
+    _record_chain_visit(state, "cloud_enum")
+    if not _phase_in_template(state, "cloud_enum"):
+        state.log(f"[链模板] 跳过 cloud_enum（模板={state.chain_template_id}）")
+        return state
+    from backend.tools.executor import ToolExecutor
+    state.log("云资产发现: 探测 IMDS/S3/IAM 端点")
+    try:
+        executor = ToolExecutor(state)
+        target = state.target_host or state.target
+        result = await executor.run("curl", ["-s", f"http://{target}/latest/meta-data/", "--connect-timeout", "5"])
+        state.log(f"IMDS 探测完成: {result.stdout[:300] if result and result.stdout else '无结果'}"[:500])
+    except Exception as e:
+        state.log(f"云资产枚举异常: {e}")
+    return state
+
+
+async def node_cloud_exploit(state: PentestState) -> PentestState:
+    state.current_phase = "cloud_exploit"
+    _record_chain_visit(state, "cloud_exploit")
+    if not _phase_in_template(state, "cloud_exploit"):
+        state.log(f"[链模板] 跳过 cloud_exploit（模板={state.chain_template_id}）")
+        return state
+    from backend.tools.executor import ToolExecutor
+    state.log("云漏洞利用: 尝试 IMDSv1 SSRF / S3 公开访问 / IAM 权限提升")
+    try:
+        executor = ToolExecutor(state)
+        target = state.target_host or state.target
+        result = await executor.run("curl", ["-s", f"http://{target}/latest/meta-data/iam/security-credentials/", "--connect-timeout", "5"])
+        state.log(f"IAM 凭据探测完成: {result.stdout[:300] if result and result.stdout else '无结果'}"[:500])
+    except Exception as e:
+        state.log(f"云漏洞利用异常: {e}")
+    return state
+
+
+
 async def node_report(state: PentestState) -> PentestState:
     from backend.report.generator import ReportGenerator, _filter_phase_log
     state.current_phase = "report"
@@ -3401,13 +3523,30 @@ _LINEAR_CHAIN_SUCCESSORS: dict[str, list[str]] = {
 
 
 def _edge_plan_forward(state: PentestState, current_phase: str) -> str:
-    """沿线性链向前走，跳过被策略排除的阶段。"""
+    """沿线性链向前走，跳过被策略排除的阶段，同时跳过不在当前链模板中的阶段。"""
     for nxt in _LINEAR_CHAIN_SUCCESSORS.get(current_phase, ["exploit_decision"]):
+        if not _phase_in_template(state, nxt):
+            continue
         skip, _ = _plan_should_skip_phase(state, nxt)
         if not skip:
             return nxt
     return "exploit_decision"
 
+
+def _edge_after_smb_enum(state: PentestState) -> str:
+    return _edge_plan_forward(state, "smb_enum")
+
+def _edge_after_ldap_enum(state: PentestState) -> str:
+    return _edge_plan_forward(state, "ldap_enum")
+
+def _edge_after_kerberos_attack(state: PentestState) -> str:
+    return _edge_plan_forward(state, "kerberos_attack")
+
+def _edge_after_cloud_enum(state: PentestState) -> str:
+    return _edge_plan_forward(state, "cloud_enum")
+
+def _edge_after_cloud_exploit(state: PentestState) -> str:
+    return _edge_plan_forward(state, "cloud_exploit")
 
 def _edge_after_recon(state: PentestState) -> str:
     return _edge_plan_forward(state, "recon")
@@ -3595,6 +3734,11 @@ def _build_graph_linear(checkpointer=None):
     graph.add_node("vuln_scan",           node_vuln_scan)
     graph.add_node("surface_enum",        node_surface_enum)
     graph.add_node("intel_harvest",       node_intel_harvest)
+    graph.add_node("smb_enum",            node_smb_enum)
+    graph.add_node("ldap_enum",           node_ldap_enum)
+    graph.add_node("kerberos_attack",     node_kerberos_attack)
+    graph.add_node("cloud_enum",         node_cloud_enum)
+    graph.add_node("cloud_exploit",       node_cloud_exploit)
     graph.add_node("exploit_decision",    node_exploit_decision)
     graph.add_node("human_approval",      node_human_approval)
     graph.add_node("foothold_attempt",    node_foothold_attempt)
@@ -3623,10 +3767,17 @@ def _build_graph_linear(checkpointer=None):
             "lateral_movement":   "lateral_movement",
             "persistence":        "persistence",
             "objective_collect":  "objective_collect",
+            "smb_enum":          "smb_enum",
+            "ldap_enum":         "ldap_enum",
+            "kerberos_attack":   "kerberos_attack",
+            "cloud_enum":        "cloud_enum",
+            "cloud_exploit":     "cloud_exploit",
         },
     )
     _PLAN_FWD_TARGETS_RECON = {
         "surface_enum": "surface_enum", "intel_harvest": "intel_harvest",
+        "smb_enum": "smb_enum", "ldap_enum": "ldap_enum",
+        "cloud_enum": "cloud_enum",
         "vuln_scan": "vuln_scan", "exploit_decision": "exploit_decision",
     }
     _PLAN_FWD_TARGETS_SURF = {
@@ -3639,6 +3790,27 @@ def _build_graph_linear(checkpointer=None):
     graph.add_conditional_edges("recon", _edge_after_recon, _PLAN_FWD_TARGETS_RECON)
     graph.add_conditional_edges("surface_enum", _edge_after_surface_enum, _PLAN_FWD_TARGETS_SURF)
     graph.add_conditional_edges("intel_harvest", _edge_after_intel_harvest, _PLAN_FWD_TARGETS_INTEL)
+
+    _PLAN_FWD_TARGETS_SMB = {
+        "ldap_enum": "ldap_enum", "vuln_scan": "vuln_scan", "exploit_decision": "exploit_decision",
+    }
+    _PLAN_FWD_TARGETS_LDAP = {
+        "vuln_scan": "vuln_scan", "exploit_decision": "exploit_decision",
+    }
+    _PLAN_FWD_TARGETS_KERBEROS = {
+        "vuln_scan": "vuln_scan", "exploit_decision": "exploit_decision",
+    }
+    _PLAN_FWD_TARGETS_CLOUD_ENUM = {
+        "vuln_scan": "vuln_scan", "exploit_decision": "exploit_decision",
+    }
+    _PLAN_FWD_TARGETS_CLOUD_EXPLOIT = {
+        "vuln_scan": "vuln_scan", "exploit_decision": "exploit_decision",
+    }
+    graph.add_conditional_edges("smb_enum", _edge_after_smb_enum, _PLAN_FWD_TARGETS_SMB)
+    graph.add_conditional_edges("ldap_enum", _edge_after_ldap_enum, _PLAN_FWD_TARGETS_LDAP)
+    graph.add_conditional_edges("kerberos_attack", _edge_after_kerberos_attack, _PLAN_FWD_TARGETS_KERBEROS)
+    graph.add_conditional_edges("cloud_enum", _edge_after_cloud_enum, _PLAN_FWD_TARGETS_CLOUD_ENUM)
+    graph.add_conditional_edges("cloud_exploit", _edge_after_cloud_exploit, _PLAN_FWD_TARGETS_CLOUD_EXPLOIT)
     graph.add_edge("vuln_scan", "exploit_decision")
     graph.add_conditional_edges(
         "exploit_decision", edge_should_exploit,
@@ -3704,6 +3876,11 @@ def _build_graph_feedback(checkpointer=None):
     graph.add_node("vuln_scan",           node_vuln_scan)
     graph.add_node("surface_enum",        node_surface_enum)
     graph.add_node("intel_harvest",       node_intel_harvest)
+    graph.add_node("smb_enum",            node_smb_enum)
+    graph.add_node("ldap_enum",           node_ldap_enum)
+    graph.add_node("kerberos_attack",     node_kerberos_attack)
+    graph.add_node("cloud_enum",         node_cloud_enum)
+    graph.add_node("cloud_exploit",       node_cloud_exploit)
     graph.add_node("exploit_decision",    node_exploit_decision)
     graph.add_node("human_approval",      node_human_approval)
     graph.add_node("foothold_attempt",    node_foothold_attempt)
@@ -3733,10 +3910,17 @@ def _build_graph_feedback(checkpointer=None):
             "lateral_movement":   "lateral_movement",
             "persistence":        "persistence",
             "objective_collect":  "objective_collect",
+            "smb_enum":          "smb_enum",
+            "ldap_enum":         "ldap_enum",
+            "kerberos_attack":   "kerberos_attack",
+            "cloud_enum":        "cloud_enum",
+            "cloud_exploit":     "cloud_exploit",
         },
     )
     graph.add_conditional_edges("recon", _edge_after_recon, {
         "surface_enum": "surface_enum", "intel_harvest": "intel_harvest",
+        "smb_enum": "smb_enum", "ldap_enum": "ldap_enum",
+        "cloud_enum": "cloud_enum",
         "vuln_scan": "vuln_scan", "exploit_decision": "exploit_decision",
     })
     graph.add_conditional_edges("surface_enum", _edge_after_surface_enum, {
@@ -3744,6 +3928,21 @@ def _build_graph_feedback(checkpointer=None):
         "vuln_scan": "vuln_scan", "exploit_decision": "exploit_decision",
     })
     graph.add_conditional_edges("intel_harvest", _edge_after_intel_harvest, {
+        "vuln_scan": "vuln_scan", "exploit_decision": "exploit_decision",
+    })
+    graph.add_conditional_edges("smb_enum", _edge_after_smb_enum, {
+        "ldap_enum": "ldap_enum", "vuln_scan": "vuln_scan", "exploit_decision": "exploit_decision",
+    })
+    graph.add_conditional_edges("ldap_enum", _edge_after_ldap_enum, {
+        "vuln_scan": "vuln_scan", "exploit_decision": "exploit_decision",
+    })
+    graph.add_conditional_edges("kerberos_attack", _edge_after_kerberos_attack, {
+        "vuln_scan": "vuln_scan", "exploit_decision": "exploit_decision",
+    })
+    graph.add_conditional_edges("cloud_enum", _edge_after_cloud_enum, {
+        "vuln_scan": "vuln_scan", "exploit_decision": "exploit_decision",
+    })
+    graph.add_conditional_edges("cloud_exploit", _edge_after_cloud_exploit, {
         "vuln_scan": "vuln_scan", "exploit_decision": "exploit_decision",
     })
     graph.add_edge("vuln_scan", "exploit_decision")
@@ -3833,6 +4032,11 @@ def _build_graph_supervisor(checkpointer=None):
     graph.add_node("vuln_scan",           node_vuln_scan)
     graph.add_node("surface_enum",        node_surface_enum)
     graph.add_node("intel_harvest",       node_intel_harvest)
+    graph.add_node("smb_enum",            node_smb_enum)
+    graph.add_node("ldap_enum",           node_ldap_enum)
+    graph.add_node("kerberos_attack",     node_kerberos_attack)
+    graph.add_node("cloud_enum",         node_cloud_enum)
+    graph.add_node("cloud_exploit",       node_cloud_exploit)
     graph.add_node("exploit_decision",    node_exploit_decision)
     graph.add_node("human_approval",      node_human_approval)
     graph.add_node("foothold_attempt",    node_foothold_attempt)
@@ -3849,8 +4053,9 @@ def _build_graph_supervisor(checkpointer=None):
     graph.add_edge(START, "supervisor")
 
     PHASE_NODES = [
-        "recon", "surface_enum", "intel_harvest", "vuln_scan",
-        "exploit_decision", "human_approval", "foothold_attempt",
+        "recon", "surface_enum", "intel_harvest", "smb_enum",
+        "ldap_enum", "kerberos_attack", "cloud_enum", "cloud_exploit",
+        "vuln_scan", "exploit_decision", "human_approval", "foothold_attempt",
         "secondary_attack", "post_foothold_enum", "post_foothold_approval",
         "internal_scan", "privesc_attempt", "lateral_movement",
         "persistence", "objective_collect",

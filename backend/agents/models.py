@@ -182,6 +182,7 @@ class ParsedIntent(BaseModel):
 	ambiguity_level: AmbiguityLevel = "vague"
 	clarification_needed: list[str] = Field(default_factory=list)
 	raw_prompt: str = ""
+	chain_template_id: str = "web"
 
 
 class SafetyCheckResult(BaseModel):
@@ -513,6 +514,7 @@ class PentestState(BaseModel):
 	safety_check_result: Optional[dict[str, Any]] = None
 	authorization_token: Optional[str] = None
 	workflow_mode: WorkflowMode = "pentest_engineer"
+	chain_template_id: str = "web"
 	auto_approve: bool = False
 	success_gate_level: str = "strict"
 	risk_budget: int = 3

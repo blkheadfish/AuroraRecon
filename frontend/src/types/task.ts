@@ -30,6 +30,11 @@ export interface Finding {
   evidence_snippets?: { kind?: string; text?: string; source?: string }[]
 }
 
+export interface ChainTemplateInfo {
+  id: string
+  pipeline_steps: { key: string; label: string }[]
+}
+
 export interface TaskSummary {
   task_id: string
   target: string
@@ -40,6 +45,8 @@ export interface TaskSummary {
   report_path?: string | null
   created_at?: string
   updated_at?: string
+  chain_template_id?: string
+  chain_template?: ChainTemplateInfo
   workflow_mode?: WorkflowMode | string
   auto_approve?: boolean
 }
@@ -140,6 +147,7 @@ export interface TaskDetail extends TaskSummary {
   checkpoint_history?: CheckpointPayload[]
   pending_user_prompt?: string
   attack_graph?: AttackGraphPayload
+  chain_template?: ChainTemplateInfo
 }
 
 export interface TaskLogsPage {

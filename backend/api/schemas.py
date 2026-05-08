@@ -105,6 +105,8 @@ class TaskSummary(BaseModel):
     updated_at: str = ""
     workflow_mode: str = "pentest_engineer"
     auto_approve: bool = False
+    chain_template_id: str = "web"
+    chain_template: Optional[dict] = None
 
 
 class PendingConfirmationResponse(BaseModel):

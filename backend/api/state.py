@@ -20,6 +20,7 @@ from datetime import datetime
 from typing import Optional
 
 from backend.agents.models import PentestState, TaskStatus
+from backend.agents.chain_templates import pipeline_steps_for
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +163,7 @@ class TaskStateManager:
 
     def to_summary(self, state: PentestState) -> dict:
         from backend.api.schemas import TaskSummary
+        tid = getattr(state, "chain_template_id", "web")
         return TaskSummary(
             task_id=state.task_id,
             target=state.target,
@@ -175,6 +177,11 @@ class TaskStateManager:
             updated_at=datetime.utcnow().isoformat(),
             workflow_mode=state.workflow_mode,
             auto_approve=state.auto_approve,
+            chain_template_id=tid,
+            chain_template={
+                "id": tid,
+                "pipeline_steps": pipeline_steps_for(tid),
+            },
         ).model_dump()
 
     def to_detail(self, state: PentestState) -> dict:
@@ -403,6 +410,10 @@ class TaskStateManager:
             "attack_next_steps": state.attack_next_steps,
             "privesc_attempt_count": state.privesc_attempt_count,
             "attack_graph": state.attack_graph.to_payload() if state.attack_graph else {"nodes": [], "edges": []},
+            "chain_template": {
+                "id": getattr(state, "chain_template_id", "web"),
+                "pipeline_steps": pipeline_steps_for(getattr(state, "chain_template_id", "web")),
+            },
         }
 
     @staticmethod
