@@ -64,10 +64,8 @@ def get_stats() -> dict[str, Any]:
 
     for r in records:
         sid = r.get("skill_id", "unknown")
-        # 兼容旧日志:优先读新字段 workflow_mode,回落到旧字段 operator_role
         role = r.get("workflow_mode") or r.get("operator_role") or "unknown"
 
-        # Per-skill stats
         entry = per_skill.setdefault(sid, {"total": 0, "success": 0, "avg_elapsed": 0.0})
         entry["total"] += 1
         if r.get("success"):
@@ -77,7 +75,6 @@ def get_stats() -> dict[str, Any]:
             (entry["avg_elapsed"] * (entry["total"] - 1) + elapsed) / entry["total"]
         )
 
-        # Per-role stats
         role_entry = per_role.setdefault(role, {
             "total": 0, "success": 0, "false_positives": 0,
             "avg_rounds": 0.0, "evidence_completeness": 0.0,

@@ -27,7 +27,6 @@ from backend.skills.models import MatchRule, Skill
 
 logger = logging.getLogger(__name__)
 
-# 类别优先级：越具体越优先（同分时的 tiebreaker）
 _CATEGORY_PRIORITY = {
     "java_deserialization": 10,
     "web_rce": 9,
@@ -44,10 +43,6 @@ _SERVICE_FINDING_NAMES = frozenset({
     "redis service", "mongodb service", "snmp service", "vnc service",
 })
 
-# workflow_mode → Skill matching thresholds
-# 这些只是"兜底默认值",真正生效的是从 PentestState 里传下来的
-# skill_min_score / skill_weak_boost(per-task)。match() 里优先使用外部
-# 显式传入的阈值,只有当外部没传时才回落到这张表。
 _MODE_MATCH_CONFIG: dict[str, dict] = {
     "pentest_engineer": {
         "min_score": 20,
@@ -116,7 +111,6 @@ class SkillRegistry:
         min_threshold = cfg["min_score"] if min_score is None else int(min_score)
         boost = cfg["weak_signal_boost"] if weak_signal_boost is None else int(weak_signal_boost)
 
-        # KB 命中 → Skill 加分映射：{skill_id: extra_score}
         kb_skill_boost = self._compute_kb_dispatch_boost(finding, kb_hits or [])
 
         scored: list[tuple[int, Skill]] = []
@@ -127,7 +121,6 @@ class SkillRegistry:
             if kb_extra:
                 score += kb_extra
             if score > 0 and boost and score < 60 and not kb_extra:
-                # 弱信号加权仅对 KB 未命中的低分 Skill 生效，避免与 +150 叠加
                 score += boost
             if score >= min_threshold:
                 scored.append((score, skill))
@@ -138,7 +131,6 @@ class SkillRegistry:
             )
             return None
 
-        # 按分数降序，同分按类别优先级降序
         scored.sort(
             key=lambda x: (
                 x[0],
@@ -222,7 +214,6 @@ class SkillRegistry:
             if not associated:
                 continue
 
-            # 置信度越高加分越多，但全部 ≥ 100，确保超过 CVE 关键词 +60
             confidence = float(hit.get("confidence") or 0.7)
             extra = 150 if confidence >= 0.85 else 120
             prev = boost.get(skill_id, 0)
@@ -288,7 +279,6 @@ class SkillRegistry:
         self._loaded = True
         logger.info(f"[SkillRegistry] 重载完成，共 {len(new_skills)} 个 Skill")
 
-    # ─────────────────────────────────────────────────────
 
     @staticmethod
     def _score_skill(
@@ -317,7 +307,6 @@ class SkillRegistry:
         jp_lower = json_probe.lower()
         vars_dict = context_vars or {}
 
-        # 排除规则优先
         for ex_rule in match_cfg.exclude:
             if ex_rule.matches(
                 fingerprint=fingerprint,
@@ -336,54 +325,38 @@ class SkillRegistry:
         for rule in match_cfg.rules:
             rule_score = 0
 
-            # variable_present 是门控条件：若声明但无匹配变量，跳过整条规则
             if rule.variable_present:
                 if not any(bool(vars_dict.get(v)) for v in rule.variable_present):
                     continue
-                rule_score += 30  # 运行时变量命中（强信号）
+                rule_score += 30
 
-            # tool_is 精确匹配（最强信号）：用于 fact_sink / VulnAgent 合成的
-            # service-level finding（cred-replay / service-sweep）精确路由到
-            # 专用 Skill。给 +120 分确保它能压过 ssh_exploit 等 service+port 规则
-            # （后者最高 60 + 30 + 25 = 115）。
             if rule.tool_is and finding.tool:
                 if rule.tool_is.lower() == finding.tool.lower():
                     rule_score += 120
 
-            # CVE 精确匹配（最强信号）
             if rule.cve_matches and cve_lower:
                 if any(c.lower() == cve_lower for c in rule.cve_matches):
                     rule_score += 100
 
-            # 漏洞名称命中 Skill 关键词
-            # 比如 finding.name="Apache Shiro 反序列化" 命中 shiro skill 的
-            # fingerprint_contains=["shiro"]
             if rule.fingerprint_contains:
                 if any(kw.lower() in name_lower for kw in rule.fingerprint_contains):
                     rule_score += 60
-                # 指纹匹配（比名称弱——"tomcat" 出现在指纹里可能只是宿主）
                 elif any(kw.lower() in fp_lower for kw in rule.fingerprint_contains):
                     rule_score += 20
 
-            # JSON 探测结果
             if rule.json_probe_result and jp_lower:
                 if rule.json_probe_result.lower() in jp_lower:
                     rule_score += 40
 
-            # 证据关键词（最弱信号）
             if rule.evidence_contains:
                 if any(kw.lower() in ev_lower for kw in rule.evidence_contains):
                     rule_score += 10
 
-            # 端口/服务匹配
-            # For generic service findings (e.g. "SSH Service"), port match
-            # is a strong signal (+30); for specific CVE findings it's weaker (+5)
             if rule.port_is and finding.port:
                 if finding.port in rule.port_is:
                     is_service_finding = name_lower in _SERVICE_FINDING_NAMES
                     rule_score += 30 if is_service_finding else 5
 
-            # service_is matching (for service-level findings)
             if rule.service_is and name_lower:
                 svc_kw = rule.service_is.lower()
                 if svc_kw in name_lower or svc_kw in fp_lower:
@@ -420,7 +393,6 @@ class SkillRegistry:
         )
 
 
-# ── Module-level singleton (thread-safe) ─────────────────
 _registry_lock = threading.Lock()
 _registry_singleton: SkillRegistry | None = None
 
@@ -439,7 +411,6 @@ def get_registry() -> SkillRegistry:
     return _registry_singleton
 
 
-# ── Dev-mode YAML hot-reload watcher ────────────────────
 _watcher_started = False
 
 

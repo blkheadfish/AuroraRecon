@@ -3,9 +3,19 @@ skills/loader.py
 YAML Skill 加载器
 
 职责：
-  - 扫描 skills/ 目录下所有 .yaml 文件
+  - 扫描 skills/ 目录下所有 skill.yaml（新格式）或 *.yaml（旧格式）
   - 反序列化为 Skill 数据模型
+  - 同时加载侧边 SKILL.md AI 引导文档
   - 校验必填字段
+
+新格式（推荐）：
+  skills/<category>/<skill>/
+    skill.yaml    ← 匹配规则 + 路径定义
+    SKILL.md      ← AI 引导文档
+    scripts/      ← 执行脚本
+
+旧格式（向后兼容）：
+  skills/<category>/<skill>.yaml
 """
 from __future__ import annotations
 
@@ -26,30 +36,68 @@ from backend.skills.models import (
     Skill,
     SuccessCriteria,
 )
+from backend.skills.skill_doc import load_skill_doc
 
 logger = logging.getLogger(__name__)
 
 SKILLS_DIR = Path(__file__).parent
 
+# 不扫描 YAML 的子目录
+_SKIP_DIRS = {"scripts", "references", "workflows", "templates", "examples"}
+
 
 def load_all_skills() -> list[Skill]:
-    """扫描并加载所有 Skill YAML 文件"""
+    """扫描并加载所有 Skill YAML 文件（兼容新旧格式）"""
     skills: list[Skill] = []
+    loaded_dirs: set[Path] = set()
 
-    for yaml_path in SKILLS_DIR.rglob("*.yaml"):
+    # 1) 新格式：扫描 */skill.yaml
+    for yaml_path in SKILLS_DIR.rglob("skill.yaml"):
+        parent_dir = yaml_path.parent
+        if _should_skip_path(parent_dir):
+            continue
         try:
             skill = load_skill(yaml_path)
             skills.append(skill)
-            logger.info(f"[SkillLoader] 加载: {skill.skill_id} ({yaml_path.name})")
+            loaded_dirs.add(parent_dir)
+            logger.info("[SkillLoader] 加载: %s (%s)", skill.skill_id, yaml_path.parent.name)
         except Exception as e:
-            logger.warning(f"[SkillLoader] 加载失败 {yaml_path}: {e}")
+            logger.warning("[SkillLoader] 加载失败 %s: %s", yaml_path, e)
 
-    logger.info(f"[SkillLoader] 共加载 {len(skills)} 个 Skill")
+    # 2) 旧格式：扫描剩余 *.yaml（不在已加载目录或跳过目录中）
+    for yaml_path in SKILLS_DIR.rglob("*.yaml"):
+        if yaml_path.name == "skill.yaml":
+            continue  # 已在上面处理
+        parent_dir = yaml_path.parent
+        if parent_dir in loaded_dirs:
+            continue  # 该目录已有新格式
+        if _should_skip_path(parent_dir):
+            continue
+        try:
+            skill = load_skill(yaml_path)
+            skills.append(skill)
+            logger.info("[SkillLoader] 加载(旧): %s (%s)", skill.skill_id, yaml_path.name)
+        except Exception as e:
+            logger.warning("[SkillLoader] 加载失败 %s: %s", yaml_path, e)
+
+    logger.info("[SkillLoader] 共加载 %d 个 Skill", len(skills))
     return skills
 
 
+def _should_skip_path(path: Path) -> bool:
+    """检查路径是否属于不该扫描的目录"""
+    for part in path.parts:
+        if part in _SKIP_DIRS:
+            return True
+    return False
+
+
 def load_skill(path: Path) -> Skill:
-    """加载单个 YAML 文件为 Skill 对象"""
+    """
+    加载单个 YAML 文件为 Skill 对象。
+
+    同时尝试加载同目录下的 SKILL.md 作为 AI 引导文档（可选）。
+    """
     with open(path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
 
@@ -73,13 +121,17 @@ def load_skill(path: Path) -> Skill:
         remediation=raw.get("remediation", ""),
         source_file=str(path),
     )
+
+    # 加载侧边 SKILL.md（AI 引导文档，可选）
+    skill_dir = path.parent
+    doc_path = skill_dir / "SKILL.md"
+    if doc_path.exists():
+        skill.doc = load_skill_doc(doc_path)
+
     _validate_variable_consistency(skill, path)
     return skill
 
 
-# ─────────────────────────────────────────────────────────
-# 内部解析函数
-# ─────────────────────────────────────────────────────────
 
 def _parse_match(raw: dict) -> MatchConfig:
     return MatchConfig(
