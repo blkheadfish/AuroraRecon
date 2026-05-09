@@ -71,9 +71,55 @@ class ParsedDecision:
 
 
 _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
-_JSON_OBJECT_RE = re.compile(r"\{[\s\S]*\}")
 _TRAILING_COMMA_RE = re.compile(r",(\s*[}\]])")
 _SINGLE_QUOTE_KEY_RE = re.compile(r"'([^']+)'(\s*):")
+_LINE_COMMENT_RE = re.compile(r"//[^\n]*")
+_BLOCK_COMMENT_RE = re.compile(r"/\*[\s\S]*?\*/")
+_UNQUOTED_KEY_RE = re.compile(r'(?<=\{|\s*,\s*)(\w[\w.]*)(\s*):(?!\s*")')
+_PYTHON_DICT_RE = re.compile(r"\{'([^']+)'(\s*):" )
+_BOM_RE = re.compile(r"^[﻿​‌‍￯]+")
+
+
+def _strip_invisible(text: str) -> str:
+    """Remove BOM and zero-width characters from the start."""
+    return _BOM_RE.sub("", text)
+
+
+def _remove_json_comments(text: str) -> str:
+    """Strip // and /* */ style comments from JSON-ish text."""
+    text = _BLOCK_COMMENT_RE.sub("", text)
+    text = _LINE_COMMENT_RE.sub("", text)
+    return text
+
+
+def _extract_json_balanced(text: str) -> str:
+    """Extract the first balanced {} object from text (non-regex)."""
+    start = text.find("{")
+    if start == -1:
+        return text
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_string:
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return text[start:]
 
 
 def _extract_json_candidate(text: str) -> str:
@@ -82,69 +128,184 @@ def _extract_json_candidate(text: str) -> str:
     m = _JSON_BLOCK_RE.search(text)
     if m:
         return m.group(1).strip()
-    # Try to find the outermost {} pair
-    m = _JSON_OBJECT_RE.search(text)
-    if m:
-        return m.group(0).strip()
+    # Try balanced brace extraction
+    extracted = _extract_json_balanced(text)
+    if len(extracted) < len(text):
+        return extracted.strip()
     return text.strip()
 
 
 def _repair_json(text: str) -> str:
     """Apply successive JSON repairs without throwing."""
+    # Remove // and /* */ comments
+    text = _remove_json_comments(text)
     # Remove trailing commas before } or ]
     text = _TRAILING_COMMA_RE.sub(r"\1", text)
     # Fix single-quoted keys: 'key': → "key":
     text = _SINGLE_QUOTE_KEY_RE.sub(r'"\1"\2', text)
+    # Fix Python-style keys: {'key': → {"key":
+    text = _PYTHON_DICT_RE.sub(r'{"\1"\2', text)
     return text
+
+
+def _fix_unquoted_keys(text: str) -> str:
+    """Quote JavaScript-style unquoted keys: {action: "x"} → {"action": "x"}."""
+    # Only replace keys that look like identifiers, not already quoted
+    return _UNQUOTED_KEY_RE.sub(r'"\1"\2', text)
+
+
+def _auto_close_json(text: str) -> str:
+    """Attempt to auto-close a truncated JSON object by adding missing } and ". """
+    # Count braces
+    opens = text.count("{") - text.count("}")
+    if opens <= 0:
+        return text
+    # Check if last char is an incomplete string value (odd number of quotes)
+    in_str = False
+    escaped = False
+    for ch in text:
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+    if in_str:
+        text += '"'
+    return text + ("}" * opens)
 
 
 def parse_react_decision(response_raw: str) -> ParsedDecision:
     """
     把 LLM 返回的 JSON 字符串解析成 ``ParsedDecision``。
 
-    多策略降级：
+    多策略降级（按顺序尝试，任一成功即返回）：
       1. 直接 ``json.loads``
-      2. 从 markdown 代码块 / 自由文本中提取 JSON
-      3. 修复尾部逗号 + 单引号 key → json.loads
-      4. 单引号全局替换 → json.loads（最激进）
+      2. 去除 BOM/不可见字符 → json.loads
+      3. 处理双重转义的 JSON 字符串 → json.loads
+      4. 提取 markdown 代码块 / 平衡括号 JSON → json.loads
+      5. 去除注释 (//, /* */) → json.loads
+      6. 修复尾部逗号 + 单引号 key + Python dict → json.loads
+      7. 修复无引号 JS key → json.loads
+      8. 自动闭合截断的 JSON → json.loads
+      9. 激进: 单引号全局替换 → json.loads
+     10. 最后手段: 正则逐字段提取
     """
     if not response_raw or not isinstance(response_raw, str):
         return ParsedDecision(ok=False, decision={}, raw="")
 
     raw_preview = response_raw[:1000]
 
-    # Strategy 1: direct parse
+    def _success(parsed) -> bool:
+        return isinstance(parsed, dict) and "action" in parsed
+
+    # S1: direct parse
     try:
         parsed = json.loads(response_raw)
-        if isinstance(parsed, dict):
+        if _success(parsed):
             return ParsedDecision(ok=True, decision=parsed, raw=raw_preview)
     except json.JSONDecodeError:
         pass
 
-    # Strategy 2: extract from markdown / free text, then direct parse
-    candidate = _extract_json_candidate(response_raw)
-    if candidate != response_raw:
-        try:
-            parsed = json.loads(candidate)
-            if isinstance(parsed, dict):
-                return ParsedDecision(ok=True, decision=parsed, raw=raw_preview[:500])
-        except json.JSONDecodeError:
-            pass
-
-    # Strategy 3: repair trailing commas + single-quoted keys
+    # S2: strip BOM / invisible chars
     try:
-        repaired = _repair_json(candidate)
-        parsed = json.loads(repaired)
-        if isinstance(parsed, dict):
+        clean = _strip_invisible(response_raw)
+        parsed = json.loads(clean)
+        if _success(parsed):
             return ParsedDecision(ok=True, decision=parsed, raw=raw_preview[:500])
     except json.JSONDecodeError:
         pass
 
-    # Strategy 4: fallback — global single-quote → double-quote
+    # S3: handle double-escaped JSON string: "\"{...}\""
     try:
-        parsed = json.loads(candidate.replace("'", '"'))
-        if isinstance(parsed, dict):
+        stripped = response_raw.strip().strip('"')
+        unescaped = stripped.encode().decode("unicode_escape")
+        if unescaped.strip().startswith("{"):
+            parsed = json.loads(unescaped)
+            if _success(parsed):
+                return ParsedDecision(ok=True, decision=parsed, raw=raw_preview[:500])
+    except (json.JSONDecodeError, UnicodeDecodeError, Exception):
+        pass
+
+    # S4: extract JSON from markdown / free text
+    candidate = _extract_json_candidate(response_raw)
+    if candidate != response_raw:
+        try:
+            parsed = json.loads(candidate)
+            if _success(parsed):
+                return ParsedDecision(ok=True, decision=parsed, raw=raw_preview[:500])
+        except json.JSONDecodeError:
+            pass
+
+    # S5: remove comments
+    try:
+        no_comments = _remove_json_comments(candidate)
+        if no_comments != candidate:
+            parsed = json.loads(no_comments)
+            if _success(parsed):
+                return ParsedDecision(ok=True, decision=parsed, raw=raw_preview[:500])
+    except json.JSONDecodeError:
+        pass
+
+    # S6: repair trailing commas + single-quoted keys + python dict
+    try:
+        repaired = _repair_json(candidate)
+        parsed = json.loads(repaired)
+        if _success(parsed):
             return ParsedDecision(ok=True, decision=parsed, raw=raw_preview[:500])
+    except json.JSONDecodeError:
+        pass
+
+    # S7: fix unquoted JS keys
+    try:
+        with_keys = _fix_unquoted_keys(repaired)
+        if with_keys != repaired:
+            parsed = json.loads(with_keys)
+            if _success(parsed):
+                return ParsedDecision(ok=True, decision=parsed, raw=raw_preview[:500])
+    except json.JSONDecodeError:
+        pass
+
+    # S8: auto-close truncated JSON
+    try:
+        closed = _auto_close_json(repaired)
+        if closed != repaired:
+            parsed = json.loads(closed)
+            if _success(parsed):
+                return ParsedDecision(ok=True, decision=parsed, raw=raw_preview[:500])
+    except json.JSONDecodeError:
+        pass
+
+    # S9: aggressive — global single-quote → double-quote
+    # Only apply if there are single quotes (avoid corrupting valid JSON with apostrophes)
+    single_quoted = candidate if "'" in candidate else repaired
+    try:
+        full_replaced = single_quoted.replace("'", '"')
+        parsed = json.loads(full_replaced)
+        if _success(parsed):
+            return ParsedDecision(ok=True, decision=parsed, raw=raw_preview[:500])
+    except json.JSONDecodeError:
+        pass
+
+    # S10: last resort — regex field extraction from mangled JSON
+    try:
+        fields = {}
+        for key in ("action", "thinking", "purpose", "command", "reason", "shell_type"):
+            escaped = re.escape(key)
+            # Match: "key": "value" or "key": 'value' or key: "value"
+            for pat in (
+                rf'["\']?{escaped}["\']?\s*:\s*"([^"]*)"',
+                rf'["\']?{escaped}["\']?\s*:\s*\'([^\']*)\'',
+                rf'{escaped}\s*:\s*"([^"]*)"',
+            ):
+                m = re.search(pat, response_raw[:3000], re.IGNORECASE)
+                if m:
+                    fields[key] = m.group(1)
+                    break
+        if fields.get("action"):
+            return ParsedDecision(ok=True, decision=fields, raw=raw_preview[:500])
     except Exception:
         pass
 
