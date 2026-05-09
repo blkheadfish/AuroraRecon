@@ -49,6 +49,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     hashcat \
     enum4linux smbclient ldap-utils onesixtyone \
     tcpdump tshark socat \
+    snmp snmpcheck dnsenum nfs-common rpcbind \
+    impacket-scripts \
     wordlists \
     && rm -rf /var/lib/apt/lists/*
 
@@ -101,6 +103,22 @@ RUN apt-get update \
         || { echo "Retry $i..."; apt-get update --fix-missing; sleep 5; }; \
     done \
     && rm -rf /var/lib/apt/lists/*
+
+# ---------- Ruby + evil-winrm（WinRM 后渗透，国内镜像）----------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ruby ruby-dev \
+    && gem sources --remove https://rubygems.org/ 2>/dev/null || true \
+    && gem sources -a https://gems.ruby-china.com/ \
+    && gem install evil-winrm --no-document \
+    && rm -rf /var/lib/apt/lists/* \
+    || echo "WARN: evil-winrm install failed"
+
+# ---------- pysnmp（SNMP shell 依赖，优先 apt，国内 PyPI 兜底）----------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3-pysnmp 2>/dev/null \
+    || pip3 install -i https://mirrors.aliyun.com/pypi/simple/ \
+        --no-cache-dir --break-system-packages --ignore-installed pysnmp \
+    && rm -rf /var/lib/apt/lists/* || true
 
 # ---------- Nuclei 二进制 ----------
 RUN NUCLEI_VER="3.3.8" \
@@ -177,6 +195,10 @@ ENV JAVA8=/usr/lib/jvm/java-8/bin/java
 
 # 验证两个 JDK 共存
 RUN ${JAVA8} -version 2>&1 | head -1 && java -version 2>&1 | head -1
+
+# ---------- snmp-shell.py ----------
+COPY snmp-shell.py /opt/snmp-shell.py
+RUN chmod +x /opt/snmp-shell.py
 
 # ---------- Legacy SSH 客户端（OpenSSH 7.4p1 + OpenSSL 1.0.2k）----------
 # 专供"日志投毒"场景（新版 OpenSSH 会过滤 invalid-character 用户名，
