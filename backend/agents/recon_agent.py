@@ -564,6 +564,10 @@ class ReconAgent:
 			"mysql": ({3306}, "mysql-vuln-cve2012-2122,mysql-empty-password,mysql-enum"),
 			"rdp": ({3389}, "rdp-vuln-ms12-020"),
 			"smtp": ({25, 587}, "smtp-vuln-cve2010-4344,smtp-open-relay"),
+			"snmp": ({161}, "snmp-info,snmp-sysdescr,snmp-brute"),
+			"dns": ({53}, "dns-zone-transfer,dns-brute"),
+			"nfs": ({2049}, "nfs-ls,nfs-statfs,nfs-showmount"),
+			"mssql": ({1433}, "ms-sql-info,ms-sql-hasdbaccess,ms-sql-empty-password"),
 		}
 
 		svc_port_map: dict[str, list[int]] = {}

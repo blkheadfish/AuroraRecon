@@ -124,3 +124,12 @@
   category: general
   timeout: 30
   description: "Apache HTTP 服务器控制（攻击机侧，用于向靶机提供 exp/payload）"
+
+# ---------- NFS ----------
+
+- name: mount.nfs
+  executor: container
+  command: "mount.nfs"
+  category: general
+  timeout: 30
+  description: "挂载 NFS 共享（需 --privileged 容器）"

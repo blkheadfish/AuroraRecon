@@ -103,6 +103,8 @@ class ExecuteResult:
     command:   str = ""
     tool_name: str = ""
     backend:   str = ""
+    timed_out: bool = False
+    container_crashed: bool = False
 
 
 
@@ -334,6 +336,7 @@ class ToolExecutor:
                     record_round=record_round,
                     record_command=effective_record_command,
                     record_runtime_command=record_runtime_command,
+                    task_id=task_id,
                 )
             else:
                 if publish_ports and container_name:
@@ -359,6 +362,12 @@ class ToolExecutor:
         )
 
 
+    _CRASH_PATTERNS = (
+        "No such container",
+        "container is not running",
+        "is not running",
+    )
+
     async def _run_docker_exec(
         self,
         tool: str,
@@ -376,6 +385,7 @@ class ToolExecutor:
         record_command: Optional[str] = None,
         record_runtime_command: Optional[str] = None,
         input_data: Optional[str] = None,
+        task_id: Optional[str] = None,
     ) -> ExecuteResult:
         tool_def = self._registry.get_or_default(tool)
         env_args: list[str] = []
@@ -420,7 +430,7 @@ class ToolExecutor:
             try: await log_callback(log_msg)
             except Exception: pass
 
-        return await self._run_subprocess(
+        result = await self._run_subprocess(
             tool, cmd, "container-exec",
             timeout=timeout, input_data=effective_input, log_callback=log_callback,
             record_callback=record_callback,
@@ -430,6 +440,41 @@ class ToolExecutor:
             record_command=record_command,
             record_runtime_command=record_runtime_command or runtime_display_cmd,
         )
+
+        if not result.success and task_id:
+            stderr_lower = result.stderr.lower()
+            if any(p.lower() in stderr_lower for p in self._CRASH_PATTERNS):
+                logger.warning(
+                    f"[Executor] 容器 {container_name[:20]} 已退出，尝试重启并重试"
+                )
+                try:
+                    new_name = await TaskContainerManager.start(task_id)
+                    # rebuild cmd with the new container name
+                    retry_cmd = [new_name if a == container_name else a for a in cmd]
+                    retry_display = (record_runtime_command or runtime_display_cmd).replace(
+                        container_name, new_name
+                    )
+                    if log_callback:
+                        try:
+                            await log_callback(f"🔄 容器已重启 {new_name[:20]}，重试命令...")
+                        except Exception:
+                            pass
+                    result = await self._run_subprocess(
+                        tool, retry_cmd, "container-exec",
+                        timeout=timeout, input_data=effective_input,
+                        log_callback=log_callback,
+                        record_callback=record_callback,
+                        record_phase=record_phase,
+                        record_purpose=record_purpose,
+                        record_round=record_round,
+                        record_command=record_command,
+                        record_runtime_command=retry_display,
+                    )
+                    result.container_crashed = True
+                except Exception as e:
+                    logger.error(f"[Executor] 容器重启失败: {e}")
+
+        return result
 
 
     def _build_docker_run_cmd(self, tool_def, args, env, workdir, publish_ports=None) -> list[str]:
@@ -581,6 +626,7 @@ class ToolExecutor:
                             "exit_code": -1,
                             "elapsed": round(elapsed, 3),
                             "truncated": False,
+                            "timed_out": True,
                             "total_len": sum(len(l) for l in stdout_lines + stderr_lines),
                         },
                     )
@@ -590,6 +636,7 @@ class ToolExecutor:
                         stderr=f"执行超时（{timeout}秒）",
                         exit_code=-1, elapsed=elapsed,
                         command=" ".join(cmd), tool_name=tool, backend=backend_label,
+                        timed_out=True,
                     )
 
                 stdout = "\n".join(stdout_lines)
@@ -628,6 +675,7 @@ class ToolExecutor:
                             "exit_code": -1,
                             "elapsed": round(elapsed, 3),
                             "truncated": False,
+                            "timed_out": True,
                             "total_len": len(f"执行超时（{timeout}秒）"),
                         },
                     )
@@ -635,6 +683,7 @@ class ToolExecutor:
                         success=False, stdout="", stderr=f"执行超时（{timeout}秒）",
                         exit_code=-1, elapsed=elapsed,
                         command=" ".join(cmd), tool_name=tool, backend=backend_label,
+                        timed_out=True,
                     )
 
                 elapsed = time.monotonic() - start

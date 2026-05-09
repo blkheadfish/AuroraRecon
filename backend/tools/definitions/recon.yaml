@@ -122,3 +122,58 @@
   category: recon
   timeout: 120
   description: "多引擎资产发现（Shodan/Fofa/Hunter）"
+
+# ---------- SNMP ----------
+
+- name: snmpwalk
+  executor: container
+  command: "snmpwalk"
+  category: recon
+  timeout: 120
+  description: "SNMP MIB 树遍历枚举"
+
+- name: snmp-check
+  executor: container
+  command: "snmp-check"
+  category: recon
+  timeout: 120
+  description: "SNMP 综合性枚举（用户/进程/网络接口）"
+
+- name: onesixtyone
+  executor: container
+  command: "onesixtyone"
+  category: recon
+  timeout: 120
+  description: "SNMP 社区字符串暴力枚举"
+
+# ---------- DNS ----------
+
+- name: dig
+  executor: container
+  command: "dig"
+  category: recon
+  timeout: 30
+  description: "DNS 查询工具（A/AAAA/MX/NS/ANY/axfr 域传送）"
+
+- name: dnsenum
+  executor: container
+  command: "dnsenum"
+  category: recon
+  timeout: 300
+  description: "DNS 综合性枚举（域传送/反向解析/子域爆破/google搜索）"
+
+# ---------- NFS ----------
+
+- name: showmount
+  executor: container
+  command: "showmount"
+  category: recon
+  timeout: 30
+  description: "NFS 导出列表查询"
+
+- name: rpcinfo
+  executor: container
+  command: "rpcinfo"
+  category: recon
+  timeout: 30
+  description: "RPC 服务端口映射查询（NFS 依赖 RPC）"

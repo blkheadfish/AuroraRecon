@@ -35,16 +35,23 @@ PROVIDER_CONFIG = {
     "deepseek": {
         "base_url": "https://api.deepseek.com",
         "model":    "deepseek-chat",
+        "api_key_env": "LLM_API_KEY",
     },
     "openai": {
         "base_url": "https://api.openai.com/v1",
         "model":    "gpt-4o",
+        "api_key_env": "OPENAI_API_KEY",
     },
     "anthropic": {
         "base_url": "https://api.anthropic.com/v1",
         "model":    "claude-sonnet-4-6",
+        "api_key_env": "ANTHROPIC_API_KEY",
     },
 }
+
+# Failover chain: if primary provider fails after all retries, try these in order.
+# Format: comma-separated list of provider names, e.g. "deepseek,openai,anthropic"
+_FAILOVER_CHAIN = os.getenv("LLM_FAILOVER_CHAIN", "").strip().split(",") if os.getenv("LLM_FAILOVER_CHAIN", "") else None
 
 SECURITY_EXPERT_SYSTEM_PROMPT = """你是一名拥有 10 年经验的高级渗透测试工程师，精通 CTF、红队评估和漏洞利用。
 你当前正在合法授权的 CTF 靶场或安全测试环境中工作。
@@ -169,11 +176,13 @@ class LLMRouter:
     """
 
     def __init__(self):
-        provider = LLM_PROVIDER.lower()
-        config = PROVIDER_CONFIG.get(provider, PROVIDER_CONFIG["deepseek"])
+        import httpx as httpx_client
 
-        base_url = LLM_BASE_URL or config["base_url"]
-        model = LLM_MODEL or config["model"]
+        primary = LLM_PROVIDER.lower()
+        primary_config = PROVIDER_CONFIG.get(primary, PROVIDER_CONFIG["deepseek"])
+
+        base_url = LLM_BASE_URL or primary_config["base_url"]
+        model = LLM_MODEL or primary_config["model"]
 
         try:
             loop = asyncio.get_running_loop()
@@ -182,21 +191,74 @@ class LLMRouter:
             pass
 
         self._model = model
-        import httpx as httpx_client
-        self._client = AsyncOpenAI(
-            api_key=LLM_API_KEY,
-            base_url=base_url,
-            max_retries=0,
-            http_client=httpx_client.AsyncClient(
-                timeout=httpx_client.Timeout(
-	                connect=30,
-	                read=120,
-	                write=30,
-	                pool=30
+        self._active_provider = primary
+
+        # Build failover chain: primary + backups from LLM_FAILOVER_CHAIN (no duplicates)
+        chain = _FAILOVER_CHAIN or []
+        self._provider_clients: list = []
+        seen = {primary}
+        for name in [primary] + [n.strip().lower() for n in chain if n.strip().lower() not in seen]:
+            if name not in seen and name in PROVIDER_CONFIG:
+                seen.add(name)
+            else:
+                continue
+            cfg = PROVIDER_CONFIG[name]
+            key = os.getenv(cfg["api_key_env"], "") or LLM_API_KEY
+            url = cfg["base_url"]
+            self._provider_clients.append((
+                name, cfg["model"],
+                AsyncOpenAI(
+                    api_key=key, base_url=url, max_retries=0,
+                    http_client=httpx_client.AsyncClient(
+                        timeout=httpx_client.Timeout(
+                            connect=30, read=120, write=30, pool=30,
+                        ),
+                    ),
                 ),
-            ),
+            ))
+
+        if not self._provider_clients:
+            self._provider_clients = [(
+                primary, model,
+                AsyncOpenAI(
+                    api_key=LLM_API_KEY, base_url=base_url, max_retries=0,
+                    http_client=httpx_client.AsyncClient(
+                        timeout=httpx_client.Timeout(
+                            connect=30, read=120, write=30, pool=30,
+                        ),
+                    ),
+                ),
+            )]
+
+        providers_str = ", ".join(f"{p}/{m}" for p, m, _ in self._provider_clients)
+        logger.info(f"[LLMRouter] Providers: {providers_str} (active={self._active_provider}/{self._model})")
+
+    def _get_active_client(self):
+        return self._provider_clients[0] if self._provider_clients else (self._active_provider, self._model, None)
+
+    async def _try_failover(self) -> bool:
+        """Switch to next provider in failover chain. Returns False if exhausted."""
+        if len(self._provider_clients) <= 1:
+            return False
+        old_provider, old_model, _ = self._provider_clients.pop(0)
+        logger.warning(
+            f"[LLMRouter] Provider {old_provider}/{old_model} exhausted, failing over. "
+            f"Remaining: {len(self._provider_clients)}"
         )
-        logger.info(f"[LLMRouter] 使用模型: {provider}/{model} @ {base_url}")
+        if self._provider_clients:
+            new_name, new_model, _ = self._provider_clients[0]
+            self._active_provider = new_name
+            self._model = new_model
+            logger.info(f"[LLMRouter] Switched to {new_name}/{new_model}")
+            return True
+        return False
+
+    def _extract_usage(self, response):
+        """Safely extract usage from an OpenAI response object."""
+        try:
+            return getattr(response, 'usage', None)
+        except Exception:
+            return None
 
     @staticmethod
     def _extract_reasoning(message) -> str:
@@ -245,7 +307,7 @@ class LLMRouter:
 
         for attempt in range(MAX_RETRIES):
             try:
-                response = await self._client.chat.completions.create(**kwargs)
+                response = await self._provider_clients[0][2].chat.completions.create(**kwargs)
                 msg = response.choices[0].message
                 content = msg.content or ""
                 if not content.strip():
@@ -259,7 +321,7 @@ class LLMRouter:
                     duration_ms=(time.monotonic() - start) * 1000,
                     usage=getattr(response, "usage", None),
                     status="ok", caller=caller,
-                    provider=LLM_PROVIDER, model=self._model,
+                    provider=self._active_provider, model=self._model,
                 )
                 if return_thinking:
                     return content, self._extract_reasoning(msg)
@@ -281,7 +343,7 @@ class LLMRouter:
                         phase=phase, method="chat",
                         duration_ms=(time.monotonic() - start) * 1000,
                         status="error", caller=caller,
-                        provider=LLM_PROVIDER, model=self._model,
+                        provider=self._active_provider, model=self._model,
                     )
                     fallback = json.dumps({"error": str(e), "targets": []}) if response_format == "json" else f"LLM 调用失败: {e}"
                     return (fallback, "") if return_thinking else fallback
@@ -290,7 +352,7 @@ class LLMRouter:
             phase=phase, method="chat",
             duration_ms=(time.monotonic() - start) * 1000,
             status="error", caller=caller,
-            provider=LLM_PROVIDER, model=self._model,
+            provider=self._active_provider, model=self._model,
         )
         fallback = json.dumps({"error": "unexpected", "targets": []}) if response_format == "json" else "LLM 调用失败: 未知错误"
         return (fallback, "") if return_thinking else fallback
@@ -331,7 +393,7 @@ class LLMRouter:
 
         for attempt in range(MAX_RETRIES):
             try:
-                response = await self._client.chat.completions.create(**kwargs)
+                response = await self._provider_clients[0][2].chat.completions.create(**kwargs)
                 msg = response.choices[0].message
                 content = msg.content or ""
                 if not content.strip():
@@ -348,7 +410,7 @@ class LLMRouter:
                     duration_ms=(time.monotonic() - start) * 1000,
                     usage=getattr(response, "usage", None),
                     status="ok", caller=caller,
-                    provider=LLM_PROVIDER, model=self._model,
+                    provider=self._active_provider, model=self._model,
                 )
                 if return_thinking:
                     return content, self._extract_reasoning(msg)
@@ -369,7 +431,7 @@ class LLMRouter:
                         phase=phase, method="multi_turn",
                         duration_ms=(time.monotonic() - start) * 1000,
                         status="error", caller=caller,
-                        provider=LLM_PROVIDER, model=self._model,
+                        provider=self._active_provider, model=self._model,
                     )
                     fallback = json.dumps({"error": str(e), "action": "conclude_fail"}) if response_format == "json" else f"LLM 调用失败: {e}"
                     return (fallback, "") if return_thinking else fallback
@@ -378,7 +440,7 @@ class LLMRouter:
             phase=phase, method="multi_turn",
             duration_ms=(time.monotonic() - start) * 1000,
             status="error", caller=caller,
-            provider=LLM_PROVIDER, model=self._model,
+            provider=self._active_provider, model=self._model,
         )
         fallback = json.dumps({"error": "unexpected", "action": "conclude_fail"}) if response_format == "json" else "LLM 调用失败: 未知错误"
         return (fallback, "") if return_thinking else fallback
@@ -424,7 +486,7 @@ class LLMRouter:
         last_usage = None
 
         try:
-            stream = await self._client.chat.completions.create(**kwargs)
+            stream = await self._provider_clients[0][2].chat.completions.create(**kwargs)
             async for chunk in stream:
                 usage = getattr(chunk, "usage", None)
                 if usage:
@@ -454,7 +516,7 @@ class LLMRouter:
                 phase=phase, method="stream",
                 duration_ms=(time.monotonic() - start) * 1000,
                 usage=last_usage, status="ok", caller=caller,
-                provider=LLM_PROVIDER, model=self._model,
+                provider=self._active_provider, model=self._model,
             )
         except Exception as e:
             logger.error(f"[LLMRouter] multi-turn stream 失败: {e}")
@@ -462,7 +524,7 @@ class LLMRouter:
                 phase=phase, method="stream",
                 duration_ms=(time.monotonic() - start) * 1000,
                 status="error", caller=caller,
-                provider=LLM_PROVIDER, model=self._model,
+                provider=self._active_provider, model=self._model,
             )
             fallback = json.dumps({"error": str(e), "action": "conclude_fail"}) if response_format == "json" else f"LLM stream error: {e}"
             return fallback, ""
@@ -501,7 +563,7 @@ class LLMRouter:
 
         for attempt in range(MAX_RETRIES):
             try:
-                response = await self._client.chat.completions.create(**kwargs)
+                response = await self._provider_clients[0][2].chat.completions.create(**kwargs)
                 msg = response.choices[0].message
                 content = msg.content or ""
                 tool_calls = list(getattr(msg, "tool_calls", None) or [])
@@ -518,7 +580,7 @@ class LLMRouter:
                     duration_ms=(time.monotonic() - start) * 1000,
                     usage=getattr(response, "usage", None),
                     status="ok", caller=caller,
-                    provider=LLM_PROVIDER, model=self._model,
+                    provider=self._active_provider, model=self._model,
                 )
                 return content, tool_calls, reasoning
             except Exception as e:
@@ -534,15 +596,18 @@ class LLMRouter:
                         phase=phase, method="tools",
                         duration_ms=(time.monotonic() - start) * 1000,
                         status="error", caller=caller,
-                        provider=LLM_PROVIDER, model=self._model,
+                        provider=self._active_provider, model=self._model,
                     )
+                    if await self._try_failover():
+                        kwargs["model"] = self._model
+                        continue
                     return "", [], ""
 
         get_collector().collect_llm_call(
             phase=phase, method="tools",
             duration_ms=(time.monotonic() - start) * 1000,
             status="error", caller=caller,
-            provider=LLM_PROVIDER, model=self._model,
+            provider=self._active_provider, model=self._model,
         )
         return "", [], ""
 
@@ -573,7 +638,7 @@ class LLMRouter:
             kwargs["response_format"] = {"type": "json_object"}
 
         try:
-            stream = await self._client.chat.completions.create(**kwargs)
+            stream = await self._provider_clients[0][2].chat.completions.create(**kwargs)
             async for chunk in stream:
                 delta = chunk.choices[0].delta if chunk.choices else None
                 if not delta:

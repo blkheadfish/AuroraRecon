@@ -70,29 +70,84 @@ class ParsedDecision:
         return str(self.decision.get("reason") or "")
 
 
+_JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
+_JSON_OBJECT_RE = re.compile(r"\{[\s\S]*\}")
+_TRAILING_COMMA_RE = re.compile(r",(\s*[}\]])")
+_SINGLE_QUOTE_KEY_RE = re.compile(r"'([^']+)'(\s*):")
+
+
+def _extract_json_candidate(text: str) -> str:
+    """Best-effort extraction of a JSON object from free-form text."""
+    # Try markdown code block first
+    m = _JSON_BLOCK_RE.search(text)
+    if m:
+        return m.group(1).strip()
+    # Try to find the outermost {} pair
+    m = _JSON_OBJECT_RE.search(text)
+    if m:
+        return m.group(0).strip()
+    return text.strip()
+
+
+def _repair_json(text: str) -> str:
+    """Apply successive JSON repairs without throwing."""
+    # Remove trailing commas before } or ]
+    text = _TRAILING_COMMA_RE.sub(r"\1", text)
+    # Fix single-quoted keys: 'key': → "key":
+    text = _SINGLE_QUOTE_KEY_RE.sub(r'"\1"\2', text)
+    return text
+
+
 def parse_react_decision(response_raw: str) -> ParsedDecision:
     """
     把 LLM 返回的 JSON 字符串解析成 ``ParsedDecision``。
 
-    宽容度：
-      - 标准 ``json.loads`` 失败时再尝试单引号修正（少数 LLM 输出会用 '）
-      - 仍失败 → ``ok=False`` + 空 dict
+    多策略降级：
+      1. 直接 ``json.loads``
+      2. 从 markdown 代码块 / 自由文本中提取 JSON
+      3. 修复尾部逗号 + 单引号 key → json.loads
+      4. 单引号全局替换 → json.loads（最激进）
     """
     if not response_raw or not isinstance(response_raw, str):
         return ParsedDecision(ok=False, decision={}, raw="")
 
     raw_preview = response_raw[:1000]
+
+    # Strategy 1: direct parse
     try:
         parsed = json.loads(response_raw)
         if isinstance(parsed, dict):
             return ParsedDecision(ok=True, decision=parsed, raw=raw_preview)
     except json.JSONDecodeError:
+        pass
+
+    # Strategy 2: extract from markdown / free text, then direct parse
+    candidate = _extract_json_candidate(response_raw)
+    if candidate != response_raw:
         try:
-            parsed = json.loads(response_raw.replace("'", '"'))
+            parsed = json.loads(candidate)
             if isinstance(parsed, dict):
-                return ParsedDecision(ok=True, decision=parsed, raw=raw_preview)
-        except Exception:
+                return ParsedDecision(ok=True, decision=parsed, raw=raw_preview[:500])
+        except json.JSONDecodeError:
             pass
+
+    # Strategy 3: repair trailing commas + single-quoted keys
+    try:
+        repaired = _repair_json(candidate)
+        parsed = json.loads(repaired)
+        if isinstance(parsed, dict):
+            return ParsedDecision(ok=True, decision=parsed, raw=raw_preview[:500])
+    except json.JSONDecodeError:
+        pass
+
+    # Strategy 4: fallback — global single-quote → double-quote
+    try:
+        parsed = json.loads(candidate.replace("'", '"'))
+        if isinstance(parsed, dict):
+            return ParsedDecision(ok=True, decision=parsed, raw=raw_preview[:500])
+    except Exception:
+        pass
+
     return ParsedDecision(ok=False, decision={}, raw=raw_preview)
 
 

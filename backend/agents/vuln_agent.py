@@ -536,14 +536,24 @@ $PHUIP "{web_url}/index.php" 2>&1
         "postgresql": {"name": "PostgreSQL Service", "severity": "medium", "desc": "PostgreSQL 数据库暴露"},
         "redis":  {"name": "Redis Service", "severity": "high", "desc": "Redis 服务暴露，可尝试未授权访问/写文件"},
         "mongodb": {"name": "MongoDB Service", "severity": "high", "desc": "MongoDB 暴露，可尝试未授权访问"},
-        "snmp":   {"name": "SNMP Service", "severity": "medium", "desc": "SNMP 服务开放，可尝试社区字符串枚举"},
+        "snmp":   {"name": "SNMP Service", "severity": "medium", "desc": "SNMP 服务开放，可尝试社区字符串枚举/OID RCE"},
         "vnc":    {"name": "VNC Service",  "severity": "medium", "desc": "VNC 远程桌面开放，可尝试弱口令"},
+        "dns":    {"name": "DNS Service",  "severity": "medium", "desc": "DNS 服务开放，可尝试域传送/子域爆破"},
+        "domain": {"name": "DNS Service",  "severity": "medium", "desc": "DNS 服务开放"},
+        "ms-sql-m": {"name": "MSSQL Service", "severity": "medium", "desc": "MSSQL 数据库暴露，可尝试弱口令/xp_cmdshell"},
+        "mssql":  {"name": "MSSQL Service", "severity": "medium", "desc": "MSSQL 数据库暴露，可尝试弱口令/xp_cmdshell"},
+        "winrm":  {"name": "WinRM Service", "severity": "medium", "desc": "WinRM 远程管理开放，可尝试凭据爆破/密码喷射"},
+        "wsman":  {"name": "WinRM Service", "severity": "medium", "desc": "WinRM WS-Management 开放"},
+        "nfs":    {"name": "NFS Service",   "severity": "medium", "desc": "NFS 文件共享开放，可尝试挂载未授权导出"},
+        "rpcbind": {"name": "NFS/RPC Service", "severity": "medium", "desc": "RPC 端口映射服务开放（通常关联 NFS）"},
+        "mountd": {"name": "NFS Service",  "severity": "medium", "desc": "NFS 挂载守护进程开放"},
     }
 
     _PORT_SERVICE_OVERRIDE: dict[int, str] = {
         21: "ftp", 22: "ssh", 23: "telnet", 445: "smb", 139: "netbios-ssn",
         3306: "mysql", 5432: "postgresql", 6379: "redis", 27017: "mongodb",
-        3389: "rdp", 161: "snmp", 5900: "vnc",
+        3389: "rdp", 161: "snmp", 5900: "vnc", 53: "dns", 2049: "nfs",
+        5985: "winrm", 5986: "winrm", 1433: "mssql",
     }
 
     def _generate_service_findings(
