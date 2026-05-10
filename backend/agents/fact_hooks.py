@@ -11,7 +11,7 @@ import hashlib
 import logging
 import re
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 
 from backend.agents.evidence_verifier import _passwd_content_detected
 from backend.agents.models import ExploitResult, PentestState, TaskFact, VulnFinding
@@ -783,6 +783,39 @@ def snapshot_facts(state: PentestState) -> dict[str, Any]:
     }
 
 
+def _resolve_new_credentials(
+    state: PentestState, before: dict[str, Any], after: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Return the actual credential dicts that are new in *after* vs *before*."""
+    before_set = set(before.get("credentials") or [])
+    after_set = set(after.get("credentials") or [])
+    new_keys = after_set - before_set
+    if not new_keys:
+        return []
+    new_creds: list[dict[str, Any]] = []
+    for c in (state.credential_store or []):
+        try:
+            c_key = _json.dumps(c, sort_keys=True, default=str)
+        except Exception:
+            c_key = repr(c)
+        if c_key in new_keys:
+            if c not in new_creds:
+                new_creds.append(c)
+    return new_creds
+
+
+def _resolve_new_paths(
+    paths: list[str], before: dict[str, Any], after: dict[str, Any], key: str,
+) -> list[str]:
+    """Return the actual path strings that are new in *after* vs *before*."""
+    before_set = set(before.get(key) or [])
+    after_set = set(after.get(key) or [])
+    new_keys = after_set - before_set
+    if not new_keys:
+        return []
+    return [p for p in paths if p in new_keys]
+
+
 def emit_replan_signals(
     state: PentestState,
     *,
@@ -791,6 +824,10 @@ def emit_replan_signals(
     source_node: str,
 ) -> dict[str, int]:
     """Compare ``before`` / ``after`` snapshots and increment replan signals.
+
+    Also populates ``state.replan_contexts`` with structured context so
+    downstream phase nodes can act on specific targets (WHICH credentials,
+    WHICH hosts, WHICH ports) instead of just knowing *that* something changed.
 
     Signal vocabulary (consumed by ``edge_after_*_v2`` in feedback mode and by
     ``_rule_decide`` in supervisor mode):
@@ -801,13 +838,21 @@ def emit_replan_signals(
       - ``re_vuln_scan_for_ports``    — 新发现 open_port
       - ``re_intel_harvest_for_paths``— intel_discovered_paths 增长
     """
+    from backend.agents.models import ReplanContext
+
     signals = dict(state.replan_signals or {})
+    contexts = dict(state.replan_contexts or {})
     log_lines: list[str] = []
 
     def _diff(key: str) -> int:
         b = set(map(str, before.get(key) or []))
         a = set(map(str, after.get(key) or []))
         return len(a - b)
+
+    def _diff_values(key: str) -> set[str]:
+        b = set(map(str, before.get(key) or []))
+        a = set(map(str, after.get(key) or []))
+        return a - b
 
     new_creds = _diff("credentials")
     new_paths = _diff("web_paths")
@@ -818,27 +863,85 @@ def emit_replan_signals(
     if new_creds:
         signals["re_vuln_scan_for_creds"] = int(signals.get("re_vuln_scan_for_creds", 0)) + new_creds
         log_lines.append(f"+{new_creds} 凭据")
+        new_cred_items = _resolve_new_credentials(state, before, after)
+        ctx = contexts.get("re_vuln_scan_for_creds", ReplanContext(
+            signal_key="re_vuln_scan_for_creds", source_node=source_node,
+        ))
+        ctx.credentials.extend(new_cred_items)
+        contexts["re_vuln_scan_for_creds"] = ctx
+
     if new_paths:
         signals["re_surface_enum_for_paths"] = int(signals.get("re_surface_enum_for_paths", 0)) + new_paths
         log_lines.append(f"+{new_paths} 路径")
+        new_path_items = _resolve_new_paths(state.web_paths or [], before, after, "web_paths")
+        ctx = contexts.get("re_surface_enum_for_paths", ReplanContext(
+            signal_key="re_surface_enum_for_paths", source_node=source_node,
+        ))
+        for p in new_path_items:
+            if p not in ctx.web_paths:
+                ctx.web_paths.append(p)
+        contexts["re_surface_enum_for_paths"] = ctx
+
     if new_intel_paths:
         signals["re_intel_harvest_for_paths"] = int(signals.get("re_intel_harvest_for_paths", 0)) + new_intel_paths
+        new_intel_items = _resolve_new_paths(state.intel_discovered_paths or [], before, after, "intel_paths")
+        ctx = contexts.get("re_intel_harvest_for_paths", ReplanContext(
+            signal_key="re_intel_harvest_for_paths", source_node=source_node,
+        ))
+        for p in new_intel_items:
+            if p not in ctx.intel_paths:
+                ctx.intel_paths.append(p)
+        contexts["re_intel_harvest_for_paths"] = ctx
+
     if new_hosts:
         signals["re_recon_for_hosts"] = int(signals.get("re_recon_for_hosts", 0)) + new_hosts
         log_lines.append(f"+{new_hosts} 主机")
+        new_host_values = _diff_values("hosts")
+        ctx = contexts.get("re_recon_for_hosts", ReplanContext(
+            signal_key="re_recon_for_hosts", source_node=source_node,
+        ))
+        for h in new_host_values:
+            if h not in ctx.hosts:
+                ctx.hosts.append(str(h))
+        contexts["re_recon_for_hosts"] = ctx
+
     if new_ports:
         signals["re_vuln_scan_for_ports"] = int(signals.get("re_vuln_scan_for_ports", 0)) + new_ports
         log_lines.append(f"+{new_ports} 端口")
+        new_port_values = _diff_values("ports")
+        ctx = contexts.get("re_vuln_scan_for_ports", ReplanContext(
+            signal_key="re_vuln_scan_for_ports", source_node=source_node,
+        ))
+        for p_str in new_port_values:
+            try:
+                p_int = int(p_str)
+                if p_int not in ctx.ports:
+                    ctx.ports.append(p_int)
+            except ValueError:
+                pass
+        contexts["re_vuln_scan_for_ports"] = ctx
 
     state.replan_signals = signals
+    state.replan_contexts = contexts
 
     if log_lines:
-        state.log(f"[replan] {source_node}: {', '.join(log_lines)} → 信号 {signals}")
+        items_detail: list[str] = []
+        for ctx in contexts.values():
+            if ctx.credentials:
+                items_detail.append(f"凭据={len(ctx.credentials)}条")
+            if ctx.hosts:
+                items_detail.append(f"主机={ctx.hosts}")
+            if ctx.ports:
+                items_detail.append(f"端口={ctx.ports}")
+            if ctx.web_paths:
+                items_detail.append(f"路径={len(ctx.web_paths)}条")
+        detail_str = "; ".join(items_detail) if items_detail else ""
+        state.log(f"[replan] {source_node}: {', '.join(log_lines)} → 信号 {signals}" + (f" | {detail_str}" if detail_str else ""))
         try:
             state.push_decision({
                 "action": "replan_signal",
                 "phase": source_node,
-                "thinking": f"{source_node} 检测到新事实，发出 replan 信号",
+                "thinking": f"{source_node} 检测到新事实，发出 replan 信号" + (f" | {detail_str}" if detail_str else ""),
                 "message": f"replan: {', '.join(log_lines)}",
                 "raw": _json.dumps(signals, ensure_ascii=False),
                 "tone": "info",
@@ -855,6 +958,80 @@ def consume_replan_signal(state: PentestState, key: str) -> None:
     if key in signals:
         signals.pop(key, None)
         state.replan_signals = signals
+
+
+def get_replan_context(state: PentestState, signal_key: str) -> "Optional[Any]":
+    """Read the structured context for *signal_key* without consuming it.
+
+    Returns None if no context exists for that key.
+    """
+    from backend.agents.models import ReplanContext
+    ctx = (state.replan_contexts or {}).get(signal_key)
+    if ctx is None:
+        return None
+    if isinstance(ctx, ReplanContext):
+        return ctx
+    if isinstance(ctx, dict):
+        return ReplanContext(**ctx)
+    return None
+
+
+def consume_replan_context(state: PentestState, signal_key: str) -> "Optional[Any]":
+    """Read and remove the structured context for *signal_key*.
+
+    Call this in phase node entry when the node is about to act on the
+    context, so the same context isn't re-applied on re-entry.
+    """
+    ctx = get_replan_context(state, signal_key)
+    if ctx is not None:
+        contexts = dict(state.replan_contexts or {})
+        contexts.pop(signal_key, None)
+        state.replan_contexts = contexts
+    return ctx
+
+
+def merge_operator_context(state: PentestState) -> None:
+    """Merge operator-derived replan context into existing replan_contexts.
+
+    Called by ``apply_plan_to_state`` after the OperatorPlan is validated,
+    so focus_targets / preferred_tools / keyword_hints from the operator
+    are stored as structured context keyed by each derived signal.
+    """
+    plan = getattr(state, "operator_plan", None)
+    if plan is None:
+        return
+    from backend.agents.models import ReplanContext
+
+    contexts = dict(state.replan_contexts or {})
+    sig = dict(state.replan_signals or {})
+
+    # Build a single operator context from the plan's focus_targets / hints
+    op_ctx = ReplanContext(
+        signal_key="operator",
+        source_node="operator_replanner",
+        preferred_tools=list(plan.preferred_tools or []),
+        keyword_hints=list(plan.keyword_hints or []),
+        operator_notes=(plan.intent_summary or ""),
+    )
+    for ft in (plan.focus_targets or []):
+        if isinstance(ft, dict):
+            op_ctx.focus_targets.append({"type": ft.get("type", ""), "value": ft.get("value", "")})
+        else:
+            op_ctx.focus_targets.append({"type": getattr(ft, "type", ""), "value": getattr(ft, "value", "")})
+
+    # Merge operator context into each signal-specific context that was
+    # derived from this plan, so that e.g. re_vuln_scan_for_creds context
+    # carries both the new credentials AND the operator's tool preferences.
+    for signal_key in sig:
+        if signal_key in ("operator_intent",):
+            continue
+        ctx = contexts.get(signal_key, ReplanContext(
+            signal_key=signal_key, source_node="operator_replanner",
+        ))
+        ctx.merge(op_ctx)
+        contexts[signal_key] = ctx
+
+    state.replan_contexts = contexts
 
 
 

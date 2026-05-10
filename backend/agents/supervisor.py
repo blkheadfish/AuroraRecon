@@ -19,7 +19,9 @@ from typing import Any, Optional
 
 from backend.agents.fact_hooks import (
     compute_phase_signature,
+    consume_replan_context as _consume_replan_context,
     consume_replan_signal as _consume_replan_signal,
+    push_pending_seed as _push_pending_seed,
     snapshot_facts,
 )
 from backend.agents.models import PentestState, TaskStatus
@@ -116,6 +118,53 @@ def _no_new_facts(state: PentestState, k: int = 3) -> bool:
     return len(sigs) == 1
 
 
+def _inject_replan_context(state: PentestState, signal_key: str) -> None:
+    """Consume structured replan context and push into pending_seeds.
+
+    Called when ``_rule_decide`` routes on a replan signal, so the target
+    phase node receives concrete data (credentials, hosts, ports, tools)
+    instead of just a flag.
+    """
+    ctx = _consume_replan_context(state, signal_key)
+    if ctx is None:
+        return
+    try:
+        for cred in (ctx.credentials or []):
+            _push_pending_seed(state, "credentials", cred)
+        for host in (ctx.hosts or []):
+            _push_pending_seed(state, "hosts", host)
+        for port in (ctx.ports or []):
+            _push_pending_seed(state, "ports", port)
+        for path in (ctx.web_paths or []):
+            _push_pending_seed(state, "web_paths", path)
+        if ctx.preferred_tools or ctx.keyword_hints or ctx.focus_targets:
+            rf = dict(state.runtime_facts or {})
+            hints = dict(rf.get("operator_hints", {}))
+            if ctx.preferred_tools:
+                hints["preferred_tools"] = list(ctx.preferred_tools)
+            if ctx.keyword_hints:
+                hints["keyword_hints"] = list(ctx.keyword_hints)
+            if ctx.focus_targets:
+                hints["focus_targets"] = list(ctx.focus_targets)
+            if ctx.operator_notes:
+                hints["operator_notes"] = ctx.operator_notes
+            rf["operator_hints"] = hints
+            state.runtime_facts = rf
+        detail: list[str] = []
+        if ctx.credentials:
+            detail.append(f"凭据{len(ctx.credentials)}条")
+        if ctx.hosts:
+            detail.append(f"主机={ctx.hosts}")
+        if ctx.ports:
+            detail.append(f"端口={ctx.ports}")
+        if ctx.preferred_tools:
+            detail.append(f"工具={ctx.preferred_tools[:4]}")
+        if detail:
+            state.log(f"[supervisor] replan 上下文注入 ({signal_key}): {', '.join(detail)}")
+    except Exception as exc:
+        logger.warning(f"[supervisor] 上下文注入失败 ({signal_key}): {exc}")
+
+
 def _rule_decide(state: PentestState) -> Optional[dict[str, Any]]:
     """Deterministic routing rules, in priority order.
 
@@ -174,14 +223,19 @@ def _rule_decide(state: PentestState) -> Optional[dict[str, Any]]:
         sig = state.replan_signals or {}
 
     if sig.get("re_recon_for_hosts") and _under_cap(state, "recon"):
+        _inject_replan_context(state, "re_recon_for_hosts")
         return {"next": "recon", "reason": "new hosts discovered", "rule": "replan.re_recon_for_hosts"}
     if sig.get("re_vuln_scan_for_creds") and _under_cap(state, "vuln_scan"):
+        _inject_replan_context(state, "re_vuln_scan_for_creds")
         return {"next": "vuln_scan", "reason": "new credentials → re-scan with weak-cred angle", "rule": "replan.re_vuln_scan_for_creds"}
     if sig.get("re_vuln_scan_for_ports") and _under_cap(state, "vuln_scan"):
+        _inject_replan_context(state, "re_vuln_scan_for_ports")
         return {"next": "vuln_scan", "reason": "new open ports → re-scan", "rule": "replan.re_vuln_scan_for_ports"}
     if sig.get("re_surface_enum_for_paths") and _under_cap(state, "surface_enum"):
+        _inject_replan_context(state, "re_surface_enum_for_paths")
         return {"next": "surface_enum", "reason": "new web paths discovered", "rule": "replan.re_surface_enum_for_paths"}
     if sig.get("re_intel_harvest_for_paths") and _under_cap(state, "intel_harvest"):
+        _inject_replan_context(state, "re_intel_harvest_for_paths")
         return {"next": "intel_harvest", "reason": "new intel paths to harvest", "rule": "replan.re_intel_harvest_for_paths"}
 
     if state.got_shell:

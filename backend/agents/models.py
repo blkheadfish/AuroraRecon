@@ -85,6 +85,66 @@ class OperatorFocusTarget(BaseModel):
 	value: str
 
 
+class ReplanContext(BaseModel):
+	"""Structured context behind a replan signal.
+
+	Carries the actual data (credentials, hosts, ports, paths, operator
+	directives) so downstream phase nodes can act on specific targets instead
+	of just knowing *that* something changed.
+	"""
+	signal_key: str = ""
+	source_node: str = ""
+	credentials: list[dict[str, Any]] = Field(default_factory=list)
+	hosts: list[str] = Field(default_factory=list)
+	ports: list[int] = Field(default_factory=list)
+	web_paths: list[str] = Field(default_factory=list)
+	intel_paths: list[str] = Field(default_factory=list)
+	focus_targets: list[dict[str, str]] = Field(default_factory=list)
+	preferred_tools: list[str] = Field(default_factory=list)
+	keyword_hints: list[str] = Field(default_factory=list)
+	operator_notes: str = ""
+
+	def merge(self, other: "ReplanContext") -> "ReplanContext":
+		"""Merge another context into this one (dedup by value)."""
+		for cred in other.credentials:
+			if cred not in self.credentials:
+				self.credentials.append(cred)
+		for h in other.hosts:
+			if h not in self.hosts:
+				self.hosts.append(h)
+		for p in other.ports:
+			if p not in self.ports:
+				self.ports.append(p)
+		for path in other.web_paths:
+			if path not in self.web_paths:
+				self.web_paths.append(path)
+		for path in other.intel_paths:
+			if path not in self.intel_paths:
+				self.intel_paths.append(path)
+		for ft in other.focus_targets:
+			if ft not in self.focus_targets:
+				self.focus_targets.append(ft)
+		for t in other.preferred_tools:
+			if t not in self.preferred_tools:
+				self.preferred_tools.append(t)
+		for h in other.keyword_hints:
+			if h not in self.keyword_hints:
+				self.keyword_hints.append(h)
+		if other.operator_notes and other.operator_notes not in self.operator_notes:
+			self.operator_notes = (
+				f"{self.operator_notes}; {other.operator_notes}"
+				if self.operator_notes else other.operator_notes
+			)
+		return self
+
+	def is_empty(self) -> bool:
+		return not any([
+			self.credentials, self.hosts, self.ports,
+			self.web_paths, self.intel_paths, self.focus_targets,
+			self.preferred_tools, self.keyword_hints,
+		])
+
+
 class OperatorPlan(BaseModel):
 	plan_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:8])
 	created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
@@ -644,6 +704,7 @@ class PentestState(BaseModel):
 		"privesc_attempt": 3,
 	})
 	replan_signals: dict[str, int] = Field(default_factory=dict)
+	replan_contexts: dict[str, ReplanContext] = Field(default_factory=dict)
 	replan_count: int = 0
 	max_replan: int = 3
 

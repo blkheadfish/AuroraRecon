@@ -1124,6 +1124,12 @@ async def node_recon(state: PentestState) -> PentestState:
     from backend.agents.prompt_utils import operator_guidance_block
     _op_block = operator_guidance_block(state)
     _op_plan = getattr(state, "operator_plan", None)
+    _op_hints = (state.runtime_facts or {}).get("operator_hints") or None
+    if _op_hints:
+        state.log(
+            f"recon 操作员提示: tools={_op_hints.get('preferred_tools', [])}, "
+            f"targets={_op_hints.get('focus_targets', [])}"
+        )
     _recon_plan_tools = _plan_get_step_tools(state, "recon") or None
     agent._plan_steps = _plan_get_phase_steps(state, "recon") or None
     result = await agent.run(
@@ -1347,6 +1353,12 @@ async def node_vuln_scan(state: PentestState) -> PentestState:
     from backend.agents.prompt_utils import operator_guidance_block
     _op_block = operator_guidance_block(state)
     _op_plan = getattr(state, "operator_plan", None)
+    _op_hints = (state.runtime_facts or {}).get("operator_hints") or None
+    if _op_hints:
+        state.log(
+            f"vuln_scan 操作员提示: tools={_op_hints.get('preferred_tools', [])}, "
+            f"keywords={_op_hints.get('keyword_hints', [])}"
+        )
     if _op_plan is not None:
         _consume_operator_plan_for_phase(state, "vuln_scan_tactic", None)
     result = await agent.run(
@@ -1959,10 +1971,13 @@ from backend.agents.fact_hooks import (
     attach_service_to_graph as _attach_service_to_graph,
     compute_phase_signature as _compute_phase_signature,
     consume_pending_seeds as _consume_pending_seeds,
+    consume_replan_context as _consume_replan_context,
     consume_replan_signal as _consume_replan_signal,
     emit_replan_signals as _emit_replan_signals,
+    get_replan_context as _get_replan_context,
     make_fact_sink as _make_fact_sink,
     mark_phase_visited as _mark_phase_visited,
+    merge_operator_context as _merge_operator_context,
     normalize_and_dedupe_state_facts as _normalize_and_dedupe_state_facts,
     push_pending_seed as _push_pending_seed,
     should_skip_phase as _should_skip_phase,
@@ -3596,6 +3611,49 @@ def _can_replan(state: PentestState, target_phase: str) -> bool:
 def _do_replan(state: PentestState, target_phase: str, signal_key: str) -> str:
     state.replan_count += 1
     _consume_replan_signal(state, signal_key)
+
+    # Consume structured context and inject into pending_seeds so the
+    # target phase node can act on concrete data (which creds, which
+    # hosts, which ports) instead of just knowing something changed.
+    ctx = _consume_replan_context(state, signal_key)
+    if ctx is not None:
+        try:
+            for cred in (ctx.credentials or []):
+                _push_pending_seed(state, "credentials", cred)
+            for host in (ctx.hosts or []):
+                _push_pending_seed(state, "hosts", host)
+            for port in (ctx.ports or []):
+                _push_pending_seed(state, "ports", port)
+            for path in (ctx.web_paths or []):
+                _push_pending_seed(state, "web_paths", path)
+            # Store preferred_tools / keyword_hints in runtime_facts for
+            # tool selection nodes to reference
+            if ctx.preferred_tools or ctx.keyword_hints or ctx.focus_targets:
+                hints = dict(state.runtime_facts or {}).setdefault("operator_hints", {})
+                if ctx.preferred_tools:
+                    hints["preferred_tools"] = list(ctx.preferred_tools)
+                if ctx.keyword_hints:
+                    hints["keyword_hints"] = list(ctx.keyword_hints)
+                if ctx.focus_targets:
+                    hints["focus_targets"] = list(ctx.focus_targets)
+                if ctx.operator_notes:
+                    hints["operator_notes"] = ctx.operator_notes
+                state.runtime_facts = dict(state.runtime_facts or {})
+                state.runtime_facts["operator_hints"] = hints
+            ctx_detail = []
+            if ctx.credentials:
+                ctx_detail.append(f"凭据{len(ctx.credentials)}条")
+            if ctx.hosts:
+                ctx_detail.append(f"主机={ctx.hosts}")
+            if ctx.ports:
+                ctx_detail.append(f"端口={ctx.ports}")
+            if ctx.preferred_tools:
+                ctx_detail.append(f"工具={ctx.preferred_tools[:4]}")
+            if ctx_detail:
+                state.log(f"[replan] 上下文注入: {', '.join(ctx_detail)}")
+        except Exception as exc:
+            logger.warning(f"[replan] 上下文注入失败: {exc}")
+
     state.log(
         f"[replan] {target_phase} ← 触发反馈 (#{state.replan_count}/{state.max_replan}, "
         f"signal={signal_key})"

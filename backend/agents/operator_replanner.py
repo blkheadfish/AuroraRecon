@@ -160,6 +160,10 @@ def _build_user_prompt(state: PentestState, op_block: str) -> str:
 def _derive_signals(plan: OperatorPlan, state: PentestState) -> dict[str, int]:
     """把 plan 里的"我想干什么"翻译成 ``replan_signals`` 桶, 让 feedback DAG /
     阶段节点的 ``_consume_replan_signal`` 链路天然复用现有重入通路。
+
+    同时把 focus_targets / preferred_tools / keyword_hints 写入
+    ``state.replan_contexts`` —— 每个 derived signal 都附带一份 operator
+    上下文的合并副本, 下游节点消费 signal 时能拿到完整的"做什么 + 怎么做"。
     """
     sig: dict[str, int] = {}
     cur = state.current_phase or ""
@@ -180,6 +184,58 @@ def _derive_signals(plan: OperatorPlan, state: PentestState) -> dict[str, int]:
     if {"cve", "service"} & target_types:
         sig["re_vuln_scan_for_ports"] = 1
 
+    # Build structured context from operator plan — each focus target is
+    # resolved into the appropriate context bucket so downstream nodes
+    # can read specific target values (e.g. which port to scan).
+    from backend.agents.models import ReplanContext
+    contexts = dict(getattr(state, "replan_contexts", None) or {})
+
+    op_ctx = ReplanContext(
+        signal_key="operator",
+        source_node="operator_replanner",
+        preferred_tools=list(plan.preferred_tools or []),
+        keyword_hints=list(plan.keyword_hints or []),
+        operator_notes=(plan.intent_summary or ""),
+    )
+    for ft in (plan.focus_targets or []):
+        if isinstance(ft, OperatorFocusTarget):
+            op_ctx.focus_targets.append({"type": ft.type, "value": ft.value})
+        elif isinstance(ft, dict):
+            op_ctx.focus_targets.append({"type": ft.get("type", ""), "value": ft.get("value", "")})
+
+    # Resolve focus targets into concrete context fields
+    for ft in (plan.focus_targets or []):
+        ttype = ft.type if isinstance(ft, OperatorFocusTarget) else ft.get("type", "")
+        tval = ft.value if isinstance(ft, OperatorFocusTarget) else ft.get("value", "")
+        if not ttype or not tval:
+            continue
+        if ttype == "host":
+            if tval not in op_ctx.hosts:
+                op_ctx.hosts.append(tval)
+        elif ttype == "port":
+            try:
+                p_int = int(tval)
+                if p_int not in op_ctx.ports:
+                    op_ctx.ports.append(p_int)
+            except ValueError:
+                pass
+        elif ttype == "path":
+            if tval not in op_ctx.web_paths:
+                op_ctx.web_paths.append(tval)
+        elif ttype in ("cve", "service"):
+            if tval not in op_ctx.keyword_hints:
+                op_ctx.keyword_hints.append(tval)
+
+    # Merge operator context into every derived signal key so consumers
+    # get the full picture
+    for signal_key in sig:
+        ctx = contexts.get(signal_key, ReplanContext(
+            signal_key=signal_key, source_node="operator_replanner",
+        ))
+        ctx.merge(op_ctx)
+        contexts[signal_key] = ctx
+
+    state.replan_contexts = contexts
     return sig
 
 
