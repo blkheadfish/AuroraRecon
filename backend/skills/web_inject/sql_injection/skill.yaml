@@ -1,0 +1,127 @@
+skill_id: sql_injection
+name: "SQL 注入检测与利用"
+category: web_inject
+phase: foothold
+version: "1.0"
+
+match:
+  rules:
+    - evidence_contains: ["sql injection", "sqli", "SQL Injection"]
+    - evidence_contains: ["sqlmap", "syntax error", "SQL syntax"]
+    - evidence_contains: ["mysql_fetch", "pg_query", "ORA-", "sqlite3"]
+    - fingerprint_contains: ["sql injection"]
+
+probes:
+  - id: confirm_sqli
+    description: "确认 SQL 注入存在并识别注入点"
+    command: "bash {skill_dir}/scripts/confirm_sqli.sh {ENDPOINT}"
+    timeout: 60
+    parse_rules:
+      - if_regex: "SQLI_PARAM:([^:]+):(\\w+)"
+        set: { sqli_confirmed: true }
+
+  - id: time_blind_confirm
+    description: "时间盲注确认（最可靠的检测方法）"
+    depends_on: { sqli_confirmed: true }
+    command: "bash {skill_dir}/scripts/time_blind_confirm.sh {ENDPOINT}"
+    timeout: 30
+    parse_rules:
+      - if_contains: ["TIME_BLIND_MYSQL"]
+        set: { db_type: "mysql", time_blind: true }
+      - if_contains: ["TIME_BLIND_PGSQL"]
+        set: { db_type: "postgresql", time_blind: true }
+
+exploit_paths:
+  - path_id: sqlmap_auto
+    name: "sqlmap 自动化注入利用"
+    priority: 1
+    principle: |
+      sqlmap 是最成熟的 SQL 注入自动化工具，支持所有注入类型和
+      大部分数据库。先用 --batch --dbs 获取数据库列表确认 RCE 能力，
+      再尝试 --os-shell 获取系统命令执行。
+    conditions:
+      sqli_confirmed: true
+    steps:
+      - id: sqlmap_detect
+        description: "sqlmap 自动检测注入类型并提取数据库信息"
+        command: "bash {skill_dir}/scripts/sqlmap_detect.sh {ENDPOINT}"
+        timeout: 180
+        success_criteria:
+          stdout_contains_any: ["available databases", "fetched data logged", "information_schema"]
+        on_success: sqlmap_os_shell
+        on_fail: sqlmap_forms
+
+      - id: sqlmap_forms
+        description: "sqlmap 测试 POST 表单参数"
+        command: "bash {skill_dir}/scripts/sqlmap_forms.sh {ENDPOINT}"
+        timeout: 180
+        success_criteria:
+          stdout_contains_any: ["available databases", "fetched data logged"]
+        on_success: sqlmap_os_shell
+        on_fail: next_path
+
+      - id: sqlmap_os_shell
+        description: "尝试 sqlmap --os-shell 获取系统命令执行"
+        command: "bash {skill_dir}/scripts/sqlmap_os_shell.sh {ENDPOINT}"
+        timeout: 120
+        success_criteria:
+          stdout_regex: "(uid=\\d+\\(\\w+\\)|www-data|os-shell)"
+        on_success: conclude_success
+        on_fail: sqlmap_file_read
+        evidence_capture:
+          shell_type: "rce_sqlmap_shell"
+
+      - id: sqlmap_file_read
+        description: "sqlmap 文件读取（/etc/passwd）作为利用证明"
+        command: "bash {skill_dir}/scripts/sqlmap_file_read.sh {ENDPOINT}"
+        timeout: 120
+        success_criteria:
+          stdout_contains_any: ["root:", "/etc/passwd"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "file_read_sqli"
+
+  - path_id: manual_union
+    name: "手工 UNION 联合查询注入"
+    priority: 2
+    principle: |
+      当 sqlmap 失败时（WAF、非标准注入点等），手工构造 payload。
+      先用 ORDER BY 确定列数，再用 UNION SELECT 提取数据。
+    conditions:
+      sqli_confirmed: true
+    steps:
+      - id: union_columns
+        description: "ORDER BY 确定查询列数"
+        command: "bash {skill_dir}/scripts/union_columns.sh {ENDPOINT}"
+        timeout: 60
+        success_criteria:
+          stdout_contains_any: ["COLUMNS:"]
+        on_success: union_extract
+        on_fail: next_path
+
+      - id: union_extract
+        description: "UNION SELECT 提取数据库版本和用户"
+        command: "bash {skill_dir}/scripts/union_extract.sh {ENDPOINT}"
+        timeout: 15
+        success_criteria:
+          stdout_contains_any: ["|", "MariaDB", "mysql", "PostgreSQL"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "sqli_union"
+
+  - path_id: llm_freeform
+    name: "LLM 自由推理"
+    priority: 99
+    mode: react_freeform
+    max_rounds: 5
+    conditions:
+      sqli_confirmed: true
+
+remediation: |
+  1. 使用参数化查询（PreparedStatement / 绑定变量），绝不拼接 SQL
+  2. 使用 ORM 框架（SQLAlchemy、Hibernate、Django ORM）
+  3. 实施输入验证（白名单）和输出编码
+  4. 数据库用户最小权限原则（不给 FILE、EXECUTE 权限）
+  5. 启用 WAF 的 SQL 注入防护规则

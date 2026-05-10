@@ -1,0 +1,151 @@
+skill_id: directory_discovery
+name: "Web 目录/路径发现与目录列表利用"
+category: server_misconfig
+phase: recon
+version: "2.0"
+
+principle: |
+  递归扫描 Web 目录，发现隐藏的管理后台、配置文件、备份文件、
+  信息泄露端点。当发现 Apache/Nginx "Index of" 目录列表页时，
+  递归爬取其中的文件和子目录，重点提取有价值的文件。
+  工具链: feroxbuster(快速递归) -> dirsearch(全面) -> gobuster。
+  重点关注: 管理后台、.git/.env/.bak、phpinfo、目录遍历、
+  源码文件、配置文件、数据库dump、密钥文件。
+
+match:
+  rules:
+    - evidence_contains: ["directory listing"]
+    - evidence_contains: ["目录遍历"]
+    - evidence_contains: ["directory traversal"]
+    - evidence_contains: ["index of"]
+    - evidence_contains: ["information disclosure", "sensitive"]
+    - evidence_contains: ["sensitive file"]
+    - evidence_contains: ["敏感路径"]
+    - evidence_contains: ["敏感文件"]
+    - evidence_contains: [".git", "exposed"]
+    - evidence_contains: [".env", "exposed"]
+
+probes:
+  - id: quick_dir_scan
+    description: "feroxbuster 快速递归目录扫描"
+    command: "bash {skill_dir}/scripts/quick_dir_scan.sh '{ENDPOINT}'"
+    timeout: 120
+    parse_rules:
+      - if_contains: ["200"]
+        set: { found_paths: true }
+      - if_contains: ["admin"]
+        set: { admin_panel: true }
+      - if_contains: [".git"]
+        set: { git_exposed: true }
+      - if_contains: [".env"]
+        set: { env_exposed: true }
+      - if_contains: ["phpinfo"]
+        set: { phpinfo_exposed: true }
+      - if_contains: ["manager"]
+        set: { manager_found: true }
+      - if_contains: ["console"]
+        set: { console_found: true }
+
+  - id: check_sensitive_files
+    description: "检查敏感文件泄露"
+    command: "bash {skill_dir}/scripts/check_sensitive_files.sh '{ENDPOINT}'"
+    timeout: 60
+    parse_rules:
+      - if_contains: ["SENSITIVE_FILE"]
+        set: { sensitive_files: true }
+      - if_contains: [".git/HEAD"]
+        set: { git_exposed: true }
+
+  - id: crawl_directory_listings
+    description: "检测并爬取 Index of 目录列表页"
+    command: "bash {skill_dir}/scripts/crawl_directory_listings.sh '{ENDPOINT}'"
+    timeout: 120
+    parse_rules:
+      - if_contains: ["DIRLIST_FOUND"]
+        set: { directory_listing: true }
+      - if_regex: "ENTRY:.*\\.(sql|db|sqlite|bak|backup|zip|tar|gz|key|pem|conf|env|log|php|py|sh)"
+        set: { interesting_files: true }
+      - if_regex: "ENTRY:.*\\.(key|pem|id_rsa|ppk|p12)"
+        set: { credential_files: true }
+
+exploit_paths:
+  - path_id: git_dump
+    name: ".git 源码泄露利用"
+    priority: 1
+    conditions:
+      git_exposed: true
+    steps:
+      - id: dump_git
+        description: "下载 .git 目录并提取源码"
+        command: "bash {skill_dir}/scripts/git_dump.sh '{ENDPOINT}'"
+        timeout: 30
+        success_criteria:
+          stdout_contains_any: ["ref:", "repositoryformatversion", "GIT_DUMP_DONE"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "info_disclosure"
+
+  - path_id: env_leak
+    name: ".env 配置泄露"
+    priority: 2
+    conditions:
+      env_exposed: true
+    steps:
+      - id: read_env
+        description: "读取 .env 文件内容"
+        command: "bash {skill_dir}/scripts/env_leak.sh '{ENDPOINT}'"
+        timeout: 15
+        success_criteria:
+          stdout_contains_any: ["DB_", "SECRET", "PASSWORD", "KEY", "TOKEN"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "info_disclosure"
+
+  - path_id: dirlist_credential_files
+    name: "目录列表中的密钥/凭据文件"
+    priority: 3
+    conditions:
+      credential_files: true
+    steps:
+      - id: download_creds
+        description: "下载密钥和凭据文件"
+        command: "bash {skill_dir}/scripts/dirlist_credential_files.sh '{ENDPOINT}'"
+        timeout: 60
+        success_criteria:
+          stdout_contains_any: ["PRIVATE KEY", "RSA PRIVATE", "ssh-rsa", "PuTTY"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "credential_theft"
+
+  - path_id: dirlist_interesting_files
+    name: "目录列表中的有价值文件下载"
+    priority: 4
+    conditions:
+      interesting_files: true
+    steps:
+      - id: download_interesting
+        description: "下载目录列表中发现的敏感文件"
+        command: "bash {skill_dir}/scripts/dirlist_interesting_files.sh '{ENDPOINT}'"
+        timeout: 60
+        success_criteria:
+          stdout_contains_any: ["password", "secret", "token", "key", "db_", "mysql", "postgres", "root", "admin", "CREATE TABLE", "INSERT INTO"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "info_disclosure"
+
+  - path_id: llm_freeform
+    name: "LLM 自由推理"
+    priority: 99
+    mode: react_freeform
+    max_rounds: 5
+
+remediation: |
+  1. 删除或限制访问 .git、.env 等敏感文件
+  2. 配置 Web 服务器禁止目录列表（autoindex off）
+  3. 移除备份文件和调试端点
+  4. 使用 .htaccess 或 nginx deny 规则保护敏感路径
+  5. 敏感密钥文件不应放在 Web 可访问目录

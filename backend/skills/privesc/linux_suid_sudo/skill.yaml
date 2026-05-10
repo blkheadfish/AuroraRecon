@@ -1,0 +1,210 @@
+skill_id: linux_suid_sudo_privesc
+name: "Linux SUID/sudo/capabilities 本地提权"
+category: privesc
+phase: privesc
+version: "1.0"
+
+principle: |
+  Linux 本地提权的三大常见向量：
+  1. SUID 二进制：以文件所有者权限执行，若所有者为 root 则可提权
+  2. sudo 配置：/etc/sudoers 中允许当前用户 NOPASSWD 执行某些命令
+  3. capabilities：文件级 capability 可绕过普通权限检查
+  利用方式参考 GTFOBins (https://gtfobins.github.io/)
+
+match:
+  rules:
+    - fingerprint_contains: ["suid"]
+    - fingerprint_contains: ["sudo"]
+    - fingerprint_contains: ["privesc"]
+    - fingerprint_contains: ["privilege escalation"]
+    - evidence_contains: ["setuid", "setgid"]
+
+probes:
+  - id: enum_suid
+    description: "枚举所有 SUID 二进制文件"
+    command: "bash {skill_dir}/scripts/enum_suid.sh"
+    timeout: 30
+    parse_rules:
+      - if_regex: "(/usr/bin/(?:python|perl|ruby|bash|dash|zsh|env|find|vim|nmap|awk|sed|cp|mv|less|more|man|ftp|zip|tar|gcc|gdb|php|node|lua|docker|pkexec))"
+        set:
+          suid_found: true
+          suid_binary: "$1"
+      - if_contains: ["/usr/bin/python"]
+        set: { suid_python: true }
+      - if_contains: ["/usr/bin/find"]
+        set: { suid_find: true }
+      - if_contains: ["/usr/bin/vim"]
+        set: { suid_vim: true }
+      - if_contains: ["/usr/bin/nmap"]
+        set: { suid_nmap: true }
+      - if_contains: ["/usr/bin/bash", "/bin/bash"]
+        set: { suid_bash: true }
+      - if_contains: ["/usr/bin/env"]
+        set: { suid_env: true }
+      - if_contains: ["/usr/bin/pkexec"]
+        set: { suid_pkexec: true }
+
+  - id: enum_sudo
+    description: "检查当前用户的 sudo 权限"
+    command: "bash {skill_dir}/scripts/enum_sudo.sh"
+    timeout: 15
+    parse_rules:
+      - if_regex: "\\((?:root|ALL)\\)\\s+NOPASSWD:\\s+(.+)"
+        set:
+          sudo_nopasswd: true
+          sudo_commands: "$1"
+      - if_contains: ["SUDO_CHECK_FAILED"]
+        set: { sudo_available: false }
+      - if_not_contains: ["SUDO_CHECK_FAILED"]
+        set: { sudo_available: true }
+
+  - id: enum_capabilities
+    description: "枚举具有特殊 capabilities 的文件"
+    command: "bash {skill_dir}/scripts/enum_capabilities.sh"
+    timeout: 20
+    parse_rules:
+      - if_regex: "(\\S+)\\s*=\\s*(\\S*cap_setuid\\S*)"
+        set:
+          cap_setuid_found: true
+          cap_setuid_binary: "$1"
+      - if_regex: "(\\S+)\\s*=\\s*(\\S*cap_dac_override\\S*)"
+        set:
+          cap_dac_found: true
+          cap_dac_binary: "$1"
+
+  - id: enum_cron
+    description: "检查可写的 cron 任务和定时脚本"
+    command: "bash {skill_dir}/scripts/enum_cron.sh"
+    timeout: 15
+    parse_rules:
+      - if_regex: "=== WRITABLE ===\\s*\\n(\\S+)"
+        set:
+          writable_cron: true
+          writable_cron_file: "$1"
+
+exploit_paths:
+  - path_id: sudo_nopasswd_shell
+    name: "sudo NOPASSWD 直接获取 root shell"
+    priority: 1
+    conditions: { sudo_nopasswd: true }
+    steps:
+      - id: try_sudo_bash
+        description: "尝试 sudo bash"
+        command: "bash {skill_dir}/scripts/sudo_nopasswd_shell.sh"
+        timeout: 10
+        success_criteria:
+          stdout_contains_any: ["root"]
+        on_success: conclude_success
+        on_fail: try_sudo_command
+        evidence_capture:
+          current_user: "stdout"
+          shell_type: "sudo_nopasswd"
+
+      - id: try_sudo_command
+        description: "尝试通过允许的命令提权"
+        command: "bash {skill_dir}/scripts/try_sudo_command.sh"
+        timeout: 15
+        success_criteria:
+          stdout_contains_any: ["uid=0"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          current_user: "stdout"
+          shell_type: "sudo_command_abuse"
+
+  - path_id: suid_python
+    name: "SUID Python 提权"
+    priority: 2
+    conditions: { suid_python: true }
+    steps:
+      - id: python_suid_exec
+        description: "通过 SUID python 提权"
+        command: "bash {skill_dir}/scripts/suid_python.sh"
+        timeout: 10
+        success_criteria:
+          stdout_contains_any: ["uid=0"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          current_user: "stdout"
+          shell_type: "suid_python"
+
+  - path_id: suid_find
+    name: "SUID find 提权"
+    priority: 3
+    conditions: { suid_find: true }
+    steps:
+      - id: find_suid_exec
+        description: "通过 SUID find -exec 提权"
+        command: "bash {skill_dir}/scripts/suid_find.sh"
+        timeout: 10
+        success_criteria:
+          stdout_contains_any: ["uid=0", "euid=0"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          current_user: "stdout"
+          shell_type: "suid_find"
+
+  - path_id: suid_bash
+    name: "SUID bash -p 提权"
+    priority: 4
+    conditions: { suid_bash: true }
+    steps:
+      - id: bash_p_exec
+        description: "通过 bash -p 保留有效用户 ID 提权"
+        command: "bash {skill_dir}/scripts/suid_bash.sh"
+        timeout: 10
+        success_criteria:
+          stdout_contains_any: ["euid=0"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          current_user: "stdout"
+          shell_type: "suid_bash"
+
+  - path_id: cap_setuid
+    name: "capabilities cap_setuid 提权"
+    priority: 5
+    conditions: { cap_setuid_found: true }
+    steps:
+      - id: cap_exploit
+        description: "通过 cap_setuid 文件提权"
+        command: "bash {skill_dir}/scripts/cap_setuid.sh '{cap_setuid_binary}'"
+        timeout: 10
+        success_criteria:
+          stdout_contains_any: ["uid=0"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          current_user: "stdout"
+          shell_type: "cap_setuid"
+
+  - path_id: writable_cron
+    name: "可写 cron 文件注入"
+    priority: 6
+    conditions: { writable_cron: true }
+    steps:
+      - id: inject_cron
+        description: "向可写 cron 文件注入反弹 shell 或标记文件"
+        command: "bash {skill_dir}/scripts/writable_cron.sh '{writable_cron_file}'"
+        timeout: 90
+        success_criteria:
+          stdout_contains_any: ["uid=0"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          current_user: "stdout"
+          shell_type: "writable_cron"
+
+  - path_id: llm_freeform
+    name: "LLM 自由推理提权"
+    priority: 99
+    mode: react_freeform
+    max_rounds: 5
+
+remediation: |
+  1. 审查所有 SUID 二进制文件，移除不必要的 setuid 位
+  2. 限制 sudoers 配置，避免 NOPASSWD 对危险命令的授权
+  3. 使用最小权限原则分配 Linux capabilities
+  4. 确保 cron 文件权限正确，不可被普通用户写入

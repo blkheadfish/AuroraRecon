@@ -48,7 +48,13 @@
 
       <div class="chat-stream-wrap" ref="streamRef" @scroll="scroll.onUserScroll">
         <div class="bubble-stream">
-          <template v-for="msg in messages" :key="msg.id">
+          <div v-if="hasMoreMessages" class="load-earlier-wrap">
+            <button class="load-earlier-btn" @click="loadMoreMessages">
+              <el-icon><ArrowUp /></el-icon>
+              加载更早消息 ({{ messages.length - displayedMessages.length }} 条未显示)
+            </button>
+          </div>
+          <template v-for="msg in displayedMessages" :key="msg.id">
             <div
               :data-bubble-id="msg.id"
               class="bubble-anchor"
@@ -390,6 +396,7 @@ import { ElMessage } from 'element-plus'
 import {
   ArrowDown,
   ArrowLeft,
+  ArrowUp,
   ChatLineRound,
   Check,
   CircleCheck,
@@ -471,7 +478,7 @@ const checkpointSubmitting = computed(() => state.value?.checkpointState === 'su
 // ── composables ────────────────────────────────
 const toolStreams = computed(() => state.value?.toolStreams || {})
 
-const { messages, activeStreamBubbles, activeToolStreamBubbles } = useChatMessages(
+const { messages, displayedMessages, hasMoreMessages, loadMoreMessages, activeStreamBubbles, activeToolStreamBubbles } = useChatMessages(
   decisionEvents,
   task,
   pendingCheckpoint,
@@ -928,6 +935,28 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   gap: 14px;
+}
+.load-earlier-wrap {
+  display: flex;
+  justify-content: center;
+  padding: 4px 0 8px;
+}
+.load-earlier-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 16px;
+  font-size: 12px;
+  color: var(--accent-blue);
+  background: color-mix(in srgb, var(--accent-blue) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent-blue) 25%, transparent);
+  border-radius: 20px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+.load-earlier-btn:hover {
+  background: color-mix(in srgb, var(--accent-blue) 16%, transparent);
+  border-color: var(--accent-blue);
 }
 .bubble-anchor {
   position: relative;

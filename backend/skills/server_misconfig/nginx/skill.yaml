@@ -1,0 +1,127 @@
+skill_id: nginx_misconfig
+name: "Nginx 配置漏洞利用"
+category: server_misconfig
+phase: foothold
+version: "1.0"
+
+match:
+  rules:
+    - fingerprint_contains: ["nginx"]
+    - fingerprint_contains: ["Nginx"]
+    - evidence_contains: ["nginx"]
+    - service_is: "http"
+
+probes:
+  - id: confirm_nginx
+    description: "确认 Nginx 并获取版本"
+    command: "bash {skill_dir}/scripts/nginx_confirm.sh {ENDPOINT}"
+    parse_rules:
+      - if_regex: "[Nn]ginx/?([\\d.]*)"
+        set: { nginx_confirmed: true }
+      - if_contains: ["nginx"]
+        set: { nginx_confirmed: true }
+
+  - id: scan_sensitive_paths
+    description: "探测 Nginx 相关敏感路径"
+    depends_on: { nginx_confirmed: true }
+    steps:
+      - command: "bash {skill_dir}/scripts/nginx_scan_sensitive_paths.sh {ENDPOINT}"
+        parse_rules:
+          - if_contains: ["SENSITIVE_PATH"]
+            set: { sensitive_paths_found: true }
+
+      - command: "bash {skill_dir}/scripts/nginx_scan_autoindex.sh {ENDPOINT}"
+        parse_rules:
+          - if_contains: ["AUTOINDEX"]
+            set: { autoindex_found: true }
+
+exploit_paths:
+  # 路径 A: alias 路径穿越
+  - path_id: alias_traversal
+    name: "Nginx alias 路径穿越"
+    priority: 1
+    conditions:
+      nginx_confirmed: true
+    steps:
+      - id: alias_detect
+        description: "探测常见 alias 穿越路径"
+        command: "bash {skill_dir}/scripts/nginx_alias_traversal.sh {ENDPOINT}"
+        timeout: 60
+        success_criteria:
+          stdout_contains_any: ["ALIAS_TRAVERSAL", "root:"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "file_read_alias"
+
+  # 路径 B: off-by-slash proxy 穿越
+  - path_id: proxy_traversal
+    name: "off-by-slash 反向代理穿越"
+    priority: 2
+    conditions:
+      nginx_confirmed: true
+    steps:
+      - id: proxy_detect
+        description: "探测反向代理穿越"
+        command: "bash {skill_dir}/scripts/nginx_proxy_traversal.sh {ENDPOINT}"
+        timeout: 60
+        success_criteria:
+          stdout_contains_any: ["PROXY_TRAVERSAL"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "proxy_traversal"
+
+  # 路径 C: CRLF 注入
+  - path_id: crlf_injection
+    name: "CRLF Header 注入"
+    priority: 3
+    conditions:
+      nginx_confirmed: true
+    steps:
+      - id: crlf_detect
+        description: "在重定向 URL 中注入 CRLF"
+        command: "bash {skill_dir}/scripts/nginx_crlf_injection.sh {ENDPOINT}"
+        timeout: 20
+        success_criteria:
+          stdout_contains_any: ["CRLF_PATH_INJECTION", "CRLF_PARAM_INJECTION"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "crlf_injection"
+
+  # 路径 D: 信息泄露汇总
+  - path_id: info_disclosure
+    name: "敏感信息泄露"
+    priority: 4
+    conditions:
+      nginx_confirmed: true
+      sensitive_paths_found: true
+    steps:
+      - id: read_sensitive
+        description: "读取已发现的敏感文件内容"
+        command: "bash {skill_dir}/scripts/nginx_read_sensitive.sh {ENDPOINT}"
+        timeout: 30
+        success_criteria:
+          stdout_contains_any: ["server {", "SECRET_KEY", "ref:", "Active connections"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "info_disclosure"
+
+  # 路径 E: LLM 兜底
+  - path_id: llm_freeform
+    name: "LLM 自由推理"
+    priority: 99
+    mode: react_freeform
+    max_rounds: 4
+    conditions:
+      nginx_confirmed: true
+
+remediation: |
+  1. alias 路径穿越: location 和 alias 路径末尾的 / 必须一致
+  2. 关闭 autoindex（除非确实需要）
+  3. 不要在 return/rewrite 中使用未过滤的 \$uri
+  4. 限制敏感路径（.git, .env, nginx.conf）的访问
+  5. proxy_pass 使用完整路径，避免 off-by-slash
+  6. 保持 Nginx 版本更新

@@ -37,6 +37,45 @@ _CATEGORY_PRIORITY = {
     "recon_skill": 3,
 }
 
+# (port, service_lower) → skill_id — 当标准评分匹配不到任何 skill 时兜底
+_SERVICE_PORT_FALLBACK: dict[tuple[int, str], str] = {
+    (389, "ldap"): "ldap_exploit",
+    (636, "ldaps"): "ldap_exploit",
+    (3268, "ldap"): "ldap_exploit",
+    (3269, "ldaps"): "ldap_exploit",
+    (88, "kerberos"): "kerberos_exploit",
+    (88, "kerberos-sec"): "kerberos_exploit",
+    (464, "kpasswd5"): "kerberos_exploit",
+    (5985, "winrm"): "winrm_exploit",
+    (5985, "ws-management"): "winrm_exploit",
+    (5986, "winrm"): "winrm_exploit",
+    (5986, "ws-management"): "winrm_exploit",
+    (1433, "ms-sql-s"): "mssql_exploit",
+    (1433, "ms-sql-m"): "mssql_exploit",
+    (1433, "mssql"): "mssql_exploit",
+    (6379, "redis"): "redis_exploit",
+    (3306, "mysql"): "mysql_exploit",
+    (3306, "mariadb"): "mysql_exploit",
+    (5432, "postgresql"): "mysql_exploit",
+    (5432, "pgsql"): "mysql_exploit",
+    (6443, "kubernetes"): "k8s_exploit",
+    (6443, "kube-apiserver"): "k8s_exploit",
+    (10250, "kubelet"): "k8s_exploit",
+    (10255, "kubelet"): "k8s_exploit",
+    (2379, "etcd"): "k8s_exploit",
+    (2049, "nfs"): "nfs_exploit",
+    (2049, "nfs-acl"): "nfs_exploit",
+    (111, "rpcbind"): "nfs_exploit",
+    (111, "portmapper"): "nfs_exploit",
+    (161, "snmp"): "snmp_exploit",
+    (53, "domain"): "dns_exploit",
+    (53, "dns"): "dns_exploit",
+    (25, "smtp"): "smtp_exploit",
+    (587, "submission"): "smtp_exploit",
+    (3389, "ms-wbt-server"): "rdp_exploit",
+    (3389, "rdp"): "rdp_exploit",
+}
+
 _SERVICE_FINDING_NAMES = frozenset({
     "ssh service", "ftp service", "smb service", "rdp service",
     "telnet service", "mysql service", "postgresql service",
@@ -355,7 +394,7 @@ class SkillRegistry:
             if rule.port_is and finding.port:
                 if finding.port in rule.port_is:
                     is_service_finding = name_lower in _SERVICE_FINDING_NAMES
-                    rule_score += 30 if is_service_finding else 5
+                    rule_score += 30 if is_service_finding else 15
 
             if rule.service_is and name_lower:
                 svc_kw = rule.service_is.lower()
@@ -375,7 +414,8 @@ class SkillRegistry:
     ) -> Optional[Skill]:
         """Match a skill purely by port/service when no VulnFinding matched.
 
-        Creates a synthetic minimal finding for scoring purposes.
+        Creates a synthetic minimal finding for scoring purposes, then falls
+        back to ``_SERVICE_PORT_FALLBACK`` if standard scoring returns None.
         """
         self.ensure_loaded()
         synthetic = VulnFinding(
@@ -386,11 +426,26 @@ class SkillRegistry:
             exploitable=True,
             tool="port-match",
         )
-        return self.match(
+        result = self.match(
             finding=synthetic,
             fingerprint=fingerprint,
             context_vars=context_vars,
         )
+        if result is not None:
+            return result
+
+        # Last-chance: direct port→skill lookup
+        svc_lower = (service or "").lower()
+        skill_id = _SERVICE_PORT_FALLBACK.get((port, svc_lower))
+        if skill_id:
+            fallback = self.get_by_id(skill_id)
+            if fallback:
+                logger.info(
+                    f"[SkillRegistry] port fallback → {skill_id} "
+                    f"(port={port}, service={svc_lower})"
+                )
+                return fallback
+        return None
 
 
 _registry_lock = threading.Lock()

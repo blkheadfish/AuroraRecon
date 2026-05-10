@@ -19,7 +19,7 @@ type CheckpointState = 'idle' | 'submitting' | 'submitted' | 'error'
 
 // ── 有界缓存阈值 ───────────────────────────────────────
 const MAX_LOG_BUFFER = 3000
-const MAX_DECISION_EVENTS = 1000
+const MAX_DECISION_EVENTS = 5000
 const MAX_TOOL_STREAM_LINES = 500
 
 interface LlmStreamBubble {
