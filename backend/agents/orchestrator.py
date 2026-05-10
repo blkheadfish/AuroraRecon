@@ -624,13 +624,21 @@ def _plan_get_phase_steps(state: PentestState, phase_name: str) -> list[dict]:
 
 
 def _plan_should_skip_phase(state: PentestState, phase_name: str) -> tuple[bool, str]:
-    """检查 pentest_plan 是否指示跳过该阶段。
+    """检查 pentest_plan 或场景分类器是否指示跳过该阶段。
 
     当策略存在时，未被策略覆盖的阶段一律跳过——确保执行流严格按策略走。
 
     phase_name 可以是策略阶段名（recon/exploit/post_exploit）或攻击链节点名
     （surface_enum/foothold_attempt 等），本函数统一处理映射。
     """
+    # ── 场景分类器跳过 ──
+    try:
+        from backend.agents.scene_classifier import scene_should_skip
+        if scene_should_skip(state, phase_name):
+            return True, f"场景适配: 当前场景不适用 {phase_name}，跳过"
+    except Exception:
+        pass
+
     plan = state.pentest_plan or {}
     if not plan:
         return False, ""
@@ -1230,6 +1238,16 @@ async def node_recon(state: PentestState) -> PentestState:
         logger.debug(f"[node_recon] attack_graph upsert skipped: {_ag_exc}")
     _consume_replan_signal(state, "re_recon_for_hosts")
     _mark_phase_visited(state, "recon", sig)
+
+    # ── 场景感知分类（首次 recon 完成后）──
+    if state.phase_visit_count.get("recon", 0) == 1:
+        try:
+            from backend.agents.scene_classifier import classify_scene, apply_scene_to_state
+            scene = classify_scene(state)
+            apply_scene_to_state(state, scene)
+        except Exception as _sc_exc:
+            logger.warning(f"[node_recon] 场景分类失败: {_sc_exc}")
+
     return state
 
 
@@ -3549,6 +3567,9 @@ def _edge_after_cloud_exploit(state: PentestState) -> str:
     return _edge_plan_forward(state, "cloud_exploit")
 
 def _edge_after_recon(state: PentestState) -> str:
+    if not state.open_ports and not state.web_paths and not state.web_paths_inventory:
+        state.log("[orchestrator] recon 未发现任何攻击面，直接生成报告")
+        return "exploit_decision"
     return _edge_plan_forward(state, "recon")
 
 

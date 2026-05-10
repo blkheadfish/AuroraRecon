@@ -90,6 +90,22 @@ def _mark_plan_consumed_by(plan: Any, consumer: str) -> None:
             pass
 
 
+def _scene_has_no_attack_surface(state: PentestState) -> bool:
+    """Recon 完成后，判断是否有任何可用攻击面。"""
+    if state.open_ports:
+        return False
+    if state.web_paths:
+        return False
+    if state.web_paths_inventory:
+        return False
+    if state.subdomains:
+        return False
+    if state.raw_recon:
+        # 有原始侦察数据但未解析 → 可能还有东西
+        return False
+    return True
+
+
 def _no_new_facts(state: PentestState, k: int = 3) -> bool:
     """Check the last *k* supervisor rounds — if they produced no fact churn."""
     hist = list(state.supervisor_history or [])
@@ -182,6 +198,9 @@ def _rule_decide(state: PentestState) -> Optional[dict[str, Any]]:
 
     if not _has_visited(state, "recon"):
         return {"next": "recon", "reason": "first run", "rule": "phase.recon_first"}
+
+    if _has_visited(state, "recon") and _scene_has_no_attack_surface(state):
+        return {"next": "report", "reason": "recon 未发现任何开放端口或 Web 路径，无可攻击面", "rule": "guard.dead_end"}
 
     if state.open_ports and not _has_visited(state, "surface_enum"):
         return {"next": "surface_enum", "reason": "ports discovered, surface enumeration pending", "rule": "phase.surface_first"}
