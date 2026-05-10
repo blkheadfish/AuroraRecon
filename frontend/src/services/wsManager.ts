@@ -26,6 +26,9 @@ interface ChannelState {
   reconnectTimer: number | null
   /** 重连后第一条业务帧到达时复位 retries 并补拉一次任务快照。 */
   firstMessageAfterReconnect: boolean
+  /** IndexedDB 批量写入缓冲: 200ms 内的 event 合并成一笔事务。 */
+  writeBuffer: EventEnvelope[]
+  writeTimer: number | null
 }
 
 const channels = new Map<string, ChannelState>()
@@ -36,6 +39,9 @@ const channels = new Map<string, ChannelState>()
  */
 const BACKOFF_MS = [500, 1000, 2000, 4000, 8000, 15000, 30000, 30000]
 const MAX_RETRIES = 30
+
+/** IndexedDB 批量写入缓冲延迟: 合并 200ms 内的业务事件为一笔事务。 */
+const WRITE_FLUSH_MS = 200
 
 /** 去重 Set 上限: 单任务 5w 事件, Set 占用约 ~2MB, 控在可接受范围。 */
 const SEEN_IDS_CAP = 50000
@@ -69,6 +75,22 @@ function broadcast(taskId: string, event: Record<string, unknown>) {
   for (const listener of channel.listeners) {
     listener(event)
   }
+}
+
+function _flushWrites(taskId: string) {
+  const channel = channels.get(taskId)
+  if (!channel || !channel.writeBuffer.length) return
+  const batch = channel.writeBuffer.splice(0)
+  if (channel.writeTimer !== null) {
+    window.clearTimeout(channel.writeTimer)
+    channel.writeTimer = null
+  }
+  appendEvents(taskId, batch).catch(() => {})
+}
+
+function _scheduleWrite(channel: ChannelState, taskId: string) {
+  if (channel.writeTimer !== null) return
+  channel.writeTimer = window.setTimeout(() => _flushWrites(taskId), WRITE_FLUSH_MS)
 }
 
 function clearReconnectTimer(state: ChannelState) {
@@ -147,9 +169,10 @@ async function connect(taskId: string) {
         _bumpLastEventId(channel, eid)
       }
 
-      // 持久化到 IndexedDB (fire-and-forget)
+      // 持久化到 IndexedDB (缓冲批量写入, 200ms 合并一事务)
       if (eid) {
-        appendEvents(taskId, [ev as unknown as EventEnvelope]).catch(() => {})
+        channel.writeBuffer.push(ev as unknown as EventEnvelope)
+        _scheduleWrite(channel, taskId)
       }
 
       broadcast(taskId, ev)
@@ -190,6 +213,8 @@ export function subscribeTaskEvents(taskId: string, listener: Listener): () => v
       retries: 0,
       reconnectTimer: null,
       firstMessageAfterReconnect: false,
+      writeBuffer: [],
+      writeTimer: null,
     }
     channels.set(taskId, channel)
 
@@ -214,6 +239,14 @@ export function subscribeTaskEvents(taskId: string, listener: Listener): () => v
     current.listeners.delete(listener)
     if (current.listeners.size === 0) {
       clearReconnectTimer(current)
+      if (current.writeTimer !== null) {
+        window.clearTimeout(current.writeTimer)
+        current.writeTimer = null
+      }
+      // 销毁前 flush 残留缓冲
+      if (current.writeBuffer.length) {
+        appendEvents(taskId, current.writeBuffer.splice(0)).catch(() => {})
+      }
       current.conn.close()
       channels.delete(taskId)
     }

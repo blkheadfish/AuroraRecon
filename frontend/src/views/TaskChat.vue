@@ -235,28 +235,32 @@
             </div>
           </template>
 
-          <div v-for="(bubble, sid) in activeStreamBubbles" :key="sid" class="llm-stream-bubble">
-            <div class="bubble-header">
-              <span class="bubble-phase">{{ bubble.phase || '推理' }}</span>
-              <span class="bubble-indicator">正在思考<span class="dots">...</span></span>
+          <TransitionGroup name="stream-enter" tag="div">
+            <div v-for="(bubble, sid) in activeStreamBubbles" :key="sid" class="llm-stream-bubble">
+              <div class="bubble-header">
+                <span class="bubble-phase">{{ bubble.phase || '推理' }}</span>
+                <span class="bubble-indicator">正在思考<span class="dots">...</span></span>
+              </div>
+              <pre class="bubble-text">{{ bubble.text }}</pre>
             </div>
-            <pre class="bubble-text">{{ bubble.text }}</pre>
-          </div>
+          </TransitionGroup>
 
-          <div
-            v-for="bubble in activeToolStreamBubbles"
-            :key="`tool-${bubble.sid}`"
-            class="tool-stream-bubble"
-          >
-            <div class="bubble-header">
-              <span class="bubble-phase">{{ bubble.tool }}</span>
-              <span class="bubble-indicator">
-                正在执行<span class="dots">...</span>
-                · {{ bubble.total }} 行
-              </span>
+          <TransitionGroup name="stream-enter" tag="div">
+            <div
+              v-for="bubble in activeToolStreamBubbles"
+              :key="`tool-${bubble.sid}`"
+              class="tool-stream-bubble"
+            >
+              <div class="bubble-header">
+                <span class="bubble-phase">{{ bubble.tool }}</span>
+                <span class="bubble-indicator">
+                  正在执行<span class="dots">...</span>
+                  · {{ bubble.total }} 行
+                </span>
+              </div>
+              <pre class="bubble-text">{{ bubble.lines.join('\n') }}</pre>
             </div>
-            <pre class="bubble-text">{{ bubble.lines.join('\n') }}</pre>
-          </div>
+          </TransitionGroup>
         </div>
 
         <transition name="fade">
@@ -268,7 +272,12 @@
       </div>
 
       <div v-if="strategyPlan.length > 0" class="strategy-side">
-        <StrategyRail :title="hasPentestPlan ? '渗透策略' : '攻击链'" :items="strategyPlan" />
+        <StrategyRail
+          :title="hasPentestPlan ? '渗透策略' : '攻击链'"
+          :items="strategyPlan"
+          :collapsed="uiPrefs.strategyPanelCollapsed"
+          @toggle="uiPrefs.strategyPanelCollapsed = !uiPrefs.strategyPanelCollapsed"
+        />
       </div>
     </main>
 
@@ -411,6 +420,7 @@ import {
 import { api } from '@/api'
 import { useTaskListStore } from '@/stores/taskList'
 import { useTaskLiveStore } from '@/stores/taskLive'
+import { useUiPrefsStore } from '@/stores/uiPrefs'
 import { trackEvent } from '@/metrics/tracker'
 import BranchTreeNode from '@/components/BranchTreeNode.vue'
 import ChatBubble from '@/components/ChatBubble.vue'
@@ -422,7 +432,7 @@ import ToolChainRail from '@/components/ToolChainRail.vue'
 import ApprovalCard from '@/components/ApprovalCard.vue'
 import StrategyRail from '@/components/StrategyRail.vue'
 import type { StrategyItem } from '@/components/StrategyRail.vue'
-import { useChatMessages, PLAN_PHASE_TO_CHAIN, PLAN_PHASE_LABELS, CHAIN_PHASES } from '@/composables/useChatMessages'
+import { useChatMessages, PLAN_PHASE_TO_CHAIN, PLAN_PHASE_LABELS, CHAIN_PHASES, formatTime } from '@/composables/useChatMessages'
 import { useBranchNavigator } from '@/composables/useBranchNavigator'
 import { useApprovalCard } from '@/composables/useApprovalCard'
 import { useScrollController } from '@/composables/useScrollController'
@@ -432,6 +442,7 @@ const router = useRouter()
 const taskId = String(route.params.id)
 const listStore = useTaskListStore()
 const liveStore = useTaskLiveStore()
+const uiPrefs = useUiPrefsStore()
 
 const loading = ref(true)
 const chatInput = ref('')
@@ -1274,6 +1285,27 @@ onUnmounted(() => {
   overflow-y: auto;
   margin: 0;
   line-height: 1.6;
+  transition: height 0.2s ease;
+}
+
+/* TransitionGroup: stream bubble enter/leave */
+.stream-enter-enter-active {
+  transition: all 0.35s ease-out;
+}
+.stream-enter-leave-active {
+  transition: all 0.25s ease-in;
+  position: absolute;
+}
+.stream-enter-enter-from {
+  opacity: 0;
+  transform: translateY(8px);
+}
+.stream-enter-leave-to {
+  opacity: 0;
+  transform: translateY(-4px);
+}
+.stream-enter-move {
+  transition: transform 0.3s ease;
 }
 
 .jump-latest {
