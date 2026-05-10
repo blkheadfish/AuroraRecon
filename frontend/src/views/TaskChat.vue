@@ -46,7 +46,7 @@
         />
       </div>
 
-      <div class="chat-stream-wrap" ref="streamRef" @scroll="onUserScroll">
+      <div class="chat-stream-wrap" ref="streamRef" @scroll="scroll.onUserScroll">
         <div class="bubble-stream">
           <template v-for="msg in messages" :key="msg.id">
             <div
@@ -178,78 +178,8 @@
               v-if="msg.action === 'approval_required' || msg.action === 'approval'"
               class="approval-slot"
             >
-              <div v-if="showApprovalActions && msg.isLastApproval" class="approval-card">
-                <!-- Header -->
-                <div class="approval-card-header">
-                  <div class="approval-card-header-left">
-                    <el-icon class="approval-card-icon"><WarningFilled /></el-icon>
-                    <div>
-                      <div class="approval-card-title">
-                        <span>人工审批确认</span>
-                        <el-tag v-if="approvalCardContext?.phaseLabel" size="small" type="warning" class="approval-card-phase-tag">
-                          {{ approvalCardContext.phaseLabel }}
-                        </el-tag>
-                      </div>
-                      <div class="approval-card-subtitle">
-                        {{ approvalCardContext?.summary || 'Agent 已暂停, 等待你审批后续操作。' }}
-                      </div>
-                    </div>
-                  </div>
-                  <div class="approval-card-header-right">
-                    <el-tag v-if="approvalCardContext?.risk" :type="approvalCardContext.riskType" effect="dark" size="small">
-                      风险 · {{ approvalCardContext.risk }}
-                    </el-tag>
-                  </div>
-                </div>
-
-                <!-- Targets list -->
-                <div v-if="approvalCardContext?.targets?.length" class="approval-card-targets">
-                  <div class="approval-card-section-head">
-                    <el-icon><Aim /></el-icon>
-                    <span>待利用漏洞 ({{ approvalCardContext.targets.length }})</span>
-                  </div>
-                  <div class="approval-card-target-list">
-                    <div v-for="(t, i) in approvalCardContext.targets.slice(0, 6)" :key="i" class="approval-card-target-item">
-                      <span class="approval-card-sev" :class="`sev-${t.severity}`">{{ (t.severity || '?').toUpperCase() }}</span>
-                      <span class="approval-card-target-name">{{ t.name }}</span>
-                      <code v-if="t.cve" class="approval-card-target-cve">{{ t.cve }}</code>
-                      <span v-if="t.port" class="approval-card-target-port">:{{ t.port }}</span>
-                    </div>
-                  </div>
-                </div>
-
-                <!-- Recommendation -->
-                <div v-if="approvalCardContext?.recommendation" class="approval-card-recommendation">
-                  <div class="approval-card-section-head">
-                    <el-icon><Promotion /></el-icon>
-                    <span>Agent 建议</span>
-                  </div>
-                  <p class="approval-card-recommendation-text">{{ approvalCardContext.recommendation }}</p>
-                </div>
-
-                <!-- What happens -->
-                <div class="approval-card-consequences">
-                  <div class="approval-card-consequence approve-consequence">
-                    <el-icon><CircleCheck /></el-icon>
-                    <span>批准后将进入利用阶段, 尝试对上述漏洞发起攻击获取立足点</span>
-                  </div>
-                  <div class="approval-card-consequence reject-consequence">
-                    <el-icon><CircleCloseFilled /></el-icon>
-                    <span>拒绝将跳过利用阶段, 直接生成报告</span>
-                  </div>
-                </div>
-
-                <!-- Actions -->
-                <div class="approval-card-actions">
-                  <el-button type="primary" :loading="approving" @click="doApprove(true)">
-                    <el-icon><Check /></el-icon>
-                    批准并开始利用
-                  </el-button>
-                  <el-button type="danger" plain :loading="approving" @click="doApprove(false)">
-                    <el-icon><Close /></el-icon>
-                    拒绝, 直接生成报告
-                  </el-button>
-                </div>
+              <div v-if="showApprovalActions && msg.isLastApproval">
+                <ApprovalCard :context="approvalCardContext" :loading="approving" @approve="doApprove" />
               </div>
               <div v-else class="checkpoint-done">
                 <el-icon><Check /></el-icon>
@@ -270,29 +200,29 @@
             </div>
 
             <div
-              v-if="msg.action === 'branch_forked' && msg.branchId && siblingNavFor(msg.branchId)"
+              v-if="msg.action === 'branch_forked' && msg.branchId && nav.siblingNavFor(msg.branchId)"
               class="branch-navigator"
             >
               <button
                 class="nav-btn"
-                :disabled="siblingNavFor(msg.branchId).total <= 1"
-                @click="gotoSibling(msg.branchId, -1)"
+                :disabled="nav.siblingNavFor(msg.branchId).total <= 1"
+                @click="nav.gotoSibling(msg.branchId, -1)"
                 title="上一个兄弟分支"
               >‹</button>
               <span class="nav-counter">
-                &lt;{{ siblingNavFor(msg.branchId).index }}/{{ siblingNavFor(msg.branchId).total }}&gt;
+                &lt;{{ nav.siblingNavFor(msg.branchId).index }}/{{ nav.siblingNavFor(msg.branchId).total }}&gt;
               </span>
               <button
                 class="nav-btn"
-                :disabled="siblingNavFor(msg.branchId).total <= 1"
-                @click="gotoSibling(msg.branchId, 1)"
+                :disabled="nav.siblingNavFor(msg.branchId).total <= 1"
+                @click="nav.gotoSibling(msg.branchId, 1)"
                 title="下一个兄弟分支"
               >›</button>
               <span class="nav-active" v-if="msg.branchId === activeBranchId">当前激活</span>
               <button
                 v-else
                 class="nav-activate"
-                @click="activateBranch(msg.branchId)"
+                @click="nav.activateBranch(msg.branchId)"
               >切到此分支</button>
             </div>
           </ChatBubble>
@@ -324,62 +254,29 @@
         </div>
 
         <transition name="fade">
-          <button v-if="showJumpBtn" class="jump-latest" @click="jumpToBottom">
+          <button v-if="scroll.showJumpBtn" class="jump-latest" @click="scroll.jumpToBottom">
             <el-icon><ArrowDown /></el-icon>
             跳转最新
           </button>
         </transition>
       </div>
 
-      <!-- 右侧策略面板：优先按用户制定的策略展示，无策略时展示通用攻击链 -->
       <div v-if="strategyPlan.length > 0" class="strategy-side">
-        <div class="strategy-rail">
-          <div class="strategy-rail-header">
-            <span class="strategy-rail-title">{{ hasPentestPlan ? '渗透策略' : '攻击链' }}</span>
-            <span class="strategy-rail-count">{{ strategyPlan.filter(i => i.status === 'done').length }}/{{ strategyPlan.length }}</span>
-          </div>
-          <div class="strategy-rail-list">
-            <div
-              v-for="(item, i) in strategyPlan"
-              :key="item.key"
-              class="strategy-node"
-              :class="{ 'strategy-node-active': item.status === 'active' }"
-            >
-              <div class="strategy-connector" :class="item.status === 'done' ? 'connector-done' : ''" v-if="i > 0" />
-              <div class="strategy-dot" :class="{
-                'dot-done': item.status === 'done',
-                'dot-active': item.status === 'active',
-                'dot-pending': item.status === 'pending',
-              }" />
-              <div class="strategy-body">
-                <div class="strategy-label" :class="{ 'label-active': item.status === 'active' }">{{ item.label }}</div>
-                <div class="strategy-detail" v-if="item.detail">{{ item.detail }}</div>
-                <div v-if="item.steps && item.steps.length" class="strategy-steps">
-                  <div v-for="(step, si) in item.steps" :key="si" class="strategy-step">
-                    <span class="strategy-step-idx">{{ si + 1 }}</span>
-                    <code v-if="step.tool" class="strategy-step-tool">{{ step.tool }}</code>
-                    <code v-else-if="step.skill" class="strategy-step-skill">{{ step.skill }}</code>
-                    <span v-if="step.purpose" class="strategy-step-purpose">{{ step.purpose }}</span>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
+        <StrategyRail :title="hasPentestPlan ? '渗透策略' : '攻击链'" :items="strategyPlan" />
       </div>
     </main>
 
       <section class="composer" :class="{ 'composer-flash': composerFlashing }">
-        <div v-if="branches.length || activeBranch" class="branch-status-band">
+        <div v-if="branches.length || nav.activeBranch" class="branch-status-band">
           <span class="band-icon">
             <el-icon><Share /></el-icon>
           </span>
           <span class="band-text">
-            <template v-if="activeBranch">
+            <template v-if="nav.activeBranch">
               当前分支
-              <strong>{{ activeBranch.label || activeBranch.branch_id }}</strong>
-              <span class="band-status" :class="`status-${activeBranch.status}`">
-                · {{ branchStatusLabel(activeBranch.status) }}
+              <strong>{{ nav.activeBranch.label || nav.activeBranch.branch_id }}</strong>
+              <span class="band-status" :class="`status-${nav.activeBranch.status}`">
+                · {{ nav.branchStatusLabel(nav.activeBranch.status) }}
               </span>
             </template>
             <template v-else>
@@ -389,7 +286,7 @@
               · 共 {{ branches.length }} 个分支
             </span>
           </span>
-          <span v-if="branchAtCap" class="band-cap">已达分支上限, 新输入将被合并到当前分支</span>
+          <span v-if="nav.branchAtCap" class="band-cap">已达分支上限, 新输入将被合并到当前分支</span>
           <el-popover
             v-if="branches.length"
             placement="top-end"
@@ -401,7 +298,7 @@
             <template #reference>
               <button type="button" class="band-switch" :title="`分支总数: ${branches.length}`">
                 <el-icon><Share /></el-icon>
-                全部分支 ({{ branches.length }}/{{ state.maxBranchesPerTask || 12 }})
+                全部分支 ({{ branches.length }}/{{ maxBranchesPerTask }})
               </button>
             </template>
             <div class="branch-popover-body">
@@ -411,10 +308,10 @@
               </div>
               <div class="branch-popover-tree">
                 <BranchTreeNode
-                  v-for="node in branchRoots"
+                  v-for="node in nav.branchRoots"
                   :key="node.branch_id"
                   :node="node"
-                  :children-by-parent="branchChildrenByParent"
+                  :children-by-parent="nav.branchChildrenByParent"
                   :active-id="activeBranchId"
                   :depth="0"
                   @activate="onBranchActivate"
@@ -487,17 +384,15 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import {
-  Aim,
   ArrowDown,
   ArrowLeft,
   ChatLineRound,
   Check,
   CircleCheck,
-  CircleCloseFilled,
   Close,
   Document,
   Loading,
@@ -505,7 +400,6 @@ import {
   Promotion,
   Share,
   Warning,
-  WarningFilled,
 } from '@element-plus/icons-vue'
 import { api } from '@/api'
 import { useTaskListStore } from '@/stores/taskList'
@@ -518,6 +412,13 @@ import { resolveToolDisplay } from '@/utils/toolDisplay'
 import PayloadCodeBlock from '@/components/PayloadCodeBlock.vue'
 import StatusBadge from '@/components/StatusBadge.vue'
 import ToolChainRail from '@/components/ToolChainRail.vue'
+import ApprovalCard from '@/components/ApprovalCard.vue'
+import StrategyRail from '@/components/StrategyRail.vue'
+import type { StrategyItem } from '@/components/StrategyRail.vue'
+import { useChatMessages, PLAN_PHASE_TO_CHAIN, PLAN_PHASE_LABELS, CHAIN_PHASES } from '@/composables/useChatMessages'
+import { useBranchNavigator } from '@/composables/useBranchNavigator'
+import { useApprovalCard } from '@/composables/useApprovalCard'
+import { useScrollController } from '@/composables/useScrollController'
 
 const route = useRoute()
 const router = useRouter()
@@ -530,41 +431,25 @@ const chatInput = ref('')
 const sending = ref(false)
 const cancelling = ref(false)
 const streamRef = ref(null)
-const showJumpBtn = ref(false)
-const stickyBottom = ref(true)
-let scrollTimeout = null
-let userScrolling = false
-let scrollRafId = 0
 
 const state = computed(() => liveStore.getLiveState(taskId))
 const task = computed(() => state.value.task || listStore.getTaskById(taskId))
 
-// 后端 timestamp 是 HH:MM:SS 短格式,store 层虽然做了 sort 但 Vue3 reactive
-// 对原地 sort 触发依赖更新不一定可靠。这里在 view 层再 sort 一次作为最终防线,
-// 确保 rail/messages 的渲染顺序严格按事件先后。
-//
-// 比较器:
-//   1. 主 key = timestamp 字典序 (HH:MM:SS / ISO 都是字典序 = 时间序)
-//   2. tie-breaker = id 里的 idx (后端 push 顺序), 解决同秒 / 同 timestamp 时的稳定性
-function _eventIdx(id) {
+function _eventIdx(id: unknown): number {
   const m = String(id || '').match(/^de-(\d+)-/)
   return m ? Number(m[1]) : 0
 }
-function _compareEvents(a, b) {
-  const ta = String(a?.timestamp || '')
-  const tb = String(b?.timestamp || '')
+function _compareEvents(a: Record<string, unknown>, b: Record<string, unknown>): number {
+  const ta = String((a as { timestamp?: string })?.timestamp || '')
+  const tb = String((b as { timestamp?: string })?.timestamp || '')
   const cmp = ta.localeCompare(tb)
   if (cmp !== 0) return cmp
-  return _eventIdx(a?.id) - _eventIdx(b?.id)
+  return _eventIdx((a as { id?: string })?.id) - _eventIdx((b as { id?: string })?.id)
 }
 
 const decisionEvents = computed(() => {
   const raw = state.value?.decisionEvents
   if (!Array.isArray(raw) || !raw.length) return []
-  // 按 activeBranchId 切片: 后端在 ``push_decision`` / WS sink 注入了
-  // ``branch_id``, 切到老分支时 chat 流和 ToolChainRail 只显示属于该
-  // 分支的事件; 没有 branch_id 的"全局事件"(老快照、approval_required
-  // 等系统事件)始终展示, 避免审批气泡因切分支而消失。
   const activeBid = state.value?.activeBranchId || ''
   const filtered = activeBid
     ? raw.filter((ev) => {
@@ -572,8 +457,7 @@ const decisionEvents = computed(() => {
         return !bid || bid === activeBid
       })
     : raw
-  // slice 后再 sort, 不影响 store 内部数组
-  return filtered.slice().sort(_compareEvents)
+  return (filtered.slice() as Array<Record<string, unknown>>).sort(_compareEvents) as unknown as typeof raw
 })
 const llmStreams = computed(() => state.value?.llmStreams || {})
 const isRunning = computed(() => ['pending', 'running'].includes(task.value?.status || ''))
@@ -584,40 +468,20 @@ const showApprovalActions = computed(() => needsApproval.value && (approvalState
 const pendingCheckpoint = computed(() => state.value?.pendingCheckpoint || null)
 const checkpointSubmitting = computed(() => state.value?.checkpointState === 'submitting')
 
-// 策略阶段名 → 对应的攻击链节点名（用于进度跟踪）
-const PLAN_PHASE_TO_CHAIN: Record<string, string[]> = {
-  recon: ['recon'],
-  surface_enum: ['surface_enum'],
-  intel_harvest: ['intel_harvest'],
-  vuln_scan: ['vuln_scan'],
-  exploit: ['exploit_decision', 'awaiting_approval', 'human_approval', 'foothold_attempt', 'secondary_attack'],
-  post_exploit: ['post_foothold_enum', 'post_foothold_approval', 'internal_scan', 'privesc_attempt', 'lateral_movement', 'persistence', 'objective_collect'],
-  report: ['report'],
-}
+// ── composables ────────────────────────────────
+const toolStreams = computed(() => state.value?.toolStreams || {})
 
-const PLAN_PHASE_LABELS: Record<string, string> = {
-  recon: '侦察',
-  surface_enum: '攻击面枚举',
-  intel_harvest: '情报收集',
-  vuln_scan: '漏洞扫描',
-  exploit: '漏洞利用',
-  post_exploit: '后渗透',
-  report: '报告',
-}
+const { messages, activeStreamBubbles, activeToolStreamBubbles } = useChatMessages(
+  decisionEvents,
+  task,
+  pendingCheckpoint,
+  llmStreams,
+  toolStreams,
+)
 
-interface StrategyStep {
-  tool?: string
-  skill?: string
-  purpose?: string
-}
+const { approvalCardContext } = useApprovalCard(pendingCheckpoint, messages)
 
-interface StrategyItem {
-  key: string
-  label: string
-  detail: string
-  status: 'done' | 'active' | 'pending'
-  steps?: StrategyStep[]
-}
+const scroll = useScrollController(streamRef, computed(() => messages.value.length))
 
 const hasPentestPlan = computed(() => {
   const plan = task.value?.pentest_plan as Record<string, unknown> | undefined
@@ -666,24 +530,6 @@ const strategyPlan = computed<StrategyItem[]>(() => {
   }
 
   // ── 无策略时：展示通用攻击链 ──
-  const CHAIN_PHASES: Array<{ key: string; label: string }> = [
-    { key: 'recon', label: '侦察' },
-    { key: 'surface_enum', label: '攻击面枚举' },
-    { key: 'intel_harvest', label: '情报收集' },
-    { key: 'vuln_scan', label: '漏洞扫描' },
-    { key: 'exploit_decision', label: '利用决策' },
-    { key: 'awaiting_approval', label: '等待审批' },
-    { key: 'foothold_attempt', label: '立足点尝试' },
-    { key: 'secondary_attack', label: '二次攻击' },
-    { key: 'post_foothold_enum', label: '立足后枚举' },
-    { key: 'post_foothold_approval', label: '立足后确认' },
-    { key: 'internal_scan', label: '内网扫描' },
-    { key: 'privesc_attempt', label: '提权尝试' },
-    { key: 'lateral_movement', label: '横向移动' },
-    { key: 'persistence', label: '持久化' },
-    { key: 'objective_collect', label: '目标收集' },
-    { key: 'report', label: '报告' },
-  ]
   const items: StrategyItem[] = []
   for (let i = 0; i < CHAIN_PHASES.length; i++) {
     const p = CHAIN_PHASES[i]
@@ -699,568 +545,6 @@ const strategyPlan = computed<StrategyItem[]>(() => {
     items.push({ key: p.key, label: p.label, detail, status })
   }
   return items
-})
-
-// ── 审批卡片上下文: 优先从 pendingCheckpoint 取(最丰富),
-//    再回退到 approval_required 事件里的轻量字段 ─────────
-interface ApprovalCardContext {
-  phase: string
-  phaseLabel: string
-  risk: string
-  riskType: 'danger' | 'warning' | 'info' | ''
-  summary: string
-  targets: { name: string; severity: string; vuln_id: string; cve?: string; port?: number }[]
-  recommendation: string
-  exploitableCount: number
-}
-
-const approvalCardContext = computed<ApprovalCardContext | null>(() => {
-  // Priority 1: pending checkpoint (from node_human_approval / interactive pause)
-  const ckpt = pendingCheckpoint.value
-  if (ckpt && (ckpt.checkpoint_type === 'exploit_gate' || ckpt.checkpoint_type === 'post_foothold_gate' || ckpt.checkpoint_type === 'interactive_gate')) {
-    const ctx = (ckpt.context || {}) as Record<string, unknown>
-    const topTargets = (ctx.top_targets || []) as { name: string; severity: string; vuln_id: string; cve?: string; port?: number }[]
-    const count = Number(ctx.exploitable_count ?? topTargets.length)
-    // interactive_gate: use interrupted_phase for the phase label
-    const isInteractive = ckpt.checkpoint_type === 'interactive_gate'
-    const phaseLabel = isInteractive
-      ? '阶段确认'
-      : (ckpt.phase === 'post_foothold_approval' ? '立足后确认' : '利用前确认')
-    const phase = isInteractive
-      ? ((ckpt.context as Record<string, unknown> | undefined)?.interrupted_phase as string) || ckpt.phase || ''
-      : (ckpt.phase || 'awaiting_approval')
-    return {
-      phase,
-      phaseLabel,
-      risk: ckpt.risk || '',
-      riskType: (ckpt.risk === '高风险' ? 'danger' : ckpt.risk === '中等风险' ? 'warning' : 'info') as ApprovalCardContext['riskType'],
-      summary: ckpt.summary || `系统已识别 ${count} 个可利用漏洞，等待你的授权再开始利用。`,
-      targets: topTargets,
-      recommendation: ckpt.recommendation || '批准后将进入利用阶段;拒绝则跳过利用并直接生成报告。',
-      exploitableCount: count,
-    }
-  }
-
-  // Priority 2: last approval message with inline context
-  const msgs = messages.value
-  for (let i = msgs.length - 1; i >= 0; i--) {
-    const m = msgs[i]
-    if ((m.action === 'approval_required' || m.action === 'approval') && m.isLastApproval) {
-      const targets = (m.topTargets || []) as ApprovalCardContext['targets']
-      const count = Number(m.exploitableCount ?? targets.length)
-      if (count > 0 || targets.length > 0) {
-        return {
-          phase: 'awaiting_approval',
-          phaseLabel: '利用前确认',
-          risk: m.risk || '',
-          riskType: (m.risk === '高风险' ? 'danger' : m.risk === '中等风险' ? 'warning' : 'info') as ApprovalCardContext['riskType'],
-          summary: m.text?.split('\n').slice(1).join('\n') || `系统已识别 ${count} 个可利用漏洞，等待你的授权。`,
-          targets,
-          recommendation: '批准后将进入利用阶段;拒绝则跳过利用并直接生成报告。',
-          exploitableCount: count,
-        }
-      }
-    }
-  }
-
-  // No context available — still show a card, but minimal
-  return null
-})
-
-function inferPayloadLang(text) {
-  if (/^\s*\{[\s\S]*\}\s*$/.test(text)) return 'json'
-  if (/GET\s+\/|POST\s+\/|HTTP\/1\.1/i.test(text)) return 'http'
-  if (/^\s*<\?xml|^\s*<\/?[a-zA-Z][\w:-]*[\s>]/.test(String(text || ''))) return 'xml'
-  if (/python|def |import /.test(text)) return 'python'
-  return 'bash'
-}
-
-function inferOutputLang(text) {
-  const raw = String(text || '').trim()
-  if (!raw) return 'text'
-  if (/^\s*[\[{][\s\S]*[\]}]\s*$/.test(raw)) return 'json'
-  if (/^(HTTP\/\d\.\d\s+\d{3}|GET\s+\/|POST\s+\/|PUT\s+\/|DELETE\s+\/)/im.test(raw)) return 'http'
-  if (/^\s*<\?xml|^\s*<\/?[a-zA-Z][\w:-]*[\s>]/.test(raw)) return 'xml'
-  return 'auto'
-}
-
-function buildExecPayloads(command, stdout, stderr, meta = {}) {
-  const outputMeta = {
-    truncated: Boolean(meta?.truncated),
-    totalLen: Number(meta?.totalLen || 0),
-  }
-  const blocks = [{
-    title: 'Command',
-    language: inferPayloadLang(command || ''),
-    code: command || '(empty command)',
-  }]
-  if (stdout) blocks.push({ title: 'Stdout', language: inferOutputLang(stdout), code: stdout, ...outputMeta })
-  if (stderr) blocks.push({ title: 'Stderr', language: inferOutputLang(stderr), code: stderr, ...outputMeta })
-  if (!stdout && !stderr) blocks.push({ title: 'Output', language: 'text', code: '(empty)', ...outputMeta })
-  return blocks
-}
-
-function formatTime(ts) {
-  if (!ts) return ''
-  try {
-    const d = new Date(ts)
-    if (Number.isNaN(d.getTime())) return ts
-    return d.toLocaleTimeString()
-  } catch {
-    return ts
-  }
-}
-
-const messages = computed(() => {
-  const out = []
-  // 第一条: 用户的原始指令
-  const userPrompt = task.value?.user_prompt || ''
-  if (userPrompt) {
-    out.push({
-      id: 'origin-user-prompt',
-      role: 'user',
-      text: userPrompt,
-      timestamp: formatTime(task.value?.created_at),
-    })
-  }
-
-  const events = decisionEvents.value.slice(-200)
-  // 找到最新一个审批气泡的 id, 用于决定哪条审批 bubble 可交互。
-  // 同时认 'approval_required' (后端 WS bus 推) 和 'approval'
-  // (phase_log 文本"等待审批"派生) 两种 action: 任何一种事件存在都能让
-  // 用户点按钮, 哪怕另一条因为 WS race / 时间戳排序错位丢失了, 兜底通路
-  // 始终在线 — 这是用户截图里 "审批节点卡片有但按钮没有" 的根本修复。
-  let lastApprovalId = ''
-  for (let i = events.length - 1; i >= 0; i--) {
-    const a = events[i]?.action
-    if (a === 'approval_required' || a === 'approval') {
-      lastApprovalId = events[i]?.id || ''
-      break
-    }
-  }
-  // 处理过的 checkpoint id 集合, 用于决策点已处理标识
-  const resolvedCheckpointIds = new Set()
-  for (const ev of events) {
-    if (ev?.action === 'checkpoint_resolved' && ev.checkpoint_id) {
-      resolvedCheckpointIds.add(String(ev.checkpoint_id))
-    }
-  }
-
-  events.forEach((entry, idx) => {
-    const time = formatTime(entry.timestamp)
-    const baseId = entry.id || `ev-${idx}`
-
-    // 操作员实时重规划: 由后端 ``backend.agents.operator_replanner`` 在
-    // chat 触发 fork 时同步生成的 OperatorPlan, 走专用高亮卡片渲染。
-    if (entry.action === 'operator_replan') {
-      const headBits = ['操作员重规划']
-      if (entry.phase) headBits.push(entry.phase)
-      const summary = entry.message || entry.operator_plan?.intent_summary || '已重规划'
-      out.push({
-        id: baseId,
-        role: 'agent',
-        tone: 'primary',
-        action: 'operator_replan',
-        text: `${headBits.join(' · ')}\n${summary}`,
-        timestamp: time,
-        purpose: entry.purpose || '',
-        plan: entry.plan || [],
-        thinking: '',
-        thinkingPreview: '',
-        thinkingHasMore: false,
-        thinkingFullLen: 0,
-        reasoning: '',
-        operatorPlan: entry.operator_plan ? (() => {
-          const raw = entry.operator_plan
-          const normalize = (arr) => {
-            if (!Array.isArray(arr)) return []
-            return arr.map(x => {
-              if (typeof x === 'string') return x
-              if (x && typeof x === 'object') return x.name || x.tool || x.value || String(x)
-              return String(x)
-            }).filter(Boolean)
-          }
-          return { ...raw, preferred_tools: normalize(raw.preferred_tools), avoided_tools: normalize(raw.avoided_tools), keyword_hints: normalize(raw.keyword_hints) }
-        })() : null,
-      })
-      return
-    }
-
-    // 初始策略: 由后端 create_task 在任务创建后立即推送,
-    // 让用户在执行开始前就能看到 Agent 对目标的理解和即将遵循的路径。
-    if (entry.action === 'initial_plan') {
-      const headBits = ['初始策略']
-      if (entry.phase) headBits.push(entry.phase)
-      const summary = entry.message || '已生成初始渗透策略'
-      out.push({
-        id: baseId,
-        role: 'agent',
-        tone: 'primary',
-        action: 'initial_plan',
-        text: `${headBits.join(' · ')}\n${summary}`,
-        timestamp: time,
-        purpose: entry.purpose || '',
-        plan: entry.plan || [],
-        thinking: entry.thinking || '',
-        thinkingPreview: (entry.thinking || '').slice(0, 320),
-        thinkingHasMore: (entry.thinking || '').length > 320,
-        thinkingFullLen: (entry.thinking || '').length,
-        reasoning: '',
-      })
-      return
-    }
-
-    // 战术层 (planner / agent.run) 真消费 OperatorPlan 后推送的事件;
-    // 与 operator_replan 卡片的区别在于: replan 是"我听懂了你要做什么",
-    // plan_applied 是"我把你说的工具偏好真的塞进了本阶段的执行序列",
-    // 这两条事件配合可以让用户清楚看到"路由 + 工具选型"两层都改了。
-    if (entry.action === 'operator_plan_applied') {
-      const headBits = ['战术计划已应用']
-      if (entry.phase) headBits.push(entry.phase)
-      if (entry.consumer) headBits.push(entry.consumer)
-      const headline = entry.message || '已注入工具偏好'
-      const text = `${headBits.join(' · ')}\n${headline}`
-      out.push({
-        id: baseId,
-        role: 'agent',
-        tone: 'success',
-        action: 'operator_plan_applied',
-        text,
-        timestamp: time,
-        purpose: entry.purpose || '',
-        plan: entry.plan || [],
-        thinking: String(entry.thinking || '').trim(),
-        thinkingPreview: String(entry.thinking || '').trim().slice(0, 320),
-        thinkingHasMore: String(entry.thinking || '').length > 320,
-        thinkingFullLen: String(entry.thinking || '').length,
-        reasoning: '',
-      })
-      return
-    }
-
-    if (entry.action === 'thought') {
-      const roundLabel = entry.round ? `第 ${entry.round} 轮` : ''
-      const vulnLabel = entry.vuln_name ? ` · ${entry.vuln_name}` : ''
-      const head = `AI 推理${roundLabel ? ' · ' + roundLabel : ''}${vulnLabel}`
-      // 头部展示 message(短句状态), 不放 thinking, 避免 ChatBubble 文本框
-      // 把整段推理压成单行、同时还要再"展开完整推理". 推理正文走下面的
-      // thinkingPreview / thinking 字段, 默认就在卡片里渲染一段摘要,
-      // 解决"AI 决策结果过于精简、只有一行 head" 的问题。
-      const headline = String(entry.message || '').trim()
-      const thinkingFull = String(entry.thinking || '').trim()
-      const reasoningFull = String(entry.reasoning || '').trim()
-      const PREVIEW_LIMIT = 600
-      const preview = thinkingFull.length > PREVIEW_LIMIT
-        ? thinkingFull.slice(0, PREVIEW_LIMIT).replace(/\s+$/, '') + '…'
-        : thinkingFull
-      const text = headline ? `${head}\n${headline}` : head
-      out.push({
-        id: baseId,
-        role: 'agent',
-        tone: 'primary',
-        action: 'thought',
-        text,
-        timestamp: time,
-        thinking: thinkingFull,
-        thinkingPreview: preview,
-        thinkingHasMore: thinkingFull.length > PREVIEW_LIMIT,
-        thinkingFullLen: thinkingFull.length,
-        reasoning: reasoningFull,
-        purpose: entry.purpose || '',
-        expected: entry.expected || '',
-        plan: entry.plan || [],
-      })
-      return
-    }
-
-    if (entry.action === 'agent_reply') {
-      out.push({
-        id: baseId,
-        role: 'agent',
-        tone: 'success',
-        text: entry.message || '(空回复)',
-        timestamp: time,
-      })
-      return
-    }
-
-    if (entry.action === 'user_chat') {
-      out.push({
-        id: baseId,
-        role: 'user',
-        tone: 'info',
-        text: entry.message || '',
-        timestamp: time,
-      })
-      return
-    }
-
-    if (entry.action === 'command_exec') {
-      const command = entry.command || '(empty command)'
-      const stdout = entry.stdout || ''
-      const stderr = entry.stderr || ''
-      const toolLabel = resolveToolDisplay({
-        display_tool: entry.display_tool,
-        tool: entry.tool,
-        command: entry.command,
-        purpose: entry.purpose,
-      })
-      const head = entry.poc_or_vuln
-        ? `命令执行 · ${entry.poc_or_vuln}`
-        : `命令执行 · ${toolLabel}`
-      const desc = `exit=${entry.exit_code ?? '-'} ｜ elapsed=${entry.elapsed_ms ?? '-'}ms${entry.purpose ? ' ｜ ' + entry.purpose : ''}`
-      out.push({
-        id: baseId,
-        role: 'agent',
-        tone: (entry.exit_code ?? -1) === 0 ? 'success' : 'danger',
-        text: `${head}\n${desc}`,
-        timestamp: time,
-        payloads: buildExecPayloads(command, stdout, stderr, {
-          runtimeCommand: entry.runtime_command || '',
-          truncated: Boolean(entry.truncated),
-          totalLen: Number(entry.total_len || 0),
-        }),
-      })
-      return
-    }
-
-    if (entry.action === 'tool_start') {
-      const toolLabel = resolveToolDisplay({
-        display_tool: entry.display_tool,
-        tool: entry.tool,
-        command: entry.command,
-        purpose: entry.purpose,
-      })
-      // tool_start 通常没有 stdout/stderr,只是状态打点;这里给一个最小卡片
-      // 让用户至少看到「工具/阶段/目的」三件套,而不是工具链上多了节点但
-      // 主聊天区却找不到对应气泡。
-      const detailLines = []
-      if (entry.phase) detailLines.push(`阶段 ${entry.phase}`)
-      if (entry.purpose) detailLines.push(`目的 ${entry.purpose}`)
-      if (entry.message) detailLines.push(entry.message)
-      out.push({
-        id: baseId,
-        role: 'agent',
-        tone: 'primary',
-        text: `工具调用 · ${toolLabel}${detailLines.length ? '\n' + detailLines.join('\n') : ''}`,
-        timestamp: time,
-        payloads: entry.command
-          ? [{ title: 'Command', language: inferPayloadLang(entry.command), code: entry.command }]
-          : null,
-      })
-      return
-    }
-
-    if (entry.action === 'tool_result') {
-      const exitText = entry.exit_code ?? '-'
-      const elapsedText = entry.elapsed_ms ? `${entry.elapsed_ms}ms` : '-'
-      const toolLabel = resolveToolDisplay({
-        display_tool: entry.display_tool,
-        tool: entry.tool,
-        command: entry.command,
-        purpose: entry.purpose,
-      })
-      const command = entry.command || ''
-      const stdout = entry.stdout || ''
-      const stderr = entry.stderr || ''
-      // 给 tool_result 也补一组 payload 卡片: 即便没有命令也至少展示
-      // 一个 Output 占位,避免「工具链上有节点但聊天区一片空白」。
-      const payloads = (command || stdout || stderr)
-        ? buildExecPayloads(command, stdout, stderr, {
-            runtimeCommand: entry.runtime_command || '',
-            truncated: Boolean(entry.truncated),
-            totalLen: Number(entry.total_len || 0),
-          })
-        : [{ title: 'Output', language: 'text', code: '(仅状态事件,无命令输出)' }]
-      out.push({
-        id: baseId,
-        role: 'agent',
-        tone: Number(exitText) === 0 ? 'success' : 'danger',
-        text: `调用结果 · ${toolLabel}\nexit=${exitText} ｜ elapsed=${elapsedText}${entry.message ? '\n' + entry.message : ''}`.trim(),
-        timestamp: time,
-        payloads,
-      })
-      return
-    }
-
-    if (entry.action === 'tool_executed') {
-      const toolLabel = resolveToolDisplay({
-        display_tool: entry.display_tool,
-        tool: entry.tool,
-        command: entry.command,
-        purpose: entry.purpose,
-      })
-      const statusText = entry.status || entry.message || ''
-      const cleanMsg = entry.message
-        ? entry.message.replace(/^\s*\w+:\s*/, '').trim()
-        : ''
-      out.push({
-        id: baseId,
-        role: 'agent',
-        tone: entry.tone === 'warn' ? 'warning' : 'info',
-        text: `工具完成 · ${toolLabel}${cleanMsg ? '\n' + cleanMsg : ''}${statusText ? '\n' + statusText : ''}`.trim(),
-        timestamp: time,
-        payloads: entry.command
-          ? [{ title: 'Command', language: 'bash', code: entry.command }]
-          : null,
-      })
-      return
-    }
-
-    if (entry.action === 'checkpoint_request') {
-      const cpId = entry.checkpoint_id || ''
-      const head = `Plan 决策点 · 等待确认`
-      const summary = entry.summary || entry.recommendation || entry.message || '我建议进入下一步, 请确认是否继续。'
-      out.push({
-        id: baseId,
-        role: 'agent',
-        tone: 'warning',
-        text: `${head}\n${summary}`,
-        timestamp: time,
-        thinking: entry.thinking || '',
-        action: 'checkpoint_request',
-        checkpointId: cpId,
-      })
-      return
-    }
-
-    if (entry.action === 'checkpoint_resolved') {
-      const resp = entry.response || {}
-      const acted = resp.action || 'approve'
-      const label = acted === 'approve'
-        ? '已批准'
-        : (acted === 'reject' ? '已拒绝' : (acted === 'modify' ? '已采纳意见' : '已处理'))
-      out.push({
-        id: baseId,
-        role: 'agent',
-        tone: acted === 'reject' ? 'danger' : 'success',
-        text: `Plan 决策点 · ${label}${resp.user_prompt ? '\n补充意见: ' + resp.user_prompt : ''}`,
-        timestamp: time,
-      })
-      return
-    }
-
-    if (entry.action === 'approval_required') {
-      out.push({
-        id: baseId,
-        role: 'agent',
-        tone: 'warning',
-        text: `审批请求\n${entry.message || '系统检测到可利用路径,等待人工审批。'}`,
-        timestamp: time,
-        action: 'approval_required',
-        isLastApproval: baseId === lastApprovalId,
-        exploitableCount: entry.exploitable_count ?? 0,
-        topTargets: entry.top_targets ?? [],
-        risk: entry.risk ?? '',
-      })
-      return
-    }
-
-    if (entry.action === 'approval') {
-      out.push({
-        id: baseId,
-        role: 'agent',
-        tone: 'warning',
-        text: `审批节点\n${entry.message || entry.raw || ''}`,
-        timestamp: time,
-        action: 'approval',
-        isLastApproval: baseId === lastApprovalId,
-      })
-      return
-    }
-
-    if (entry.action === 'branch_forked') {
-      const branchId = String(entry.branch_id || '')
-      out.push({
-        id: baseId,
-        role: 'system',
-        tone: 'primary',
-        text: entry.message || '已基于此处分叉新分支',
-        timestamp: time,
-        action: 'branch_forked',
-        branchId,
-      })
-      return
-    }
-
-    if (entry.action === 'log') {
-      const msg = entry.message || entry.raw || ''
-      if (!msg) return
-      const isPhase = /开始|完成|端口|漏洞|侦察|扫描|利用|后渗透|报告|阶段|Phase/i.test(msg)
-      if (!isPhase) return
-      out.push({
-        id: baseId,
-        role: 'system',
-        tone: 'info',
-        text: msg,
-        timestamp: time,
-      })
-    }
-  })
-
-  // 给每条 message 注入原始事件 id / ISO 时间戳, 供"在此分叉"按钮把
-  // ``from_event_id`` / ``from_event_ts`` 透传到后端。message.timestamp
-  // 已经经过 formatTime 转成本地时分秒, 不能直接用作分叉锚点。
-  const tsByBase = {}
-  for (const ev of events) {
-    if (ev?.id) tsByBase[ev.id] = ev.timestamp || ''
-  }
-  for (const m of out) {
-    if (m && tsByBase[m.id] && !m.eventTs) {
-      m.eventTs = tsByBase[m.id]
-      m.eventId = m.id
-    }
-  }
-
-  // 兜底: 如果有 pendingCheckpoint 但未在事件流中找到对应 checkpoint_request bubble, 单独追加一条
-  if (pendingCheckpoint.value) {
-    const cpId = pendingCheckpoint.value.checkpoint_id
-    const has = out.some((m) => m.action === 'checkpoint_request' && m.checkpointId === cpId)
-    if (!has) {
-      out.push({
-        id: `cp-pending-${cpId}`,
-        role: 'agent',
-        tone: 'warning',
-        text: `Plan 决策点 · 等待确认\n${pendingCheckpoint.value.summary || pendingCheckpoint.value.recommendation || ''}`,
-        timestamp: formatTime(pendingCheckpoint.value.created_at),
-        thinking: pendingCheckpoint.value.thinking || '',
-        action: 'checkpoint_request',
-        checkpointId: cpId,
-      })
-    }
-  }
-
-  return out
-})
-
-const activeStreamBubbles = computed(() => {
-  const now = Date.now()
-  const result = {}
-  for (const [sid, bubble] of Object.entries(llmStreams.value || {})) {
-    if (bubble && bubble.text && now - bubble.updatedAt < 60000) {
-      result[sid] = bubble
-    }
-  }
-  return result
-})
-
-// 工具命令的实时 stdout/stderr 流; 只展示尾部 N 行让用户看见工具正在干活,
-// 避免「ToolChainRail 上有节点但聊天区一片空白」的体感。命令完成后对应的
-// tool_result 会落到主消息流里, 这块可以淡出。
-const TOOL_STREAM_TAIL_VIEW = 12
-
-const activeToolStreamBubbles = computed(() => {
-  const streams = state.value?.toolStreams || {}
-  const result = []
-  // 显示的 stream id 跟 ``stream_id`` 一致 (executor 是 ``{display_tool}-{hash}``),
-  // 这里直接拿 stream id 第一段当工具名展示。
-  for (const [sid, lines] of Object.entries(streams)) {
-    if (!Array.isArray(lines) || !lines.length) continue
-    const tail = lines.slice(-TOOL_STREAM_TAIL_VIEW)
-    const tool = String(sid).split('-')[0] || 'tool'
-    result.push({ sid, tool, lines: tail, total: lines.length })
-  }
-  return result
 })
 
 // 给侧边工具链用的事件项: 收集 thought / tool / approval / checkpoint 类事件
@@ -1388,51 +672,8 @@ function handleRailJump(id) {
   target.classList.add('bubble-flash')
   setTimeout(() => target.classList.remove('bubble-flash'), 1400)
   // 因为是手动跳转, 不再粘到底部
-  stickyBottom.value = false
+  scroll.stickyBottom.value = false
 }
-
-const BOTTOM_THRESHOLD = 150
-
-function isNearBottom() {
-  const el = streamRef.value
-  if (!el) return true
-  return el.scrollHeight - el.scrollTop - el.clientHeight < BOTTOM_THRESHOLD
-}
-
-function onUserScroll() {
-  userScrolling = true
-  if (scrollTimeout) clearTimeout(scrollTimeout)
-  scrollTimeout = setTimeout(() => { userScrolling = false }, 120)
-  stickyBottom.value = isNearBottom()
-  if (stickyBottom.value) showJumpBtn.value = false
-}
-
-function smoothScrollToBottom() {
-  if (!streamRef.value) return
-  cancelAnimationFrame(scrollRafId)
-  scrollRafId = requestAnimationFrame(() => {
-    streamRef.value?.scrollTo({ top: streamRef.value.scrollHeight, behavior: 'smooth' })
-  })
-}
-
-function jumpToBottom() {
-  stickyBottom.value = true
-  showJumpBtn.value = false
-  smoothScrollToBottom()
-}
-
-watch(
-  () => messages.value.length,
-  async (newLen, oldLen) => {
-    if (newLen <= (oldLen || 0)) return
-    await nextTick()
-    if (stickyBottom.value && !userScrolling) {
-      smoothScrollToBottom()
-    } else {
-      showJumpBtn.value = true
-    }
-  },
-)
 
 // "在此处分叉"上下文: 当用户右键/点击某条历史 chat bubble 选择"在此分叉"时,
 // 把对应 decision_event 的 id + timestamp 暂存到这里, 下一次 sendMessage
@@ -1509,110 +750,17 @@ async function sendMessage() {
 
 const branches = computed(() => state.value?.branches || [])
 const activeBranchId = computed(() => state.value?.activeBranchId || '')
-const branchById = computed(() => {
-  const map = {}
-  for (const b of branches.value) map[b.branch_id] = b
-  return map
-})
-const activeBranch = computed(() => branchById.value[activeBranchId.value] || null)
-const branchAtCap = computed(() => {
-  const max = state.value?.maxBranchesPerTask || 12
-  return branches.value.length >= max
-})
+const maxBranchesPerTask = computed(() => state.value?.maxBranchesPerTask || 12)
 const composerFlashAt = ref(0)
 const composerFlashing = computed(() => {
   if (!composerFlashAt.value) return false
   return Date.now() - composerFlashAt.value < 2400
 })
 
-// 把分支按 parent_branch_id 聚合成 forest, 给 popover 内嵌 BranchTreeNode 用,
-// 同时也复用现有 sibling navigator 的查询逻辑。
-const branchChildrenByParent = computed(() => {
-  const map = new Map()
-  for (const it of branches.value) {
-    const key = it.parent_branch_id || ''
-    if (!map.has(key)) map.set(key, [])
-    map.get(key).push(it)
-  }
-  for (const arr of map.values()) {
-    arr.sort((a, b) => (a.created_at || '').localeCompare(b.created_at || ''))
-  }
-  return map
-})
-
-const branchRoots = computed(() => {
-  const map = branchChildrenByParent.value
-  return map.get('') || map.get(null) || []
-})
-
-// 把 branch_forked 事件下方挂的 sibling navigator 用到的元数据集中算一次, 避免
-// v-for 内部闭包反复扫描 branches。key = branch_id。
-const navigatorBubbleMeta = computed(() => {
-  const out = {}
-  for (const b of branches.value) {
-    const total = Number(b.sibling_total || 1)
-    if (total <= 1) continue
-    const siblings = branches.value
-      .filter((s) => (s.parent_branch_id || '') === (b.parent_branch_id || '')
-        && (s.fork_event_id || '') === (b.fork_event_id || ''))
-      .sort((a, c) => (a.created_at || '').localeCompare(c.created_at || ''))
-    out[b.branch_id] = {
-      siblings: siblings.map((s) => ({
-        id: s.branch_id,
-        label: s.label || s.branch_id,
-        status: s.status,
-      })),
-      index: Math.max(1, Number(b.sibling_index || 1)),
-      total,
-    }
-  }
-  return out
-})
-
-function siblingNavFor(branchId) {
-  return navigatorBubbleMeta.value[branchId] || null
-}
-
-async function activateBranch(branchId) {
-  if (!branchId || branchId === activeBranchId.value) return
-  await liveStore.activateBranch(taskId, branchId)
-  trackEvent('task.branch.activate', { taskId, branch_id: branchId })
-}
-
-function onBranchActivate(branchId) {
-  return activateBranch(branchId)
-}
-
-async function onBranchResume(branchId) {
-  await liveStore.resumeBranch(taskId, branchId)
-  trackEvent('task.branch.resume', { taskId, branch_id: branchId })
-}
-
-async function onBranchPause(branchId) {
-  await liveStore.pauseBranch(taskId, branchId)
-  trackEvent('task.branch.pause', { taskId, branch_id: branchId })
-}
-
-async function gotoSibling(currentBranchId, delta) {
-  const meta = navigatorBubbleMeta.value[currentBranchId]
-  if (!meta) return
-  const siblings = meta.siblings
-  const cur = siblings.findIndex((s) => s.id === currentBranchId)
-  if (cur < 0) return
-  const next = (cur + delta + siblings.length) % siblings.length
-  const tgt = siblings[next]
-  if (tgt) await activateBranch(tgt.id)
-}
-
-function branchStatusLabel(status) {
-  switch (status) {
-    case 'running': return '运行中'
-    case 'paused': return '已暂停'
-    case 'completed': return '已完成'
-    case 'failed': return '失败'
-    default: return status || ''
-  }
-}
+const nav = useBranchNavigator(taskId, branches, activeBranchId, maxBranchesPerTask)
+function onBranchActivate(branchId: string) { nav.activateBranch(branchId) }
+function onBranchResume(branchId: string) { nav.resumeBranch(branchId) }
+function onBranchPause(branchId: string) { nav.pauseBranch(branchId) }
 
 function doApprove(approved) {
   trackEvent('task.approval', { taskId, approved })
@@ -1656,14 +804,12 @@ onMounted(async () => {
   } finally {
     loading.value = false
     await nextTick()
-    smoothScrollToBottom()
+    scroll.smoothScrollToBottom()
   }
 })
 
 onUnmounted(() => {
   liveStore.detach(taskId)
-  if (scrollTimeout) clearTimeout(scrollTimeout)
-  cancelAnimationFrame(scrollRafId)
 })
 </script>
 
@@ -1774,162 +920,6 @@ onUnmounted(() => {
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
-}
-.strategy-rail {
-  width: 170px;
-  min-width: 170px;
-  display: flex;
-  flex-direction: column;
-  border-left: 1px solid var(--border);
-  background: var(--bg-elevated);
-  overflow: hidden;
-  height: 100%;
-}
-.strategy-rail-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 10px 12px;
-  border-bottom: 1px solid var(--border);
-  flex-shrink: 0;
-}
-.strategy-rail-title {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-primary);
-}
-.strategy-rail-count {
-  font-size: 10px;
-  font-family: var(--font-mono);
-  color: var(--text-muted);
-  background: var(--bg-hover);
-  padding: 1px 6px;
-  border-radius: 8px;
-}
-.strategy-rail-list {
-  flex: 1;
-  overflow-y: auto;
-  padding: 8px 0;
-}
-.strategy-node {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  padding: 6px 12px;
-  position: relative;
-}
-.strategy-connector {
-  position: absolute;
-  left: 17px;
-  top: -4px;
-  width: 1px;
-  height: 10px;
-  background: var(--border);
-}
-.strategy-dot {
-  width: 8px;
-  height: 8px;
-  min-width: 8px;
-  border-radius: 50%;
-  margin-top: 3px;
-  border: 1.5px solid var(--border);
-  background: var(--bg-base);
-  transition: all 0.15s;
-}
-.strategy-body {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-  flex: 1;
-  gap: 2px;
-}
-.strategy-label {
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--text-secondary);
-  line-height: 1.35;
-  word-break: break-word;
-}
-.strategy-detail {
-  font-size: 10px;
-  color: var(--text-muted);
-  line-height: 1.3;
-}
-.strategy-steps {
-  margin-top: 4px;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-.strategy-step {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 10px;
-  color: var(--text-muted);
-  line-height: 1.3;
-}
-.strategy-step-idx {
-  flex-shrink: 0;
-  width: 14px;
-  height: 14px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: 50%;
-  background: var(--bg-soft);
-  color: var(--text-secondary);
-  font-size: 9px;
-  font-weight: 600;
-}
-.strategy-step-tool,
-.strategy-step-skill {
-  flex-shrink: 0;
-  font-size: 10px;
-  padding: 0 3px;
-  border-radius: 3px;
-  background: rgba(var(--c-brand-rgb, 64, 158, 255), 0.1);
-  color: var(--el-color-primary);
-}
-.strategy-step-skill {
-  background: rgba(var(--el-color-success-rgb, 103, 194, 58), 0.1);
-  color: var(--el-color-success);
-}
-.strategy-step-purpose {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* ── 攻击链节点状态 ── */
-.strategy-node-active {
-  background: rgba(var(--c-brand-rgb, 64, 158, 255), 0.06);
-}
-.strategy-connector.connector-done {
-  background: var(--el-color-success);
-}
-.strategy-dot.dot-done {
-  border-color: var(--el-color-success);
-  background: var(--el-color-success);
-}
-.strategy-dot.dot-active {
-  border-color: var(--el-color-primary);
-  background: var(--el-color-primary);
-  box-shadow: 0 0 0 3px rgba(var(--c-brand-rgb, 64, 158, 255), 0.25);
-  animation: strategy-pulse 2s ease-in-out infinite;
-}
-.strategy-dot.dot-pending {
-  border-color: var(--border);
-  background: var(--bg-base);
-}
-.strategy-label.label-active {
-  color: var(--el-color-primary);
-  font-weight: 700;
-}
-
-@keyframes strategy-pulse {
-  0%, 100% { box-shadow: 0 0 0 2px rgba(var(--c-brand-rgb, 64, 158, 255), 0.2); }
-  50% { box-shadow: 0 0 0 5px rgba(var(--c-brand-rgb, 64, 158, 255), 0.08); }
 }
 
 .bubble-stream {
@@ -2195,221 +1185,6 @@ onUnmounted(() => {
 }
 
 .approval-slot { margin-top: 8px; }
-
-/* ── 审批卡片 (取代原来的 inline-approval "是否继续执行?") ── */
-.approval-card {
-  margin: 6px 0 0;
-  border: 1px solid color-mix(in srgb, var(--accent-yellow) 35%, transparent);
-  border-left: 4px solid var(--accent-yellow);
-  border-radius: var(--radius-md);
-  background: color-mix(in srgb, var(--accent-yellow) 5%, var(--bg-elevated));
-  overflow: hidden;
-}
-
-.approval-card-header {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 12px 14px 10px;
-  border-bottom: 1px solid color-mix(in srgb, var(--accent-yellow) 15%, transparent);
-}
-
-.approval-card-header-left {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  flex: 1;
-  min-width: 0;
-}
-
-.approval-card-icon {
-  margin-top: 2px;
-  font-size: 18px;
-  color: var(--accent-yellow);
-  flex-shrink: 0;
-}
-
-.approval-card-title {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 14px;
-  font-weight: 700;
-  color: var(--text-primary);
-  margin-bottom: 4px;
-}
-
-.approval-card-phase-tag {
-  font-size: 11px;
-}
-
-.approval-card-subtitle {
-  font-size: 12.5px;
-  color: var(--text-secondary);
-  line-height: 1.55;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-
-.approval-card-header-right {
-  flex-shrink: 0;
-}
-
-/* targets */
-.approval-card-targets {
-  padding: 10px 14px;
-  border-bottom: 1px solid color-mix(in srgb, var(--accent-yellow) 10%, transparent);
-}
-
-.approval-card-section-head {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin-bottom: 8px;
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-primary);
-}
-
-.approval-card-target-list {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.approval-card-target-item {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 4px 8px;
-  border-radius: var(--radius-sm);
-  background: color-mix(in srgb, var(--bg-base) 80%, var(--accent-yellow) 5%);
-  font-size: 12px;
-  line-height: 1.5;
-}
-
-.approval-card-sev {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 48px;
-  padding: 1px 6px;
-  font-size: 10px;
-  font-weight: 700;
-  border-radius: 3px;
-  letter-spacing: 0.3px;
-  font-family: var(--font-mono);
-  flex-shrink: 0;
-}
-
-.approval-card-sev.sev-critical {
-  background: color-mix(in srgb, #f85149 25%, transparent);
-  color: #f85149;
-  border: 1px solid color-mix(in srgb, #f85149 45%, transparent);
-}
-
-.approval-card-sev.sev-high {
-  background: color-mix(in srgb, #d29922 22%, transparent);
-  color: #d29922;
-  border: 1px solid color-mix(in srgb, #d29922 40%, transparent);
-}
-
-.approval-card-sev.sev-medium {
-  background: color-mix(in srgb, var(--accent-blue) 18%, transparent);
-  color: var(--accent-blue);
-  border: 1px solid color-mix(in srgb, var(--accent-blue) 35%, transparent);
-}
-
-.approval-card-sev.sev-low,
-.approval-card-sev.sev-info {
-  background: color-mix(in srgb, var(--text-secondary) 12%, transparent);
-  color: var(--text-secondary);
-  border: 1px solid color-mix(in srgb, var(--text-secondary) 20%, transparent);
-}
-
-.approval-card-target-name {
-  color: var(--text-primary);
-  font-weight: 500;
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.approval-card-target-cve {
-  font-size: 11px;
-  font-family: var(--font-mono);
-  color: var(--accent-blue);
-  background: color-mix(in srgb, var(--accent-blue) 8%, transparent);
-  padding: 1px 6px;
-  border-radius: 3px;
-  flex-shrink: 0;
-}
-
-.approval-card-target-port {
-  font-size: 11px;
-  font-family: var(--font-mono);
-  color: var(--text-muted);
-  flex-shrink: 0;
-}
-
-/* recommendation */
-.approval-card-recommendation {
-  padding: 10px 14px;
-  border-bottom: 1px solid color-mix(in srgb, var(--accent-yellow) 10%, transparent);
-}
-
-.approval-card-recommendation-text {
-  margin: 0;
-  font-size: 12px;
-  line-height: 1.6;
-  color: var(--text-secondary);
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-
-/* consequences */
-.approval-card-consequences {
-  padding: 8px 14px;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  border-bottom: 1px solid color-mix(in srgb, var(--accent-yellow) 10%, transparent);
-}
-
-.approval-card-consequence {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 11.5px;
-  line-height: 1.45;
-  color: var(--text-secondary);
-}
-
-.approve-consequence .el-icon {
-  color: var(--accent-green, #3fb950);
-  flex-shrink: 0;
-}
-
-.reject-consequence .el-icon {
-  color: var(--accent-red, #f85149);
-  flex-shrink: 0;
-}
-
-/* actions */
-.approval-card-actions {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 12px 14px;
-  background: color-mix(in srgb, var(--bg-base) 60%, transparent);
-}
-
-.approval-card-actions .el-button {
-  font-size: 13px;
-}
 
 .payload-slot { margin-top: 8px; }
 

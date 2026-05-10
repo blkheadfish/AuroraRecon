@@ -589,6 +589,18 @@ export interface ApprovalTarget {
   description?: string
 }
 
+/** 审批卡片上下文（前端视图层派生） */
+export interface ApprovalCardContext {
+  phase: string
+  phaseLabel: string
+  risk: string
+  riskType: 'danger' | 'warning' | 'info' | ''
+  summary: string
+  targets: ApprovalTarget[]
+  recommendation: string
+  exploitableCount: number
+}
+
 /** 等待审批 */
 export interface WsApprovalRequiredV2 {
   type: 'approval_required'
