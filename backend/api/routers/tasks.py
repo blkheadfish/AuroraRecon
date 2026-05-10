@@ -129,6 +129,108 @@ def _fallback_extract_target(prompt: str) -> str:
     return ""
 
 
+def _repair_truncated_json(raw: str) -> dict:
+    """尝试修复被截断的 JSON，关闭未闭合的字符串和括号。
+
+    处理 LLM 因 max_tokens 不足而截断 JSON 的场景。
+    修复失败时抛出原始 json.JSONDecodeError。
+    """
+    s = raw.strip()
+
+    # ---- 第一遍扫描：记录字符串状态 + 括号栈
+    in_string = False
+    escape = False
+    stack: list[str] = []  # '{' or '['
+
+    for ch in s:
+        if escape:
+            escape = False
+            continue
+        if ch == '\\':
+            escape = not escape
+            continue
+        if ch == '"' and not escape:
+            in_string = not in_string
+        elif not in_string:
+            if ch in '{[':
+                stack.append(ch)
+            elif ch == '}':
+                if stack and stack[-1] == '{':
+                    stack.pop()
+            elif ch == ']':
+                if stack and stack[-1] == '[':
+                    stack.pop()
+
+    # ---- 修复：闭合字符串
+    if in_string:
+        s = s + '"'
+
+    # ---- 修复：去掉末尾不完整的 key:value 结构
+    s = s.rstrip()
+    while s.endswith(','):
+        s = s[:-1].rstrip()
+    if s.endswith(':'):
+        bracket_count = 0
+        cut_pos = len(s) - 1
+        for i in range(len(s) - 1, -1, -1):
+            if s[i] == '"':
+                bracket_count += 1
+            if s[i] == ',' and bracket_count % 2 == 0:
+                cut_pos = i
+                break
+        else:
+            cut_pos = s.find('"')
+        s = s[:cut_pos].rstrip().rstrip(',').rstrip()
+
+    # ---- 修复：闭合括号
+    closer = {'{': '}', '[': ']'}
+    while stack:
+        s = s + closer[stack.pop()]
+
+    # ---- 尝试解析
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        pass
+
+    # ---- 渐进回退：从末尾逐字符裁剪，每裁剪一次就重新闭合括号再试
+    #     处理 "partial_key" 变成裸字符串 或 其他复杂截断场景
+    for cut in range(len(s) - 1, max(0, len(s) - 500), -1):
+        candidate = s[:cut].rstrip().rstrip(',').rstrip()
+        # 重新计算括号栈
+        st2: list[str] = []
+        in_str = False
+        esc = False
+        for ch in candidate:
+            if esc:
+                esc = False
+                continue
+            if ch == '\\':
+                esc = True
+                continue
+            if ch == '"' and not esc:
+                in_str = not in_str
+            elif not in_str:
+                if ch in '{[':
+                    st2.append(ch)
+                elif ch == '}':
+                    if st2 and st2[-1] == '{':
+                        st2.pop()
+                elif ch == ']':
+                    if st2 and st2[-1] == '[':
+                        st2.pop()
+        if in_str:
+            candidate = candidate + '"'
+        while st2:
+            candidate = candidate + closer[st2.pop()]
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+
+    raise json.JSONDecodeError("无法修复截断的 JSON", raw, 0)
+
+
 def _validate_target_candidate(raw: str) -> str:
     """对 LLM 返回的 target 做安全 + 合法性校验,失败返回空串。"""
     if not raw:
@@ -440,29 +542,66 @@ async def generate_pentest_plan(req: PlanRequest, request: Request):
     )
 
     llm = LLMRouter()
+
+    async def _call_and_parse(max_tokens: int, prompt_override: str = "") -> tuple[dict, str]:
+        """调用 LLM 并解析 JSON，返回 (data, raw_text)。"""
+        raw = await llm.chat(
+            prompt_override or prompt,
+            response_format="json",
+            temperature=0.2,
+            max_tokens=max_tokens,
+        )
+        raw_str = raw if isinstance(raw, str) else str(raw)
+        try:
+            data = json.loads(raw_str)
+        except json.JSONDecodeError:
+            # 尝试修复截断的 JSON（LLM 输出被 max_tokens 截断）
+            try:
+                data = _repair_truncated_json(raw_str)
+                logger.warning(
+                    f"[plan] JSON 被截断，已修复 (max_tokens={max_tokens})"
+                )
+            except Exception:
+                raise  # 重新抛出原始异常，由外层处理
+        if not isinstance(data, dict):
+            raise ValueError("LLM 返回不是 JSON 对象")
+        return data, raw_str
+
+    raw_str = ""
     try:
-        raw = await asyncio.wait_for(
-            llm.chat(
-                prompt,
-                response_format="json",
-                temperature=0.2,
-                max_tokens=2048,
-            ),
+        data, raw_str = await asyncio.wait_for(
+            _call_and_parse(4096),
             timeout=180.0,
         )
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="LLM 策略生成超时，请重试")
+    except (json.JSONDecodeError, ValueError) as e:
+        logger.warning(
+            f"[plan] 首次调用 JSON 解析失败 (max_tokens=4096): {e}, "
+            f"raw_tail={raw_str[-300:] if raw_str else ''}"
+        )
+        # 重试：更大 token 预算 + 强调完整性
+        try:
+            retry_prompt = (
+                prompt
+                + "\n\n【重要提醒】上一次你的回复因为输出过长被截断了。"
+                "这次请务必将 JSON 输出完整，不要省略任何字段。"
+            )
+            data, raw_str = await asyncio.wait_for(
+                _call_and_parse(8192, prompt_override=retry_prompt),
+                timeout=180.0,
+            )
+            logger.info("[plan] 重试成功 (max_tokens=8192)")
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail="LLM 策略生成超时，请重试")
+        except Exception as e2:
+            logger.error(
+                f"[plan] 重试仍失败: {e2}, raw_tail={raw_str[-500:] if raw_str else ''}"
+            )
+            raise HTTPException(status_code=502, detail=f"策略解析失败（重试后仍无效）: {e2}")
     except Exception as e:
         logger.error(f"[plan] LLM 调用失败: {e}")
         raise HTTPException(status_code=502, detail=f"LLM 调用失败: {e}")
-
-    try:
-        data = json.loads(raw if isinstance(raw, str) else str(raw))
-        if not isinstance(data, dict):
-            raise ValueError("LLM 返回不是 JSON 对象")
-    except Exception as e:
-        logger.error(f"[plan] JSON 解析失败: {e}, raw={raw[:500]}")
-        raise HTTPException(status_code=502, detail=f"策略解析失败: {e}")
 
     valid_tool_names = {t["name"] for t in available_tools}
     valid_skill_ids = {s["skill_id"] for s in available_skills}
