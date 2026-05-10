@@ -1285,7 +1285,6 @@ onUnmounted(() => {
   overflow-y: auto;
   margin: 0;
   line-height: 1.6;
-  transition: height 0.2s ease;
 }
 
 /* TransitionGroup: stream bubble enter/leave */
