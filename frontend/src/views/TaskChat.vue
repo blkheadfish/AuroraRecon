@@ -77,6 +77,7 @@
             :text="msg.text"
             :timestamp="msg.timestamp"
             :tone="msg.tone"
+            :use-markdown="msg.role === 'agent'"
           >
             <div v-if="msg.action === 'operator_replan' && msg.operatorPlan" class="replan-card">
               <div class="replan-row" v-if="msg.operatorPlan.intent_summary">
@@ -241,7 +242,7 @@
                 <span class="bubble-phase">{{ bubble.phase || '推理' }}</span>
                 <span class="bubble-indicator">正在思考<span class="dots">...</span></span>
               </div>
-              <pre class="bubble-text">{{ bubble.text }}</pre>
+              <pre class="bubble-text">{{ bubble.text }}<span class="stream-cursor">|</span></pre>
             </div>
           </TransitionGroup>
 
@@ -974,6 +975,8 @@ onUnmounted(() => {
   scroll-margin-top: 40px;
   border-radius: var(--radius-md);
   transition: background 0.4s ease, box-shadow 0.4s ease;
+  content-visibility: auto;
+  contain-intrinsic-size: auto 120px;
 }
 .bubble-flash {
   background: color-mix(in srgb, var(--accent-blue) 12%, transparent);
@@ -1237,6 +1240,7 @@ onUnmounted(() => {
   border-radius: var(--radius-md);
   background: color-mix(in srgb, var(--bg-base) 92%, var(--accent-purple, #a371f7) 8%);
   padding: 10px 12px;
+  contain: layout style;
 }
 /* 工具实时输出气泡: 让用户在 tool_result 落位之前就能看到工具在跑什么,
  * 同时把样式与 LLM 推理流区分(蓝色,monospace)。 */
@@ -1249,6 +1253,7 @@ onUnmounted(() => {
   border-radius: var(--radius-md);
   background: color-mix(in srgb, var(--bg-base) 92%, var(--accent-blue, #58a6ff) 6%);
   padding: 10px 12px;
+  contain: layout style;
 }
 .tool-stream-bubble .bubble-phase {
   color: var(--accent-blue, #58a6ff);
@@ -1275,6 +1280,16 @@ onUnmounted(() => {
   100% { opacity: 0; }
 }
 .dots { animation: dot-blink 1.4s infinite; }
+@keyframes cursor-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+.stream-cursor {
+  animation: cursor-blink 0.8s infinite;
+  color: var(--accent-purple, #a371f7);
+  font-weight: 700;
+  user-select: none;
+}
 .bubble-text {
   font-family: var(--font-mono);
   font-size: 11px;

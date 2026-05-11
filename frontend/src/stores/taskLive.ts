@@ -22,6 +22,44 @@ const MAX_LOG_BUFFER = 3000
 const MAX_DECISION_EVENTS = 5000
 const MAX_TOOL_STREAM_LINES = 500
 
+// ── Token 批处理：合并 80ms 窗口内的 delta，降低 Vue 重渲染频率 ──
+// key = "${taskId}::${streamId}", 避免同任务多流碰撞
+const DELTA_BATCH_MS = 80
+const _deltaBufs: Record<string, { taskId: string; sid: string; phase: string; kind: string; text: string }> = {}
+let _deltaRafId: number | null = null
+let _deltaLastFlush = 0
+
+function _flushDeltas(stateMap: Record<string, TaskLiveState>) {
+  _deltaRafId = null
+  const now = Date.now()
+  for (const [key, buf] of Object.entries(_deltaBufs)) {
+    if (!buf.text) continue
+    const state = stateMap[buf.taskId]
+    if (!state) { delete _deltaBufs[key]; continue }
+    const sid = buf.sid
+    if (!state.llmStreams[sid]) {
+      state.llmStreams[sid] = { streamId: sid, phase: buf.phase, kind: buf.kind, text: '', updatedAt: now }
+    }
+    state.llmStreams[sid].text += buf.text
+    state.llmStreams[sid].updatedAt = now
+    delete _deltaBufs[key]
+  }
+  _deltaLastFlush = now
+}
+
+function _scheduleDeltaFlush(stateMap: Record<string, TaskLiveState>) {
+  if (_deltaRafId !== null) return
+  const elapsed = Date.now() - _deltaLastFlush
+  if (elapsed >= DELTA_BATCH_MS) {
+    _deltaRafId = requestAnimationFrame(() => _flushDeltas(stateMap))
+  } else {
+    const delay = DELTA_BATCH_MS - elapsed
+    setTimeout(() => {
+      _deltaRafId = requestAnimationFrame(() => _flushDeltas(stateMap))
+    }, delay)
+  }
+}
+
 interface LlmStreamBubble {
   streamId: string
   phase: string
@@ -529,13 +567,22 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
       if (action === 'llm_delta') {
         const sid = (p.stream_id as string) || 'default'
         const delta = (p.delta as string) || ''
+        if (!delta) return
         const phase = (p.phase as string) || ''
         const kind = (p.kind as string) || 'content'
+        // 批处理：合并 80ms 窗口内的 delta，减少 Vue 重渲染次数
+        const bufKey = `${taskId}::${sid}`
+        if (!_deltaBufs[bufKey]) {
+          _deltaBufs[bufKey] = { taskId, sid, phase, kind, text: '' }
+        }
+        _deltaBufs[bufKey].text += delta
+        _deltaBufs[bufKey].phase = phase || _deltaBufs[bufKey].phase
+        _deltaBufs[bufKey].kind = kind || _deltaBufs[bufKey].kind
+        // 首次创建 stream bubble 时同步初始化，避免 UI 闪现空 bubble
         if (!state.llmStreams[sid]) {
           state.llmStreams[sid] = { streamId: sid, phase, kind, text: '', updatedAt: Date.now() }
         }
-        state.llmStreams[sid].text += delta
-        state.llmStreams[sid].updatedAt = Date.now()
+        _scheduleDeltaFlush(taskStateMap.value)
       } else if (action === 'tool_stream') {
         const sid = (p.stream_id as string) || 'default'
         const line = (p.line as string) || ''

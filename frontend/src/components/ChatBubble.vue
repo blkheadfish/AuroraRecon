@@ -5,12 +5,13 @@
       <span v-else-if="role === 'user'">你</span>
       <span v-else>·</span>
     </div>
-    <div class="bubble" :class="[`tone-${tone || 'info'}`]">
+    <div class="bubble" :class="[`tone-${tone || 'info'}`, { 'bubble-markdown': useMarkdown }]">
       <div class="bubble-meta">
         <span class="role">{{ roleLabel }}</span>
         <span class="time" v-if="timestamp">{{ timestamp }}</span>
       </div>
-      <div class="text">{{ text }}</div>
+      <div v-if="useMarkdown" class="text md-body" v-html="renderedText"></div>
+      <div v-else class="text">{{ text }}</div>
       <slot name="suggestions" />
       <slot />
     </div>
@@ -19,7 +20,14 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
+import { marked } from 'marked'
 import robotIcon from '@/assets/robot.png'
+
+// 配置 marked 安全选项
+marked.setOptions({
+  breaks: true,
+  gfm: true,
+})
 
 const props = withDefaults(
   defineProps<{
@@ -27,14 +35,23 @@ const props = withDefaults(
     text: string
     timestamp?: string
     tone?: 'info' | 'primary' | 'warning' | 'success' | 'danger'
+    useMarkdown?: boolean
   }>(),
-  { tone: 'info', timestamp: '' },
+  { tone: 'info', timestamp: '', useMarkdown: false },
 )
 
 const roleLabel = computed(() => {
   if (props.role === 'agent') return 'Agent'
   if (props.role === 'user') return '我'
   return 'System'
+})
+
+const renderedText = computed(() => {
+  try {
+    return marked.parse(props.text) as string
+  } catch {
+    return props.text
+  }
 })
 </script>
 
@@ -133,5 +150,67 @@ const roleLabel = computed(() => {
   line-height: 1.6;
   font-size: 13px;
   color: var(--text-primary);
+}
+.md-body {
+  white-space: normal;
+}
+.md-body :deep(p) { margin: 0 0 8px; }
+.md-body :deep(p:last-child) { margin-bottom: 0; }
+.md-body :deep(ul), .md-body :deep(ol) { margin: 4px 0; padding-left: 20px; }
+.md-body :deep(li) { margin: 2px 0; line-height: 1.6; }
+.md-body :deep(code) {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  background: color-mix(in srgb, var(--text-primary) 10%, transparent);
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+.md-body :deep(pre) {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  background: color-mix(in srgb, var(--bg-base) 60%, black);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  overflow-x: auto;
+  margin: 6px 0;
+}
+.md-body :deep(pre code) {
+  background: none;
+  padding: 0;
+  font-size: 11px;
+}
+.md-body :deep(strong) { font-weight: 600; }
+.md-body :deep(em) { font-style: italic; }
+.md-body :deep(h1), .md-body :deep(h2), .md-body :deep(h3), .md-body :deep(h4) {
+  margin: 10px 0 6px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+.md-body :deep(h1) { font-size: 16px; }
+.md-body :deep(h2) { font-size: 15px; }
+.md-body :deep(h3) { font-size: 14px; }
+.md-body :deep(h4) { font-size: 13px; }
+.md-body :deep(blockquote) {
+  margin: 6px 0;
+  padding: 4px 10px;
+  border-left: 3px solid var(--accent-blue);
+  color: var(--text-secondary);
+}
+.md-body :deep(table) {
+  border-collapse: collapse;
+  margin: 6px 0;
+  font-size: 12px;
+  width: 100%;
+}
+.md-body :deep(th), .md-body :deep(td) {
+  border: 1px solid var(--border);
+  padding: 4px 8px;
+  text-align: left;
+}
+.md-body :deep(th) { background: color-mix(in srgb, var(--bg-elevated) 50%, transparent); font-weight: 600; }
+.md-body :deep(a) {
+  color: var(--accent-blue);
+  text-decoration: underline;
 }
 </style>
