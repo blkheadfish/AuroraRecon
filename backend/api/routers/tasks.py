@@ -1442,6 +1442,15 @@ async def respond_checkpoint(
     )
     sm.set(task_id, state)
 
+    # Signal any waiting ExploitAgent (asyncio.Event bridge for Tier 1/2 approval)
+    from backend.agents.agent_checkpoint_registry import signal as _signal_checkpoint
+    _signal_checkpoint(task_id, {
+        "action": req.action,
+        "selected_option": req.selected_option,
+        "user_prompt": req.user_prompt,
+        "note": req.note,
+    })
+
     from backend.api.services.task_runner import resume_task
     from backend.api.services.branch_manager import get_branch_manager
     bm = get_branch_manager()

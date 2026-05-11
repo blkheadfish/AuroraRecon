@@ -212,6 +212,7 @@ export interface CheckpointPayload {
   requires_input?: boolean
   default_action?: 'approve' | 'reject' | 'modify' | 'skip' | string
   options?: CheckpointOption[]
+  command?: string
   context?: Record<string, unknown>
   response?: {
     action: string

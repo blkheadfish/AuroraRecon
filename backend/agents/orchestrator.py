@@ -2515,6 +2515,8 @@ async def node_foothold_attempt(state: PentestState) -> PentestState:
     state.log(f"攻链: 立足点尝试 — 利用 {len(exploitable)} 个漏洞条目（含服务级 finding）")
     try:
         agent = ExploitAgent()
+        agent._checkpoint_state = state
+        agent._enable_step_approval = (state.workflow_mode == "pentest_engineer")
         exploit_context = _build_exploit_context(state)
         async def _on_tool_log(line: str):
             state.log(line)
@@ -2618,6 +2620,8 @@ async def node_secondary_attack(state: PentestState) -> PentestState:
     state.log(f"二次攻击：对 {len(findings_retry)} 个漏洞再尝试一轮...")
     try:
         agent = ExploitAgent()
+        agent._checkpoint_state = state
+        agent._enable_step_approval = (state.workflow_mode == "pentest_engineer")
         exploit_context = _build_exploit_context(state)
         exploit_context["secondary_pass"] = True
         if state.foothold_status == "file_read":
