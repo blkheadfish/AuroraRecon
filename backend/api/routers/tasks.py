@@ -1417,7 +1417,8 @@ async def respond_checkpoint(
     inflight_ts = sm.get_approval_inflight(task_id)
     if inflight_ts is not None:
         elapsed = _time.time() - inflight_ts
-        if elapsed < sm.APPROVAL_INFLIGHT_TIMEOUT:
+        # Only block rapid double-clicks (3s), NOT subsequent checkpoints.
+        if elapsed < 3:
             return {"status": "ok", "note": "审批已在执行中"}
         sm.clear_approval_inflight(task_id)
 
