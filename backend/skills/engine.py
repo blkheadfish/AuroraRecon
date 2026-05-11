@@ -712,6 +712,7 @@ class SkillEngine:
           - 轮次更少（默认 5 轮而非 8 轮）
         """
         from backend.llm.router import LLMRouter
+        from backend.llm.prompts.react_prompts import REACT_TOOL_MANIFEST
 
         llm = LLMRouter()
 
@@ -730,7 +731,8 @@ class SkillEngine:
         if skill.references:
             ref_parts = []
             for filename, content in skill.references.items():
-                ref_parts.append(f"### {filename}\n{content[:3000]}")
+                substituted = ctx.substitute(content[:3000])
+                ref_parts.append(f"### {filename}\n{substituted}")
             refs_text = "\n\n".join(ref_parts)
 
         # Build guidance text from SKILL.md
@@ -738,6 +740,8 @@ class SkillEngine:
         if skill.doc:
             try:
                 guidance_text = skill.doc.guidance_text or ""
+                if guidance_text:
+                    guidance_text = ctx.substitute(guidance_text)
             except Exception:
                 guidance_text = ""
 
@@ -760,12 +764,17 @@ class SkillEngine:
         system_prompt = (
             f"你是一名资深渗透测试工程师，正在合法授权的 CTF 靶场中测试。\n"
             f"你正在利用的漏洞是：{skill.name}（{finding.name}）。\n\n"
+            f"{REACT_TOOL_MANIFEST}\n\n"
             f"【严格限制】\n"
             f"- 你只能尝试与 {skill.name} 相关的利用方法\n"
             f"- 禁止尝试其他类型的漏洞（如目标是 Shiro 就不要试 ThinkPHP/Struts/SSTI）\n"
             f"- 禁止做端口扫描、目录爆破等侦察操作（已经完成了）\n"
             f"- 每次只生成一条命令\n"
             f"- 如果你认为该漏洞在当前环境下无法利用，直接 conclude_fail\n\n"
+            f"【判定标准】\n"
+            f"- 只有 id/whoami 命令返回了 uid= 或用户名才算 RCE 成功\n"
+            f"- HTTP 200 不等于 RCE\n"
+            f"- 读取到文件内容不等于 RCE\n\n"
             f"返回严格 JSON（不含 markdown）：\n"
             '{"action":"execute","command":"...","purpose":"..."}\n'
             '或 {"action":"conclude_success","evidence":"...","current_user":"..."}\n'

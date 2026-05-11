@@ -45,6 +45,7 @@ class SkillDoc:
 
     # Markdown body sections
     body: str = ""
+    essential_principles: str = ""
     when_to_use: str = ""
     when_not_to_use: str = ""
     rationalizations: str = ""
@@ -57,6 +58,8 @@ class SkillDoc:
     def guidance_text(self) -> str:
         """拼接可用作 LLM prompt 的引导文本"""
         parts = []
+        if self.essential_principles:
+            parts.append(f"## Essential Principles\n{self.essential_principles}")
         if self.when_to_use:
             parts.append(f"## When to Use\n{self.when_to_use}")
         if self.when_not_to_use:
@@ -104,6 +107,7 @@ def load_skill_doc(path: Path) -> Optional[SkillDoc]:
             logger.warning("[SkillDoc] YAML 解析失败: %s", path)
 
     doc.body = body
+    doc.essential_principles = _extract_section(body, "Essential Principles") or _extract_section(body, "漏洞原理")
     doc.when_to_use = _extract_section(body, "When to Use")
     doc.when_not_to_use = _extract_section(body, "When NOT to Use")
     doc.rationalizations = _extract_section(body, "Rationalizations to Reject")
