@@ -995,6 +995,77 @@ class SkillEngine:
                 ),
             })
 
+        # After max_rounds exhausted, give LLM one final chance to judge
+        # the last result. No execution allowed — only conclude_success or conclude_fail.
+        if conversation:
+            try:
+                final_response_raw = await llm.chat_multi_turn(
+                    messages=conversation,
+                    system_prompt=(
+                        f"{system_prompt}\n\n"
+                        "【最终判定】已达到最大执行轮数。请根据最后一轮的输出结果，"
+                        "判定利用是否成功。只能返回 conclude_success 或 conclude_fail，"
+                        "不允许返回 execute。"
+                    ),
+                    response_format="json",
+                    temperature=0.1,
+                )
+            except Exception as e:
+                logger.error(f"[SkillEngine] 最终判定 LLM 调用失败: {e}")
+                final_response_raw = None
+
+            if final_response_raw:
+                from backend.agents.react_base import (
+                    parse_react_decision,
+                    feedback_for_invalid_json,
+                )
+                final_parsed = parse_react_decision(final_response_raw)
+                if final_parsed.ok:
+                    final_decision = final_parsed.decision
+                    final_action = final_decision.get("action", "")
+                    if final_action == "conclude_success":
+                        last_stdout = ""
+                        last_stderr = ""
+                        if ctx.step_records:
+                            last_stdout = ctx.step_records[-1].get("stdout", "")
+                            last_stderr = ctx.step_records[-1].get("stderr", "")
+                        verifier = get_verifier()
+                        vr = verifier.verify(
+                            stdout=last_stdout,
+                            stderr=last_stderr,
+                            shell_type=final_decision.get("shell_type", "rce"),
+                            all_records=ctx.step_records,
+                        )
+                        if vr.passed:
+                            logger.info(
+                                f"[SkillEngine] ✅ 最终判定: 利用成功 "
+                                f"(level={vr.level.value})"
+                            )
+                            return ExploitResult(
+                                vuln_id=finding.vuln_id,
+                                success=True,
+                                shell_type=final_decision.get("shell_type", "rce"),
+                                exploit_level=vr.level.value.replace("confirmed_", "").replace("probable_", ""),
+                                session_info={
+                                    "method": f"skill:{skill.skill_id}:llm_freeform_final",
+                                    "skill_id": skill.skill_id,
+                                    "current_user": final_decision.get("current_user", ""),
+                                    "rounds": max_rounds,
+                                    "evidence_level": vr.level.value,
+                                    "evidence_snippets": vr.evidence_snippets,
+                                },
+                                evidence=(
+                                    f"{final_decision.get('evidence', '')} "
+                                    f"[verified: {vr.level.value} — {vr.reason}]"
+                                ),
+                                commands_run=ctx.commands_run,
+                                command_records=ctx.step_records,
+                            )
+                        else:
+                            logger.warning(
+                                f"[SkillEngine] 最终判定: LLM认为成功但EvidenceVerifier拒绝 "
+                                f"(level={vr.level.value}, reason={vr.reason})"
+                            )
         return ExploitResult(
             vuln_id=finding.vuln_id,
             success=False,
