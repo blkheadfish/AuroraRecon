@@ -622,8 +622,6 @@ class PentestState(BaseModel):
 	intel_files: list[dict[str, Any]] = Field(default_factory=list)
 	page_params: list[dict[str, Any]] = Field(default_factory=list)
 	intel_discovered_paths: list[str] = Field(default_factory=list)
-	kb_probe_hits: list[dict[str, Any]] = Field(default_factory=list)
-
 	subdomains: list[str] = Field(default_factory=list)
 	raw_recon: dict = Field(default_factory=dict)
 

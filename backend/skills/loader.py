@@ -1,10 +1,10 @@
 """
 skills/loader.py
-YAML Skill 加载器
+YAML Skill 加载器 — 渐进式加载（Progressive Disclosure）
 
 职责：
-  - 扫描 skills/ 目录下所有 skill.yaml（新格式）或 *.yaml（旧格式）
-  - 反序列化为 Skill 数据模型
+  - 启动时只加载 metadata（~50 tokens/skill）用于匹配
+  - 执行时按需加载完整 Skill + references/*.md
   - 同时加载侧边 SKILL.md AI 引导文档
   - 校验必填字段
 
@@ -13,6 +13,7 @@ YAML Skill 加载器
     skill.yaml    ← 匹配规则 + 路径定义
     SKILL.md      ← AI 引导文档
     scripts/      ← 执行脚本
+    references/   ← 参考资料（按需加载）
 
 旧格式（向后兼容）：
   skills/<category>/<skill>.yaml
@@ -34,6 +35,7 @@ from backend.skills.models import (
     Probe,
     ProbeStep,
     Skill,
+    SkillMeta,
     SuccessCriteria,
 )
 from backend.skills.skill_doc import load_skill_doc
@@ -42,12 +44,152 @@ logger = logging.getLogger(__name__)
 
 SKILLS_DIR = Path(__file__).parent
 
-# 不扫描 YAML 的子目录
-_SKIP_DIRS = {"scripts", "references", "workflows", "templates", "examples"}
+# 不扫描 YAML 的子目录（references 可在执行时加载）
+_SKIP_DIRS = {"scripts", "workflows", "templates", "examples"}
+
+
+def load_skills_metadata() -> list[SkillMeta]:
+    """启动时加载：只提取匹配和路由所需的轻量元数据（~50 tokens/skill）。"""
+    metas: list[SkillMeta] = []
+    loaded_dirs: set[Path] = set()
+
+    # 1) 新格式：扫描 */skill.yaml
+    for yaml_path in SKILLS_DIR.rglob("skill.yaml"):
+        parent_dir = yaml_path.parent
+        if _should_skip_path(parent_dir):
+            continue
+        try:
+            meta = _load_skill_meta(yaml_path)
+            metas.append(meta)
+            loaded_dirs.add(parent_dir)
+        except Exception as e:
+            logger.warning("[SkillLoader] Metadata 加载失败 %s: %s", yaml_path, e)
+
+    # 2) 旧格式：扫描剩余 *.yaml（不在已加载目录中）
+    for yaml_path in SKILLS_DIR.rglob("*.yaml"):
+        if yaml_path.name == "skill.yaml":
+            continue
+        parent_dir = yaml_path.parent
+        if parent_dir in loaded_dirs:
+            continue
+        if _should_skip_path(parent_dir):
+            continue
+        try:
+            meta = _load_skill_meta(yaml_path)
+            metas.append(meta)
+        except Exception as e:
+            logger.warning("[SkillLoader] Metadata 加载失败 %s: %s", yaml_path, e)
+
+    logger.info("[SkillLoader] Metadata: 加载 %d 个 Skill", len(metas))
+    return metas
+
+
+def _load_skill_meta(path: Path) -> SkillMeta:
+    """只解析 YAML frontmatter 中的路由信息，不加载 probes/paths 详情。"""
+    with open(path, "r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+
+    if not raw or not isinstance(raw, dict):
+        raise ValueError(f"无效的 Skill 文件: {path}")
+
+    skill_id = raw.get("skill_id", "")
+    if not skill_id:
+        raise ValueError(f"缺少 skill_id: {path}")
+
+    return SkillMeta(
+        skill_id=skill_id,
+        name=raw.get("name", skill_id),
+        description=raw.get("description", raw.get("principle", ""))[:200],
+        category=raw.get("category", ""),
+        phase=raw.get("phase", "foothold"),
+        match=_parse_match(raw.get("match", {})),
+        source_file=str(path),
+    )
+
+
+def load_skill_full(skill_id_or_path: str) -> Skill | None:
+    """
+    按需加载完整 Skill（含 probes、exploit_paths、SKILL.md、references）。
+
+    支持按 skill_id 或 source_file 路径查找。
+    """
+    # 尝试按路径查找
+    path = Path(skill_id_or_path)
+    if path.exists() and path.suffix in (".yaml", ".yml"):
+        return _load_skill_full_from_path(path)
+
+    # 按 skill_id 搜索
+    for yaml_path in SKILLS_DIR.rglob("skill.yaml"):
+        if _should_skip_path(yaml_path.parent):
+            continue
+        try:
+            with open(yaml_path, "r", encoding="utf-8") as f:
+                raw = yaml.safe_load(f)
+            if raw and raw.get("skill_id") == skill_id_or_path:
+                return _load_skill_full_from_path(yaml_path)
+        except Exception:
+            continue
+
+    # 旧格式 fallback
+    for yaml_path in SKILLS_DIR.rglob("*.yaml"):
+        if yaml_path.name == "skill.yaml":
+            continue
+        if _should_skip_path(yaml_path.parent):
+            continue
+        try:
+            with open(yaml_path, "r", encoding="utf-8") as f:
+                raw = yaml.safe_load(f)
+            if raw and raw.get("skill_id") == skill_id_or_path:
+                return _load_skill_full_from_path(yaml_path)
+        except Exception:
+            continue
+
+    logger.warning("[SkillLoader] 未找到 Skill: %s", skill_id_or_path)
+    return None
+
+
+def _load_skill_full_from_path(path: Path) -> Skill | None:
+    """从 YAML 路径加载完整 Skill（含 probes/paths/doc/references）。"""
+    try:
+        skill = load_skill(path)
+        # 加载 references
+        skill_dir = path.parent
+        skill.references = load_skill_references(skill_dir)
+        if skill.references:
+            logger.info(
+                "[SkillLoader] %s: 加载 %d 个 references",
+                skill.skill_id, len(skill.references),
+            )
+        return skill
+    except Exception as e:
+        logger.warning("[SkillLoader] 完整加载失败 %s: %s", path, e)
+        return None
+
+
+def load_skill_references(skill_dir: Path) -> dict[str, str]:
+    """
+    扫描 skill_dir/references/*.md，返回 {filename: content}。
+
+    用于注入 _react_freeform LLM context。
+    """
+    refs_dir = skill_dir / "references"
+    if not refs_dir.is_dir():
+        return {}
+
+    refs: dict[str, str] = {}
+    for md_path in sorted(refs_dir.glob("*.md")):
+        try:
+            content = md_path.read_text(encoding="utf-8").strip()
+            if content:
+                refs[md_path.name] = content
+        except Exception as e:
+            logger.warning("[SkillLoader] 读取 reference 失败 %s: %s", md_path, e)
+
+    return refs
 
 
 def load_all_skills() -> list[Skill]:
-    """扫描并加载所有 Skill YAML 文件（兼容新旧格式）"""
+    """全量加载所有 Skill（保留向后兼容，内部使用渐进式加载的 metadata 路径）。"""
     skills: list[Skill] = []
     loaded_dirs: set[Path] = set()
 
@@ -67,10 +209,10 @@ def load_all_skills() -> list[Skill]:
     # 2) 旧格式：扫描剩余 *.yaml（不在已加载目录或跳过目录中）
     for yaml_path in SKILLS_DIR.rglob("*.yaml"):
         if yaml_path.name == "skill.yaml":
-            continue  # 已在上面处理
+            continue
         parent_dir = yaml_path.parent
         if parent_dir in loaded_dirs:
-            continue  # 该目录已有新格式
+            continue
         if _should_skip_path(parent_dir):
             continue
         try:
@@ -130,7 +272,6 @@ def load_skill(path: Path) -> Skill:
 
     _validate_variable_consistency(skill, path)
     return skill
-
 
 
 def _parse_match(raw: dict) -> MatchConfig:

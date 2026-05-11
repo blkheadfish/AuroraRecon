@@ -396,6 +396,25 @@ class Skill:
     # AI 引导文档（从 SKILL.md 加载，可选）
     doc: Any = field(default=None, repr=False)
 
+    # References 文件内容（按需加载，filename → content）
+    references: dict[str, str] = field(default_factory=dict, repr=False)
+
+
+@dataclass
+class SkillMeta:
+    """
+    轻量 Skill 元数据 — 启动时加载（~50 tokens/skill）。
+
+    只包含匹配和路由所需的最小信息，完整 Skill 在执行时按需加载。
+    """
+    skill_id: str
+    name: str
+    description: str = ""
+    category: str = ""
+    phase: str = "foothold"
+    match: MatchConfig = field(default_factory=MatchConfig)
+    source_file: str = ""
+
 
 
 @dataclass

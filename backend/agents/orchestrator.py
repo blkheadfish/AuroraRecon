@@ -332,7 +332,6 @@ def get_intent_skill_boost(parsed_intent: dict | None) -> dict[str, int]:
     例如 priority_vulns=["shiro", "fastjson"] →
          {"shiro": +20, "fastjson": +20, "deserialization": +15}
 
-    由 ExploitAgent 在调用 SkillRegistry.match() 时通过 kb_hits 参数传入。
     """
     if not parsed_intent:
         return {}
@@ -791,41 +790,6 @@ def _build_exploit_context(state: PentestState) -> dict[str, Any]:
     if not dir_intel:
         dir_intel = _build_dir_intel(state)
 
-    kb_hits = list(state.kb_probe_hits) if state.kb_probe_hits else []
-
-    _INTENT_VULN_TO_SKILL: dict[str, str] = {
-        "shiro": "shiro_rce",
-        "fastjson": "fastjson_rce",
-        "log4j": "log4shell_rce",
-        "struts2": "struts2_rce",
-        "thinkphp": "thinkphp_rce",
-        "weblogic": "weblogic_rce",
-        "jboss": "jboss_rce",
-        "tomcat": "tomcat_exploit",
-        "wordpress": "wordpress_exploit",
-        "sql_injection": "sql_injection",
-        "sqli": "sql_injection",
-        "lfi": "lfi_rfi",
-        "ssti": "flask_ssti",
-        "weak_password": "credential_bruteforce",
-        "default_creds": "tomcat_exploit",
-    }
-    parsed = state.parsed_intent or {}
-    for tag in parsed.get("priority_vulns", []) or []:
-        tag_lower = tag.lower().strip()
-        skill_id = _INTENT_VULN_TO_SKILL.get(tag_lower)
-        if skill_id:
-            kb_hits.append({
-                "vuln_id": f"intent_{tag_lower}",
-                "dispatch_skill": skill_id,
-                "confidence": 0.5,
-                "base_url": f"http://{state.target_host}" if state.target_host else "",
-                "port": state.target_port,
-                "cves": [],
-                "finding_vuln_id": "",
-                "source": "parsed_intent",
-            })
-
     ctx: dict[str, Any] = {
         "ports_summary": ", ".join(
             f"{p.port}/{p.service}({p.version[:30]})" for p in state.open_ports[:20]
@@ -852,7 +816,6 @@ def _build_exploit_context(state: PentestState) -> dict[str, Any]:
         "confirmed_facts": state.confirmed_facts or {},
         "prior_probe_variables": state.exploit_probe_variables or {},
         "prior_failed_commands": state.failed_commands_by_vuln or {},
-        "kb_probe_hits": kb_hits,
         "attack_chain_mode": True,
         "attack_chain_hint": (
             "主机攻链优先：以「立足点→枚举→提权→目标」为主线；"
@@ -1985,101 +1948,6 @@ from backend.agents.fact_hooks import (
 )
 
 
-async def _run_kb_probe_scan(
-    *,
-    state: PentestState,
-    executor: Any,
-    host: str,
-    web_ports: list[Any],
-    log_callback: Any,
-    record_callback: Any,
-) -> None:
-    """
-    在 intel_harvest 末尾运行一轮 KB 探针扫描。
-
-    设计目标：
-      - 把 KB 从被动文本检索升级为主动指纹引擎；
-      - KB 命中后产出 VulnFinding(tool="kb_probe")，并把 dispatch_skill 写到
-        ``state.kb_probe_hits``，让后续 SkillRegistry.match() 直接命中对应 Skill；
-      - 不替代 VulnAgent 的模糊匹配，只做"已知 CVE 快速确认"的补充。
-    """
-    from backend.knowledge import ProbeScanner, build_probe_targets_from_ports
-
-    if not host or not web_ports:
-        return
-
-    targets = build_probe_targets_from_ports(host=host, ports=web_ports)
-    if not targets:
-        return
-
-    scanner = ProbeScanner(executor=executor)
-    try:
-        hits = await scanner.scan(
-            targets=targets,
-            task_id=state.task_id,
-            log_callback=log_callback,
-            record_callback=record_callback,
-        )
-    except Exception as exc:
-        logger.warning(f"[IntelHarvest:KBProbe] 扫描失败: {exc}")
-        return
-
-    if not hits:
-        state.log("KB 探针扫描: 无命中")
-        return
-
-    existing_signatures = {
-        (f.name, f.target, f.cve or "")
-        for f in state.findings
-    }
-
-    new_findings = 0
-    for hit in hits:
-        cve = hit.cves[0] if hit.cves else None
-        name = f"KB 命中: {hit.vuln_id}"
-        target = hit.base_url
-        sig = (name, target, cve or "")
-        if sig in existing_signatures:
-            continue
-        existing_signatures.add(sig)
-
-        severity = "high" if hit.confidence >= 0.85 else "medium"
-        finding = VulnFinding(
-            name=name,
-            severity=severity,
-            cve=cve,
-            target=target,
-            port=hit.port,
-            description=hit.description or hit.vuln_id,
-            evidence=hit.evidence[:800],
-            exploitable=True,
-            tool="kb_probe",
-            confidence=int(round(hit.confidence * 100)),
-        )
-        state.findings.append(finding)
-        new_findings += 1
-
-        state.kb_probe_hits.append({
-            "vuln_id": hit.vuln_id,
-            "dispatch_skill": hit.dispatch_skill,
-            "confidence": hit.confidence,
-            "base_url": hit.base_url,
-            "port": hit.port,
-            "probe_id": hit.probe_id,
-            "cves": list(hit.cves),
-            "evidence": hit.evidence[:300],
-            "finding_vuln_id": finding.vuln_id,
-        })
-
-    if new_findings:
-        state.log(
-            f"KB 探针扫描: 新增 {new_findings} 个 finding "
-            f"({len(hits)} 命中, 其中 {sum(1 for h in hits if h.dispatch_skill)} 有 Skill 派发)"
-        )
-    else:
-        state.log(f"KB 探针扫描: {len(hits)} 命中均已存在，未新增 finding")
-
-
 @retry_node()
 async def node_intel_harvest(state: PentestState) -> PentestState:
     """Pipeline between surface_enum and vuln_scan: download files + audit page source."""
@@ -2345,42 +2213,12 @@ async def node_intel_harvest(state: PentestState) -> PentestState:
                 ))
                 state.log(f"情报采集: 已验证 {vuln_label} @ {param_url}")
 
-    try:
-        await _run_kb_probe_scan(
-            state=state,
-            executor=executor,
-            host=host,
-            web_ports=web_ports,
-            log_callback=_on_tool_log,
-            record_callback=_on_exec_record,
-        )
-    except Exception as exc:
-        logger.warning(f"[IntelHarvest] KB 探针扫描异常: {exc}")
-
     verified_count = sum(1 for p in state.page_params if p.get("verified"))
     state.log(
         f"情报采集完成: "
         f"文件情报 {len(state.intel_files)} 份, "
         f"发现参数 {len(state.page_params)} 个 "
         f"(已验证 {verified_count})"
-        + (f", KB 探针命中 {len(state.kb_probe_hits)} 个" if state.kb_probe_hits else "")
-    )
-    kb_probe_lines: list[str] = []
-    if state.kb_probe_hits:
-        for h in state.kb_probe_hits[:20]:
-            name = h.get("vuln_id", "")
-            skill = h.get("dispatch_skill", "")
-            conf = h.get("confidence", 0)
-            evidence = (h.get("evidence", "") or "")[:120]
-            kb_probe_lines.append(
-                f"  • {name} (confidence={conf:.2f}"
-                + (f", skill={skill}" if skill else "")
-                + (f", evidence={evidence}" if evidence else "")
-                + ")"
-            )
-    kb_probe_detail = (
-        f"\nKB 探针命中 ({len(state.kb_probe_hits)} 个):\n" + "\n".join(kb_probe_lines)
-        if kb_probe_lines else ""
     )
 
     intel_file_lines: list[str] = []
@@ -2413,7 +2251,6 @@ async def node_intel_harvest(state: PentestState) -> PentestState:
         f"提取文件情报 {len(state.intel_files)} 份, "
         f"发现注入参数 {len(state.page_params)} 个, "
         f"其中已验证 {verified_count} 个."
-        + kb_probe_detail
         + intel_file_detail
         + param_detail
     )
@@ -2426,9 +2263,7 @@ async def node_intel_harvest(state: PentestState) -> PentestState:
         "message": (
             f"情报采集: {len(state.intel_files)} 文件情报, "
             f"{len(state.page_params)} 参数 ({verified_count} 已验证)"
-            + (f", KB 探针命中 {len(state.kb_probe_hits)} 个" if state.kb_probe_hits else "")
         ),
-        "kb_probe_hits_count": len(state.kb_probe_hits),
         "intel_files_count": len(state.intel_files),
         "page_params_count": len(state.page_params),
     })

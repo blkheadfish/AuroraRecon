@@ -1,9 +1,8 @@
 """
 skills/registry.py
-Skill 注册表
+Skill 注册表 — 渐进式加载
 
 匹配策略（v3 评分制）：
-  KB 探针 dispatch_skill +150  （最强信号，KB 主动探针已确认漏洞 + 显式派发）
   CVE 精确命中           +100  （强信号，明确就是这个漏洞）
   漏洞名称命中           +60   （VulnAgent 已经识别了漏洞名）
   json_probe 命中        +40   （主动探测确认）
@@ -12,6 +11,9 @@ Skill 注册表
 
   多个 Skill 匹配时，选评分最高的。
   同分时，category 越具体越优先（java_deserialization > server_misconfig）。
+
+渐进式加载：
+  启动时只加载 SkillMeta（~50 tokens/skill），匹配命中后才 load_skill_full()。
 """
 from __future__ import annotations
 
@@ -22,8 +24,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 from backend.agents.models import VulnFinding
-from backend.skills.loader import load_all_skills
-from backend.skills.models import MatchRule, Skill
+from backend.skills.loader import load_all_skills, load_skill_full, load_skills_metadata
+from backend.skills.models import MatchRule, Skill, SkillMeta
 
 logger = logging.getLogger(__name__)
 
@@ -96,20 +98,40 @@ _MODE_MATCH_CONFIG: dict[str, dict] = {
 
 class SkillRegistry:
     def __init__(self):
-        self._skills: list[Skill] = []
+        self._metas: list[SkillMeta] = []  # 轻量元数据（启动时加载）
+        self._skill_cache: dict[str, Skill] = {}  # 全量 Skill 缓存（按需加载）
         self._loaded = False
 
     def ensure_loaded(self) -> None:
         if self._loaded:
             return
-        self._skills = load_all_skills()
+        # 启动时只加载轻量元数据
+        self._metas = load_skills_metadata()
         self._loaded = True
-        logger.info(f"[SkillRegistry] 注册 {len(self._skills)} 个 Skill")
+        logger.info(f"[SkillRegistry] 注册 {len(self._metas)} 个 Skill (渐进式加载)")
 
     @property
     def size(self) -> int:
         self.ensure_loaded()
-        return len(self._skills)
+        return len(self._metas)
+
+    def _resolve_full(self, meta: SkillMeta) -> Skill | None:
+        """按需加载完整 Skill（含 probes/paths/references）。"""
+        skill_id = meta.skill_id
+        if skill_id not in self._skill_cache:
+            full = load_skill_full(meta.source_file)
+            if full:
+                self._skill_cache[skill_id] = full
+            else:
+                # Fallback: 从全量加载中获取
+                for s in load_all_skills():
+                    if s.skill_id == skill_id:
+                        self._skill_cache[skill_id] = s
+                        break
+        cached = self._skill_cache.get(skill_id)
+        if cached is None:
+            logger.warning("[SkillRegistry] 无法加载完整 Skill: %s", skill_id)
+        return cached
 
     def match(
         self,
@@ -119,21 +141,17 @@ class SkillRegistry:
         workflow_mode: str = "pentest_engineer",
         min_score: Optional[int] = None,
         weak_signal_boost: Optional[int] = None,
-        kb_hits: Optional[list[dict]] = None,
         context_vars: Optional[dict[str, Any]] = None,
     ) -> Optional[Skill]:
         """
         根据漏洞发现匹配最适用的 Skill(评分制 + mode 权重)。
 
+        匹配基于轻量 SkillMeta，命中后按需加载完整 Skill。
+
         Args:
             workflow_mode: pentest_engineer / ctf_expert,用作阈值兜底。
             min_score: 任务显式指定的下限(per-task,覆盖 mode 默认值)。
             weak_signal_boost: 任务显式指定的弱信号加权。
-            kb_hits: KB 探针扫描产出的命中列表。每条 dict 形如 ``{
-              "vuln_id", "dispatch_skill", "confidence", "base_url", "port",
-              "cves", "finding_vuln_id"}``。当 kb_hit 与当前 finding 关联
-              （finding_vuln_id 匹配 / target+cve 匹配 / port 匹配）时，
-              其 dispatch_skill 指向的 Skill 直接 +150 分，压过一切关键词匹配。
             context_vars: 当前上下文变量字典（如 auth_log_readable 等），供
               MatchRule.variable_present 条件使用。
         """
@@ -150,19 +168,14 @@ class SkillRegistry:
         min_threshold = cfg["min_score"] if min_score is None else int(min_score)
         boost = cfg["weak_signal_boost"] if weak_signal_boost is None else int(weak_signal_boost)
 
-        kb_skill_boost = self._compute_kb_dispatch_boost(finding, kb_hits or [])
+        scored: list[tuple[int, SkillMeta]] = []
 
-        scored: list[tuple[int, Skill]] = []
-
-        for skill in self._skills:
-            score = self._score_skill(skill, finding, combined_fp, json_probe, context_vars)
-            kb_extra = kb_skill_boost.get(skill.skill_id, 0)
-            if kb_extra:
-                score += kb_extra
-            if score > 0 and boost and score < 60 and not kb_extra:
+        for meta in self._metas:
+            score = self._score_skill(meta, finding, combined_fp, json_probe, context_vars)
+            if score > 0 and boost and score < 60:
                 score += boost
             if score >= min_threshold:
-                scored.append((score, skill))
+                scored.append((score, meta))
 
         if not scored:
             logger.debug(
@@ -187,79 +200,14 @@ class SkillRegistry:
                 f"[SkillRegistry] 匹配评分: {', '.join(top3)}"
             )
 
-        best_score, chosen = scored[0]
-        kb_marker = " [KB 派发]" if kb_skill_boost.get(chosen.skill_id) else ""
+        best_score, chosen_meta = scored[0]
         logger.info(
-            f"[SkillRegistry] ✅ 选择 Skill: {chosen.skill_id} "
-            f"(得分={best_score}{kb_marker}) ← {finding.name} ({finding.cve})"
+            f"[SkillRegistry] ✅ 选择 Skill: {chosen_meta.skill_id} "
+            f"(得分={best_score}) ← {finding.name} ({finding.cve})"
         )
-        return chosen
 
-    @staticmethod
-    def _compute_kb_dispatch_boost(
-        finding: VulnFinding,
-        kb_hits: list[dict],
-    ) -> dict[str, int]:
-        """
-        从 KB 探针命中里挑出与当前 finding 关联的 hit，返回 ``{skill_id: 加分}``。
-
-        关联策略（任一满足即视为关联）：
-          1. ``finding_vuln_id`` 与 ``finding.vuln_id`` 一致（最强信号，直接是
-             由这次 KB 探针生成的 finding）；
-          2. ``port`` 一致 + (CVE 一致 / target host 一致 / 描述包含 vuln_id)。
-        """
-        if not kb_hits:
-            return {}
-
-        boost: dict[str, int] = {}
-        finding_vuln_id = getattr(finding, "vuln_id", "") or ""
-        finding_cves = {(finding.cve or "").lower()} if finding.cve else set()
-        finding_port = finding.port
-        finding_target = (finding.target or "").lower()
-        finding_text = " ".join([
-            (finding.name or ""), (finding.description or ""),
-            (finding.evidence or "")[:300],
-        ]).lower()
-
-        for hit in kb_hits:
-            if not isinstance(hit, dict):
-                continue
-            skill_id = hit.get("dispatch_skill")
-            if not skill_id:
-                continue
-
-            associated = False
-
-            if hit.get("finding_vuln_id") and hit.get("finding_vuln_id") == finding_vuln_id:
-                associated = True
-            else:
-                same_port = (
-                    finding_port and hit.get("port") == finding_port
-                )
-                hit_cves = {str(c).lower() for c in (hit.get("cves") or [])}
-                cve_overlap = bool(finding_cves & hit_cves)
-                same_target = bool(
-                    finding_target and (hit.get("base_url") or "").lower()
-                    and (hit.get("base_url") or "").lower() in finding_target
-                )
-                kb_vuln_id = (hit.get("vuln_id") or "").lower()
-                vuln_id_in_text = bool(kb_vuln_id) and kb_vuln_id in finding_text
-
-                if same_port and (cve_overlap or vuln_id_in_text or same_target):
-                    associated = True
-                elif cve_overlap:
-                    associated = True
-
-            if not associated:
-                continue
-
-            confidence = float(hit.get("confidence") or 0.7)
-            extra = 150 if confidence >= 0.85 else 120
-            prev = boost.get(skill_id, 0)
-            if extra > prev:
-                boost[skill_id] = extra
-
-        return boost
+        # 按需加载完整 Skill（含 probes/paths/references）
+        return self._resolve_full(chosen_meta)
 
     def match_all(
         self,
@@ -276,52 +224,172 @@ class SkillRegistry:
         ]))
 
         scored = []
-        for s in self._skills:
-            score = self._score_skill(s, finding, combined_fp, json_probe)
+        for meta in self._metas:
+            score = self._score_skill(meta, finding, combined_fp, json_probe)
             if score > 0:
-                scored.append((score, s))
+                scored.append((score, meta))
 
         scored.sort(key=lambda x: x[0], reverse=True)
-        return [s for _, s in scored]
+        return [s for _, m in scored if (s := self._resolve_full(m))]
 
     def get_by_id(self, skill_id: str) -> Optional[Skill]:
         self.ensure_loaded()
-        for s in self._skills:
-            if s.skill_id == skill_id:
-                return s
+        # Check cache first
+        if skill_id in self._skill_cache:
+            return self._skill_cache[skill_id]
+        # Search metas then lazy-load
+        for meta in self._metas:
+            if meta.skill_id == skill_id:
+                return self._resolve_full(meta)
         return None
 
     def list_all(self) -> list[dict]:
         self.ensure_loaded()
         return [
             {
-                "skill_id": s.skill_id,
-                "name": s.name,
-                "category": s.category,
-                "phase": s.phase,
-                "paths_count": len(s.exploit_paths),
-                "probes_count": len(s.probes),
-                "source": s.source_file,
+                "skill_id": m.skill_id,
+                "name": m.name,
+                "category": m.category,
+                "phase": m.phase,
+                "source": m.source_file,
             }
-            for s in self._skills
+            for m in self._metas
         ]
 
     def list_by_phase(self, phase: str) -> list[Skill]:
         """Return all skills tagged for the given attack phase."""
         self.ensure_loaded()
-        return [s for s in self._skills if s.phase == phase]
+        return [s for m in self._metas if m.phase == phase and (s := self._resolve_full(m))]
 
     def reload(self) -> None:
-        """Atomic reload: load into a new list first, then swap."""
-        new_skills = load_all_skills()
-        self._skills = new_skills
+        """Atomic reload: reload metadata and clear full-skill cache."""
+        new_metas = load_skills_metadata()
+        self._metas = new_metas
+        self._skill_cache.clear()
         self._loaded = True
-        logger.info(f"[SkillRegistry] 重载完成，共 {len(new_skills)} 个 Skill")
+        logger.info(f"[SkillRegistry] 重载完成，共 {len(new_metas)} 个 Skill")
 
+    # ── LLM 语义匹配兜底 ──────────────────────────────────────────────
+
+    def _build_skill_list_for_llm(self) -> str:
+        """Build a compact skill catalog for LLM semantic matching."""
+        self.ensure_loaded()
+        lines = ["Available Skills:"]
+        for m in self._metas:
+            desc = m.description or m.name
+            lines.append(f"- skill_id: {m.skill_id}")
+            lines.append(f"  description: {desc}")
+        return "\n".join(lines)
+
+    async def _llm_select_skill(
+        self,
+        finding: VulnFinding,
+        fingerprint: str = "",
+        json_probe: str = "",
+    ) -> Optional[Skill]:
+        """
+        LLM semantic fallback: when algorithmic scoring fails, ask LLM to pick
+        the best matching skill from the catalog.
+
+        Returns the matched Skill or None.
+        """
+        from backend.llm.router import LLMRouter
+
+        llm = LLMRouter()
+        skill_list = self._build_skill_list_for_llm()
+
+        finding_info = (
+            f"漏洞名称: {finding.name}\n"
+            f"CVE: {finding.cve or 'N/A'}\n"
+            f"描述: {finding.description or '无'}\n"
+            f"证据: {(finding.evidence or '')[:500]}\n"
+            f"指纹: {fingerprint[:500]}\n"
+            f"JSON探针: {json_probe[:300]}\n"
+        )
+
+        prompt = (
+            f"根据以下漏洞发现信息，从 Skill 列表中选择最匹配的一个 skill_id。\n"
+            f"如果没有任何 Skill 匹配，返回 \"none\"。\n\n"
+            f"{finding_info}\n\n"
+            f"{skill_list}\n\n"
+            f"请严格返回 JSON: {{\"skill_id\": \"<skill_id 或 none>\", \"reason\": \"简短理由\"}}"
+        )
+
+        try:
+            response_raw = await llm.chat_multi_turn(
+                messages=[{"role": "user", "content": prompt}],
+                system_prompt="你是一名渗透测试 Skill 路由器。根据漏洞信息选择最匹配的 Skill。",
+                response_format="json",
+                temperature=0.1,
+            )
+        except Exception as e:
+            logger.warning(f"[SkillRegistry] LLM 语义匹配失败: {e}")
+            return None
+
+        import json as _json
+        try:
+            response_text = response_raw if isinstance(response_raw, str) else response_raw[0]
+            result = _json.loads(response_text)
+            chosen_id = (result.get("skill_id") or "").strip()
+            reason = result.get("reason", "")
+        except Exception:
+            logger.warning("[SkillRegistry] LLM 返回非法 JSON")
+            return None
+
+        if not chosen_id or chosen_id.lower() == "none":
+            logger.info("[SkillRegistry] LLM 语义匹配: 无匹配")
+            return None
+
+        skill = self.get_by_id(chosen_id)
+        if skill:
+            logger.info(
+                f"[SkillRegistry] 🤖 LLM 语义匹配: {chosen_id} — {reason}"
+            )
+        else:
+            logger.warning(
+                f"[SkillRegistry] LLM 选择了不存在的 skill_id: {chosen_id}"
+            )
+        return skill
+
+    async def match_with_llm_fallback(
+        self,
+        finding: VulnFinding,
+        fingerprint: str = "",
+        json_probe: str = "",
+        workflow_mode: str = "pentest_engineer",
+        min_score: Optional[int] = None,
+        weak_signal_boost: Optional[int] = None,
+        context_vars: Optional[dict[str, Any]] = None,
+    ) -> Optional[Skill]:
+        """
+        算法匹配 + LLM 语义匹配兜底。
+
+        先跑算法评分，无匹配时用 LLM 从 skill catalog 中选择。
+        """
+        # 算法匹配
+        skill = self.match(
+            finding=finding,
+            fingerprint=fingerprint,
+            json_probe=json_probe,
+            workflow_mode=workflow_mode,
+            min_score=min_score,
+            weak_signal_boost=weak_signal_boost,
+            context_vars=context_vars,
+        )
+        if skill:
+            return skill
+
+        # LLM 语义兜底
+        logger.info("[SkillRegistry] 算法无匹配，启动 LLM 语义兜底...")
+        return await self._llm_select_skill(
+            finding=finding,
+            fingerprint=fingerprint,
+            json_probe=json_probe,
+        )
 
     @staticmethod
     def _score_skill(
-        skill: Skill,
+        skill: Skill | SkillMeta,
         finding: VulnFinding,
         fingerprint: str,
         json_probe: str,

@@ -725,9 +725,27 @@ class SkillEngine:
                 "exit_code": rec["exit_code"],
             })
 
+        # Build references text from skill.references
+        refs_text = ""
+        if skill.references:
+            ref_parts = []
+            for filename, content in skill.references.items():
+                ref_parts.append(f"### {filename}\n{content[:3000]}")
+            refs_text = "\n\n".join(ref_parts)
+
+        # Build guidance text from SKILL.md
+        guidance_text = ""
+        if skill.doc:
+            try:
+                guidance_text = skill.doc.guidance_text or ""
+            except Exception:
+                guidance_text = ""
+
         context_for_llm = (
             f"## 漏洞原理\n{skill.principle}\n\n"
-            f"## 环境信息\n"
+            + (f"## 利用指南\n{guidance_text}\n\n" if guidance_text else "")
+            + (f"## 参考资料\n{refs_text}\n\n" if refs_text else "")
+            + f"## 环境信息\n"
             f"- 目标: {ctx.endpoint}\n"
             f"- 目标OS: {ctx.target_os}\n"
             f"- 攻击机IP: {ctx.lhost or '未配置(NAT环境)'}\n"
