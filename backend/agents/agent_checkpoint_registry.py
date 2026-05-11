@@ -54,6 +54,16 @@ async def open_and_wait(
     except Exception as exc:
         logger.warning(f"[CheckpointRegistry] open_checkpoint failed: {exc}")
 
+    # Sync state back to StateManager so the API endpoint can see pending_checkpoint.
+    # Without this, sm.get(task_id) returns the state snapshot from the *previous*
+    # LangGraph node — which has pending_checkpoint=None — and respond_checkpoint
+    # rejects the request with HTTP 400.
+    try:
+        from backend.api.state import get_state_manager
+        get_state_manager().set(task_id, state)
+    except Exception as exc:
+        logger.warning(f"[CheckpointRegistry] state sync failed: {exc}")
+
     logger.info(
         f"[CheckpointRegistry] open_and_wait task={task_id} "
         f"type={checkpoint_payload.get('checkpoint_type', '?')}"

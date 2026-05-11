@@ -1451,19 +1451,26 @@ async def respond_checkpoint(
         "note": req.note,
     })
 
-    from backend.api.services.task_runner import resume_task
-    from backend.api.services.branch_manager import get_branch_manager
-    bm = get_branch_manager()
-    try:
-        active_branch = await bm.lazy_init_root(task_id, state)
-    except Exception as exc:
-        logger.warning(f"[checkpoint] lazy_init_root failed: {exc}")
-        active_branch = None
-    thread_id = active_branch.thread_id if active_branch else task_id
-    task_handle = asyncio.create_task(
-        resume_task(task_id, approved, thread_id=thread_id)
-    )
-    sm.register_bg_task(task_id, task_handle)
+    # Only resume LangGraph if we're at an interrupt_before boundary.
+    # exploit_plan/exploit_step checkpoints fire mid-node (asyncio.Event bridge);
+    # the agent is still running inside the node — signal_checkpoint above
+    # already woke it, so calling resume_task would create a conflicting
+    # parallel graph execution.
+    is_langgraph_interrupt = state.current_phase in ("awaiting_approval", "post_foothold_approval")
+    if is_langgraph_interrupt:
+        from backend.api.services.task_runner import resume_task
+        from backend.api.services.branch_manager import get_branch_manager
+        bm = get_branch_manager()
+        try:
+            active_branch = await bm.lazy_init_root(task_id, state)
+        except Exception as exc:
+            logger.warning(f"[checkpoint] lazy_init_root failed: {exc}")
+            active_branch = None
+        thread_id = active_branch.thread_id if active_branch else task_id
+        task_handle = asyncio.create_task(
+            resume_task(task_id, approved, thread_id=thread_id)
+        )
+        sm.register_bg_task(task_id, task_handle)
 
     payload = sm.ws_phase_payload(state, log_tail=3)
     payload["status"] = "running"
