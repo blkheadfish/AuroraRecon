@@ -58,14 +58,6 @@
       </ul>
     </div>
 
-    <div v-if="commandText" class="block command-block">
-      <div class="block-head">
-        <el-icon><Operation /></el-icon>
-        <span>拟执行命令</span>
-      </div>
-      <pre class="command-text">{{ commandText }}</pre>
-    </div>
-
     <div v-if="visibleOptions.length" class="block options-block">
       <div class="block-head">
         <el-icon><Operation /></el-icon>
@@ -137,16 +129,6 @@
           采纳意见后继续
         </el-button>
         <el-button
-          v-if="checkpointType === 'exploit_step'"
-          type="success"
-          plain
-          :loading="loading"
-          @click="onSubmit('auto_all')"
-        >
-          <el-icon><Check /></el-icon>
-          自动批准后续全部
-        </el-button>
-        <el-button
           type="primary"
           :loading="loading"
           @click="onSubmit('approve')"
@@ -187,7 +169,7 @@ const props = withDefaults(
 
 const emit = defineEmits<{
   (e: 'submit', payload: {
-    action: 'approve' | 'reject' | 'modify' | 'skip' | 'auto_all'
+    action: 'approve' | 'reject' | 'modify' | 'skip'
     selected_option: string
     user_prompt: string
     note: string
@@ -228,8 +210,6 @@ const phaseLabel = computed(() => PHASE_LABELS[phase.value] || phase.value || 'c
 const TYPE_LABELS: Record<string, string> = {
   exploit_gate: '利用授权',
   post_foothold_gate: '立足后授权',
-  exploit_plan: '利用方案确认',
-  exploit_step: '命令逐条审批',
   generic: '',
 }
 const checkpointTypeLabel = computed(() =>
@@ -278,10 +258,6 @@ const contextEntries = computed(() => {
   return out
 })
 
-const commandText = computed(() => {
-  return props.checkpoint?.command || ''
-})
-
 const createdAtLabel = computed(() => {
   const ts = props.checkpoint?.created_at
   if (!ts) return ''
@@ -315,7 +291,7 @@ watch(
 // phase_completed 类型的 checkpoint —— 交互式流程暂停点
 const isPhaseCompleted = computed(() => checkpointType.value === 'phase_completed')
 
-function onSubmit(action: 'approve' | 'reject' | 'modify' | 'skip' | 'auto_all') {
+function onSubmit(action: 'approve' | 'reject' | 'modify' | 'skip') {
   if (props.loading) return
   let resolved = action
   let nextAction = ''
@@ -461,21 +437,6 @@ function onSubmitFinish() {
   font-size: 13px;
   line-height: 1.55;
   color: var(--text-primary);
-}
-
-.command-text {
-  margin: 0;
-  font-family: var(--font-mono);
-  font-size: 12px;
-  line-height: 1.55;
-  white-space: pre-wrap;
-  color: var(--text-primary);
-  background: color-mix(in srgb, var(--bg-base) 50%, transparent);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 8px 10px;
-  max-height: 120px;
-  overflow-y: auto;
 }
 
 .context-list {

@@ -1417,8 +1417,7 @@ async def respond_checkpoint(
     inflight_ts = sm.get_approval_inflight(task_id)
     if inflight_ts is not None:
         elapsed = _time.time() - inflight_ts
-        # Only block rapid double-clicks (3s), NOT subsequent checkpoints.
-        if elapsed < 3:
+        if elapsed < sm.APPROVAL_INFLIGHT_TIMEOUT:
             return {"status": "ok", "note": "审批已在执行中"}
         sm.clear_approval_inflight(task_id)
 
@@ -1443,35 +1442,19 @@ async def respond_checkpoint(
     )
     sm.set(task_id, state)
 
-    # Signal any waiting ExploitAgent (asyncio.Event bridge for Tier 1/2 approval)
-    from backend.agents.agent_checkpoint_registry import signal as _signal_checkpoint
-    _signal_checkpoint(task_id, {
-        "action": req.action,
-        "selected_option": req.selected_option,
-        "user_prompt": req.user_prompt,
-        "note": req.note,
-    })
-
-    # Only resume LangGraph if we're at an interrupt_before boundary.
-    # exploit_plan/exploit_step checkpoints fire mid-node (asyncio.Event bridge);
-    # the agent is still running inside the node — signal_checkpoint above
-    # already woke it, so calling resume_task would create a conflicting
-    # parallel graph execution.
-    is_langgraph_interrupt = state.current_phase in ("awaiting_approval", "post_foothold_approval")
-    if is_langgraph_interrupt:
-        from backend.api.services.task_runner import resume_task
-        from backend.api.services.branch_manager import get_branch_manager
-        bm = get_branch_manager()
-        try:
-            active_branch = await bm.lazy_init_root(task_id, state)
-        except Exception as exc:
-            logger.warning(f"[checkpoint] lazy_init_root failed: {exc}")
-            active_branch = None
-        thread_id = active_branch.thread_id if active_branch else task_id
-        task_handle = asyncio.create_task(
-            resume_task(task_id, approved, thread_id=thread_id)
-        )
-        sm.register_bg_task(task_id, task_handle)
+    from backend.api.services.task_runner import resume_task
+    from backend.api.services.branch_manager import get_branch_manager
+    bm = get_branch_manager()
+    try:
+        active_branch = await bm.lazy_init_root(task_id, state)
+    except Exception as exc:
+        logger.warning(f"[checkpoint] lazy_init_root failed: {exc}")
+        active_branch = None
+    thread_id = active_branch.thread_id if active_branch else task_id
+    task_handle = asyncio.create_task(
+        resume_task(task_id, approved, thread_id=thread_id)
+    )
+    sm.register_bg_task(task_id, task_handle)
 
     payload = sm.ws_phase_payload(state, log_tail=3)
     payload["status"] = "running"
