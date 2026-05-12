@@ -511,3 +511,63 @@ async def resume_task(
 def is_msf_available() -> bool:
     """供 exploit_agent / post_agent 调用。"""
     return get_state_manager().msf_available
+
+
+# ── 启动恢复 ──────────────────────────────────────────────────────────
+
+async def auto_resume_startup_tasks() -> None:
+    """服务重启后自动恢复处在 interrupt 边界的任务。
+
+    遍历已从 DB 加载的所有任务:
+      - AWAITING_APPROVAL / WAITING_USER / pending_checkpoint → 可恢复，spawn resume
+      - RUNNING (mid-ReAct) → 标记 FAILED，不可恢复
+    """
+    sm = get_state_manager()
+    recovered_count = 0
+    failed_count = 0
+
+    for task_id, state in list(sm.items()):
+        is_resumable = (
+            state.status in (TaskStatus.AWAITING_APPROVAL, TaskStatus.WAITING_USER)
+            or state.pending_checkpoint is not None
+        )
+        if is_resumable:
+            state.log("[重启] 检测到服务重启，正在恢复任务…")
+            sm.set(task_id, state)
+
+            from backend.api.services.branch_manager import get_branch_manager
+            bm = get_branch_manager()
+            try:
+                active_branch = await bm.lazy_init_root(task_id, state)
+            except Exception:
+                active_branch = None
+            thread_id = active_branch.thread_id if active_branch else task_id
+
+            asyncio.ensure_future(_startup_resume_one(task_id, thread_id))
+            recovered_count += 1
+            continue
+
+        if state.status == TaskStatus.RUNNING:
+            state.status = TaskStatus.FAILED
+            state.error_msg = "服务重启导致运行中断，请手动恢复"
+            state.log("[重启] 检测到服务重启，任务已中断")
+            sm.set(task_id, state)
+            await _maybe_save_db(task_id, state, force=True)
+            failed_count += 1
+
+    if recovered_count or failed_count:
+        logger.info(
+            f"[启动] 任务自动恢复完成: 恢复 {recovered_count} 个, "
+            f"标记失败 {failed_count} 个"
+        )
+
+
+async def _startup_resume_one(task_id: str, thread_id: str) -> None:
+    """启动时恢复单个任务的异步包装。"""
+    try:
+        async for _ in get_orchestrator().resume_stream(
+            task_id=task_id, approved=True, thread_id=thread_id,
+        ):
+            pass
+    except Exception as e:
+        logger.error(f"[启动] 恢复任务 {task_id} 失败: {e}", exc_info=True)

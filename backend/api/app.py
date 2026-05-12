@@ -87,6 +87,31 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"[启动] 恢复任务失败: {e}")
 
+    # --- 跨会话持久化: 中断信号恢复 + 自动恢复任务 ---
+    try:
+        from backend.agents import interrupt_registry
+        interrupt_registry.set_db_enabled(sm.db_available)
+        loaded = await interrupt_registry.load_from_db()
+        if loaded:
+            logger.info(f"[启动] 从DB恢复 {len(loaded)} 个中断信号")
+    except Exception as e:
+        logger.warning(f"[启动] 中断信号恢复失败: {e}")
+
+    try:
+        from backend.api.services.task_runner import auto_resume_startup_tasks
+        await auto_resume_startup_tasks()
+    except Exception as e:
+        logger.warning(f"[启动] 任务自动恢复失败: {e}")
+
+    # --- RAG 语义技能路由: 预计算 embedding ---
+    try:
+        from backend.skills.registry import get_registry
+        reg = get_registry()
+        asyncio.create_task(reg.precompute_embeddings())
+        logger.info("[启动] Skill embedding 预计算任务已提交")
+    except Exception as e:
+        logger.warning(f"[启动] Skill embedding 预计算失败: {e}")
+
     try:
         from backend.tools.executor import TaskContainerManager
         cleaned = await TaskContainerManager.cleanup_orphans()

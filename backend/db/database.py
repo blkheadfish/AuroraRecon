@@ -154,6 +154,19 @@ class AdminOverrideRecord(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class TaskInterruptRecord(Base):
+    __tablename__ = "task_interrupts"
+
+    task_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    reason: Mapped[str] = mapped_column(String(64), default="")
+    payload_json: Mapped[str] = mapped_column(Text, default="{}")
+    requested_at: Mapped[str] = mapped_column(String(32), default="")
+    count: Mapped[int] = mapped_column(Integer, default=1)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow,
+    )
+
+
 class TaskBranchRecord(Base):
     """任务对话分支元数据 — Claude/Kimi 风格 branch tree。
 
@@ -816,6 +829,56 @@ async def get_branch(branch_id: str) -> Optional[dict]:
 async def delete_branch(branch_id: str) -> bool:
     async with async_session() as session:
         rec = await session.get(TaskBranchRecord, branch_id)
+        if not rec:
+            return False
+        await session.delete(rec)
+        await session.commit()
+        return True
+
+
+# ── task_interrupts CRUD ──────────────────────────────────────────────
+
+async def save_interrupt(
+    task_id: str,
+    reason: str,
+    payload_json: str,
+    requested_at: str,
+    count: int,
+) -> None:
+    async with async_session() as session:
+        rec = await session.get(TaskInterruptRecord, task_id)
+        if not rec:
+            rec = TaskInterruptRecord(task_id=task_id)
+            session.add(rec)
+        rec.reason = reason
+        rec.payload_json = payload_json
+        rec.requested_at = requested_at
+        rec.count = count
+        rec.updated_at = datetime.utcnow()
+        await session.commit()
+
+
+async def load_all_interrupts() -> list[dict]:
+    async with async_session() as session:
+        result = await session.execute(
+            text("SELECT task_id, reason, payload_json, requested_at, count "
+                 "FROM task_interrupts ORDER BY task_id")
+        )
+        return [
+            {
+                "task_id": r.task_id,
+                "reason": r.reason,
+                "payload_json": r.payload_json,
+                "requested_at": r.requested_at,
+                "count": r.count,
+            }
+            for r in result.fetchall()
+        ]
+
+
+async def delete_interrupt_from_db(task_id: str) -> bool:
+    async with async_session() as session:
+        rec = await session.get(TaskInterruptRecord, task_id)
         if not rec:
             return False
         await session.delete(rec)

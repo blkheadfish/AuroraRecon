@@ -1326,6 +1326,64 @@ async def delete_task(task_id: str, request: Request):
 
 
 
+@router.post("/tasks/{task_id}/recover")
+async def recover_task(task_id: str, request: Request):
+    """手动恢复因服务重启而中断的任务。
+
+    仅允许 FAILED（且 error_msg 提示重启）或 RUNNING（无后台协程）的任务。
+    恢复后重新调度 resume_stream，从 LangGraph checkpoint 继续。
+    """
+    sm = _get_sm()
+    state = await _resolve_state(task_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    _enforce_task_owner(state, request, "recover_task")
+
+    is_failed_by_restart = (
+        state.status == TaskStatus.FAILED
+        and state.error_msg
+        and "重启" in (state.error_msg or "")
+    )
+    is_orphan_running = (
+        state.status == TaskStatus.RUNNING
+        and not sm.is_running(task_id)
+    )
+
+    if not (is_failed_by_restart or is_orphan_running):
+        raise HTTPException(
+            status_code=400,
+            detail="仅支持恢复因重启中断的任务（FAILED+重启原因 或 RUNNING+无后台协程）",
+        )
+
+    state.status = TaskStatus.RUNNING
+    state.error_msg = ""
+    state.log("[恢复] 用户手动恢复任务")
+    sm.set(task_id, state)
+
+    if sm.db_available:
+        try:
+            from backend.db.database import save_task
+            await save_task(state)
+        except Exception as e:
+            logger.warning(f"[DB] recover save failed: {e}")
+
+    from backend.api.services.task_runner import resume_task
+    from backend.api.services.branch_manager import get_branch_manager
+    bm = get_branch_manager()
+    try:
+        active_branch = await bm.lazy_init_root(task_id, state)
+    except Exception as exc:
+        logger.warning(f"[recover] lazy_init_root failed: {exc}")
+        active_branch = None
+    thread_id = active_branch.thread_id if active_branch else task_id
+    task_handle = asyncio.create_task(
+        resume_task(task_id, approved=True, thread_id=thread_id)
+    )
+    sm.register_bg_task(task_id, task_handle)
+
+    return {"status": "recovered", "task_id": task_id}
+
+
 @router.post("/tasks/{task_id}/approve")
 async def approve_task(task_id: str, req: ApproveRequest, request: Request):
     """

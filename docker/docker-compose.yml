@@ -80,6 +80,10 @@ services:
       - LLM_MODEL=${LLM_MODEL:-deepseek-chat}
       - LLM_BASE_URL=${LLM_BASE_URL:-https://api.deepseek.com}
       - LLM_MAX_TOKENS=${LLM_MAX_TOKENS:-4096}
+      # Embedding API（语义技能路由）
+      - KB_EMBEDDING_API_KEY=${KB_EMBEDDING_API_KEY:-}
+      - KB_EMBEDDING_BASE_URL=${KB_EMBEDDING_BASE_URL:-}
+      - KB_EMBEDDING_MODEL=${KB_EMBEDDING_MODEL:-}
       # MSF RPC
       - MSF_HOST=msf
       - MSF_PORT=55553

@@ -17,9 +17,12 @@ Skill 注册表 — 渐进式加载
 """
 from __future__ import annotations
 
+import asyncio
+import json as _json
 import logging
 import os
 import threading
+import time as _time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -101,6 +104,12 @@ class SkillRegistry:
         self._metas: list[SkillMeta] = []  # 轻量元数据（启动时加载）
         self._skill_cache: dict[str, Skill] = {}  # 全量 Skill 缓存（按需加载）
         self._loaded = False
+        # RAG 语义路由
+        self._embeddings: dict[str, list[float]] = {}  # skill_id → vector
+        self._embeddings_ready: bool = False
+        self._query_embed_cache: dict[str, tuple[list[float], float]] = {}
+        self._embed_cache_ttl: float = 3600.0
+        self._embed_semaphore = asyncio.Semaphore(3)
 
     def ensure_loaded(self) -> None:
         if self._loaded:
@@ -266,8 +275,235 @@ class SkillRegistry:
         new_metas = load_skills_metadata()
         self._metas = new_metas
         self._skill_cache.clear()
+        self._embeddings.clear()
+        self._query_embed_cache.clear()
+        self._embeddings_ready = False
         self._loaded = True
         logger.info(f"[SkillRegistry] 重载完成，共 {len(new_metas)} 个 Skill")
+
+    # ── RAG 语义技能路由 ──────────────────────────────────────────────
+
+    @staticmethod
+    def _build_skill_search_text(meta: SkillMeta) -> str:
+        """构建用于 embedding 的 skill 搜索文本。
+
+        从 SkillMeta 的 match.rules 中提取 CVE / fingerprint / service 等
+        关键词，与 name / category 拼接为 embedding 输入。
+        """
+        parts = [
+            meta.name,
+            meta.description or "",
+            meta.category or "",
+        ]
+        # 从 match.rules 提取关键词
+        for rule in meta.match.rules:
+            if rule.cve_matches:
+                parts.append(" ".join(rule.cve_matches))
+            if rule.fingerprint_contains:
+                parts.append(" ".join(rule.fingerprint_contains))
+            if rule.service_is:
+                parts.append(rule.service_is)
+            if rule.evidence_contains:
+                parts.append(" ".join(rule.evidence_contains))
+        return " ".join(filter(None, parts))
+
+    async def precompute_embeddings(self) -> None:
+        """启动时预计算所有 Skill 的 embedding 向量。
+
+        - 检查磁盘缓存 ``skills/.embeddings_cache/{skill_id}.json``
+        - 缺失的调用 embedding API 生成
+        - 用 asyncio.Semaphore(3) 限制并发
+        """
+        self.ensure_loaded()
+        if not self._metas:
+            return
+
+        from backend.knowledge.exploit_kb import get_embedding
+        import os as _os
+
+        _ekey = _os.getenv("KB_EMBEDDING_API_KEY", _os.getenv("LLM_API_KEY", ""))
+        _eurl = _os.getenv("KB_EMBEDDING_BASE_URL", _os.getenv("LLM_BASE_URL", ""))
+        _emodel = _os.getenv("KB_EMBEDDING_MODEL", "")
+
+        logger.info(
+            "[SkillRegistry] Embedding 配置: key=%s..., base_url=%s, model=%s",
+            (_ekey[:8] + "..." if len(_ekey) > 8 else "(空)"),
+            _eurl or "(空)",
+            _emodel or "(空，fallback text-embedding-3-small)",
+        )
+
+        if not _ekey or not _eurl:
+            logger.warning(
+                "[SkillRegistry] Embedding API 未配置，语义路由不可用"
+            )
+            return
+        if "deepseek" in _eurl.lower() and not _emodel:
+            logger.warning(
+                "[SkillRegistry] DeepSeek 不支持 embedding，请单独配置 provider"
+            )
+            return
+
+        # 快速预检：用一个 skill 测试 API 连通性，不通则快速降级
+        test_meta = self._metas[0]
+        test_text = self._build_skill_search_text(test_meta)
+        try:
+            test_vec = await get_embedding(test_text)
+            if not test_vec:
+                logger.warning(
+                    "[SkillRegistry] Embedding API 连通性测试失败，跳过预计算"
+                )
+                return
+        except Exception as e:
+            logger.warning(
+                f"[SkillRegistry] Embedding API 预检异常: {e}，跳过预计算"
+            )
+            return
+
+        cache_dir = Path(__file__).resolve().parent / ".embeddings_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # 用 list 做可变计数器，避免 nonlocal 在 asyncio.gather 里的潜在问题
+        counters = [0, 0]  # [new_count, cached_count]
+        # 先存好测试结果的缓存
+        self._embeddings[test_meta.skill_id] = test_vec
+        counters[0] += 1
+
+        async def _compute_one(meta: SkillMeta) -> None:
+            cache_file = cache_dir / f"{meta.skill_id}.json"
+
+            if cache_file.exists():
+                try:
+                    data = _json.loads(cache_file.read_text(encoding="utf-8"))
+                    vec = data.get("embedding")
+                    if isinstance(vec, list) and len(vec) > 0:
+                        self._embeddings[meta.skill_id] = vec
+                        counters[1] += 1
+                        return
+                except Exception:
+                    pass
+
+            search_text = self._build_skill_search_text(meta)
+            if not search_text.strip():
+                return
+
+            async with self._embed_semaphore:
+                try:
+                    vec = await get_embedding(search_text)
+                except Exception as e:
+                    logger.warning(
+                        f"[SkillRegistry] embedding API 异常 {meta.skill_id}: {e}"
+                    )
+                    return
+
+            if vec and len(vec) > 0:
+                self._embeddings[meta.skill_id] = vec
+                counters[0] += 1
+                try:
+                    cache_file.write_text(
+                        _json.dumps({"embedding": vec}, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                except Exception:
+                    pass
+            else:
+                _empty_count = getattr(self, "_embed_empty_logged", 0)
+                if _empty_count < 3:
+                    self._embed_empty_logged = _empty_count + 1
+                    logger.warning(
+                        f"[SkillRegistry] get_embedding 返回空 ({meta.skill_id})，"
+                        f"检查 base_url={_eurl}"
+                    )
+
+        tasks = [_compute_one(m) for m in self._metas]
+        await asyncio.gather(*tasks)
+
+        self._embeddings_ready = bool(self._embeddings)
+        logger.info(
+            f"[SkillRegistry] embedding 预计算完成: "
+            f"新增 {counters[0]}, 缓存命中 {counters[1]}, "
+            f"总计 {len(self._embeddings)}/{len(self._metas)}"
+        )
+
+    async def _match_by_embedding(
+        self,
+        finding: VulnFinding,
+        fingerprint: str = "",
+        json_probe: str = "",
+    ) -> Optional[Skill]:
+        """用 embedding 语义匹配 Skill。
+
+        若 ``_embeddings_ready`` 为 False 或无 embedding API 配置，返回 None。
+        对 finding 构建 query text → embedding → 对所有 skill 计算 cosine similarity。
+        取最高相似度 >= 0.60 的 skill。
+        """
+        if not self._embeddings_ready or not self._embeddings:
+            return None
+
+        from backend.knowledge.exploit_kb import get_embedding, cosine_similarity
+
+        # 构建 query text
+        query_parts = [
+            finding.name,
+            finding.cve or "",
+            finding.description or "",
+            (finding.evidence or "")[:500],
+            fingerprint[:500],
+            json_probe[:300],
+        ]
+        query_text = " ".join(filter(None, query_parts))
+        if not query_text.strip():
+            return None
+
+        # 检查 query 缓存
+        now = _time.monotonic()
+        query_vec = None
+        cached = self._query_embed_cache.get(query_text)
+        if cached:
+            vec, ts = cached
+            if now - ts < self._embed_cache_ttl:
+                query_vec = vec
+
+        if query_vec is None:
+            try:
+                query_vec = await get_embedding(query_text)
+            except Exception as e:
+                logger.warning(f"[SkillRegistry] query embedding 失败: {e}")
+                return None
+            if not query_vec:
+                return None
+            self._query_embed_cache[query_text] = (query_vec, now)
+            # 清理过期缓存
+            if len(self._query_embed_cache) > 500:
+                expired = [
+                    k for k, (_, t) in self._query_embed_cache.items()
+                    if now - t > self._embed_cache_ttl
+                ]
+                for k in expired:
+                    self._query_embed_cache.pop(k, None)
+
+        # 计算 cosine similarity 对所有 skill
+        best_score = 0.0
+        best_skill_id = ""
+        for skill_id, skill_vec in self._embeddings.items():
+            sim = cosine_similarity(query_vec, skill_vec)
+            if sim > best_score:
+                best_score = sim
+                best_skill_id = skill_id
+
+        MIN_SIMILARITY = 0.60
+        if best_score >= MIN_SIMILARITY and best_skill_id:
+            skill = self.get_by_id(best_skill_id)
+            if skill:
+                logger.info(
+                    f"[SkillRegistry] 🧠 embedding 匹配: {best_skill_id} "
+                    f"(相似度={best_score:.3f}) ← {finding.name}"
+                )
+                return skill
+
+        logger.debug(
+            f"[SkillRegistry] embedding 无匹配 (最高={best_score:.3f} < {MIN_SIMILARITY})"
+        )
+        return None
 
     # ── LLM 语义匹配兜底 ──────────────────────────────────────────────
 
@@ -326,7 +562,6 @@ class SkillRegistry:
             logger.warning(f"[SkillRegistry] LLM 语义匹配失败: {e}")
             return None
 
-        import json as _json
         try:
             response_text = response_raw if isinstance(response_raw, str) else response_raw[0]
             result = _json.loads(response_text)
@@ -366,7 +601,7 @@ class SkillRegistry:
 
         先跑算法评分，无匹配时用 LLM 从 skill catalog 中选择。
         """
-        # 算法匹配
+        # 1. 算法评分匹配
         skill = self.match(
             finding=finding,
             fingerprint=fingerprint,
@@ -379,8 +614,17 @@ class SkillRegistry:
         if skill:
             return skill
 
-        # LLM 语义兜底
-        logger.info("[SkillRegistry] 算法无匹配，启动 LLM 语义兜底...")
+        # 2. embedding 语义匹配
+        skill = await self._match_by_embedding(
+            finding=finding,
+            fingerprint=fingerprint,
+            json_probe=json_probe,
+        )
+        if skill:
+            return skill
+
+        # 3. LLM 语义兜底
+        logger.info("[SkillRegistry] 算法+embedding 无匹配，启动 LLM 语义兜底...")
         return await self._llm_select_skill(
             finding=finding,
             fingerprint=fingerprint,

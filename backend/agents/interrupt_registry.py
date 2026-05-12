@@ -17,12 +17,79 @@
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import threading
 from datetime import datetime
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+_db_enabled: bool = False
+
+
+def set_db_enabled(v: bool) -> None:
+    global _db_enabled
+    _db_enabled = v
+
+
+async def _save_interrupt_to_db(
+    task_id: str, reason: str, payload: dict, requested_at: str, count: int,
+) -> None:
+    try:
+        from backend.db.database import save_interrupt
+        await save_interrupt(
+            task_id=task_id,
+            reason=reason,
+            payload_json=json.dumps(payload, ensure_ascii=False),
+            requested_at=requested_at,
+            count=count,
+        )
+    except Exception:
+        logger.debug("[InterruptRegistry] DB save skipped", exc_info=True)
+
+
+async def _delete_interrupt_from_db(task_id: str) -> None:
+    try:
+        from backend.db.database import delete_interrupt_from_db
+        await delete_interrupt_from_db(task_id)
+    except Exception:
+        logger.debug("[InterruptRegistry] DB delete skipped", exc_info=True)
+
+
+async def load_from_db() -> dict[str, dict[str, Any]]:
+    """启动时从 PostgreSQL 恢复所有中断信号到内存。"""
+    try:
+        from backend.db.database import load_all_interrupts
+        rows = await load_all_interrupts()
+    except Exception as e:
+        logger.warning(f"[InterruptRegistry] 从DB加载中断失败: {e}")
+        return {}
+    restored: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        tid = row["task_id"]
+        payload = {}
+        try:
+            payload = json.loads(row.get("payload_json", "{}"))
+        except Exception:
+            pass
+        restored[tid] = {
+            "task_id": tid,
+            "reason": row.get("reason", ""),
+            "payload": payload,
+            "requested_at": row.get("requested_at", ""),
+            "count": int(row.get("count", 1)),
+        }
+    if restored:
+        with _lock:
+            for tid, entry in restored.items():
+                existing = _interrupts.get(tid)
+                if existing and int(existing.get("count", 0)) >= entry["count"]:
+                    continue
+                _interrupts[tid] = entry
+        logger.info(f"[InterruptRegistry] 从DB恢复 {len(restored)} 个中断信号")
+    return restored
 
 
 class OperatorInterrupt(Exception):
@@ -75,6 +142,19 @@ def request_interrupt(
         "[InterruptRegistry] request_interrupt task=%s reason=%s count=%d",
         task_id, entry["reason"], entry["count"],
     )
+    # Fire-and-forget persist to PostgreSQL
+    if _db_enabled:
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(_save_interrupt_to_db(
+                    task_id=task_id, reason=entry["reason"],
+                    payload=entry["payload"],
+                    requested_at=entry["requested_at"],
+                    count=entry["count"],
+                ))
+        except RuntimeError:
+            pass
     return dict(entry)
 
 
@@ -107,6 +187,14 @@ def consume_interrupt(task_id: str) -> Optional[dict[str, Any]]:
             "[InterruptRegistry] consume_interrupt task=%s reason=%s",
             task_id, entry.get("reason", ""),
         )
+        # Fire-and-forget delete from PostgreSQL
+        if _db_enabled:
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(_delete_interrupt_from_db(task_id))
+            except RuntimeError:
+                pass
         return dict(entry)
     return None
 
