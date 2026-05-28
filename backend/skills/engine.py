@@ -261,6 +261,30 @@ class SkillEngine:
 
         sorted_paths = sorted(skill.exploit_paths, key=lambda p: p.priority)
 
+        # ---- NEW: selector-based adaptive path selection ----
+        if skill.selector:
+            selected_path = self._evaluate_selector(skill.selector, ctx, sorted_paths)
+            if selected_path:
+                logger.info(
+                    f"[SkillEngine] 🎯 Selector 选中路径 [{selected_path.path_id}] {selected_path.name}"
+                )
+                result = await self._execute_path(selected_path, ctx, finding, task_id)
+                if result.success:
+                    logger.info(
+                        f"[SkillEngine] ✅ Selector 路径 {selected_path.path_id} 利用成功"
+                    )
+                    await self._handle_path_on_success(selected_path, ctx, skill)
+                    return result
+                logger.info(
+                    f"[SkillEngine] ❌ Selector 路径 {selected_path.path_id} 失败，"
+                    f"回退到 default 或标准路径遍历"
+                )
+                # fall through to standard priority-based iteration
+            else:
+                logger.info(
+                    f"[SkillEngine] ⚠ Selector 无匹配条件，回退到标准路径遍历"
+                )
+
         for path in sorted_paths:
             if path.mode == "react_freeform":
                 logger.info(
@@ -306,6 +330,8 @@ class SkillEngine:
                 logger.info(
                     f"[SkillEngine] ✅ 路径 {path.path_id} 利用成功"
                 )
+                # ---- NEW: publish events for cross-skill chaining ----
+                await self._handle_path_on_success(path, ctx, skill)
                 return result
 
             logger.info(
@@ -482,6 +508,14 @@ class SkillEngine:
                     await ctx.set_var_async(k, v)
                     logger.info(f"[SkillEngine]   ✓ 设置变量: {k} = {v}")
 
+        # ---- NEW: parse structured NDJSON output ----
+        if result.stdout:
+            structured_count = ctx.merge_structured_output(result.stdout)
+            if structured_count > 0:
+                logger.info(
+                    f"[SkillEngine]   📊 解析到 {structured_count} 条结构化输出"
+                )
+
         if not any_triggered and parse_rules:
             logger.info(f"[SkillEngine]   ✗ 无解析规则触发")
 
@@ -650,6 +684,18 @@ class SkillEngine:
                         "method": f"skill:{path.path_id}",
                         "current_user": evidence_data.get("current_user", ""),
                         "skill_id": path.path_id,
+                        "pending_events": [
+                            {
+                                "event_id": e.event_id,
+                                "event_type": e.event_type,
+                                "source_skill_id": e.source_skill_id,
+                                "target_skill_ids": e.target_skill_ids,
+                                "payload": e.payload,
+                                "priority": e.priority,
+                            }
+                            for e in ctx.event_queue
+                            if not e.consumed
+                        ],
                     },
                     evidence=(
                         f"Skill 路径 [{path.name}] 利用成功\n\n"
@@ -693,6 +739,90 @@ class SkillEngine:
             command_records=ctx.step_records,
         )
 
+
+    @staticmethod
+    def _evaluate_selector(
+        selector: dict,
+        ctx: SkillContext,
+        paths: list[ExploitPath],
+    ) -> ExploitPath | None:
+        """
+        评估 selector 决策树，返回选中的路径。
+
+        selector 格式:
+            if:
+              - condition: { data_wrapper_available: true }
+                then_path: lfi_wrapper_rce
+              - condition: { shadow_readable: true }
+                then_path: lfi_shadow_crack
+            default: lfi_sensitive_read
+
+        按顺序评估 if 条目，第一个条件匹配的路径被选中。
+        无匹配时返回 default 指定的路径。
+        """
+        path_map = {p.path_id: p for p in paths}
+
+        if_entries = selector.get("if") or []
+        if isinstance(if_entries, list):
+            for entry in if_entries:
+                if not isinstance(entry, dict):
+                    continue
+                conditions = entry.get("condition") or {}
+                then_path = entry.get("then_path", "")
+                if ctx.check(conditions) and then_path in path_map:
+                    return path_map[then_path]
+
+        default_id = selector.get("default", "")
+        if default_id and default_id in path_map:
+            return path_map[default_id]
+
+        return None
+
+    @staticmethod
+    async def _handle_path_on_success(
+        path: ExploitPath,
+        ctx: SkillContext,
+        skill: Skill,
+    ) -> None:
+        """处理路径成功后的 on_success 动作（主要是事件发布）。"""
+        on_success = path.on_success or {}
+        action = on_success.get("action", "")
+        if action != "publish_event":
+            return
+
+        event_cfg = on_success.get("event") or {}
+        if not isinstance(event_cfg, dict):
+            return
+
+        event_type = event_cfg.get("event_type", "")
+        if not event_type:
+            return
+
+        target_ids = event_cfg.get("target_skill_ids") or []
+        if isinstance(target_ids, str):
+            target_ids = [target_ids]
+
+        # substitute variables in payload values
+        raw_payload = event_cfg.get("payload") or {}
+        payload: dict[str, Any] = {}
+        if isinstance(raw_payload, dict):
+            for k, v in raw_payload.items():
+                if isinstance(v, str):
+                    payload[k] = ctx.substitute(v)
+                else:
+                    payload[k] = v
+
+        event = ctx.publish_event(
+            event_type=event_type,
+            source_skill_id=skill.skill_id,
+            target_skill_ids=target_ids,
+            payload=payload,
+            priority=event_cfg.get("priority", 5),
+        )
+        logger.info(
+            f"[SkillEngine] 📤 发布事件: type={event.event_type}, "
+            f"targets={target_ids}, id={event.event_id}"
+        )
 
     async def _react_freeform(
         self,

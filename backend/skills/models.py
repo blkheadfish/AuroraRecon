@@ -12,6 +12,8 @@ from __future__ import annotations
 import asyncio
 import re
 import shlex
+import time
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
@@ -96,6 +98,202 @@ class StepOutcome(str, Enum):
     NEXT_PATH = "next_path"
     CONCLUDE_SUCCESS = "conclude_success"
     CONCLUDE_FAIL = "conclude_fail"
+
+
+@dataclass
+class SkillEvent:
+    """
+    跨 Skill 消息传递事件。
+
+    一个 Skill 执行成功后发布事件，下游 Skill 消费事件。
+    支持发布-订阅模式，实现 Skill 间组合链。
+    """
+    event_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    event_type: str = ""           # "file_extracted", "credential_found", "service_discovered"
+    source_skill_id: str = ""
+    target_skill_ids: list[str] = field(default_factory=list)  # 推荐的后续 skill
+    payload: dict[str, Any] = field(default_factory=dict)
+    priority: int = 5
+    timestamp: float = field(default_factory=time.time)
+    consumed: bool = False
+
+    def to_context_variables(self) -> dict[str, Any]:
+        """将事件载荷转换为可注入 ctx.variables 的平面字典。"""
+        result: dict[str, Any] = {}
+        for k, v in self.payload.items():
+            safe_key = f"event_{self.event_type}_{k}"
+            result[safe_key] = v
+            result[k] = v  # also set short form (may be overridden)
+        result["_source_event_type"] = self.event_type
+        result["_source_skill_id"] = self.source_skill_id
+        return result
+
+
+# ============================================================
+# 结构化探测结果（替代字符串正则 IPC）
+# ============================================================
+
+@dataclass
+class LFIProbeResult:
+    """LFI 探测的结构化结果"""
+    confirmed: bool = False
+    params: list[str] = field(default_factory=list)       # 多个可注入参数
+    depths: dict[str, int] = field(default_factory=dict)  # param → depth 映射
+    styles: list[str] = field(default_factory=list)        # absolute/relative/php_filter
+    readable_files: list[str] = field(default_factory=list)  # 已确认可读的文件列表
+    wrappers_available: list[str] = field(default_factory=list)  # data://, php://input, expect://
+    waf_detected: bool = False
+    blind: bool = False  # blind LFI (no direct output, only side-channel)
+
+    def __post_init__(self):
+        """Normalize single-value fields from scripts that use singular keys."""
+        pass  # normalization handled in to_variables()
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "LFIProbeResult":
+        """Construct from a payload dict with flexible key handling."""
+        kwargs: dict[str, Any] = {}
+        # Handle singular 'param' → 'params'
+        if "param" in payload and "params" not in payload:
+            kwargs["params"] = [payload["param"]]
+        # Handle singular 'depth' → 'depths'
+        if "depth" in payload and "depths" not in payload:
+            param_name = payload.get("param", "unknown")
+            kwargs["depths"] = {param_name: int(payload["depth"])}
+        # Handle singular 'style' → 'styles'
+        if "style" in payload and "styles" not in payload:
+            kwargs["styles"] = [payload["style"]]
+        # Handle 'files' → 'readable_files'
+        if "files" in payload and "readable_files" not in payload:
+            kwargs["readable_files"] = payload["files"]
+        # Handle 'wrapper' → 'wrappers_available'
+        if "wrapper" in payload and "wrappers_available" not in payload:
+            kwargs["wrappers_available"] = [payload["wrapper"]]
+        # Copy all known fields
+        for field_name in cls.__dataclass_fields__:
+            if field_name in payload and field_name not in kwargs:
+                kwargs[field_name] = payload[field_name]
+        return cls(**kwargs)
+
+    def to_variables(self) -> dict[str, Any]:
+        result: dict[str, Any] = {"lfi_confirmed": self.confirmed}
+        if self.params:
+            result["lfi_param"] = self.params[0]
+            result["lfi_params"] = self.params
+        if self.depths:
+            first_param = self.params[0] if self.params else "unknown"
+            result["lfi_depth"] = str(self.depths.get(first_param, 0))
+            result["lfi_depths"] = self.depths
+        if self.styles:
+            result["lfi_style"] = self.styles[0]
+            result["lfi_styles"] = self.styles
+        if self.readable_files:
+            result["readable_files_list"] = self.readable_files
+            result["readable_files_count"] = len(self.readable_files)
+        if self.wrappers_available:
+            result["wrappers_available"] = self.wrappers_available
+            result["data_wrapper_available"] = "data" in self.wrappers_available
+            result["input_wrapper_available"] = "input" in self.wrappers_available
+            result["expect_wrapper_available"] = "expect" in self.wrappers_available
+        result["waf_detected"] = self.waf_detected
+        result["lfi_blind"] = self.blind
+        return result
+
+
+@dataclass
+class CredentialProbeResult:
+    """凭据探测的结构化结果"""
+    found: bool = False
+    usernames: list[str] = field(default_factory=list)
+    passwords: list[str] = field(default_factory=list)
+    hashes: list[str] = field(default_factory=list)
+    hashes_base64: list[str] = field(default_factory=list)  # B64-encoded hash content
+    ssh_keys: list[str] = field(default_factory=list)
+    service: str = ""
+
+    def to_variables(self) -> dict[str, Any]:
+        result: dict[str, Any] = {"credential_found": self.found}
+        if self.usernames:
+            result["found_usernames"] = self.usernames
+            result["known_users_b64"] = "\n".join(self.usernames[:30])
+            result["known_users_preview"] = ", ".join(self.usernames[:5])
+        if self.passwords:
+            result["found_passwords"] = self.passwords
+            result["known_passwords_count"] = len(self.passwords)
+        if self.hashes:
+            result["found_hashes"] = self.hashes
+            result["hashes_count"] = len(self.hashes)
+        if self.ssh_keys:
+            result["ssh_key_found"] = True
+            result["ssh_keys_list"] = self.ssh_keys
+        if self.hashes or self.passwords:
+            result["has_known_creds"] = True
+        return result
+
+
+@dataclass
+class RCEProbeResult:
+    """RCE 探测的结构化结果"""
+    confirmed: bool = False
+    shell_type: str = ""  # rce_data_wrapper, rce_input_wrapper, rce_log_poison, etc.
+    current_user: str = ""
+    command_outputs: list[str] = field(default_factory=list)
+    reverse_callback_received: bool = False
+    webshell_url: str = ""
+
+    def to_variables(self) -> dict[str, Any]:
+        result: dict[str, Any] = {"rce_confirmed": self.confirmed}
+        if self.shell_type:
+            result["shell_type"] = self.shell_type
+        if self.current_user:
+            result["current_user"] = self.current_user
+        if self.command_outputs:
+            result["command_outputs"] = self.command_outputs
+        result["reverse_callback_received"] = self.reverse_callback_received
+        if self.webshell_url:
+            result["webshell_url"] = self.webshell_url
+        return result
+
+
+# Map event type → structured result parser
+_STRUCTURED_RESULT_PARSERS: dict[str, type] = {}
+
+
+def register_structured_parser(event_type: str, parser_cls: type) -> None:
+    """注册结构化结果解析器"""
+    _STRUCTURED_RESULT_PARSERS[event_type] = parser_cls
+
+
+def _parse_structured_json_line(
+    line: str,
+) -> tuple[str, dict[str, Any]] | None:
+    """
+    解析单行 NDJSON 格式的结构化输出。
+    返回 (event_type, payload) 或 None。
+    """
+    try:
+        import json as _json
+        obj = _json.loads(line.strip())
+        if not isinstance(obj, dict):
+            return None
+        event = obj.get("event", "")
+        if not event:
+            return None
+        payload = obj.get("payload") or obj.get("data") or {}
+        if not isinstance(payload, dict):
+            return None
+        return (event, payload)
+    except Exception:
+        return None
+
+
+# 预注册内置结构化类型
+register_structured_parser("lfi_param_found", LFIProbeResult)
+register_structured_parser("lfi_files_readable", LFIProbeResult)
+register_structured_parser("lfi_probe_result", LFIProbeResult)
+register_structured_parser("credential_found", CredentialProbeResult)
+register_structured_parser("credentials_found", CredentialProbeResult)
+register_structured_parser("rce_probe_result", RCEProbeResult)
 
 
 @dataclass
@@ -277,6 +475,9 @@ class ExploitPath:
     mode: str = ""
     max_rounds: int = 5
 
+    # 路径成功后触发的事件（发布-订阅模式）
+    on_success: dict[str, Any] = field(default_factory=dict)
+
 
 
 @dataclass
@@ -393,6 +594,10 @@ class Skill:
 
     source_file: str = ""
 
+    # 自适应决策树：根据探测结果动态选择路径，替代 priority 瀑布
+    # 格式: { "if": [{"condition": {...}, "then_path": "id"}...], "default": "id" }
+    selector: Optional[dict] = None
+
     # AI 引导文档（从 SKILL.md 加载，可选）
     doc: Any = field(default=None, repr=False)
 
@@ -451,6 +656,12 @@ class SkillContext:
 
     exploit_cmd_template: str = ""
 
+    # 跨 Skill 事件队列（发布-订阅模式）
+    event_queue: list[SkillEvent] = field(default_factory=list)
+
+    # 结构化探测结果（替代字符串正则 IPC）
+    structured_results: dict[str, Any] = field(default_factory=dict)
+
     _var_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     async def set_var_async(self, key: str, value: Any) -> None:
@@ -469,17 +680,192 @@ class SkillContext:
     def get_var(self, key: str, default: Any = None) -> Any:
         return self.variables.get(key, default)
 
+    def publish_event(
+        self,
+        event_type: str,
+        source_skill_id: str,
+        target_skill_ids: list[str],
+        payload: dict[str, Any],
+        priority: int = 5,
+    ) -> SkillEvent:
+        """发布一个跨 Skill 事件到事件队列。"""
+        event = SkillEvent(
+            event_type=event_type,
+            source_skill_id=source_skill_id,
+            target_skill_ids=target_skill_ids,
+            payload=payload,
+            priority=priority,
+        )
+        self.event_queue.append(event)
+        return event
+
+    def consume_events(self) -> list[SkillEvent]:
+        """消费所有未处理事件，注入变量并标记为已消费。"""
+        consumed: list[SkillEvent] = []
+        for event in self.event_queue:
+            if event.consumed:
+                continue
+            for k, v in event.to_context_variables().items():
+                if v is not None and k not in self.variables:
+                    self.variables[k] = v
+            event.consumed = True
+            consumed.append(event)
+        return consumed
+
+    def has_pending_events(self) -> bool:
+        """检查是否有未消费事件。"""
+        return any(not e.consumed for e in self.event_queue)
+
+    def merge_structured_output(self, stdout: str) -> int:
+        """
+        解析 stdout 中的 NDJSON 行，合并到 structured_results 和 variables。
+
+        返回解析到的结构化行数。
+        """
+        count = 0
+        for line in stdout.splitlines():
+            line = line.strip()
+            parsed = _parse_structured_json_line(line)
+            if parsed is None:
+                continue
+            event_type, payload = parsed
+            self.structured_results.setdefault(event_type, []).append(payload)
+
+            # 尝试通过注册的解析器转换为结构化对象
+            parser_cls = _STRUCTURED_RESULT_PARSERS.get(event_type)
+            if parser_cls is None:
+                # 尝试前缀匹配
+                for registered_key, cls in _STRUCTURED_RESULT_PARSERS.items():
+                    if event_type.startswith(registered_key):
+                        parser_cls = cls
+                        break
+
+            if parser_cls is not None:
+                try:
+                    if hasattr(parser_cls, "from_payload"):
+                        obj = parser_cls.from_payload(payload)
+                    else:
+                        obj = parser_cls(**{k: v for k, v in payload.items()
+                                           if k in parser_cls.__dataclass_fields__})
+                    if hasattr(obj, "to_variables"):
+                        for k, v in obj.to_variables().items():
+                            self.set_var(k, v)
+                    self.structured_results.setdefault("_objects", []).append(obj)
+                except Exception:
+                    pass
+
+            # 无论是否有解析器，都将 payload 扁平化到 variables
+            for k, v in payload.items():
+                safe_key = f"json_{event_type}_{k}"
+                self.set_var(safe_key, v)
+                if k not in self.variables:
+                    self.set_var(k, v)
+
+            count += 1
+        return count
+
     def check(self, conditions: dict[str, Any]) -> bool:
         """
         检查条件是否满足。
 
         支持的 key 格式：
-          - "fastjson_confirmed": true              → 布尔比较
-          - "env.can_reverse": true                  → 检查环境属性
-          - "version_tier": "lte_1.2.47"            → 字符串等值比较（推荐）
-          - "fastjson_version": ">= 1.2.68"         → 版本比较（actual 必须是纯版本号）
+          - "any_of": [{...}, {...}]               → OR 逻辑：至少一个分组全通过
+          - "all_of": [{...}, {...}]               → AND 逻辑：所有分组必须全通过
+          - "variable_present": "key"              → 检查变量存在且非空
+          - "variable_not_empty": "key"            → 检查变量存在且非空（同 variable_present）
+          - "variable_greater_than": {key: n}      → 检查变量值 > n（数值比较）
+          - "variable_in_list": {key: [v1, v2]}     → 检查变量值在列表中
+          - "match_any_keyword": {source: s, keywords: [...]}  → 模糊关键词匹配
+          - "env.can_reverse": true                → 检查环境属性
+          - "env.php.<attr>": ...                  → PHP 运行时属性
+          - "env.<kind>.<attr>": ...               → runtime_facts 属性
+          - "confirmed.<path>": ...                → confirmed_facts 属性
+          - "version_tier": "lte_1.2.47"          → 字符串等值比较
+          - "fastjson_version": ">= 1.2.68"       → 版本比较
         """
+
+        # ---- NEW: nested any_of / all_of ----
+        if "any_of" in conditions:
+            if not conditions["any_of"]:
+                return False
+            return any(self.check(sub) for sub in conditions["any_of"])
+
+        if "all_of" in conditions:
+            if not conditions["all_of"]:
+                return True
+            return all(self.check(sub) for sub in conditions["all_of"])
+
+        # ---- NEW: variable_not_empty ----
+        if "variable_not_empty" in conditions:
+            name = str(conditions["variable_not_empty"])
+            if name in self.variables and self.variables.get(name) not in (None, ""):
+                pass
+            else:
+                return False
+
+        # ---- NEW: variable_greater_than (supports >, >=, <, <=, ==) ----
+        if "variable_greater_than" in conditions:
+            vgt = conditions["variable_greater_than"]
+            if isinstance(vgt, dict):
+                for var_name, threshold in vgt.items():
+                    actual_val = self.variables.get(var_name)
+                    if actual_val is None:
+                        return False
+                    try:
+                        if not (float(actual_val) > float(threshold)):
+                            return False
+                    except (ValueError, TypeError):
+                        return False
+            else:
+                return False
+
+        # ---- NEW: variable_in_list ----
+        if "variable_in_list" in conditions:
+            vil = conditions["variable_in_list"]
+            if isinstance(vil, dict):
+                for var_name, expected_list in vil.items():
+                    actual_val = self.variables.get(var_name)
+                    if actual_val is None:
+                        return False
+                    if isinstance(expected_list, list):
+                        if actual_val not in expected_list and str(actual_val) not in expected_list:
+                            return False
+                    else:
+                        return False
+            else:
+                return False
+
+        # ---- NEW: match_any_keyword ----
+        if "match_any_keyword" in conditions:
+            mak = conditions["match_any_keyword"]
+            if isinstance(mak, dict):
+                source = mak.get("source", "")
+                keywords = mak.get("keywords", [])
+                if not keywords:
+                    return False
+                source_text = ""
+                if source == "finding_evidence":
+                    source_text = getattr(self, "_finding_evidence", "")
+                elif source in self.variables:
+                    source_text = str(self.variables.get(source, ""))
+                else:
+                    source_text = source
+                source_lower = source_text.lower()
+                if not any(kw.lower() in source_lower for kw in keywords):
+                    return False
+            else:
+                return False
+
+        # ---- existing flat-condition logic ----
         for key, expected in conditions.items():
+            # skip new nesting keys that were already handled
+            if key in (
+                "any_of", "all_of",
+                "variable_not_empty", "variable_greater_than",
+                "variable_in_list", "match_any_keyword",
+            ):
+                continue
+
             if key == "variable_present":
                 name = str(expected)
                 if name in self.variables and self.variables.get(name) not in (None, ""):

@@ -262,6 +262,7 @@ def load_skill(path: Path) -> Skill:
         exploit_paths=_parse_paths(raw.get("exploit_paths", [])),
         remediation=raw.get("remediation", ""),
         source_file=str(path),
+        selector=raw.get("selector"),
     )
 
     # 加载侧边 SKILL.md（AI 引导文档，可选）
@@ -345,6 +346,7 @@ def _parse_paths(raw_list: list) -> list[ExploitPath]:
             steps=[_parse_step(s) for s in raw.get("steps", [])],
             mode=raw.get("mode", ""),
             max_rounds=raw.get("max_rounds", 5),
+            on_success=raw.get("on_success", {}),
         )
         paths.append(path)
     return paths
