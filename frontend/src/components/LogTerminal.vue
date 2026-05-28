@@ -61,8 +61,8 @@
       </div>
 
       <div
-          v-for="line in displayLogs"
-          :key="line"
+          v-for="(line, index) in displayLogs"
+          :key="index"
           class="log-line"
           :class="getLineClass(line)"
       >
@@ -201,12 +201,11 @@ function escapeHtml(text) {
 
 // 高亮结果按行内容缓存。同一条日志行在重渲染时不再重复跑 4 次正则替换,
 // 切换/滚动 / 重新挂载时尤其有效。Map 大小上限同步 MAX_VISIBLE_ROWS。
-const formatCache = shallowRef(new Map())
+const formatCache = new Map()
 const FORMAT_CACHE_CAP = MAX_VISIBLE_ROWS * 2
 
 function formatLine(line) {
-  const cache = formatCache.value
-  const cached = cache.get(line)
+  const cached = formatCache.get(line)
   if (cached !== undefined) return cached
   let out = escapeHtml(line)
   out = out.replace(/\[(\d{2}:\d{2}:\d{2})\]/g, '<span class="ts">[$1]</span>')
@@ -219,12 +218,12 @@ function formatLine(line) {
     /\b(\d+)\s*(个|端口|漏洞|条|ms|s)\b/g,
     '<span class="hl-num">$1</span>$2',
   )
-  if (cache.size >= FORMAT_CACHE_CAP) {
+  if (formatCache.size >= FORMAT_CACHE_CAP) {
     // FIFO 驱逐: Map 维持插入顺序,删第一个就够。
-    const firstKey = cache.keys().next().value
-    if (firstKey !== undefined) cache.delete(firstKey)
+    const firstKey = formatCache.keys().next().value
+    if (firstKey !== undefined) formatCache.delete(firstKey)
   }
-  cache.set(line, out)
+  formatCache.set(line, out)
   return out
 }
 

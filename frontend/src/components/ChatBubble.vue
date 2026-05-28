@@ -19,7 +19,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, watch, shallowRef } from 'vue'
 import { marked } from 'marked'
 import robotIcon from '@/assets/robot.png'
 
@@ -46,13 +46,31 @@ const roleLabel = computed(() => {
   return 'System'
 })
 
-const renderedText = computed(() => {
+// Markdown 解析缓存：避免同一条消息在列表重渲染时反复解析
+const mdCache = new Map<string, string>()
+const MD_CACHE_CAP = 200
+
+function getCachedMd(text: string): string {
+  const cached = mdCache.get(text)
+  if (cached !== undefined) return cached
+  let parsed: string
   try {
-    return marked.parse(props.text) as string
+    parsed = marked.parse(text) as string
   } catch {
-    return props.text
+    parsed = text
   }
-})
+  if (mdCache.size >= MD_CACHE_CAP) {
+    const firstKey = mdCache.keys().next().value
+    if (firstKey !== undefined) mdCache.delete(firstKey)
+  }
+  mdCache.set(text, parsed)
+  return parsed
+}
+
+const renderedText = shallowRef('')
+watch(() => props.text, (text) => {
+  renderedText.value = getCachedMd(text)
+}, { immediate: true })
 </script>
 
 <style scoped>

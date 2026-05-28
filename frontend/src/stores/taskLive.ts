@@ -18,20 +18,20 @@ type ApprovalState = 'idle' | 'submitting' | 'submitted' | 'error'
 type CheckpointState = 'idle' | 'submitting' | 'submitted' | 'error'
 
 // ── 有界缓存阈值 ───────────────────────────────────────
-const MAX_LOG_BUFFER = 3000
-const MAX_DECISION_EVENTS = 5000
-const MAX_TOOL_STREAM_LINES = 500
+const MAX_LOG_BUFFER = 1000
+const MAX_DECISION_EVENTS = 1000
+const MAX_TOOL_STREAM_LINES = 200
 
-// ── Token 批处理：合并 80ms 窗口内的 delta，降低 Vue 重渲染频率 ──
+// ── Token 流式刷新：全局 rAF 循环，每帧 flush，视觉与显示器刷新对齐 ──
 // key = "${taskId}::${streamId}", 避免同任务多流碰撞
-const DELTA_BATCH_MS = 80
+const DELTA_BATCH_MS = 16
 const _deltaBufs: Record<string, { taskId: string; sid: string; phase: string; kind: string; text: string }> = {}
 let _deltaRafId: number | null = null
-let _deltaLastFlush = 0
 
-function _flushDeltas(stateMap: Record<string, TaskLiveState>) {
+function _flushDeltas() {
   _deltaRafId = null
   const now = Date.now()
+  const stateMap = taskStateMap.value
   for (const [key, buf] of Object.entries(_deltaBufs)) {
     if (!buf.text) continue
     const state = stateMap[buf.taskId]
@@ -44,20 +44,11 @@ function _flushDeltas(stateMap: Record<string, TaskLiveState>) {
     state.llmStreams[sid].updatedAt = now
     delete _deltaBufs[key]
   }
-  _deltaLastFlush = now
 }
 
-function _scheduleDeltaFlush(stateMap: Record<string, TaskLiveState>) {
+function _scheduleDeltaFlush() {
   if (_deltaRafId !== null) return
-  const elapsed = Date.now() - _deltaLastFlush
-  if (elapsed >= DELTA_BATCH_MS) {
-    _deltaRafId = requestAnimationFrame(() => _flushDeltas(stateMap))
-  } else {
-    const delay = DELTA_BATCH_MS - elapsed
-    setTimeout(() => {
-      _deltaRafId = requestAnimationFrame(() => _flushDeltas(stateMap))
-    }, delay)
-  }
+  _deltaRafId = requestAnimationFrame(() => _flushDeltas())
 }
 
 interface LlmStreamBubble {
@@ -77,6 +68,8 @@ interface TaskLiveState {
   logEarliestSeq: number
   decisionEvents: DecisionEvent[]
   decisionEventIds: Set<string>
+  /** 已收到的最大 event.id（Redis Stream ID 字典序单调），用于增量追加时免排序。 */
+  lastDecisionEventId: string
   llmStreams: Record<string, LlmStreamBubble>
   toolStreams: Record<string, string[]>
   approvalState: ApprovalState
@@ -92,6 +85,9 @@ interface TaskLiveState {
   branchFlashAt: number
   unsub?: () => void
   _everAttached: boolean
+  /** phase_update 节流：100ms 内多次 patch 合并为一次 state.task 更新 */
+  _phasePatchPending?: Record<string, unknown>
+  _phasePatchTimer?: number | null
 }
 
 export const useTaskLiveStore = defineStore('taskLive', () => {
@@ -111,6 +107,7 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
         logEarliestSeq: 0,
         decisionEvents: [],
         decisionEventIds: new Set<string>(),
+        lastDecisionEventId: '',
         llmStreams: {},
         toolStreams: {},
         approvalState: 'idle',
@@ -125,6 +122,8 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
         maxBranchesPerTask: 12,
         branchFlashAt: 0,
         _everAttached: false,
+        _phasePatchPending: undefined,
+        _phasePatchTimer: null,
       }
     }
     return taskStateMap.value[taskId]
@@ -362,22 +361,36 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
     }
   }
 
-  // ── 协议 v2: 按 event.id 字典序排序 (Stream ID 天然时序单调) ──
-  function mergeDecisionEvents(state: TaskLiveState, incoming: DecisionEvent[] = [], preSorted = false) {
+  // ── 协议 v2: 增量单调追加 (Redis Stream ID 天然字典序递增) ──
+  function mergeDecisionEvents(state: TaskLiveState, incoming: DecisionEvent[] = [], _preSorted = false) {
     if (!Array.isArray(incoming) || !incoming.length) return
+    const newEvents: DecisionEvent[] = []
+    let allMonotonic = true
     for (const event of incoming) {
       const id = String(event?.id || '')
       if (!id || state.decisionEventIds.has(id)) continue
       state.decisionEventIds.add(id)
-      state.decisionEvents.push(event)
+      newEvents.push(event)
+      if (id > state.lastDecisionEventId) {
+        state.lastDecisionEventId = id
+      } else {
+        allMonotonic = false
+      }
     }
-    if (!preSorted) {
-      const sorted = state.decisionEvents.slice().sort((a, b) => {
+    if (!newEvents.length) return
+    if (allMonotonic && state.decisionEvents.length > 0) {
+      //  fast path: 所有新事件 ID 都大于已有最大值，直接 push，O(k)
+      state.decisionEvents.push(...newEvents)
+    } else {
+      // slow path: 存在乱序或空数组初始化，合入后一次性排序
+      state.decisionEvents.push(...newEvents)
+      state.decisionEvents.sort((a, b) => {
         const aid = String(a?.id || '')
         const bid = String(b?.id || '')
         return aid < bid ? -1 : aid > bid ? 1 : 0
       })
-      state.decisionEvents.splice(0, state.decisionEvents.length, ...sorted)
+      const last = state.decisionEvents[state.decisionEvents.length - 1]
+      state.lastDecisionEventId = String(last?.id || '')
     }
     if (state.decisionEvents.length > MAX_DECISION_EVENTS) {
       const drop = state.decisionEvents.length - MAX_DECISION_EVENTS
@@ -501,6 +514,72 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
     }
   }
 
+  // ── phase_update 实际应用（被节流器调用）────────────────
+  function _applyPhaseUpdate(state: TaskLiveState, taskId: string, p: Record<string, unknown>) {
+    const patch = {
+      phase: String(p.phase || ''),
+      status: String(p.status || ''),
+      findings_count: Number(p.findings_count || 0),
+      got_shell: Boolean(p.got_shell),
+      privilege_level: String(p.privilege_level || ''),
+      foothold_status: String(p.foothold_status || ''),
+      chain_visited: (p.chain_visited || []) as string[],
+      secondary_elided: Boolean(p.secondary_elided),
+      attack_next_steps: (p.attack_next_steps || []) as { stage?: string; action?: string; priority?: number }[],
+      privesc_attempt_count: Number(p.privesc_attempt_count || 0),
+      branch_id: String(p.branch_id || ''),
+      attack_graph: p.attack_graph as TaskDetail['attack_graph'] | undefined,
+      chain_template: p.chain_template as TaskDetail['chain_template'] | undefined,
+    }
+
+    const updateBid = patch.branch_id
+    const sameBranch = !updateBid || !state.activeBranchId || updateBid === state.activeBranchId
+    if (!sameBranch) return
+
+    taskListStore.upsertTask({
+      task_id: taskId,
+      current_phase: patch.phase,
+      status: patch.status as TaskDetail['status'],
+      findings_count: patch.findings_count,
+      got_shell: patch.got_shell,
+    })
+    if (state.task && patch.phase) {
+      const prevPhase = state.task.current_phase
+      state.task = {
+        ...state.task,
+        current_phase: patch.phase,
+        status: (patch.status as TaskDetail['status']) ?? state.task.status,
+        got_shell: patch.got_shell ?? state.task.got_shell,
+        privilege_level: patch.privilege_level ?? state.task.privilege_level,
+        foothold_status: patch.foothold_status ?? state.task.foothold_status,
+        chain_visited: patch.chain_visited ?? state.task.chain_visited,
+        secondary_elided: patch.secondary_elided ?? state.task.secondary_elided,
+        attack_next_steps: patch.attack_next_steps ?? state.task.attack_next_steps,
+        privesc_attempt_count: patch.privesc_attempt_count ?? state.task.privesc_attempt_count,
+        attack_graph: (patch.attack_graph as TaskDetail['attack_graph']) ?? state.task.attack_graph,
+        chain_template: (patch.chain_template as TaskDetail['chain_template']) ?? state.task.chain_template,
+      }
+      if (prevPhase !== 'awaiting_approval' && patch.phase === 'awaiting_approval') {
+        state.approvalState = 'idle'
+      }
+      if (prevPhase === 'awaiting_approval' && patch.phase !== 'awaiting_approval') {
+        state.approvalState = 'idle'
+        const removed = new Set<string>()
+        state.decisionEvents = state.decisionEvents.filter((ev) => {
+          if (ev.action === 'approval_required' || ev.action === 'approval') {
+            removed.add(String(ev.id || ''))
+            state.decisionEventIds.delete(String(ev.id || ''))
+            return false
+          }
+          return true
+        })
+        if (removed.size > 0 && state.task) {
+          state.task = { ...state.task, decision_events: state.decisionEvents.slice() }
+        }
+      }
+    }
+  }
+
   // ── 协议 v2: 统一事件入口 applyEvent ──────────────────
   function applyEvent(state: TaskLiveState, taskId: string, raw: Record<string, unknown>) {
     const eventType = String(raw.type || '')
@@ -582,7 +661,7 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
         if (!state.llmStreams[sid]) {
           state.llmStreams[sid] = { streamId: sid, phase, kind, text: '', updatedAt: Date.now() }
         }
-        _scheduleDeltaFlush(taskStateMap.value)
+        _scheduleDeltaFlush()
       } else if (action === 'tool_stream') {
         const sid = (p.stream_id as string) || 'default'
         const line = (p.line as string) || ''
@@ -610,79 +689,21 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
     if (eventType === 'phase_update') {
       state.lastWsUpdate = Date.now()
       const p = (raw.payload || {}) as Record<string, unknown>
-      const patch = {
-        phase: String(p.phase || ''),
-        status: String(p.status || ''),
-        findings_count: Number(p.findings_count || 0),
-        got_shell: Boolean(p.got_shell),
-        logs: (p.logs || []) as string[],
-        privilege_level: String(p.privilege_level || ''),
-        foothold_status: String(p.foothold_status || ''),
-        chain_visited: (p.chain_visited || []) as string[],
-        secondary_elided: Boolean(p.secondary_elided),
-        attack_next_steps: (p.attack_next_steps || []) as { stage?: string; action?: string; priority?: number }[],
-        privesc_attempt_count: Number(p.privesc_attempt_count || 0),
-        branch_id: String(p.branch_id || raw.branch_id || ''),
-        // backend `ws_phase_payload` 每次都会附带最新 attack_graph 快照,
-        // 必须在这里取出, 否则前端攻击图永远停留在初始 REST 快照, 不会
-        // 随漏洞发现/凭据收集等增量事实更新。
-        attack_graph: p.attack_graph as TaskDetail['attack_graph'] | undefined,
-        chain_template: p.chain_template as TaskDetail['chain_template'] | undefined,
+      const logs = (p.logs || []) as string[]
+      if (logs.length) {
+        for (const line of logs) pushLog(state, line)
       }
-
-      const updateBid = patch.branch_id
-      const sameBranch = !updateBid || !state.activeBranchId || updateBid === state.activeBranchId
-      if (!sameBranch) {
-        if (patch.logs?.length) {
-          for (const line of patch.logs) pushLog(state, line)
-        }
-        return
-      }
-      taskListStore.upsertTask({
-        task_id: taskId,
-        current_phase: patch.phase,
-        status: patch.status as TaskDetail['status'],
-        findings_count: patch.findings_count,
-        got_shell: patch.got_shell,
-      })
-      if (state.task && patch.phase) {
-        const prevPhase = state.task.current_phase
-        state.task = {
-          ...state.task,
-          current_phase: patch.phase,
-          status: (patch.status as TaskDetail['status']) ?? state.task.status,
-          got_shell: patch.got_shell ?? state.task.got_shell,
-          privilege_level: patch.privilege_level ?? state.task.privilege_level,
-          foothold_status: patch.foothold_status ?? state.task.foothold_status,
-          chain_visited: patch.chain_visited ?? state.task.chain_visited,
-          secondary_elided: patch.secondary_elided ?? state.task.secondary_elided,
-          attack_next_steps: patch.attack_next_steps ?? state.task.attack_next_steps,
-          privesc_attempt_count: patch.privesc_attempt_count ?? state.task.privesc_attempt_count,
-          attack_graph: (patch.attack_graph as TaskDetail['attack_graph']) ?? state.task.attack_graph,
-          chain_template: (patch.chain_template as TaskDetail['chain_template']) ?? state.task.chain_template,
-        }
-        if (prevPhase !== 'awaiting_approval' && patch.phase === 'awaiting_approval') {
-          state.approvalState = 'idle'
-        }
-        if (prevPhase === 'awaiting_approval' && patch.phase !== 'awaiting_approval') {
-          state.approvalState = 'idle'
-          // 清理旧的 approval 事件，避免下次进入审批阶段时出现重复卡片
-          const removed = new Set<string>()
-          state.decisionEvents = state.decisionEvents.filter((ev) => {
-            if (ev.action === 'approval_required' || ev.action === 'approval') {
-              removed.add(String(ev.id || ''))
-              state.decisionEventIds.delete(String(ev.id || ''))
-              return false
-            }
-            return true
-          })
-          if (removed.size > 0 && state.task) {
-            state.task = { ...state.task, decision_events: state.decisionEvents.slice() }
-          }
-        }
-      }
-      if (patch.logs?.length) {
-        for (const line of patch.logs) pushLog(state, line)
+      // 节流: 100ms 内多次 phase_update 合并为一次昂贵的 state.task 更新
+      if (!state._phasePatchPending) state._phasePatchPending = {}
+      Object.assign(state._phasePatchPending, p)
+      delete state._phasePatchPending.logs
+      if (!state._phasePatchTimer) {
+        state._phasePatchTimer = window.setTimeout(() => {
+          state._phasePatchTimer = null
+          const patch = state._phasePatchPending
+          state._phasePatchPending = undefined
+          if (patch) _applyPhaseUpdate(state, taskId, patch)
+        }, 100)
       }
       return
     }

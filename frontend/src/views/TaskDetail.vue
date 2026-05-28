@@ -153,7 +153,7 @@
               <el-badge v-if="attackGraphNodeCount" :value="attackGraphNodeCount" class="tab-badge" />
             </span>
           </template>
-          <AttackGraphView :graph="attackGraph" />
+          <AttackGraphView :graph="attackGraph" :task="task" @refresh="onAttackGraphRefresh" />
         </el-tab-pane>
 
         <!-- lazy: 这些 Tab 都是重组件,首屏不挂载,减少首次渲染时间和内存。 -->
@@ -553,6 +553,15 @@ async function doCancel() {
     ElMessage.error(e?.response?.data?.detail || e.message || '取消失败')
   } finally {
     cancelling.value = false
+  }
+}
+
+async function onAttackGraphRefresh() {
+  try {
+    await liveStore.refreshTask(taskId)
+    ElMessage.success('攻击图已刷新')
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || '刷新失败')
   }
 }
 

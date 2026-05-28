@@ -1,7 +1,7 @@
 <template>
   <div class="timeline-wrap" ref="wrapRef" @scroll="onUserScroll">
     <el-timeline>
-      <TransitionGroup name="tl-item" tag="div">
+      <div class="timeline-list">
         <el-timeline-item
           v-for="item in items"
           :key="item.id"
@@ -9,6 +9,7 @@
           :type="item.tone"
           :hollow="item.tone === 'info'"
           :data-item-id="item.id"
+          class="timeline-fade-in"
         >
           <div class="timeline-item" :class="{ 'thought-item': item.action === 'thought' }" :data-item-id="item.id">
             <div class="top-line">
@@ -52,7 +53,7 @@
             />
           </div>
         </el-timeline-item>
-      </TransitionGroup>
+      </div>
     </el-timeline>
 
     <!-- Live LLM thinking bubbles -->
@@ -230,16 +231,13 @@ defineExpose({ scrollToItem })
   padding: 10px 12px;
 }
 
-/* TransitionGroup animations for new items */
-.tl-item-enter-active {
-  transition: all 0.4s cubic-bezier(0.22, 1, 0.36, 1);
+/* Pure CSS fade-in (replaces TransitionGroup to avoid forced reflow) */
+@keyframes timelineFadeIn {
+  from { opacity: 0; transform: translateY(16px); }
+  to { opacity: 1; transform: translateY(0); }
 }
-.tl-item-enter-from {
-  opacity: 0;
-  transform: translateY(16px);
-}
-.tl-item-move {
-  transition: transform 0.3s ease;
+.timeline-fade-in {
+  animation: timelineFadeIn 0.4s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 .top-line {

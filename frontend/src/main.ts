@@ -10,6 +10,7 @@ import {
   SwitchButton, Edit, Key, InfoFilled, Share,
 } from '@element-plus/icons-vue'
 import 'element-plus/dist/index.css'
+import 'vue-virtual-scroller/dist/vue-virtual-scroller.css'
 import App from './App.vue'
 import router from './router'
 import './styles/main.css'
@@ -33,6 +34,8 @@ for (const [key, component] of Object.entries(icons)) {
 app.use(pinia)
 app.use(router)
 app.use(ElementPlus)
+// vue-virtual-scroller components are auto-registered when CSS is imported;
+// no explicit plugin registration needed for Vue 3 version.
 
 router.afterEach((to) => {
   trackEvent('page.view', { path: to.fullPath })

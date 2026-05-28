@@ -236,21 +236,21 @@
             </div>
           </template>
 
-          <TransitionGroup name="stream-enter" tag="div">
-            <div v-for="(bubble, sid) in activeStreamBubbles" :key="sid" class="llm-stream-bubble">
+          <div class="stream-bubbles">
+            <div v-for="(bubble, sid) in activeStreamBubbles" :key="sid" class="llm-stream-bubble stream-fade-in">
               <div class="bubble-header">
                 <span class="bubble-phase">{{ bubble.phase || '推理' }}</span>
                 <span class="bubble-indicator">正在思考<span class="dots">...</span></span>
               </div>
               <pre class="bubble-text">{{ bubble.text }}<span class="stream-cursor">|</span></pre>
             </div>
-          </TransitionGroup>
+          </div>
 
-          <TransitionGroup name="stream-enter" tag="div">
+          <div class="stream-bubbles">
             <div
               v-for="bubble in activeToolStreamBubbles"
               :key="`tool-${bubble.sid}`"
-              class="tool-stream-bubble"
+              class="tool-stream-bubble stream-fade-in"
             >
               <div class="bubble-header">
                 <span class="bubble-phase">{{ bubble.tool }}</span>
@@ -261,7 +261,7 @@
               </div>
               <pre class="bubble-text">{{ bubble.lines.join('\n') }}</pre>
             </div>
-          </TransitionGroup>
+          </div>
         </div>
 
         <transition name="fade">
@@ -454,18 +454,6 @@ const streamRef = ref(null)
 const state = computed(() => liveStore.getLiveState(taskId))
 const task = computed(() => state.value.task || listStore.getTaskById(taskId))
 
-function _eventIdx(id: unknown): number {
-  const m = String(id || '').match(/^de-(\d+)-/)
-  return m ? Number(m[1]) : 0
-}
-function _compareEvents(a: Record<string, unknown>, b: Record<string, unknown>): number {
-  const ta = String((a as { timestamp?: string })?.timestamp || '')
-  const tb = String((b as { timestamp?: string })?.timestamp || '')
-  const cmp = ta.localeCompare(tb)
-  if (cmp !== 0) return cmp
-  return _eventIdx((a as { id?: string })?.id) - _eventIdx((b as { id?: string })?.id)
-}
-
 const decisionEvents = computed(() => {
   const raw = state.value?.decisionEvents
   if (!Array.isArray(raw) || !raw.length) return []
@@ -476,7 +464,8 @@ const decisionEvents = computed(() => {
         return !bid || bid === activeBid
       })
     : raw
-  return (filtered.slice() as Array<Record<string, unknown>>).sort(_compareEvents) as unknown as typeof raw
+  // taskLive.ts 已保证 decisionEvents 按 event.id 单调有序，此处不再二次排序
+  return filtered
 })
 const llmStreams = computed(() => state.value?.llmStreams || {})
 const isRunning = computed(() => ['pending', 'running'].includes(task.value?.status || ''))
@@ -1302,24 +1291,13 @@ onUnmounted(() => {
   line-height: 1.6;
 }
 
-/* TransitionGroup: stream bubble enter/leave */
-.stream-enter-enter-active {
-  transition: all 0.35s ease-out;
+/* Stream bubble pure CSS fade-in (replaces TransitionGroup to avoid layout thrashing) */
+@keyframes streamFadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
 }
-.stream-enter-leave-active {
-  transition: all 0.25s ease-in;
-  position: absolute;
-}
-.stream-enter-enter-from {
-  opacity: 0;
-  transform: translateY(8px);
-}
-.stream-enter-leave-to {
-  opacity: 0;
-  transform: translateY(-4px);
-}
-.stream-enter-move {
-  transition: transform 0.3s ease;
+.stream-fade-in {
+  animation: streamFadeIn 0.35s ease-out;
 }
 
 .jump-latest {

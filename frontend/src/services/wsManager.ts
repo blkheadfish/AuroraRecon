@@ -33,6 +33,29 @@ interface ChannelState {
 
 const channels = new Map<string, ChannelState>()
 
+/** WS 消息 Micro-batch: 同一帧内收到的多条事件合并为一次广播，减少 Vue DOM 重排。 */
+const _frameBuffers = new Map<string, Record<string, unknown>[]>()
+let _frameRafId: number | null = null
+
+function _enqueueFrame(taskId: string, event: Record<string, unknown>) {
+  if (!_frameBuffers.has(taskId)) {
+    _frameBuffers.set(taskId, [])
+  }
+  _frameBuffers.get(taskId)!.push(event)
+  if (_frameRafId === null) {
+    _frameRafId = requestAnimationFrame(() => {
+      _frameRafId = null
+      const buffers = new Map(_frameBuffers)
+      _frameBuffers.clear()
+      for (const [tid, events] of buffers) {
+        for (const ev of events) {
+          broadcast(tid, ev)
+        }
+      }
+    })
+  }
+}
+
 /**
  * 激进退避数组: 前 4 次必须 < 5s, 覆盖 NAT 抖动 / LB 漂移;
  * 之后稳定在 30s, 避免对服务端造成脉冲式重连压力。
@@ -128,7 +151,7 @@ async function connect(taskId: string) {
       }
 
       if (t === 'error') {
-        broadcast(taskId, ev)
+        _enqueueFrame(taskId, ev)
         return
       }
 
@@ -147,7 +170,7 @@ async function connect(taskId: string) {
           // 将历史事件批量持久化到 IndexedDB
           appendEvents(taskId, filtered).catch(() => {})
           // 广播: 前端用 history envelope 一次性注入 store
-          broadcast(taskId, { type: 'history', events: filtered })
+          _enqueueFrame(taskId, { type: 'history', events: filtered })
         }
         return
       }
@@ -159,7 +182,7 @@ async function connect(taskId: string) {
       if (channel.firstMessageAfterReconnect) {
         channel.firstMessageAfterReconnect = false
         channel.retries = 0
-        broadcast(taskId, { type: '_reconnected' })
+        _enqueueFrame(taskId, { type: '_reconnected' })
       }
 
       // 去重: 按 event.id
@@ -175,7 +198,7 @@ async function connect(taskId: string) {
         _scheduleWrite(channel, taskId)
       }
 
-      broadcast(taskId, ev)
+      _enqueueFrame(taskId, ev)
     },
     () => {
       // ── onclose 回调 ───────────────────────
@@ -249,6 +272,7 @@ export function subscribeTaskEvents(taskId: string, listener: Listener): () => v
       }
       current.conn.close()
       channels.delete(taskId)
+      _frameBuffers.delete(taskId)
     }
   }
 }
@@ -259,4 +283,9 @@ export function closeAllTaskEventChannels() {
     channel.conn.close()
   }
   channels.clear()
+  if (_frameRafId !== null) {
+    cancelAnimationFrame(_frameRafId)
+    _frameRafId = null
+  }
+  _frameBuffers.clear()
 }
