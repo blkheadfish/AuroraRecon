@@ -859,6 +859,101 @@ PLAN_GENERATION_PROMPT = """你是一名拥有 10 年经验的高级渗透测试
 5. 只输出纯 JSON，不含任何 markdown 代码块或额外说明"""
 
 
+HYPOTHESIS_GENERATION = """你是一名拥有 10 年经验的高级渗透测试工程师。基于对目标的初步侦察结果，生成 2-3 个可验证的假设，指导后续定向探测。
+
+目标: {target}
+目标端口: {target_port}
+已检测指纹: {tech_hints}
+开放端口及服务: {ports_summary}
+Nmap 扫描摘要: {nmap_snippet}
+
+【假设生成框架】
+每个假设必须包含：
+1. 明确的断言（不是模糊描述）
+2. 推理论据（基于什么证据做出的判断）
+3. 可验证性（用什么方法可以证实/证伪）
+4. 攻击面价值（如果假设正确，对渗透测试的推进作用）
+
+假设类型（每个类型最多一个）：
+- tech_stack: 目标运行的技术栈（如"目标为 WordPress 站点"）
+- service_version: 特定服务版本推测（如"SSH 版本可能为 OpenSSH 7.4 存在用户名枚举"）
+- hidden_resource: 推测存在某个未发现的资源（如"可能存在 /admin 管理后台"）
+- vulnerability: 推测存在某类漏洞（如"基于 ThinkPHP 指纹，可能存在 TP5 RCE"）
+- configuration: 推测存在配置类弱点（如"Redis 6379 端口可能未授权访问"）
+
+返回 JSON（不含代码块）：
+{{
+  "hypotheses": [
+    {{
+      "hypothesis": "具体假设描述",
+      "category": "tech_stack|service_version|hidden_resource|vulnerability|configuration",
+      "reasoning": "基于什么证据做出此假设",
+      "attack_value": "high|medium|low",
+      "initial_confidence": 0.5,
+      "verify_method": "用什么方法证实或证伪",
+      "probe_targets": ["具体的探测路径或端点"]
+    }}
+  ]
+}}
+
+约束：
+- 必须基于已有的侦察证据，不得凭空猜测
+- 假设数量 2-3 个，宁缺毋滥
+- initial_confidence 基于证据强度：强证据 0.7-0.8，弱证据 0.3-0.5
+- 每个假设必须有明确的 verify_method 和 probe_targets"""
+
+
+HYPOTHESIS_VERIFICATION = """你是一名拥有 10 年经验的高级渗透测试工程师。上一轮假设验证的探测结果已经返回，需要你判断每个假设是"证实"还是"证伪"还是"需要更多信息"。
+
+目标: {target}
+当前轮次: {round_num}/{max_rounds}
+
+【当前活跃假设与证据历史】
+{hypotheses_state}
+
+【本轮探测结果】
+{round_results}
+
+【判断标准】
+- confirmed: 证据明确支持假设，置信度提高至 >= 0.8
+  - 例: 探测 /wp-login.php 返回 200 → 确认 WordPress
+  - 例: curl 返回 header "Server: Apache/2.4.49" → 确认版本
+- falsified: 证据明确否定假设
+  - 例: 探测 /wp-login.php 返回 404 → 可能不是 WordPress
+  - 例: 大量路径探测均 404 → 目标不是常见 CMS
+- needs_more_info: 证据不充分，需要进一步探测
+  - 例: /wp-admin 返回 403 → 可能是 WordPress 但被拦截
+  - 例: 仅探测了一个端点不足以判断
+
+【收敛条件】
+- 达到收敛: 所有假设 status 均为 confirmed 或 falsified，停止循环
+- 未收敛: 仍有 needs_more_info 的假设，继续下一轮
+- 强制终止: 达到 max_rounds 或连续 2 轮置信度变化 < 0.1
+
+对每个假设返回 assessment，并给出下一轮的建议探测动作。
+
+返回 JSON（不含代码块）：
+{{
+  "converged": true,
+  "converged_reason": "所有假设已确认或证伪 / 连续2轮无进展",
+  "assessments": [
+    {{
+      "hypothesis_id": "hyp-001",
+      "status": "confirmed|falsified|needs_more_info",
+      "confidence": 0.85,
+      "confidence_delta": 0.15,
+      "evidence_summary": "基于哪些证据做出此判断",
+      "next_probe": null
+    }}
+  ]
+}}
+
+约束：
+- 每个假设都必须给出明确的 status 判断，不得模糊
+- confidence 必须在 0.0-1.0 之间
+- 连续两轮无进展时必须声明 converged=true 终止循环"""
+
+
 FILE_INTEL_EXTRACT = """你是一名资深渗透测试工程师，正在分析从目标服务器上获取的文件内容。
 你的任务是从文件中提取所有对渗透测试有价值的情报。
 

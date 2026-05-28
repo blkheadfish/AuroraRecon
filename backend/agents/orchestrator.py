@@ -1116,6 +1116,7 @@ async def node_recon(state: PentestState) -> PentestState:
     state.raw_recon = _stringify_dict_keys(result)
     state.target_os = _infer_os(state.open_ports, state.os_info)
     state.dir_scan_strategy = _stringify_dict_keys(result.get("scan_strategy", {}))
+    state.recon_hypotheses = result.get("recon_hypotheses", [])
 
     dir_cov = result.get("dir_coverage")
     if dir_cov:

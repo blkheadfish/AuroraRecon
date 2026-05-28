@@ -625,6 +625,11 @@ class PentestState(BaseModel):
 	subdomains: list[str] = Field(default_factory=list)
 	raw_recon: dict = Field(default_factory=dict)
 
+	recon_hypotheses: list[dict[str, Any]] = Field(default_factory=list)
+	max_recon_hypothesis_rounds: int = Field(
+		default_factory=lambda: max(1, int(os.getenv("MAX_RECON_ROUNDS", "5")))
+	)
+
 	findings: list[VulnFinding] = Field(default_factory=list)
 	raw_vuln: dict = Field(default_factory=dict)
 	fingerprints: dict = Field(default_factory=dict)

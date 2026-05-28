@@ -250,12 +250,27 @@ class ReconAgent:
 
 		scan_strategy: dict = {}
 		tech_hints: list[str] = []
+		recon_hypotheses: list[dict[str, Any]] = []
 		if web_ports:
 			primary_scheme = "https" if web_ports[0].port in (443, 8443) else "http"
 			primary_target = f"{primary_scheme}://{target}:{web_ports[0].port}"
 
 			tech_hints = await self._quick_fingerprint(
 				target, web_ports, task_id, log_callback,
+			)
+
+			has_waf = await self._detect_waf(
+				primary_target, task_id, log_callback,
+			)
+
+			recon_hypotheses = await self._hypothesis_driven_verify(
+				target=target,
+				tech_hints=tech_hints,
+				ports=ports,
+				web_ports=web_ports,
+				task_id=task_id,
+				log_callback=log_callback,
+				decision_callback=decision_callback,
 			)
 
 			if _run_dir_scan:
@@ -266,10 +281,6 @@ class ReconAgent:
 						"tool": "dir-discovery",
 						"message": f"开始目录发现: {len(web_ports)} 个 Web 端口",
 					})
-
-				has_waf = await self._detect_waf(
-					primary_target, task_id, log_callback,
-				)
 
 				scan_strategy = await self._llm_plan_dir_strategy(
 					primary_target, tech_hints, ports, has_waf, log_callback,
@@ -363,6 +374,7 @@ class ReconAgent:
 			"dir_coverage": dir_coverage,
 			"llm_recon_hints": llm_recon_hints,
 			"scan_strategy": scan_strategy,
+			"recon_hypotheses": recon_hypotheses,
 		}
 
 	async def _nmap_scan(
@@ -485,6 +497,342 @@ class ReconAgent:
 		ports.extend(verified_filtered)
 
 		return ports, os_info, detail_result.stdout
+
+	async def _hypothesis_driven_verify(
+		self,
+		target: str,
+		tech_hints: list[str],
+		ports: list[PortInfo],
+		web_ports: list[PortInfo],
+		task_id: Optional[str],
+		log_callback: LogCallback = None,
+		decision_callback: Optional[Callable] = None,
+	) -> list[dict[str, Any]]:
+		"""Hypothesis-Verify loop: LLM-driven multi-round targeted verification.
+
+		Flow:
+		  1. LLM generates 2-3 hypotheses based on fingerprints + ports
+		  2. Per round: execute probes for active hypotheses → LLM evaluates results
+		  3. Confidence updated; low-confidence (<0.3) falsified; high-confidence (>0.8) confirmed
+		  4. Max rounds controlled by MAX_RECON_ROUNDS; converges when all resolved
+		"""
+		import os as _os
+		max_rounds_setting = _os.getenv("MAX_RECON_ROUNDS", "")
+		max_rounds = int(max_rounds_setting) if max_rounds_setting and max_rounds_setting.isdigit() else 5
+
+		ports_summary = ", ".join(
+			f"{p.port}/{p.service}({p.version[:30]})" for p in ports[:20]
+			if p.state == "open"
+		)
+		if not ports_summary:
+			return []
+
+		primary_target = ""
+		if web_ports:
+			scheme = "https" if web_ports[0].port in (443, 8443) else "http"
+			primary_target = f"{scheme}://{target}:{web_ports[0].port}"
+
+		nmap_snippet_raw = ""
+		try:
+			result = await self.executor.run(
+				tool="curl",
+				args=["-s", "--max-time", "5",
+				      f"{primary_target}" if primary_target else f"http://{target}"],
+				timeout=10,
+				task_id=task_id,
+			)
+			if result and result.stdout:
+				nmap_snippet_raw = result.stdout[:2000]
+		except Exception:
+			pass
+
+		if log_callback:
+			await log_callback("[ReconAgent] 🧠 假设驱动验证: 生成初始假设...")
+
+		hypotheses = await self._generate_hypotheses(
+			target=target,
+			tech_hints=tech_hints,
+			ports_summary=ports_summary,
+			nmap_snippet=nmap_snippet_raw,
+			log_callback=log_callback,
+		)
+		if not hypotheses:
+			if log_callback:
+				await log_callback("[ReconAgent] LLM 未生成假设，跳过假设验证循环")
+			return []
+
+		if decision_callback:
+			hyp_preview = "; ".join(
+				f"{h.get('hypothesis', '')[:60]}(conf={h.get('confidence', 0):.1f})"
+				for h in hypotheses
+			)
+			await decision_callback({
+				"action": "thought",
+				"phase": "recon",
+				"thinking": (
+					f"假设驱动验证启动: 生成 {len(hypotheses)} 个初始假设 — {hyp_preview}"
+				),
+				"purpose": "假设驱动侦察",
+				"plan": [
+					f"H{i+1}: {h.get('hypothesis', '')[:80]} [conf={h.get('confidence', 0):.2f}]"
+					for i, h in enumerate(hypotheses)
+				],
+				"message": f"假设驱动验证: {len(hypotheses)} 个假设待验证",
+			})
+
+		for round_num in range(1, max_rounds + 1):
+			active = [h for h in hypotheses if h.get("status") in ("pending", "needs_more_info")]
+			if not active:
+				if log_callback:
+					await log_callback(
+						f"[ReconAgent] 假设验证收敛: 所有假设已确认或证伪 (第{round_num - 1}轮)"
+					)
+				break
+
+			if log_callback:
+				await log_callback(
+					f"[ReconAgent] 假设验证 第{round_num}/{max_rounds}轮: "
+					f"{len(active)} 个活跃假设"
+				)
+
+			round_results: list[dict[str, Any]] = []
+			for h in active:
+				probe_result = await self._execute_hypothesis_probe(
+					hypothesis=h,
+					target=target,
+					primary_target=primary_target,
+					task_id=task_id,
+					log_callback=log_callback,
+				)
+				round_results.append(probe_result)
+
+			verification = await self._verify_hypotheses(
+				target=target,
+				round_num=round_num,
+				max_rounds=max_rounds,
+				hypotheses=hypotheses,
+				round_results=round_results,
+				log_callback=log_callback,
+			)
+			if not verification:
+				break
+
+			for assessment in verification.get("assessments", []):
+				hid = assessment.get("hypothesis_id", "")
+				for h in hypotheses:
+					if h.get("id") == hid:
+						old_conf = h.get("confidence", 0)
+						new_status = assessment.get("status", h.get("status"))
+						new_conf = min(1.0, max(0.0, float(assessment.get("confidence", old_conf))))
+						delta = assessment.get("confidence_delta", new_conf - old_conf)
+						h["status"] = new_status
+						h["confidence"] = new_conf
+						round_record = {
+							"round": round_num,
+							"status": new_status,
+							"confidence_delta": delta,
+							"evidence_summary": assessment.get("evidence_summary", ""),
+							"next_probe": assessment.get("next_probe"),
+						}
+						h.setdefault("evidence_rounds", []).append(round_record)
+						if new_status in ("confirmed", "falsified"):
+							h["resolved_round"] = round_num
+							if new_status == "confirmed":
+								h["verified_by"] = f"hyp_round_{round_num}"
+						break
+
+			confirmed = [h for h in hypotheses if h.get("status") == "confirmed"]
+			falsified = [h for h in hypotheses if h.get("status") == "falsified"]
+			if log_callback:
+				await log_callback(
+					f"[ReconAgent] 第{round_num}轮验证完成: "
+					f"已确认 {len(confirmed)}, 已证伪 {len(falsified)}, "
+					f"仍待验证 {len(active) - len(confirmed) - len(falsified)}"
+				)
+
+			if decision_callback:
+				lines = []
+				for h in hypotheses:
+					emoji = {"confirmed": "✅", "falsified": "❌", "needs_more_info": "🔄"}.get(h.get("status"), "⏳")
+					lines.append(
+						f"{emoji} {h.get('hypothesis', '')[:80]} [conf={h.get('confidence', 0):.2f}]"
+					)
+				await decision_callback({
+					"action": "thought",
+					"phase": "recon",
+					"thinking": f"假设验证 第{round_num}轮:\n" + "\n".join(lines),
+					"purpose": f"假设验证 第{round_num}轮",
+					"plan": lines,
+					"message": f"假设验证 R{round_num}: {len(confirmed)}确认/{len(falsified)}证伪",
+				})
+
+			if verification.get("converged") and round_num < max_rounds:
+				if log_callback:
+					await log_callback(
+						f"[ReconAgent] 假设验证收敛于第{round_num}轮: "
+						f"{verification.get('converged_reason', '')}"
+					)
+				break
+
+			prev_confidence_sum = sum(
+				h.get("confidence", 0) for h in active
+			)
+			if round_num >= 2 and prev_confidence_sum == 0:
+				break
+
+		return hypotheses
+
+	async def _generate_hypotheses(
+		self,
+		target: str,
+		tech_hints: list[str],
+		ports_summary: str,
+		nmap_snippet: str,
+		log_callback: LogCallback = None,
+	) -> list[dict[str, Any]]:
+		"""LLM generates initial hypotheses based on recon intel."""
+		try:
+			from backend.llm.router import LLMRouter
+			from backend.llm.prompts.templates import HYPOTHESIS_GENERATION
+			from backend.agents.prompt_utils import wrap_prompt_with_block
+
+			llm = LLMRouter()
+			prompt = HYPOTHESIS_GENERATION.format(
+				target=target,
+				target_port="",
+				tech_hints=", ".join(tech_hints) if tech_hints else "未检测到",
+				ports_summary=ports_summary,
+				nmap_snippet=nmap_snippet[:3000],
+			)
+			prompt = wrap_prompt_with_block(prompt, self._operator_block)
+
+			response = await llm.chat(prompt, response_format="json", temperature=0.2, max_tokens=2048)
+			data = json.loads(response)
+			raw_hypotheses = data.get("hypotheses", [])
+			if not raw_hypotheses:
+				return []
+
+			hypotheses: list[dict[str, Any]] = []
+			for i, h in enumerate(raw_hypotheses):
+				hypotheses.append({
+					"id": f"hyp-{i + 1:03d}",
+					"hypothesis": str(h.get("hypothesis", "")),
+					"category": str(h.get("category", "tech_stack")),
+					"reasoning": str(h.get("reasoning", "")),
+					"attack_value": str(h.get("attack_value", "medium")),
+					"confidence": min(1.0, max(0.1, float(h.get("initial_confidence", 0.5)))),
+					"status": "pending",
+					"verify_method": str(h.get("verify_method", "")),
+					"probe_targets": list(h.get("probe_targets", []) or []),
+					"created_round": 0,
+					"evidence_rounds": [],
+					"verified_by": "",
+					"resolved_round": None,
+				})
+			logger.info(f"[ReconAgent] LLM 生成 {len(hypotheses)} 个假设")
+			return hypotheses
+		except Exception as e:
+			logger.warning(f"[ReconAgent] 假设生成失败: {e}")
+			if log_callback:
+				await log_callback(f"[ReconAgent] 假设生成跳过: {e}")
+			return []
+
+	async def _execute_hypothesis_probe(
+		self,
+		hypothesis: dict[str, Any],
+		target: str,
+		primary_target: str,
+		task_id: Optional[str],
+		log_callback: LogCallback = None,
+	) -> dict[str, Any]:
+		"""Execute targeted probes for a single hypothesis."""
+		probe_targets = hypothesis.get("probe_targets", []) or []
+		if not probe_targets:
+			probe_targets = ["/"]
+		result_lines: list[str] = []
+		base_url = primary_target or f"http://{target}"
+
+		for pt in probe_targets[:6]:
+			p = pt if pt.startswith("/") else f"/{pt}"
+			try:
+				curl_cmd = (
+					f'curl -sS -L --max-time 8 -D - -o /dev/null "{base_url}{p}" 2>/dev/null | head -20; '
+					f'echo "---BODY---"; '
+					f'curl -sS --max-time 8 "{base_url}{p}" 2>/dev/null | head -30'
+				)
+				result = await self.executor.run_script(
+					script_content=curl_cmd,
+					timeout=20,
+					task_id=task_id,
+					record_purpose=f"hyp_probe_{hypothesis.get('id', '')}",
+				)
+				stdout = (result.stdout or "")[:2000]
+				result_lines.append(f"--- PROBE: {base_url}{p} ---\n{stdout}")
+			except Exception as e:
+				result_lines.append(f"--- PROBE: {base_url}{p} ---\nERROR: {e}")
+
+		return {
+			"hypothesis_id": hypothesis.get("id", ""),
+			"hypothesis": hypothesis.get("hypothesis", ""),
+			"probe_output": "\n".join(result_lines)[:4000],
+		}
+
+	async def _verify_hypotheses(
+		self,
+		target: str,
+		round_num: int,
+		max_rounds: int,
+		hypotheses: list[dict[str, Any]],
+		round_results: list[dict[str, Any]],
+		log_callback: LogCallback = None,
+	) -> dict[str, Any] | None:
+		"""LLM evaluates probe results against each hypothesis."""
+		try:
+			from backend.llm.router import LLMRouter
+			from backend.llm.prompts.templates import HYPOTHESIS_VERIFICATION
+			from backend.agents.prompt_utils import wrap_prompt_with_block
+
+			hyp_state_lines: list[str] = []
+			for h in hypotheses:
+				ev_rounds = h.get("evidence_rounds", [])
+				hist_lines = []
+				for er in ev_rounds:
+					hist_lines.append(
+						f"    R{er.get('round', '?')}: status={er.get('status', '?')} "
+						f"conf_delta={er.get('confidence_delta', 0):+.2f} | {er.get('evidence_summary', '')[:120]}"
+					)
+				hyp_state_lines.append(
+					f"  [{h.get('id')}] {h.get('hypothesis', '')}\n"
+					f"    category={h.get('category')} conf={h.get('confidence', 0):.2f} status={h.get('status')}\n"
+					+ "\n".join(hist_lines)
+				)
+
+			results_lines: list[str] = []
+			for rr in round_results:
+				results_lines.append(
+					f"[{rr.get('hypothesis_id', '')}] {rr.get('hypothesis', '')}\n"
+					f"  探测结果:\n{rr.get('probe_output', '')}"
+				)
+
+			llm = LLMRouter()
+			prompt = HYPOTHESIS_VERIFICATION.format(
+				target=target,
+				round_num=round_num,
+				max_rounds=max_rounds,
+				hypotheses_state="\n".join(hyp_state_lines),
+				round_results="\n".join(results_lines),
+			)
+			prompt = wrap_prompt_with_block(prompt, self._operator_block)
+
+			response = await llm.chat(prompt, response_format="json", temperature=0.1, max_tokens=2048)
+			data = json.loads(response)
+			if "error" in data and not data.get("assessments"):
+				logger.warning(f"[ReconAgent] LLM 假设验证返回错误: {data.get('error')}")
+				return None
+			return data
+		except Exception as e:
+			logger.warning(f"[ReconAgent] 假设验证 LLM 调用失败: {e}")
+			return None
 
 	async def _tcp_verify_filtered_ports(
 		self,
