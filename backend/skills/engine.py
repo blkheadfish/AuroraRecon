@@ -181,6 +181,7 @@ class SkillEngine:
             php_runtime=dict((_rf.get("php") or php_runtime) or {}),
             runtime_facts=_rf,
             confirmed_facts=dict(confirmed_facts or {}),
+            _finding_evidence=finding.evidence or "",
         )
 
         if prior_probe_variables:

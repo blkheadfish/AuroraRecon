@@ -662,6 +662,9 @@ class SkillContext:
     # 结构化探测结果（替代字符串正则 IPC）
     structured_results: dict[str, Any] = field(default_factory=dict)
 
+    # 当前 finding 的原始 evidence 文本（供 match_any_keyword 条件使用）
+    _finding_evidence: str = ""
+
     _var_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     async def set_var_async(self, key: str, value: Any) -> None:
