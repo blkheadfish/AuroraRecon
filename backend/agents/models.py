@@ -297,6 +297,7 @@ class VulnFinding(BaseModel):
 	cvss_score: Optional[float] = None
 	cvss_vector: str = ""
 	cwe: str = ""
+	false_positive_likelihood: float = 0.0
 
 
 class CommandExecutionRecord(BaseModel):

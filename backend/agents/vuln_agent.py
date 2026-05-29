@@ -213,6 +213,8 @@ class VulnAgent:
                 fingerprints[wp.port] = fp_result
                 logger.info(f"[VulnAgent] 指纹 :{wp.port} -> {fp_result.get('summary', 'unknown')}")
 
+        fp_kb_cache = self._build_fingerprint_kb_cache(fingerprints)
+
         scan_strategy = await self._llm_scan_strategy(
             target,
             target_os,
@@ -240,7 +242,7 @@ class VulnAgent:
                 "message": f"LLM 扫描策略: {len(tags)} 个标签, {len(hv_targets) if isinstance(hv_targets, list) else 0} 个高价值目标",
             })
 
-        async def _scan_one_port(wp: PortInfo) -> list[VulnFinding]:
+        async def _scan_one_port(wp: PortInfo, override_tags: list[str] | None = None) -> list[VulnFinding]:
             if _user_scheme and wp.port == target_port:
                 scheme = _user_scheme
             else:
@@ -249,7 +251,7 @@ class VulnAgent:
             port_findings: list[VulnFinding] = []
             port_fp = fingerprints.get(wp.port, {})
 
-            llm_tags = scan_strategy.get("nuclei_tags", [])
+            llm_tags = override_tags if override_tags is not None else scan_strategy.get("nuclei_tags", [])
             blacklist = _get_nuclei_tag_blacklist()
             llm_tags = [t for t in llm_tags if t.lower() not in blacklist]
             if llm_tags:
@@ -297,6 +299,70 @@ class VulnAgent:
             target, target_os, ports, fingerprints, web_paths, all_findings
         )
         all_findings.extend(kb_findings)
+
+        # ── 自适应扫描策略反馈循环 ──
+        prev_round_count = len(all_findings)
+        max_iter_rounds = 3
+        for iter_round in range(1, max_iter_rounds + 1):
+            exploitable_now = sum(1 for f in all_findings if f.exploitable)
+            has_high_now = any(f.severity in ("critical", "high") for f in all_findings)
+            if exploitable_now >= 3 and has_high_now:
+                logger.info(f"[VulnAgent] 覆盖充分 (exploitable={exploitable_now}, high={has_high_now})，跳过迭代 #{iter_round}")
+                break
+
+            adjusted = await self._llm_evaluate_coverage(
+                target=target,
+                target_os=target_os,
+                ports=ports,
+                fingerprints=fingerprints,
+                current_findings=all_findings,
+                current_tags=scan_strategy.get("nuclei_tags", []),
+                round_num=iter_round,
+                max_rounds=max_iter_rounds,
+            )
+            if not adjusted or not adjusted.get("should_retry"):
+                logger.info(f"[VulnAgent] LLM 评估覆盖充分，停止迭代")
+                break
+
+            new_tags = adjusted.get("nuclei_tags", [])
+            if not new_tags:
+                break
+
+            logger.info(
+                f"[VulnAgent] 迭代扫描 #{iter_round}: 标签调整 "
+                f"{scan_strategy.get('nuclei_tags', [])[:4]} -> {new_tags[:6]} | "
+                f"原因: {adjusted.get('reason', '')[:100]}"
+            )
+            if self._decision_callback:
+                await self._decision_callback({
+                    "action": "thought",
+                    "phase": "vuln_scan",
+                    "thinking": (
+                        f"自适应扫描 第{iter_round}轮: 当前发现不足，调整标签 "
+                        f"{', '.join(new_tags[:5])}. 原因: {adjusted.get('reason', '')[:120]}"
+                    ),
+                    "purpose": "自适应扫描迭代",
+                    "plan": [f"新标签: {', '.join(new_tags[:6])}"],
+                    "message": f"自适应扫描 R{iter_round}: {len(new_tags)} 标签",
+                })
+
+            retry_tasks = [_scan_one_port(wp, override_tags=new_tags) for wp in web_ports]
+            retry_results = await asyncio.gather(*retry_tasks, return_exceptions=True)
+            round_new = 0
+            for r in retry_results:
+                if isinstance(r, list):
+                    all_findings.extend(r)
+                    round_new += len(r)
+
+            new_finding_density = round_new / max(prev_round_count, 1)
+            logger.info(
+                f"[VulnAgent] 迭代 #{iter_round} 结果: +{round_new} findings "
+                f"(密度={new_finding_density:.1%}, prev={prev_round_count})"
+            )
+            if new_finding_density < 0.20:
+                logger.info(f"[VulnAgent] 密度 {new_finding_density:.1%} < 20%，停止迭代")
+                break
+            prev_round_count += round_new
 
         exploitable_count = sum(1 for f in all_findings if f.exploitable)
         has_high = any(f.severity in ("critical", "high") for f in all_findings)
@@ -367,6 +433,8 @@ class VulnAgent:
                 + ", ".join(f.name[:60] for f in detection_results[:5])
                 + (f" ... +{len(detection_results) - 5}" if len(detection_results) > 5 else "")
             )
+
+        self._estimate_false_positive_likelihoods(all_findings)
 
         confirmed_count = sum(1 for f in all_findings if f.verification_status == "confirmed")
         rejected_count = sum(1 for f in all_findings if f.verification_status == "rejected")
@@ -555,6 +623,52 @@ $PHUIP "{web_url}/index.php" 2>&1
         3389: "rdp", 161: "snmp", 5900: "vnc", 53: "dns", 2049: "nfs",
         5985: "winrm", 5986: "winrm", 1433: "mssql",
     }
+
+    @staticmethod
+    def _estimate_false_positive_likelihoods(findings: list[VulnFinding]) -> None:
+        """Assign false_positive_likelihood (0.0-1.0) to each finding.
+
+        Heuristic based on ref: sharp-edges (insecure defaults → least-surprise).
+        Lower = more likely to be a real vulnerability.
+        """
+        _LOW_FP_TOOLS = {"nuclei", "sqlmap", "whatweb", "httpx"}
+        _HIGH_FP_TOOLS = {"nikto", "service-enum", "nmap-vuln-script"}
+
+        for f in findings:
+            fp_score = 0.5
+
+            if f.verification_status == "confirmed":
+                fp_score -= 0.30
+            elif f.verification_status == "rejected":
+                fp_score = 0.95
+            elif f.verification_status == "likely":
+                fp_score -= 0.10
+            elif f.verification_status == "suspected":
+                fp_score += 0.15
+
+            if f.cve:
+                fp_score -= 0.15
+            if f.exploitable:
+                fp_score -= 0.10
+
+            tool_lower = (f.tool or "").lower()
+            if any(t in tool_lower for t in _LOW_FP_TOOLS):
+                fp_score -= 0.05
+            if any(t in tool_lower for t in _HIGH_FP_TOOLS):
+                fp_score += 0.15
+
+            if f.confidence >= 80:
+                fp_score -= 0.10
+            elif f.confidence <= 30:
+                fp_score += 0.15
+
+            name_lower = f.name.lower()
+            if any(kw in name_lower for kw in ("detect", "detection", "info")):
+                fp_score += 0.10
+            if any(kw in name_lower for kw in ("cve-", "rce", "injection")):
+                fp_score -= 0.05
+
+            f.false_positive_likelihood = round(max(0.0, min(1.0, fp_score)), 2)
 
     def _generate_service_findings(
         self,
@@ -882,6 +996,124 @@ $PHUIP "{web_url}/index.php" 2>&1
                         fallback_tags.update(tags)
             return {"nuclei_tags": list(fallback_tags)[:8], "analysis": f"LLM 不可用，根据指纹自动回退: {list(fallback_tags)}", }
 
+    async def _llm_evaluate_coverage(
+        self,
+        target: str,
+        target_os: str,
+        ports: list[PortInfo],
+        fingerprints: dict[int, dict],
+        current_findings: list[VulnFinding],
+        current_tags: list[str],
+        round_num: int,
+        max_rounds: int,
+    ) -> dict | None:
+        """LLM evaluates if scan coverage is sufficient or needs tag adjustment.
+
+        Returns dict with keys: should_retry, reason, nuclei_tags (adjusted).
+        Returns None on LLM failure (caller should stop iterating).
+        """
+        findings_summary = []
+        for f in current_findings[-40:]:
+            findings_summary.append(
+                f"  [{f.severity}] {f.name} (CVE={f.cve or '无'}, "
+                f"port={f.port}, tool={f.tool}, exploitable={f.exploitable})"
+            )
+
+        fp_lines = []
+        for port, fp in fingerprints.items():
+            fp_lines.append(
+                f"  Port {port}: {fp.get('summary', 'unknown')}"
+            )
+
+        prompt = f"""你是渗透测试扫描策略评估专家。首轮扫描已完成，请判断覆盖面是否足够。
+
+目标: {target} (OS={target_os})
+开放端口: {len(ports)} 个
+指纹识别结果:
+{chr(10).join(fp_lines[:10])}
+
+首轮 Nuclei 标签: {', '.join(current_tags[:8]) if current_tags else '(未指定)'}
+
+本轮发现 ({len(current_findings)} 条):
+{chr(10).join(findings_summary[:20])}
+
+当前是第 {round_num}/{max_rounds} 轮迭代。请判断:
+
+1. 覆盖面评估: 当前的扫描策略是否已充分覆盖目标的技术栈？
+2. 是否需要调整标签: 如果覆盖面不足，建议从 broad→specific 细化（如 java → struts, rce → cves/cve-2017-5638）
+3. 平衡考量: 避免无限循环扫描。如果已发现 3+ 可 exploited 且含 high/critical，应建议停止。
+
+返回 JSON（不含代码块）:
+{{
+  "should_retry": false,
+  "reason": "已有 4 个可 exploited 发现，含 2 个 high，覆盖面充分",
+  "nuclei_tags": []
+}}
+
+约束:
+- 如果首轮使用了 broad 标签但发现很少 → should_retry=true, nuclei_tags 改为 specific 标签
+- 如果发现的工具/标签覆盖了大部分指纹 → should_retry=false
+- 最多推荐 6 个标签，禁止通用标签 (rce/sqli/xss/lfi/ssrf)
+"""
+        try:
+            from backend.agents.prompt_utils import wrap_prompt_with_block
+            prompt = wrap_prompt_with_block(prompt, self._operator_block)
+            raw = await self.llm.chat(prompt, response_format="json", temperature=0.1, max_tokens=1024)
+            result = json.loads(raw)
+            if "error" in result and "should_retry" not in result:
+                return None
+            return result
+        except Exception as e:
+            logger.warning(f"[VulnAgent] LLM coverage evaluation failed: {e}")
+            return None
+
+    def _build_fingerprint_kb_cache(
+        self,
+        fingerprints: dict[int, dict],
+    ) -> dict[str, list]:
+        """Build deterministic fingerprint→ExploitKB cache for fast routing.
+
+        Maps fingerprint signals (service:version, tech name) to KB entries,
+        avoiding repeated KB searches. Called once per scan at startup.
+        """
+        cache: dict[str, list] = {}
+        if self.kb.size == 0:
+            return cache
+
+        for port, fp in fingerprints.items():
+            summary = fp.get("summary", "")
+            techs = [t.strip() for t in summary.split(",") if t.strip() and t.strip() != "unknown"]
+
+            nmap_ver = fp.get("nmap_version", "")
+            nmap_svc = fp.get("nmap_service", "")
+
+            keys_to_check: list[str] = list(techs)
+            if nmap_svc and nmap_ver:
+                keys_to_check.append(f"{nmap_svc}:{nmap_ver}")
+            elif nmap_svc:
+                keys_to_check.append(nmap_svc)
+
+            for key in keys_to_check:
+                if key in cache:
+                    continue
+                key_lower = key.lower()
+                matches = []
+                for entry in self.kb.search(key_lower):
+                    matches.append({
+                        "vuln_id": entry.vuln_id,
+                        "category": entry.category,
+                        "cves": entry.match_cves,
+                        "detection_method": entry.detection_method,
+                    })
+                if matches:
+                    cache[key] = matches
+
+        if cache:
+            logger.info(
+                f"[VulnAgent] 指纹→KB 缓存: {len(cache)} 个键 "
+                f"({', '.join(list(cache.keys())[:8])})"
+            )
+        return cache
 
     @staticmethod
     def _target_scan_profile(host: str) -> dict:
