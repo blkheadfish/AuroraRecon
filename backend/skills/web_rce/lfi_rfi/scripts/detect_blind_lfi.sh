@@ -96,6 +96,7 @@ echo ""
 if [ "$HIT_COUNT" -gt 0 ]; then
   echo "BLIND_LFI_HIT:$HIT_COUNT"
   echo "LFI_FOUND:page:0:blind_differential"
+  echo "{\"event\":\"lfi_param_found\",\"payload\":{\"param\":\"page\",\"depth\":0,\"style\":\"blind\",\"blind\":true,\"confirmed\":true,\"blind_hit_count\":$HIT_COUNT}}"
 else
   echo "BLIND_LFI_NOT_FOUND"
 fi

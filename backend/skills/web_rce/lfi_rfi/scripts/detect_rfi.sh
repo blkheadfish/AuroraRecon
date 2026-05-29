@@ -82,6 +82,7 @@ for mount in "/" "$ENDPOINT_PATH"; do
     fi
     if try_rfi "$URL" "HTTP mount=$mount param=$param"; then
       echo "RFI_FOUND:$param:http"
+      echo "{\"event\":\"rfi_param_found\",\"payload\":{\"param\":\"$param\",\"scheme\":\"http\",\"confirmed\":true}}"
       exit 0
     fi
   done
