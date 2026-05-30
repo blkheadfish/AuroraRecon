@@ -118,12 +118,16 @@ class SkillEngine:
             )
 
         elapsed = round(time.monotonic() - t0, 2)
+        path_id = (result.session_info or {}).get("method", "").replace("skill:", "")
+        probe_count = len([r for r in result.command_records if r.get("purpose") == "probe"])
         persist_execution({
             "skill_id": skill.skill_id,
             "target": target_url,
             "success": result.success,
+            "path_id": path_id,
             "total_elapsed": elapsed,
             "commands_count": len(result.commands_run),
+            "probe_count": probe_count,
             "evidence_preview": (result.evidence or "")[:200],
             "workflow_mode": workflow_mode,
             "evidence_level": getattr(result, "exploit_level", ""),
@@ -261,6 +265,25 @@ class SkillEngine:
         )
 
         sorted_paths = sorted(skill.exploit_paths, key=lambda p: p.priority)
+
+        # ---- NEW: apply execution learner priority adjustments ----
+        try:
+            from backend.skills.execution_learner import get_learner
+            learner = get_learner()
+            adjustments = learner.get_adaptive_priorities(skill.skill_id)
+            if adjustments:
+                def _adjusted_priority(p: ExploitPath) -> int:
+                    delta = adjustments.get(p.path_id, 0)
+                    return p.priority + delta
+
+                sorted_paths = sorted(skill.exploit_paths, key=_adjusted_priority)
+                logger.info(
+                    "[SkillEngine] 📚 执行学习: %d paths 优先级已调整: %s",
+                    len(adjustments),
+                    {k: f"{v:+d}" for k, v in adjustments.items()},
+                )
+        except Exception as e:
+            logger.debug("[SkillEngine] 执行学习器查询跳过: %s", e)
 
         # ---- NEW: selector-based adaptive path selection ----
         if skill.selector:

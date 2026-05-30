@@ -620,6 +620,9 @@ class SkillMeta:
     match: MatchConfig = field(default_factory=MatchConfig)
     source_file: str = ""
 
+    # 跨 session 学习：执行反馈循环调整的路径优先级 {path_id: priority_delta}
+    dynamic_priority_adjustments: dict[str, int] = field(default_factory=dict)
+
 
 
 @dataclass

@@ -271,8 +271,24 @@ class SkillRegistry:
         return [s for m in self._metas if m.phase == phase and (s := self._resolve_full(m))]
 
     def reload(self) -> None:
-        """Atomic reload: reload metadata and clear full-skill cache."""
+        """Atomic reload: reload metadata, inject learner adjustments, clear caches."""
         new_metas = load_skills_metadata()
+
+        # ---- NEW: inject execution learner adjustments ----
+        try:
+            from backend.skills.execution_learner import get_learner
+            learner = get_learner()
+            for meta in new_metas:
+                adjustments = learner.get_adaptive_priorities(meta.skill_id)
+                if adjustments:
+                    meta.dynamic_priority_adjustments = adjustments
+            logger.info(
+                "[SkillRegistry] 执行学习器: 注入 %d skills 的优先级调整",
+                sum(1 for m in new_metas if m.dynamic_priority_adjustments),
+            )
+        except Exception as e:
+            logger.debug("[SkillRegistry] 执行学习器加载跳过: %s", e)
+
         self._metas = new_metas
         self._skill_cache.clear()
         self._embeddings.clear()
