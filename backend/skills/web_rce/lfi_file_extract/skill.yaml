@@ -1,0 +1,77 @@
+skill_id: lfi_file_extract
+name: "LFI 敏感文件提取"
+category: web_rce
+phase: probe
+version: "1.0"
+
+match:
+  rules:
+    - variable_present: ["lfi_confirmed"]
+    - variable_present: ["lfi_param"]
+    - evidence_contains: ["sensitive file", "file read", "information disclosure"]
+      evidence_contains: ["LFI"]
+
+probes: []
+
+exploit_paths:
+  - path_id: lfi_extract_files
+    name: "LFI 批量提取敏感文件（不进行凭据破解，只提取和推送）"
+    priority: 1
+    conditions:
+      lfi_confirmed: true
+    on_success:
+      action: publish_event
+      event:
+        event_type: file_extracted
+        target_skill_ids: ["credential_replay", "credential_bruteforce", "log_poisoning"]
+        priority: 3
+        payload:
+          source: "lfi_file_extract"
+          shadow_readable: "{{shadow_readable}}"
+          ssh_key_found: "{{ssh_key_found}}"
+          auth_log_readable: "{{auth_log_readable}}"
+          apache_log_readable: "{{apache_log_readable}}"
+          readable_files: "{{readable_files_list}}"
+          has_known_creds: "{{has_known_creds}}"
+    steps:
+      - id: read_passwd_confirm
+        description: "验证目录遍历 — 读取 /etc/passwd 确认参数和深度"
+        command: "bash {skill_dir}/scripts/exploit_read_passwd.sh {ENDPOINT}"
+        timeout: 60
+        success_criteria:
+          stdout_regex: "^[a-z_][a-z0-9_-]*:x?:[0-9]+:[0-9]+:[^:]*:/(root|home|bin|sbin|usr|var|nonexistent)"
+        on_success: read_high_value_files
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "file_read"
+
+      - id: read_high_value_files
+        description: "深度探测 — 批量读取敏感文件（shadow/SSH密钥/日志/配置）"
+        command: "bash {skill_dir}/scripts/exploit_read_high_value.sh {ENDPOINT}"
+        timeout: 120
+        success_criteria:
+          stdout_not_empty: true
+        on_success: enumerate_user_files
+        on_fail: enumerate_user_files
+        evidence_capture:
+          shell_type: "file_read"
+
+      - id: enumerate_user_files
+        description: "枚举用户目录文件 — 读取 bash_history / .ssh / 配置文件"
+        command: "bash {skill_dir}/scripts/enumerate_files.sh {ENDPOINT}"
+        timeout: 90
+        success_criteria:
+          stdout_contains_any: ["LFI_ENUM_OK", "READABLE"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "file_read"
+
+  - path_id: llm_freeform
+    name: "LLM 自由推理"
+    priority: 99
+    mode: react_freeform
+    max_rounds: 5
+
+remediation: |
+  限制 open_basedir 和文件访问权限

@@ -1,0 +1,108 @@
+skill_id: lfi_detect
+name: "LFI 探测"
+category: web_rce
+phase: probe
+version: "1.0"
+
+match:
+  rules:
+    - evidence_contains: ["file inclusion"]
+    - evidence_contains: ["LFI"]
+    - evidence_contains: ["path traversal"]
+    - evidence_contains: ["directory traversal"]
+    - fingerprint_contains: ["php"]
+      evidence_contains: ["include"]
+  exclude:
+    - variable_present: ["lfi_confirmed"]
+
+probes:
+  - id: detect_lfi
+    description: "三层策略探测 LFI: 绝对路径 -> 相对路径深度遍历 -> 编码绕过"
+    skip_if:
+      variable_present: "lfi_depth"
+    command: "bash {skill_dir}/scripts/detect_lfi.sh {ENDPOINT}"
+    timeout: 120
+    parse_rules:
+      - if_regex: "LFI_FOUND:(\\w+):(\\d+):absolute"
+        set: { lfi_confirmed: true, lfi_type: "absolute", lfi_param: "$1", lfi_depth: "0", lfi_style: "absolute" }
+      - if_regex: "LFI_FOUND:(\\w+):(\\d+):relative"
+        set: { lfi_confirmed: true, lfi_type: "param", lfi_param: "$1", lfi_depth: "$2", lfi_style: "relative" }
+      - if_regex: "LFI_FOUND:(\\w+):(\\d+):php_filter"
+        set: { lfi_confirmed: true, lfi_type: "filter", lfi_param: "$1", lfi_depth: "0", lfi_style: "php_filter" }
+      - if_regex: "LFI_PATH_FOUND:(.+?):(\\d+)"
+        set: { lfi_confirmed: true, lfi_type: "path", lfi_path: "$1", lfi_depth: "$2", lfi_style: "relative" }
+      - if_regex: "LFI_BYPASS_FOUND:(\\w+):(\\d+):(.+)"
+        set: { lfi_confirmed: true, lfi_type: "bypass", lfi_param: "$1", lfi_depth: "$2", lfi_bypass: "$3", lfi_style: "bypass" }
+      - if_regex: "LFI_MOUNT:(.+)"
+        set: { lfi_mount: "$1" }
+
+  - id: detect_blind_lfi
+    description: "Blind LFI 响应差异探测"
+    skip_if:
+      variable_present: "lfi_confirmed"
+    depends_on:
+      any_of:
+        - variable_present: "LFI_NOT_FOUND"
+    command: "bash {skill_dir}/scripts/detect_blind_lfi.sh {ENDPOINT}"
+    timeout: 120
+    parse_rules:
+      - if_regex: "BLIND_LFI_HIT:(\\d+)"
+        set: { lfi_confirmed: true, lfi_type: "blind", lfi_param: "auto", lfi_depth: "0", lfi_style: "blind", blind_lfi_count: "$1" }
+
+  - id: enumerate_files
+    description: "利用已确认的 LFI 读取高价值文件"
+    depends_on: { lfi_confirmed: true }
+    command: "bash {skill_dir}/scripts/enumerate_files.sh {ENDPOINT}"
+    timeout: 90
+    parse_rules:
+      - if_contains: ["READABLE:/var/log/auth.log"]
+        set: { auth_log_readable: true }
+      - if_contains: ["READABLE:/var/log/apache2/access.log"]
+        set: { apache_log_readable: true }
+      - if_contains: ["READABLE:/var/log/nginx/access.log"]
+        set: { nginx_log_readable: true }
+      - if_contains: ["USER_FILE_READABLE"]
+        set: { user_files_found: true }
+      - if_contains: ["READABLE:/etc/shadow"]
+        set: { shadow_readable: true }
+      - if_contains: ["BEGIN RSA PRIVATE KEY", "BEGIN OPENSSH PRIVATE KEY"]
+        set: { ssh_key_found: true }
+
+exploit_paths:
+  - path_id: lfi_detect_done
+    name: "LFI 探测完成"
+    priority: 1
+    conditions:
+      any_of:
+        - lfi_confirmed: true
+        - variable_not_empty: "LFI_NOT_FOUND"
+    on_success:
+      action: publish_event
+      event:
+        event_type: lfi_confirmed
+        target_skill_ids: ["lfi_wrapper_rce", "lfi_file_extract", "lfi_filter_chain", "log_poisoning"]
+        priority: 3
+        payload:
+          lfi_param: "{{lfi_param}}"
+          lfi_depth: "{{lfi_depth}}"
+          lfi_style: "{{lfi_style}}"
+          shadow_readable: "{{shadow_readable}}"
+          ssh_key_found: "{{ssh_key_found}}"
+          auth_log_readable: "{{auth_log_readable}}"
+          apache_log_readable: "{{apache_log_readable}}"
+    steps:
+      - id: conclude_detect
+        description: "探测阶段完成，发布事件供下游 Skill 消费"
+        command: "echo 'LFI_PROBE_COMPLETE'"
+        timeout: 5
+        success_criteria:
+          stdout_contains_any: ["LFI_PROBE_COMPLETE"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "file_read"
+
+remediation: |
+  1. 禁止用户输入直接用于 include/require
+  2. 使用白名单限制可包含的文件
+  3. 设置 open_basedir 限制文件访问范围

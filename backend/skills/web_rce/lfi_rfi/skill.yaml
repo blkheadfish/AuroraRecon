@@ -21,7 +21,10 @@ selector:
   if:
     - condition: { rfi_confirmed: true }
       then_path: lfi_wrapper_rce
-    - condition: { ssh_key_found: true }
+    - condition:
+        all_of:
+          - ssh_key_found: true
+          - waf_detected: false
       then_path: lfi_cred_reuse
     - condition: { shadow_readable: true }
       then_path: lfi_cred_reuse
@@ -29,6 +32,11 @@ selector:
         all_of:
           - lfi_style: "php_filter"
       then_path: php_filter_chain
+    - condition:
+        all_of:
+          - variable_present: "waf_detected"
+          - variable_not_empty: "lfi_param"
+      then_path: lfi_wrapper_rce
     - condition:
         all_of:
           - variable_not_empty: "lfi_param"

