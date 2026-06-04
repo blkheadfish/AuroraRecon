@@ -421,6 +421,13 @@ _FALLBACK_TEMPLATE = """# 渗透测试报告
 | **最终权限** | {{ safe_val(state.privilege_level, "未获得") }} |
 | **授权说明** | {{ safe_val(state.scope_note, "未填写") }} |
 
+{% set narrative = get_rf(state, 'report_narrative', {}) %}
+{% if narrative and narrative.get('overall_risk') %}
+
+> **整体风险评级: {{ narrative.get('overall_risk', 'medium') | upper }}**
+>
+> {{ narrative.get('executive_summary', '') }}
+{% else %}
 
 {% set critical_count = state.findings | selectattr('severity','eq','critical') | list | length %}
 {% set high_count = state.findings | selectattr('severity','eq','high') | list | length %}
@@ -433,11 +440,30 @@ _FALLBACK_TEMPLATE = """# 渗透测试报告
 | critical | {{ critical_count }} |
 | high | {{ high_count }} |
 | medium | {{ medium_count }} |
+{% endif %}
 
 {% if state.got_shell %}
 > ✅ 已获得目标访问能力，当前权限：**{{ safe_val(state.privilege_level, "unknown") }}**
 {% else %}
 > ❌ 本次测试未获得目标交互式访问权限。
+{% endif %}
+
+
+{% if narrative and narrative.get('discovery') %}
+## 侦察与发现 (AI 分析)
+
+{{ narrative.get('discovery', '') }}
+
+{% endif %}
+{% if state.recon_hypotheses %}
+
+### 假说验证记录
+
+| 状态 | 假说 | 置信度 | 类别 | 验证轮次 |
+|------|------|--------|------|----------|
+{% for h in state.recon_hypotheses %}
+| {{ h.get('status', '?') }} | {{ table_text(h.get('hypothesis', ''), 60) }} | {{ h.get('confidence', 0) }} | {{ h.get('category', '') }} | {{ h.get('evidence_rounds', []) | length }} |
+{% endfor %}
 {% endif %}
 
 
@@ -451,28 +477,6 @@ _FALLBACK_TEMPLATE = """# 渗透测试报告
 **攻链总结：** {{ state.chain_summary }}
 {% endif %}
 
-{% if state.objective_status %}
-**目标完成度（objective_status）：**
-```json
-{{ pretty_json(state.objective_status) }}
-```
-{% endif %}
-
-{% if state.credential_store %}
-**凭据资产（credential_store）：**
-```json
-{{ pretty_json(state.credential_store) }}
-```
-{% endif %}
-
-{% if state.loot_store %}
-**战利品（loot_store）：**
-```json
-{{ pretty_json(state.loot_store) }}
-```
-{% endif %}
-
-
 
 | 端口 | 协议 | 服务 | 版本 |
 |------|------|------|------|
@@ -483,17 +487,25 @@ _FALLBACK_TEMPLATE = """# 渗透测试报告
 {% endfor %}
 
 {% if state.web_paths %}
+**发现路径 ({{ state.web_paths | length }} 条):**
 {% for path in state.web_paths %}
 - `{{ path }}`
 {% endfor %}
 {% endif %}
 
 {% if state.subdomains %}
+**子域名 ({{ state.subdomains | length }} 个):**
 {% for sub in state.subdomains %}
 - `{{ sub }}`
 {% endfor %}
 {% endif %}
 
+{% if narrative and narrative.get('verification') %}
+## 漏洞验证 (AI 分析)
+
+{{ narrative.get('verification', '') }}
+
+{% endif %}
 
 {% set real_vulns = [] %}
 {% set info_items = [] %}
@@ -506,16 +518,26 @@ _FALLBACK_TEMPLATE = """# 渗透测试报告
 {% endfor %}
 
 {% if real_vulns %}
+
+| 严重程度 | 名称 | CVE | 端口 | 可Exploit | 误报风险 | 状态 |
+|----------|------|-----|------|-----------|----------|------|
 {% for f in real_vulns %}
+| {{ sev_emoji(f.severity) }} {{ sev_label(f.severity) }} | {{ table_text(f.name, 45) }} | {{ f.cve or "N/A" }} | {{ safe_val(f.port, "-") }} | {{ "✅" if f.exploitable else "❌" }} | {{ (f.false_positive_likelihood * 100) | int }}% | {{ f.verification_status }} |
+{% endfor %}
+
+{% for f in real_vulns %}
+
+### {{ sev_emoji(f.severity) }} {{ f.name }}
 
 | 属性 | 值 |
 |------|-----|
-| **严重程度** | {{ sev_emoji(f.severity) }} {{ sev_label(f.severity) }} |
+| **严重程度** | {{ sev_label(f.severity) }} |
 | **CVSS** | {% if f.cvss_score %}{{ f.cvss_score }}{% endif %} |
-| **CWE** | {{ f.cwe or "N/A" }} |
 | **CVE** | {{ f.cve or "N/A" }} |
+| **CWE** | {{ f.cwe or "N/A" }} |
 | **目标** | `{{ safe_val(f.target, "-") }}` |
 | **端口** | {{ safe_val(f.port, "N/A") }} |
+| **误报可能性** | {{ (f.false_positive_likelihood * 100) | int }}% |
 | **发现工具** | {{ safe_val(f.tool, "unknown") }} |
 
 **描述：** {{ safe_val(f.description, "无") }}
@@ -550,6 +572,12 @@ _FALLBACK_TEMPLATE = """# 渗透测试报告
 </details>
 {% endif %}
 
+{% if narrative and narrative.get('exploitation') %}
+## 攻击链分析 (AI 分析)
+
+{{ narrative.get('exploitation', '') }}
+
+{% endif %}
 
 {% if state.exploit_results %}
 
@@ -625,7 +653,6 @@ _FALLBACK_TEMPLATE = """# 渗透测试报告
 {% endif %}
 
 {% if r.evidence %}
-
 {% set sections = split_evidence(r.evidence) %}
 {% for sec in sections %}
 **{{ sec.title }}：**
@@ -642,6 +669,30 @@ _FALLBACK_TEMPLATE = """# 渗透测试报告
 {% endif %}
 
 
+{% if state.credential_store %}
+**凭据资产 ({{ state.credential_store | length }} 条):**
+
+```json
+{{ pretty_json(state.credential_store) }}
+```
+{% endif %}
+
+{% if state.loot_store %}
+**战利品 ({{ state.loot_store | length }} 条):**
+
+```json
+{{ pretty_json(state.loot_store) }}
+```
+{% endif %}
+
+{% if state.attack_graph and state.attack_graph.nodes %}
+**攻击图:**
+
+```json
+{{ state.attack_graph.to_payload() | tojson(indent=2) if state.attack_graph.to_payload is callable else pretty_json(state.attack_graph.to_payload()) }}
+```
+{% endif %}
+
 {% if state.post_findings and state.post_findings.get('findings') %}
 {% for k, v in state.post_findings.get('findings', {}).items() %}
 **{{ k }}：**
@@ -653,6 +704,33 @@ _FALLBACK_TEMPLATE = """# 渗透测试报告
 无后渗透数据。
 {% endif %}
 
+
+{% set fix_checklist = get_rf(state, 'fix_checklist', []) %}
+{% if fix_checklist %}
+
+## 修复清单 (AI 生成)
+
+| 优先级 | 严重程度 | 漏洞 | 修复方法 | 验证步骤 |
+|--------|----------|------|----------|----------|
+{% for item in fix_checklist %}
+| **{{ item.get('priority', 'P2') }}** | {{ item.get('severity', 'medium') }} | {{ table_text(item.get('name', ''), 40) }} | {{ table_text(item.get('fix_method', ''), 50) }} | {{ table_text(item.get('verification', ''), 40) }} |
+{% endfor %}
+
+{% for item in fix_checklist %}
+
+### {{ item.get('priority', 'P2') }} - {{ item.get('name', '未命名') }}
+
+| 属性 | 值 |
+|------|-----|
+| **严重程度** | {{ item.get('severity', 'medium') }} |
+| **修复方法** | {{ item.get('fix_method', '请参照上方修复建议') }} |
+| **验证步骤** | {{ item.get('verification', '修复后重新扫描验证') }} |
+{% if item.get('notes') %}
+**备注:** {{ item.get('notes') }}
+{% endif %}
+
+{% endfor %}
+{% else %}
 
 {% set remediation_items = [] %}
 {% for f in state.findings %}
@@ -675,7 +753,16 @@ _FALLBACK_TEMPLATE = """# 渗透测试报告
 {% else %}
 当前未发现需要立即处置的高/中危漏洞，建议保持基线巡检与补丁更新节奏。
 {% endif %}
+{% endif %}
 
+
+{% if narrative and narrative.get('key_recommendations') %}
+## 关键建议
+
+{% for rec in narrative.get('key_recommendations', []) %}
+{{ loop.index }}. {{ rec }}
+{% endfor %}
+{% endif %}
 
 ```text
 {% for entry in (state.filtered_log[-200:] if state.filtered_log else (state.phase_log[-200:] if state.phase_log else [])) %}
@@ -738,6 +825,9 @@ class ReportGenerator:
         self._env.globals["safe_val"] = safe_val
         self._env.globals["default_remediation"] = _default_remediation
         self._env.globals["default_impact"] = _default_impact
+        self._env.globals["get_rf"] = lambda state, key, default=None: (
+            (state.runtime_facts or {}).get(key, default)
+        )
 
     async def generate(self, state) -> tuple[str, str]:
         template_text = _load_template()

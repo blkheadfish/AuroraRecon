@@ -321,6 +321,8 @@ class SkillRegistry:
                 parts.append(rule.service_is)
             if rule.evidence_contains:
                 parts.append(" ".join(rule.evidence_contains))
+            if rule.evidence_keywords:
+                parts.append(" ".join(rule.evidence_keywords))
         return " ".join(filter(None, parts))
 
     async def precompute_embeddings(self) -> None:
@@ -718,6 +720,19 @@ class SkillRegistry:
             if rule.evidence_contains:
                 if any(kw.lower() in ev_lower for kw in rule.evidence_contains):
                     rule_score += 10
+
+            if rule.evidence_regex:
+                import re as _re
+                if any(_re.search(pattern, evidence, _re.IGNORECASE)
+                       for pattern in rule.evidence_regex):
+                    rule_score += 15
+
+            if rule.evidence_keywords:
+                from backend.skills.models import MatchRule
+                ev_tokens = MatchRule._tokenize(evidence)
+                if any(MatchRule._tokens_match(ev_tokens, MatchRule._tokenize(kw))
+                       for kw in rule.evidence_keywords):
+                    rule_score += 12
 
             if rule.port_is and finding.port:
                 if finding.port in rule.port_is:

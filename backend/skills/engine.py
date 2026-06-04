@@ -252,6 +252,20 @@ class SkillEngine:
         if known_passwords or known_users:
             ctx.variables.setdefault("has_known_creds", True)
 
+        # ---- NEW: inject references into context for deterministic paths ----
+        if skill.references:
+            ctx.variables.setdefault("has_references", True)
+            ctx.variables.setdefault("reference_count", str(len(skill.references)))
+            ctx.variables.setdefault("reference_files", ", ".join(skill.references.keys()))
+            # inject key reference content (truncated) as variables
+            for filename, content in skill.references.items():
+                base_name = filename.replace(".md", "").replace("-", "_").replace(" ", "_")
+                var_name = f"ref_{base_name}"
+                ctx.variables.setdefault(var_name, content[:3000])
+            logger.debug(
+                f"[SkillEngine] 注入 {len(skill.references)} 个 references 到上下文"
+            )
+
         logger.info(
             f"[SkillEngine] 开始执行 Skill: {skill.skill_id} "
             f"→ {target_url} (can_reverse={env_can_reverse})"
@@ -665,6 +679,50 @@ class SkillEngine:
             if success:
                 outcome = step.on_success
             else:
+                # ---- NEW: adaptive retry ----
+                retry_cfg = step.retry if hasattr(step, "retry") else None
+                retry_key = f"_retry_{step.id}"
+                retry_count = int(ctx.variables.get(retry_key, 0))
+                should_retry = False
+
+                if retry_cfg and retry_cfg.max_retries > 0 and retry_count < retry_cfg.max_retries:
+                    hint = retry_cfg.partial_success_hint
+                    combined = f"{exec_result.stdout} {exec_result.stderr}"
+                    if not hint or hint.lower() in combined.lower():
+                        # adjust parameter
+                        param = retry_cfg.adjust_param
+                        if param and param in ctx.variables:
+                            try:
+                                current_val = int(ctx.variables[param])
+                                amount = retry_cfg.adjust_amount
+                                direction = retry_cfg.adjust_direction
+                                if direction == "increment":
+                                    ctx.variables[param] = str(current_val + amount)
+                                elif direction == "decrement":
+                                    ctx.variables[param] = str(max(0, current_val - amount))
+                                elif direction == "both":
+                                    alt_key = f"{retry_key}_dir"
+                                    direction_flag = ctx.variables.get(alt_key, "inc")
+                                    if direction_flag == "inc":
+                                        ctx.variables[param] = str(current_val + amount)
+                                        ctx.variables[alt_key] = "dec"
+                                    else:
+                                        ctx.variables[param] = str(max(0, current_val - amount))
+                                        ctx.variables[alt_key] = "inc"
+                                else:
+                                    ctx.variables[param] = str(current_val + amount)
+                            except (ValueError, TypeError):
+                                pass
+                        ctx.variables[retry_key] = str(retry_count + 1)
+                        should_retry = True
+                        logger.info(
+                            f"[SkillEngine] 🔄 自适应重试 {step.id} "
+                            f"(#{retry_count + 1}/{retry_cfg.max_retries}), "
+                            f"调整 {retry_cfg.adjust_param}={ctx.variables.get(retry_cfg.adjust_param)}"
+                        )
+
+                if should_retry:
+                    continue  # re-execute same step with adjusted params
                 outcome = step.on_fail
 
             if outcome == "conclude_success":

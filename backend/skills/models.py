@@ -129,6 +129,15 @@ class SkillEvent:
         return result
 
 
+@dataclass
+class RetryConfig:
+    max_retries: int = 0
+    adjust_param: str = ""
+    adjust_amount: int = 1
+    adjust_direction: str = "increment"
+    partial_success_hint: str = ""
+
+
 # ============================================================
 # 结构化探测结果（替代字符串正则 IPC）
 # ============================================================
@@ -450,6 +459,8 @@ class ExploitStep:
 
     evidence_capture: dict[str, str] = field(default_factory=dict)
 
+    retry: RetryConfig = field(default_factory=RetryConfig)
+
 
 @dataclass
 class ExploitPath:
@@ -486,11 +497,23 @@ class MatchRule:
     fingerprint_contains: list[str] = field(default_factory=list)
     cve_matches: list[str] = field(default_factory=list)
     evidence_contains: list[str] = field(default_factory=list)
+    evidence_regex: list[str] = field(default_factory=list)
+    evidence_keywords: list[str] = field(default_factory=list)
     json_probe_result: str = ""
     service_is: str = ""
     port_is: list[int] = field(default_factory=list)
     tool_is: str = ""
     variable_present: list[str] = field(default_factory=list)
+
+    @staticmethod
+    def _tokenize(text: str) -> set[str]:
+        return set(re.findall(r'[a-z0-9]{2,}', text.lower()))
+
+    @staticmethod
+    def _tokens_match(evidence_tokens: set[str], keyword_tokens: set[str]) -> bool:
+        if not keyword_tokens:
+            return False
+        return keyword_tokens.issubset(evidence_tokens)
 
     def matches(
         self,
@@ -522,6 +545,20 @@ class MatchRule:
         if self.evidence_contains:
             checks.append(
                 any(kw.lower() in ev_lower for kw in self.evidence_contains)
+            )
+
+        if self.evidence_regex:
+            checks.append(
+                any(re.search(pattern, evidence, re.IGNORECASE) for pattern in self.evidence_regex)
+            )
+
+        if self.evidence_keywords:
+            ev_tokens = self._tokenize(evidence)
+            checks.append(
+                any(
+                    self._tokens_match(ev_tokens, self._tokenize(kw))
+                    for kw in self.evidence_keywords
+                )
             )
 
         if self.json_probe_result:
