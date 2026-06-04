@@ -278,6 +278,40 @@ async def _handle_graph_interrupt(task_id: str, state: PentestState) -> bool:
 
 
 
+async def _liveness_heartbeat(task_id: str, started: float, interval: float = 1.5):
+    """长节点期间每 ~interval 秒推送精简 phase_update (liveness)。
+
+    自建最小 payload, 不走 ws_phase_payload, 只含会变的少数字段
+    (phase/status/findings_count/got_shell/privilege_level/elapsed),
+    避免心跳把 chain_visited/attack_next_steps 等覆盖成空默认值。
+    推送失败绝不影响任务执行 (实时推送层永远不能让任务节点崩溃)。
+    """
+    sm = get_state_manager()
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            cur = sm.get(task_id)
+            if not cur:
+                continue
+            try:
+                await event_stream.publish(
+                    task_id, type="phase_update",
+                    payload={
+                        "phase": cur.current_phase,
+                        "status": cur.status.value,
+                        "findings_count": len(cur.findings),
+                        "got_shell": cur.got_shell,
+                        "privilege_level": cur.privilege_level,
+                        "elapsed": round(time.monotonic() - started, 1),
+                    },
+                    branch_id=cur.active_branch_id or "",
+                )
+            except Exception:
+                pass
+    except asyncio.CancelledError:
+        pass
+
+
 async def run_task(
     task_id: str,
     initial_state: PentestState,
@@ -325,6 +359,8 @@ async def run_task(
         set_task_loop(task_id, asyncio.get_running_loop())
     except RuntimeError:
         pass
+
+    _hb_task = asyncio.create_task(_liveness_heartbeat(task_id, time.monotonic()))
 
     is_owner = True
     try:
@@ -374,6 +410,11 @@ async def run_task(
             state.error_msg = str(e)
             await _maybe_save_db(task_id, state, force=True)
     finally:
+        _hb_task.cancel()
+        try:
+            await _hb_task
+        except asyncio.CancelledError:
+            pass
         sm.mark_stopped(task_id)
         is_owner = sm._bg_tasks.get(task_id) is my_task
         if is_owner:
@@ -457,6 +498,8 @@ async def resume_task(
     except RuntimeError:
         pass
 
+    _hb_task = asyncio.create_task(_liveness_heartbeat(task_id, time.monotonic()))
+
     is_owner = True
     try:
         async for node_name, raw_state in orchestrator.resume_stream(
@@ -496,6 +539,11 @@ async def resume_task(
             sm.set(task_id, state)
             await _maybe_save_db(task_id, state, force=True)
     finally:
+        _hb_task.cancel()
+        try:
+            await _hb_task
+        except asyncio.CancelledError:
+            pass
         sm.mark_stopped(task_id)
         sm.clear_approval_inflight(task_id)
         is_owner = sm._bg_tasks.get(task_id) is my_task

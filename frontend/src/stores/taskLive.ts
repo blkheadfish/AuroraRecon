@@ -516,53 +516,42 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
 
   // ── phase_update 实际应用（被节流器调用）────────────────
   function _applyPhaseUpdate(state: TaskLiveState, taskId: string, p: Record<string, unknown>) {
-    const patch = {
-      phase: String(p.phase || ''),
-      status: String(p.status || ''),
-      findings_count: Number(p.findings_count || 0),
-      got_shell: Boolean(p.got_shell),
-      privilege_level: String(p.privilege_level || ''),
-      foothold_status: String(p.foothold_status || ''),
-      chain_visited: (p.chain_visited || []) as string[],
-      secondary_elided: Boolean(p.secondary_elided),
-      attack_next_steps: (p.attack_next_steps || []) as { stage?: string; action?: string; priority?: number }[],
-      privesc_attempt_count: Number(p.privesc_attempt_count || 0),
-      branch_id: String(p.branch_id || ''),
-      attack_graph: p.attack_graph as TaskDetail['attack_graph'] | undefined,
-      chain_template: p.chain_template as TaskDetail['chain_template'] | undefined,
-    }
+    // 仅赋值 payload 里真实出现的 key, 缺失的一律保留 state.task 原值。
+    // 这样精简的 liveness 心跳 (只含 phase/status/... 少数字段) 不会把
+    // chain_visited / attack_next_steps / foothold_status 等覆盖成空默认值。
+    const has = (k: string) => p[k] !== undefined
 
-    const updateBid = patch.branch_id
+    const updateBid = has('branch_id') ? String(p.branch_id) : ''
     const sameBranch = !updateBid || !state.activeBranchId || updateBid === state.activeBranchId
     if (!sameBranch) return
 
-    taskListStore.upsertTask({
-      task_id: taskId,
-      current_phase: patch.phase,
-      status: patch.status as TaskDetail['status'],
-      findings_count: patch.findings_count,
-      got_shell: patch.got_shell,
-    })
-    if (state.task && patch.phase) {
+    const phase = has('phase') ? String(p.phase) : ''
+
+    const listPatch: Partial<TaskDetail> & { task_id: string } = { task_id: taskId }
+    if (has('phase')) listPatch.current_phase = phase
+    if (has('status')) listPatch.status = String(p.status) as TaskDetail['status']
+    if (has('findings_count')) listPatch.findings_count = Number(p.findings_count)
+    if (has('got_shell')) listPatch.got_shell = Boolean(p.got_shell)
+    taskListStore.upsertTask(listPatch)
+
+    if (state.task && phase) {
       const prevPhase = state.task.current_phase
-      state.task = {
-        ...state.task,
-        current_phase: patch.phase,
-        status: (patch.status as TaskDetail['status']) ?? state.task.status,
-        got_shell: patch.got_shell ?? state.task.got_shell,
-        privilege_level: patch.privilege_level ?? state.task.privilege_level,
-        foothold_status: patch.foothold_status ?? state.task.foothold_status,
-        chain_visited: patch.chain_visited ?? state.task.chain_visited,
-        secondary_elided: patch.secondary_elided ?? state.task.secondary_elided,
-        attack_next_steps: patch.attack_next_steps ?? state.task.attack_next_steps,
-        privesc_attempt_count: patch.privesc_attempt_count ?? state.task.privesc_attempt_count,
-        attack_graph: (patch.attack_graph as TaskDetail['attack_graph']) ?? state.task.attack_graph,
-        chain_template: (patch.chain_template as TaskDetail['chain_template']) ?? state.task.chain_template,
-      }
-      if (prevPhase !== 'awaiting_approval' && patch.phase === 'awaiting_approval') {
+      const t: TaskDetail = { ...state.task, current_phase: phase }
+      if (has('status')) t.status = String(p.status) as TaskDetail['status']
+      if (has('got_shell')) t.got_shell = Boolean(p.got_shell)
+      if (has('privilege_level')) t.privilege_level = String(p.privilege_level)
+      if (has('foothold_status')) t.foothold_status = String(p.foothold_status)
+      if (has('chain_visited')) t.chain_visited = p.chain_visited as string[]
+      if (has('secondary_elided')) t.secondary_elided = Boolean(p.secondary_elided)
+      if (has('attack_next_steps')) t.attack_next_steps = p.attack_next_steps as { stage?: string; action?: string; priority?: number }[]
+      if (has('privesc_attempt_count')) t.privesc_attempt_count = Number(p.privesc_attempt_count)
+      if (has('attack_graph')) t.attack_graph = p.attack_graph as TaskDetail['attack_graph']
+      if (has('chain_template')) t.chain_template = p.chain_template as TaskDetail['chain_template']
+      state.task = t
+      if (prevPhase !== 'awaiting_approval' && phase === 'awaiting_approval') {
         state.approvalState = 'idle'
       }
-      if (prevPhase === 'awaiting_approval' && patch.phase !== 'awaiting_approval') {
+      if (prevPhase === 'awaiting_approval' && phase !== 'awaiting_approval') {
         state.approvalState = 'idle'
         const removed = new Set<string>()
         state.decisionEvents = state.decisionEvents.filter((ev) => {
