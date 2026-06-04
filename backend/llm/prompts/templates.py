@@ -1028,6 +1028,74 @@ HTTP 状态码: {status_code}
   "new_paths": ["从文件内容中发现的新 URL 路径"]
 }}"""
 
+
+REPORT_GENERATION = """你是一名拥有 10 年经验的高级渗透测试工程师。请基于以下完整证据链，生成一份结构化的渗透测试报告。
+
+【目标信息】
+- 目标: {target}
+- 操作系统: {target_os}
+- 工作模式: {workflow_mode}
+- 最终权限: {privilege_level}
+
+{evidence_chain}
+
+【报告要求 — 五段式结构】
+
+## 1. 执行摘要 (Executive Summary)
+- 2-3句话总结本次测试的整体风险等级和关键发现
+- 用非技术语言描述业务影响
+- 包含关键数据: 漏洞数量、成功利用数、权限等级
+
+## 2. 侦察与发现 (Discovery)
+- 目标暴露的攻击面（端口、服务、指纹）
+- 假设验证过程（recon_hypotheses 中已确认/证伪的假设）
+- 关键发现：技术栈、版本信息、配置暴露
+
+## 3. 漏洞验证 (Verification)
+- 按严重等级分组列出确认的漏洞
+- 对每个漏洞说明：检测方法、证据、是否可利用
+- 标注误报可能性（false_positive_likelihood）
+- 区分"已利用成功"和"待验证"
+
+## 4. 攻击链与利用 (Exploitation)
+- 从初始立足点到最终权限的完整链路
+- 每一步使用的工具和技术
+- 成功获取的凭据和资产
+- 未成功的路径及原因
+
+## 5. 影响与修复建议 (Impact & Remediation)
+- 按优先级排列的修复 checklist（每个项目标注: 漏洞名称、严重等级、修复方法、验证步骤、优先级 P0-P3）
+- P0: 立即修复（严重漏洞已成功利用）
+- P1: 本周内修复（高危可被利用）
+- P2: 本月内修复（中危）
+- P3: 下次迭代修复（低危/信息）
+
+返回 JSON（不含代码块）:
+{{
+  "executive_summary": "面向管理层的 2-3 句摘要",
+  "discovery_narrative": "侦察发现部分的详细叙述 (Markdown)",
+  "verification_narrative": "漏洞验证部分的详细叙述 (Markdown)",
+  "exploitation_narrative": "攻击链部分的详细叙述 (Markdown)",
+  "fix_checklist": [
+    {{
+      "name": "漏洞名称",
+      "severity": "critical/high/medium/low",
+      "fix_method": "具体修复步骤",
+      "verification": "如何验证修复生效",
+      "priority": "P0/P1/P2/P3",
+      "notes": "补充说明"
+    }}
+  ],
+  "overall_risk": "critical/high/medium/low",
+  "key_recommendations": ["总建议1", "总建议2", "总建议3"]
+}}
+
+约束:
+- 每个部分必须基于提供的证据链，不得凭空推测
+- fix_checklist 至少包含 3 项，按优先级排列
+- 已成功利用的漏洞（got_shell=true）优先级必须为 P0"""
+
+
 PAGE_SOURCE_AUDIT = """你是一名资深渗透测试工程师，正在对目标 Web 页面进行源码审计。
 你的任务是分析 HTML/JavaScript 源码，找出所有可能存在漏洞的用户输入点。
 

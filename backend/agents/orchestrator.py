@@ -3176,7 +3176,23 @@ async def node_report(state: PentestState) -> PentestState:
 
     _build_attack_timeline(state)
 
-    state.executive_summary = _build_executive_summary(state)
+    evidence_chain = _build_evidence_chain(state)
+
+    report_narrative = await _llm_generate_report(state, evidence_chain)
+    if report_narrative:
+        state.executive_summary = report_narrative.get(
+            "executive_summary", _build_executive_summary(state)
+        )
+        state.runtime_facts["report_narrative"] = {
+            "discovery": report_narrative.get("discovery_narrative", ""),
+            "verification": report_narrative.get("verification_narrative", ""),
+            "exploitation": report_narrative.get("exploitation_narrative", ""),
+            "overall_risk": report_narrative.get("overall_risk", ""),
+            "key_recommendations": report_narrative.get("key_recommendations", []),
+        }
+        state.runtime_facts["fix_checklist"] = report_narrative.get("fix_checklist", [])
+    else:
+        state.executive_summary = _build_executive_summary(state)
 
     state.filtered_log = _filter_phase_log(state.phase_log)
 
@@ -3204,6 +3220,103 @@ async def node_report(state: PentestState) -> PentestState:
         except Exception:
             pass
     return state
+
+
+def _build_evidence_chain(state: PentestState) -> str:
+    """Collect all evidence sources into a structured text block for LLM."""
+    parts: list[str] = []
+
+    parts.append("=== 攻击时间线 ===")
+    for entry in (state.attack_timeline or [])[:20]:
+        parts.append(f"  {entry.get('phase', '?')}: {entry.get('summary', '')}")
+
+    parts.append("\n=== 假说验证记录 ===")
+    if state.recon_hypotheses:
+        for h in state.recon_hypotheses:
+            parts.append(
+                f"  [{h.get('status', '?')}] {h.get('hypothesis', '')} "
+                f"(conf={h.get('confidence', 0):.2f}, category={h.get('category', '')})"
+            )
+            for ev in h.get("evidence_rounds", []):
+                parts.append(f"    R{ev.get('round', '?')}: {ev.get('evidence_summary', '')[:120]}")
+    else:
+        parts.append("  (无假设验证记录)")
+
+    parts.append("\n=== 漏洞发现 ===")
+    for f in (state.findings or [])[:30]:
+        parts.append(
+            f"  [{f.severity}] {f.name} (CVE={f.cve or '无'}, port={f.port or 'N/A'}, "
+            f"exploitable={f.exploitable}, fp_likelihood={f.false_positive_likelihood:.2f}, "
+            f"status={f.verification_status})"
+        )
+
+    parts.append("\n=== 利用结果 ===")
+    got_shell = state.got_shell
+    parts.append(f"  got_shell: {got_shell}")
+    parts.append(f"  privilege_level: {state.privilege_level or 'unknown'}")
+    parts.append(f"  foothold_status: {state.foothold_status}")
+    for r in (state.exploit_results or [])[:20]:
+        status_text = "成功" if r.success else "失败"
+        parts.append(
+            f"  [{status_text}] vuln_id={r.vuln_id} shell_type={r.shell_type} "
+            f"level={r.exploit_level} cmds_run={len(r.commands_run or [])}"
+        )
+
+    parts.append("\n=== 凭据资产 ===")
+    if state.credential_store:
+        for c in state.credential_store[:15]:
+            parts.append(f"  {json.dumps(c, ensure_ascii=False)[:200]}")
+    else:
+        parts.append("  (无)")
+
+    parts.append("\n=== 战利品 ===")
+    if state.loot_store:
+        for l in state.loot_store[:15]:
+            parts.append(f"  {json.dumps(l, ensure_ascii=False)[:200]}")
+    else:
+        parts.append("  (无)")
+
+    parts.append("\n=== 攻击图 ===")
+    ag = state.attack_graph
+    parts.append(f"  节点数: {len(ag.nodes)}, 边数: {len(ag.edges)}")
+    for n in ag.nodes[:20]:
+        parts.append(
+            f"  [{n.type}] {n.id}: {n.label} (by={n.discovered_by})"
+        )
+
+    parts.append("\n=== 关键事实 ===")
+    task_facts = state.task_facts or {}
+    for key, fact in list(task_facts.items())[:20]:
+        parts.append(
+            f"  {fact.fact_type}: {str(fact.value)[:150]} (source={fact.source})"
+        )
+
+    return "\n".join(parts)
+
+
+async def _llm_generate_report(state: PentestState, evidence_chain: str) -> dict | None:
+    """Call LLM to generate a structured report narrative from evidence."""
+    try:
+        from backend.llm.router import LLMRouter
+        from backend.llm.prompts.templates import REPORT_GENERATION
+
+        llm = LLMRouter()
+        prompt = REPORT_GENERATION.format(
+            target=state.target_host or state.target,
+            target_os=state.target_os,
+            workflow_mode=state.workflow_mode,
+            privilege_level=state.privilege_level or "unknown",
+            evidence_chain=evidence_chain[:12000],
+        )
+        response = await llm.chat(prompt, response_format="json", temperature=0.2, max_tokens=4096)
+        result = json.loads(response)
+        if "error" in result and "executive_summary" not in result:
+            logger.warning(f"[Report] LLM 报告生成返回错误: {result.get('error')}")
+            return None
+        return result
+    except Exception as e:
+        logger.warning(f"[Report] LLM 报告生成失败，使用默认模板: {e}")
+        return None
 
 
 def _build_attack_timeline(state: PentestState) -> None:
