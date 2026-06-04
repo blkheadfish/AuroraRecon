@@ -60,6 +60,12 @@
         已折叠 {{ hiddenCount }} 行历史日志，仅渲染最近 {{ MAX_VISIBLE_ROWS }} 行避免页面卡顿
       </div>
 
+      <div v-if="hasMoreReveal" class="log-reveal-more">
+        <el-button link size="small" class="action-btn" @click="revealMore">
+          加载更早 {{ nextRevealCount }} 行（剩余 {{ hiddenCount }}）
+        </el-button>
+      </div>
+
       <div
           v-for="(line, index) in displayLogs"
           :key="index"
@@ -118,8 +124,11 @@ const props = defineProps({
 const MAX_VISIBLE_ROWS = 800
 const KEY_EVENT_SCAN_TAIL = 600
 const TOOL_STREAM_TAIL = 200
+const REVEAL_STEP = 500
 
 const showAllRows = ref(false)
+// showAll 模式下渐进揭示的尾部行数, 起始即窗口大小, 每次「加载更早」+REVEAL_STEP。
+const revealCount = ref(MAX_VISIBLE_ROWS)
 
 const activeToolStreams = computed(() => {
   const result = []
@@ -139,15 +148,31 @@ const totalRows = computed(() => props.logs.length)
 
 const displayLogs = computed(() => {
   if (hidden.value) return []
-  if (showAllRows.value || props.logs.length <= MAX_VISIBLE_ROWS) {
-    return props.logs
-  }
+  if (showAllRows.value) return props.logs.slice(-revealCount.value)
+  if (props.logs.length <= MAX_VISIBLE_ROWS) return props.logs
   return props.logs.slice(-MAX_VISIBLE_ROWS)
 })
 
 const hiddenCount = computed(() =>
   Math.max(0, props.logs.length - displayLogs.value.length),
 )
+
+// showAll 下「还差多少更早行未揭示」与下一步揭示数量。
+const hasMoreReveal = computed(() => showAllRows.value && hiddenCount.value > 0)
+const nextRevealCount = computed(() => Math.min(REVEAL_STEP, hiddenCount.value))
+
+// 每次进入 showAll 都从窗口大小重新起步, 收起后再展开不会一次性铺满。
+watch(showAllRows, (v) => { if (v) revealCount.value = MAX_VISIBLE_ROWS })
+
+async function revealMore() {
+  const el = terminalRef.value
+  const prevHeight = el ? el.scrollHeight : 0
+  const prevTop = el ? el.scrollTop : 0
+  revealCount.value = Math.min(revealCount.value + REVEAL_STEP, props.logs.length)
+  await nextTick()
+  // 顶部插入更早行后补偿 scrollTop, 锚定视口避免跳动。
+  if (el) el.scrollTop = prevTop + (el.scrollHeight - prevHeight)
+}
 
 const keyEvents = computed(() => {
   const tail = props.logs.length > KEY_EVENT_SCAN_TAIL
@@ -357,6 +382,11 @@ function toggleHidden() {
   background: rgba(56, 139, 253, 0.06);
   border: 1px dashed rgba(56, 139, 253, 0.25);
   border-radius: 4px;
+}
+
+.log-reveal-more {
+  text-align: center;
+  padding: 4px 16px 8px;
 }
 
 .wait-text {
