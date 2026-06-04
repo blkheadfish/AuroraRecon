@@ -572,6 +572,35 @@ class ToolExecutor:
                 stdout_lines: list[str] = []
                 stderr_lines: list[str] = []
 
+                # 窗口合并: 累计 ~40 行或 ~120ms (先到为准) 合并成一次推送,
+                # 把高输出工具的逐行 log / tool_stream 事件压缩一个数量级。
+                # 逐行仍写入 buffer (供最终结果汇总), 仅推送频率被合并。
+                _MERGE_MAX_LINES = 40
+                _MERGE_MAX_SECONDS = 0.12
+                _pending_log: dict[str, list[str]] = {"stdout": [], "stderr": []}
+                _pending_text: dict[str, list[str]] = {"stdout": [], "stderr": []}
+                _pending_since: dict[str, float] = {"stdout": 0.0, "stderr": 0.0}
+
+                async def _flush(kind: str):
+                    log_batch = _pending_log[kind]
+                    text_batch = _pending_text[kind]
+                    if not log_batch and not text_batch:
+                        return
+                    if log_callback and log_batch:
+                        try: await log_callback("\n".join(log_batch))
+                        except Exception: pass
+                    if stream_callback and text_batch:
+                        try:
+                            await stream_callback({
+                                "tool": tool, "display_tool": display_tool,
+                                "kind": kind, "line": "\n".join(text_batch),
+                                "stream_id": stream_id,
+                            })
+                        except Exception: pass
+                    _pending_log[kind] = []
+                    _pending_text[kind] = []
+                    _pending_since[kind] = 0.0
+
                 async def _pump(stream, kind: str, buffer: list[str]):
                     while True:
                         line = await stream.readline()
@@ -579,17 +608,18 @@ class ToolExecutor:
                             break
                         text = line.decode("utf-8", errors="replace").rstrip("\n")
                         buffer.append(text)
+                        if not _pending_log[kind] and not _pending_text[kind]:
+                            _pending_since[kind] = time.monotonic()
                         if log_callback:
-                            try: await log_callback(f"[{kind}] {text}")
-                            except Exception: pass
+                            _pending_log[kind].append(f"[{kind}] {text}")
                         if stream_callback:
-                            try:
-                                await stream_callback({
-                                    "tool": tool, "display_tool": display_tool,
-                                    "kind": kind, "line": text,
-                                    "stream_id": stream_id,
-                                })
-                            except Exception: pass
+                            _pending_text[kind].append(text)
+                        pend = max(len(_pending_log[kind]), len(_pending_text[kind]))
+                        if (pend >= _MERGE_MAX_LINES
+                                or time.monotonic() - _pending_since[kind] >= _MERGE_MAX_SECONDS):
+                            await _flush(kind)
+                    # 该流 EOF: flush 残留, 不丢尾部行
+                    await _flush(kind)
 
                 try:
                     await asyncio.wait_for(
@@ -603,6 +633,9 @@ class ToolExecutor:
                 except asyncio.TimeoutError:
                     proc.kill()
                     await proc.wait()
+                    # 超时: _pump 被取消, EOF flush 未执行, 这里补 flush 残留
+                    await _flush("stdout")
+                    await _flush("stderr")
                     elapsed = time.monotonic() - start
                     msg = f"⏰ {display_tool} 超时 ({timeout}s)"
                     logger.warning(f"[Executor] {msg}")
@@ -638,6 +671,14 @@ class ToolExecutor:
                         command=" ".join(cmd), tool_name=tool, backend=backend_label,
                         timed_out=True,
                     )
+                except Exception:
+                    # 其它流式异常: 先 flush 残留再抛给外层统一处理, 不丢尾部行
+                    try:
+                        await _flush("stdout")
+                        await _flush("stderr")
+                    except Exception:
+                        pass
+                    raise
 
                 stdout = "\n".join(stdout_lines)
                 stderr = "\n".join(stderr_lines)

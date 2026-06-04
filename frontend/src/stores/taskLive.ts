@@ -667,7 +667,8 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
       } else if (action === 'tool_stream') {
         const sid = (p.stream_id as string) || 'default'
         const line = (p.line as string) || ''
-        pushToolStreamLine(state, sid, line)
+        // 后端窗口合并后 line 可能是多行 \n 连接, 拆开保持每行一条渲染
+        for (const ln of line.split('\n')) pushToolStreamLine(state, sid, ln)
       } else {
         mergeDecisionEvents(state, [de])
         if (action === 'checkpoint_request') {
