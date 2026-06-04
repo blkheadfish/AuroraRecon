@@ -621,6 +621,7 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
 
     // ── 单条日志 (v2 log envelope) ────────────────────
     if (eventType === 'log') {
+      state.lastWsUpdate = Date.now()
       const p = (raw.payload || {}) as { line?: string; seq?: number }
       if (p.line) pushLog(state, p.line)
       if (typeof p.seq === 'number') {
@@ -633,6 +634,7 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
 
     // ── 决策事件 (v2 decision_event envelope) ─────────
     if (eventType === 'decision_event') {
+      state.lastWsUpdate = Date.now()
       const p = (raw.payload || {}) as Record<string, unknown>
       const de = {
         id: String(raw.id || ''),
