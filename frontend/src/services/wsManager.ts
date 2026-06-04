@@ -37,6 +37,40 @@ const channels = new Map<string, ChannelState>()
 const _frameBuffers = new Map<string, Record<string, unknown>[]>()
 let _frameRafId: number | null = null
 
+/** 低频兜底 flush 间隔: 隐藏态下 rAF 暂停, 防止帧缓冲无界增长。 */
+const SAFETY_FLUSH_MS = 250
+let _safetyFlushTimer: number | null = null
+
+/**
+ * 派发并清空当前所有 task 的帧缓冲 (复用 rAF 回调的派发逻辑)。
+ * flush 后立即清空 _frameBuffers, 因此前台 rAF 主路径与可见性 / 兜底
+ * 触发之间不会重复派发同一批事件。
+ */
+function flushFrameBuffers() {
+  if (_frameBuffers.size === 0) return
+  const buffers = new Map(_frameBuffers)
+  _frameBuffers.clear()
+  for (const [tid, events] of buffers) {
+    for (const ev of events) {
+      broadcast(tid, ev)
+    }
+  }
+}
+
+function _onVisibilityChange() {
+  // 切回前台: 立即派发隐藏期间堆积的帧, 避免 rAF 恢复时一次性突发卡顿。
+  if (typeof document !== 'undefined' && !document.hidden) {
+    flushFrameBuffers()
+  }
+}
+
+/** 注册可见性 flush + 低频兜底定时器 (幂等, 模块初始化与首个订阅时调用)。 */
+function _installBackgroundFlush() {
+  if (typeof document === 'undefined' || _safetyFlushTimer !== null) return
+  document.addEventListener('visibilitychange', _onVisibilityChange)
+  _safetyFlushTimer = window.setInterval(flushFrameBuffers, SAFETY_FLUSH_MS)
+}
+
 function _enqueueFrame(taskId: string, event: Record<string, unknown>) {
   if (!_frameBuffers.has(taskId)) {
     _frameBuffers.set(taskId, [])
@@ -45,16 +79,12 @@ function _enqueueFrame(taskId: string, event: Record<string, unknown>) {
   if (_frameRafId === null) {
     _frameRafId = requestAnimationFrame(() => {
       _frameRafId = null
-      const buffers = new Map(_frameBuffers)
-      _frameBuffers.clear()
-      for (const [tid, events] of buffers) {
-        for (const ev of events) {
-          broadcast(tid, ev)
-        }
-      }
+      flushFrameBuffers()
     })
   }
 }
+
+_installBackgroundFlush()
 
 /**
  * 激进退避数组: 前 4 次必须 < 5s, 覆盖 NAT 抖动 / LB 漂移;
@@ -240,6 +270,7 @@ export function subscribeTaskEvents(taskId: string, listener: Listener): () => v
       writeTimer: null,
     }
     channels.set(taskId, channel)
+    _installBackgroundFlush()
 
     // 立即连接 (首次无 afterId → 服务端返回最近 tail); 同时异步从
     // IndexedDB 恢复 lastEventId, 仅用于后续断线重连的增量回放。
@@ -288,4 +319,11 @@ export function closeAllTaskEventChannels() {
     _frameRafId = null
   }
   _frameBuffers.clear()
+  if (typeof document !== 'undefined') {
+    document.removeEventListener('visibilitychange', _onVisibilityChange)
+  }
+  if (_safetyFlushTimer !== null) {
+    window.clearInterval(_safetyFlushTimer)
+    _safetyFlushTimer = null
+  }
 }
