@@ -61,6 +61,34 @@ async def _save_db_fire_and_forget(state: PentestState):
 
 _redis_log_cursor: dict[str, int] = {}
 
+# per-task 攻击图签名 (node_count, edge_count): 仅当图发生增减时才单独推送
+# attack_graph 事件, 避免每个节点边界都重发整张图。
+_attack_graph_sig: dict[str, tuple[int, int]] = {}
+
+
+async def _maybe_publish_attack_graph(task_id: str, state: PentestState):
+    """仅当攻击图节点/边数量变化时单独推送 ``attack_graph`` 事件。
+
+    走与其它事件相同的 envelope 结构。推送失败绝不影响任务执行
+    (实时推送层永远不能让任务节点崩溃)。
+    """
+    try:
+        graph = getattr(state, "attack_graph", None)
+        if graph is None:
+            return
+        sig = (len(graph.nodes), len(graph.edges))
+        if _attack_graph_sig.get(task_id) == sig:
+            return
+        await event_stream.publish(
+            task_id,
+            type="attack_graph",
+            payload=graph.to_payload(),
+            branch_id=getattr(state, "active_branch_id", "") or "",
+        )
+        _attack_graph_sig[task_id] = sig
+    except Exception:
+        pass
+
 
 async def _cache_redis_incremental(task_id: str, state: PentestState):
     sm = get_state_manager()
@@ -327,6 +355,8 @@ async def run_task(
 
             await _maybe_save_db(task_id, state)
 
+            await _maybe_publish_attack_graph(task_id, state)
+
             payload = sm.ws_phase_payload(state, log_tail=5)
             await event_stream.publish(
                 task_id, type="phase_update",
@@ -381,6 +411,7 @@ async def run_task(
 
     _last_db_save.pop(task_id, None)
     _redis_log_cursor.pop(task_id, None)
+    _attack_graph_sig.pop(task_id, None)
     clear_task_sink(task_id)
     clear_log_sink(task_id)
     clear_task_loop(task_id)
@@ -445,6 +476,8 @@ async def resume_task(
             await _maybe_save_db(task_id, state)
             asyncio.create_task(_cache_redis_incremental(task_id, state))
 
+            await _maybe_publish_attack_graph(task_id, state)
+
             payload = sm.ws_phase_payload(state, log_tail=5)
             await event_stream.publish(
                 task_id, type="phase_update",
@@ -502,6 +535,7 @@ async def resume_task(
 
     _last_db_save.pop(task_id, None)
     _redis_log_cursor.pop(task_id, None)
+    _attack_graph_sig.pop(task_id, None)
     clear_task_sink(task_id)
     clear_log_sink(task_id)
     clear_task_loop(task_id)

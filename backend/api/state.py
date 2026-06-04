@@ -409,7 +409,6 @@ class TaskStateManager:
             "secondary_elided": state.secondary_elided,
             "attack_next_steps": state.attack_next_steps,
             "privesc_attempt_count": state.privesc_attempt_count,
-            "attack_graph": state.attack_graph.to_payload() if state.attack_graph else {"nodes": [], "edges": []},
             "chain_template": {
                 "id": getattr(state, "chain_template_id", "web"),
                 "pipeline_steps": pipeline_steps_for(getattr(state, "chain_template_id", "web")),

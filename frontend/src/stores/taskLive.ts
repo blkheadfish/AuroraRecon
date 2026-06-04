@@ -700,6 +700,16 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
       return
     }
 
+    // ── 攻击图增量更新 (v2 attack_graph envelope) ─────
+    // phase_update 不再携带 attack_graph, 改为仅在图节点/边变化时单独推送。
+    if (eventType === 'attack_graph') {
+      const p = (raw.payload || {}) as TaskDetail['attack_graph']
+      if (state.task && p) {
+        state.task = { ...state.task, attack_graph: p }
+      }
+      return
+    }
+
     // ── 等待审批 (v2 approval_required envelope) ──────
     if (eventType === 'approval_required') {
       state.lastWsUpdate = Date.now()
