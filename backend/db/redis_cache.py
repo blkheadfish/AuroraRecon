@@ -106,6 +106,18 @@ async def append_task_log(task_id: str, log_entry: str) -> None:
     await r.expire(_log_key(task_id), 86400)
 
 
+async def append_task_logs(task_id: str, entries: list[str]) -> None:
+    """批量追加多条日志到 Redis List（单次 pipeline，减少 RPUSH 往返）。"""
+    if not entries:
+        return
+    r = await get_redis()
+    key = _log_key(task_id)
+    pipe = r.pipeline()
+    pipe.rpush(key, *entries)
+    pipe.expire(key, 86400)
+    await pipe.execute()
+
+
 async def get_task_logs(task_id: str, start: int = 0, end: int = -1) -> list[str]:
     """获取任务日志（支持范围查询）"""
     r = await get_redis()

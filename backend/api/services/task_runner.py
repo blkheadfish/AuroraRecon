@@ -95,7 +95,7 @@ async def _cache_redis_incremental(task_id: str, state: PentestState):
     if not sm.redis_available:
         return
     try:
-        from backend.db.redis_cache import cache_task_state, append_task_log
+        from backend.db.redis_cache import cache_task_state, append_task_logs
         await cache_task_state(task_id, {
             "status": state.status.value,
             "current_phase": state.current_phase,
@@ -104,8 +104,8 @@ async def _cache_redis_incremental(task_id: str, state: PentestState):
         })
         prev_cursor = _redis_log_cursor.get(task_id, 0)
         new_logs = state.phase_log[prev_cursor:]
-        for log_entry in new_logs:
-            await append_task_log(task_id, log_entry)
+        if new_logs:
+            await append_task_logs(task_id, new_logs)
         _redis_log_cursor[task_id] = len(state.phase_log)
     except Exception:
         pass
