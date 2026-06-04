@@ -304,9 +304,7 @@ const decisionItems = computed(() => {
     })
   }
 
-  const liveDecisionEvents = Array.isArray(state.value?.decisionEvents) ? state.value.decisionEvents : []
-  const storedDecisionEvents = Array.isArray(task.value?.decision_events) ? task.value.decision_events : []
-  const structuredEvents = liveDecisionEvents.length ? liveDecisionEvents : storedDecisionEvents
+  const structuredEvents = Array.isArray(state.value?.decisionEvents) ? state.value.decisionEvents : []
   const SKIP_ACTIONS = new Set([
     'command_exec', 'tool_start', 'tool_result',
     'tool_coverage_report', 'tool_executed', 'tool_skipped',

@@ -673,14 +673,6 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
         } else if (action === 'checkpoint_resolved') {
           applyCheckpointResolved(state, de)
         }
-        if (state.task) {
-          state.task = {
-            ...state.task,
-            decision_events: state.decisionEvents.slice(),
-            pending_checkpoint: state.pendingCheckpoint,
-            checkpoint_history: state.checkpointHistory.slice(),
-          }
-        }
       }
       return
     }
