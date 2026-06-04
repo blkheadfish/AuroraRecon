@@ -545,6 +545,7 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
       if (has('secondary_elided')) t.secondary_elided = Boolean(p.secondary_elided)
       if (has('attack_next_steps')) t.attack_next_steps = p.attack_next_steps as { stage?: string; action?: string; priority?: number }[]
       if (has('privesc_attempt_count')) t.privesc_attempt_count = Number(p.privesc_attempt_count)
+      if (has('elapsed')) t.elapsed = Number(p.elapsed)
       if (has('attack_graph')) t.attack_graph = p.attack_graph as TaskDetail['attack_graph']
       if (has('chain_template')) t.chain_template = p.chain_template as TaskDetail['chain_template']
       state.task = t

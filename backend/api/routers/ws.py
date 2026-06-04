@@ -53,6 +53,7 @@ router = APIRouter()
 
 WS_HISTORY_DEFAULT = 1000
 WS_HISTORY_MAX = 5000
+WS_HISTORY_CHUNK = 200
 
 
 @router.websocket("/ws/{task_id}")
@@ -133,12 +134,9 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
             history = []
     else:
         try:
-            total = await event_stream.stream_length(task_id)
-            full = await event_stream.replay(task_id, after_id="0", count=WS_HISTORY_MAX)
-            history = full[-log_tail_param:] if full else []
-            del total
+            history = await event_stream.replay_tail(task_id, count=log_tail_param)
         except Exception as exc:
-            logger.warning(f"[WS] replay(initial tail) 失败: {exc}")
+            logger.warning(f"[WS] replay_tail(initial) 失败: {exc}")
             history = []
 
     last_id = history[-1]["id"] if history else (after_id or "$")
@@ -154,13 +152,17 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
         return
 
     if history:
-        if not await _send({
-            "type": "history",
-            "events": history,
-            "first_id": history[0]["id"],
-            "last_id": history[-1]["id"],
-        }):
-            return
+        overall_first = history[0]["id"]
+        overall_last = history[-1]["id"]
+        for i in range(0, len(history), WS_HISTORY_CHUNK):
+            chunk = history[i:i + WS_HISTORY_CHUNK]
+            if not await _send({
+                "type": "history",
+                "events": chunk,
+                "first_id": overall_first,
+                "last_id": overall_last,
+            }):
+                return
 
 
     if state and state.pending_checkpoint and not after_id:

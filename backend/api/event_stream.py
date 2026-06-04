@@ -276,6 +276,34 @@ async def replay(
     return out
 
 
+async def replay_tail(task_id: str, *, count: int = 1000) -> list[dict]:
+    """返回 Stream 尾部最后 ``count`` 条事件 (时间正序), 用于 WS 首连回放。
+
+    与 ``replay(after_id="0")[-count:]`` 语义等价, 但用 ``XREVRANGE COUNT n``
+    只读最后 n 条, 避免 ``XRANGE`` 全量再切片。结果反转为时间正序返回,
+    结构与 ``replay`` 一致 (list[dict], 每条含 id)。
+    """
+    if count <= 0:
+        return []
+    count = min(count, 5000)  # 与 replay 的上限一致
+    r = await _get_redis_or_none()
+    if r is not None:
+        try:
+            entries = await r.xrevrange(
+                _stream_key(task_id), max="+", min="-", count=count,
+            )
+            entries = list(reversed(entries))  # 降序 -> 时间正序
+            return [_decode_xrange_entry(eid, fields) for (eid, fields) in entries]
+        except Exception as exc:
+            logger.warning(
+                "[event_stream] XREVRANGE 失败, 退到本地 ring task=%s err=%s",
+                task_id, exc,
+            )
+
+    ring = list(_local_rings.get(task_id, ()))
+    return ring[-count:]
+
+
 def _decode_xrange_entry(stream_id, fields) -> dict:
     sid = stream_id.decode() if isinstance(stream_id, bytes) else str(stream_id)
     raw = fields.get("data") if isinstance(fields, dict) else None

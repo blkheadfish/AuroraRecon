@@ -14,6 +14,10 @@
         </div>
         <div class="title-actions" v-if="task">
           <StatusBadge :status="task.status" size="large" />
+          <span v-if="isRunning && elapsedSeconds > 0" class="elapsed-pill" title="本轮已运行时长">
+            <el-icon><Timer /></el-icon>
+            已运行 {{ elapsedText }}
+          </span>
           <el-button plain @click="router.push(`/tasks/${taskId}/chat`)">
             <el-icon><ChatDotRound /></el-icon>对话视图
           </el-button>
@@ -228,6 +232,38 @@ const logs = computed(() => state.value.logs || [])
 const findings = computed(() => task.value?.findings || [])
 const isRunning = computed(() => ['pending', 'running'].includes(task.value?.status || ''))
 const needsApproval = computed(() => task.value?.current_phase === 'awaiting_approval')
+
+// 「已运行 Xs」：后端 liveness 心跳每 ~1.5s 带来一次 elapsed(秒)，
+// 这里用本地 1s 计时器在两次心跳间插值，避免数字跳变/看起来卡死。
+const elapsedBaseSec = ref(0)
+const elapsedBaseAt = ref(0)
+const nowTick = ref(Date.now())
+const elapsedTimer = ref(null)
+watch(
+  () => task.value?.elapsed,
+  (val) => {
+    if (typeof val === 'number' && val >= 0) {
+      elapsedBaseSec.value = val
+      elapsedBaseAt.value = Date.now()
+    }
+  },
+  { immediate: true },
+)
+const elapsedSeconds = computed(() => {
+  if (!elapsedBaseAt.value) return task.value?.elapsed ?? 0
+  if (!isRunning.value) return elapsedBaseSec.value
+  const extra = (nowTick.value - elapsedBaseAt.value) / 1000
+  return elapsedBaseSec.value + Math.max(0, extra)
+})
+const elapsedText = computed(() => {
+  const total = Math.floor(elapsedSeconds.value)
+  if (total < 60) return `${total}s`
+  const m = Math.floor(total / 60)
+  const s = total % 60
+  if (m < 60) return `${m}m${String(s).padStart(2, '0')}s`
+  const h = Math.floor(m / 60)
+  return `${h}h${String(m % 60).padStart(2, '0')}m`
+})
 const approvalState = computed(() => state.value.approvalState)
 const approving = computed(() => approvalState.value === 'submitting')
 const showApprovalActions = computed(() => needsApproval.value && approvalState.value === 'idle')
@@ -588,6 +624,20 @@ function stopPolling() {
   }
 }
 
+function startElapsedTicker() {
+  stopElapsedTicker()
+  elapsedTimer.value = window.setInterval(() => {
+    if (isRunning.value) nowTick.value = Date.now()
+  }, 1000)
+}
+
+function stopElapsedTicker() {
+  if (elapsedTimer.value) {
+    window.clearInterval(elapsedTimer.value)
+    elapsedTimer.value = null
+  }
+}
+
 async function loadRawTask() {
   if (rawLoading.value) return
   rawLoading.value = true
@@ -615,6 +665,7 @@ onMounted(async () => {
     await liveStore.refreshTask(taskId)
     await liveStore.attach(taskId)
     startPolling()
+    startElapsedTicker()
     trackEvent('task.detail.open', { taskId })
   } finally {
     loading.value = false
@@ -623,6 +674,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   stopPolling()
+  stopElapsedTicker()
   liveStore.detach(taskId)
 })
 </script>
@@ -635,6 +687,8 @@ onUnmounted(() => {
 .target-title { color: var(--text-primary); font-size: 22px; font-weight: 700; font-family: var(--font-mono); }
 .task-id { margin-top: 6px; display: inline-block; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 2px 8px; color: var(--text-muted); font-size: 11px; font-family: var(--font-mono); }
 .title-actions { display: flex; gap: 8px; align-items: center; }
+.elapsed-pill { display: inline-flex; align-items: center; gap: 4px; padding: 3px 10px; border: 1px solid var(--border); border-radius: 999px; color: var(--text-muted); font-size: 12px; font-family: var(--font-mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.elapsed-pill .el-icon { font-size: 13px; }
 
 .summary-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-bottom: 12px; }
 .summary-card :deep(.el-card__body) { padding: 12px !important; }
