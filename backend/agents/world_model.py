@@ -245,3 +245,90 @@ class WorldModelQuery:
 		if a.get("exploited"):
 			score -= 10.0
 		return score
+
+
+class WorldModelWriter:
+	"""统一写入入口 (C2): 凡产生 host/service/finding/credential/session 处走它。
+
+	整合现有 fact_hooks.attach_*_to_graph, 保证写入幂等、同时建立边关系。
+	"""
+
+	def __init__(self, state: PentestState) -> None:
+		self._state = state
+
+	@property
+	def _g(self):
+		return self._state.attack_graph
+
+	def upsert_node(
+		self, type: str, key: str,
+		attrs: dict[str, Any] | None = None,
+		label: str = "",
+		discovered_by: str = "",
+	) -> str:
+		"""幂等: 同 key 的节点已存在则合并 attrs。"""
+		node_id = key
+		self._g.upsert_node(node_id, type=type, label=label or key,
+		                    attrs=attrs, discovered_by=discovered_by)
+		return node_id
+
+	def add_edge(
+		self, src_id: str, dst_id: str, relation: str,
+		attrs: dict[str, Any] | None = None,
+	) -> None:
+		self._g.add_edge(src_id, dst_id, relation=relation, attrs=attrs)
+
+	def add_finding(self, finding: Any) -> str:
+		"""高层封装: 建 finding 节点 + 与 service 的 vulnerable_to 边。"""
+		fid = f"finding:{finding.vuln_id}"
+		self.upsert_node(
+			"finding", fid,
+			attrs={
+				"cve": getattr(finding, "cve", "") or "",
+				"severity": getattr(finding, "severity", ""),
+				"exploitable": getattr(finding, "exploitable", False),
+				"exploited": False,
+				"tool": getattr(finding, "tool", ""),
+			},
+			label=getattr(finding, "name", "") or finding.vuln_id,
+		)
+		port = getattr(finding, "port", None)
+		if port:
+			host = ""
+			raw_target = getattr(finding, "target", "") or ""
+			if "://" in raw_target:
+				host = raw_target.split("/")[2].split(":")[0]
+			if not host:
+				host = raw_target.split(":")[0]
+			if host:
+				sid = f"svc:{host}:{port}"
+				self.add_edge(sid, fid, "vulnerable_to")
+		return fid
+
+	def add_credential(self, cred: dict[str, Any]) -> str:
+		"""高层封装: 建 credential 节点。"""
+		from backend.agents.fact_hooks import _ag_credential_id
+		cid = _ag_credential_id(cred)
+		self.upsert_node(
+			"credential", cid,
+			attrs={
+				"service": cred.get("service") or cred.get("source") or "",
+				"username": cred.get("user") or cred.get("username") or "",
+				"has_secret": bool(cred.get("value") or cred.get("password")),
+				"validated": cred.get("validated", False),
+			},
+			label=f"{cred.get('user') or '?'}@{cred.get('source') or '?'}",
+		)
+		return cid
+
+	def add_session(self, host: str, privilege: str, shell_type: str) -> str:
+		"""高层封装: 建 session 节点 + runs_on 边。"""
+		sid = f"session:{host}:{privilege}"
+		self.upsert_node(
+			"session", sid,
+			attrs={"host": host, "privilege": privilege, "shell_type": shell_type},
+			label=f"{privilege}@{host}",
+		)
+		host_id = f"host:{host}"
+		self.add_edge(sid, host_id, "runs_on")
+		return sid

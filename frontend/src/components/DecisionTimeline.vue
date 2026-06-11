@@ -18,28 +18,11 @@
             </div>
             <p class="desc">{{ item.desc }}</p>
 
-            <template v-if="item.action === 'thought'">
-              <div v-if="item.purpose" class="thought-meta">
-                <span class="meta-label">目标</span> {{ item.purpose }}
-              </div>
-              <div v-if="item.expected" class="thought-meta">
-                <span class="meta-label">预期</span> {{ item.expected }}
-              </div>
-              <div v-if="Array.isArray(item.plan) && item.plan.length" class="thought-plan">
-                <span class="meta-label">攻击计划</span>
-                <ol>
-                  <li v-for="(step, si) in item.plan" :key="si">{{ step }}</li>
-                </ol>
-              </div>
-              <details v-if="item.expandable" class="thought-expand">
-                <summary>展开完整推理</summary>
-                <pre class="thought-full">{{ item.thinking }}</pre>
-              </details>
-              <details v-if="item.reasoning" class="thought-expand reasoning-expand">
-                <summary>LLM Thinking (Chain-of-Thought)</summary>
-                <pre class="thought-full reasoning-full">{{ item.reasoning }}</pre>
-              </details>
-            </template>
+            <component
+              v-if="rendererFor(item.action)"
+              :is="rendererFor(item.action)"
+              :item="item"
+            />
 
             <slot name="card" :item="item" />
             <PayloadCodeBlock
@@ -77,9 +60,51 @@
 </template>
 
 <script setup>
-import { ref, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
+import { ref, watch, nextTick, onMounted, onBeforeUnmount, defineComponent, h } from 'vue'
 import { ArrowDown } from '@element-plus/icons-vue'
 import PayloadCodeBlock from '@/components/PayloadCodeBlock.vue'
+
+const DecisionThoughtRenderer = defineComponent({
+  name: 'DecisionThoughtRenderer',
+  props: { item: { type: Object, default: () => ({}) } },
+  setup(props) {
+    return () => [
+      props.item.purpose ? h('div', { class: 'thought-meta' }, [h('span', { class: 'meta-label' }, '目标'), ` ${props.item.purpose}`]) : null,
+      props.item.expected ? h('div', { class: 'thought-meta' }, [h('span', { class: 'meta-label' }, '预期'), ` ${props.item.expected}`]) : null,
+      Array.isArray(props.item.plan) && props.item.plan.length ? h('div', { class: 'thought-plan' }, [
+        h('span', { class: 'meta-label' }, '攻击计划'),
+        h('ol', props.item.plan.map((step: string, si: number) => h('li', { key: si }, step))),
+      ]) : null,
+      props.item.expandable ? h('details', { class: 'thought-expand' }, [
+        h('summary', '展开完整推理'),
+        h('pre', { class: 'thought-full' }, props.item.thinking),
+      ]) : null,
+      props.item.reasoning ? h('details', { class: 'thought-expand reasoning-expand' }, [
+        h('summary', 'LLM Thinking (Chain-of-Thought)'),
+        h('pre', { class: 'thought-full reasoning-full' }, props.item.reasoning),
+      ]) : null,
+    ]
+  },
+})
+
+const DemoRenderer = defineComponent({
+  name: 'DemoRenderer',
+  props: { item: { type: Object, default: () => ({}) } },
+  setup(props) {
+    return () => h('div', {
+      style: 'border:1px dashed #58b8e0; border-radius:6px; padding:8px 12px; margin:4px 0; font-size:12px; color:#58b8e0;',
+    }, props.item.message || '[demo] 渲染点验证')
+  },
+})
+
+const decisionRenderers: Record<string, ReturnType<typeof defineComponent>> = {
+  thought: DecisionThoughtRenderer,
+  __demo_event: DemoRenderer,
+}
+
+function rendererFor(action: string): ReturnType<typeof defineComponent> | null {
+  return decisionRenderers[action] || null
+}
 
 const props = defineProps({
   items: {
