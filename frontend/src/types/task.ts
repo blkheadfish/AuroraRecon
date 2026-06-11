@@ -67,9 +67,10 @@ export type TaskCreateResponse = TaskSummary | PendingConfirmationResponse
 
 export interface AttackGraphNode {
   id: string
-  type: 'host' | 'service' | 'finding' | 'credential' | 'foothold' | 'loot' | 'objective' | 'path'
+  type: string
   label?: string
   facts?: Record<string, unknown>
+  attrs?: Record<string, unknown>
   discovered_at?: string
   discovered_by?: string
 }
@@ -77,7 +78,8 @@ export interface AttackGraphNode {
 export interface AttackGraphEdge {
   src: string
   dst: string
-  relation: 'enables' | 'leads_to' | 'exposes' | 'consumes' | 'discovers'
+  relation: string
+  attrs?: Record<string, unknown>
   note?: string
 }
 
@@ -85,6 +87,45 @@ export interface AttackGraphPayload {
   nodes: AttackGraphNode[]
   edges: AttackGraphEdge[]
 }
+
+// ── 世界模型 (WS1 C7.5) ──────────────────────────────────
+
+export interface WMNode {
+  id: string
+  type: string
+  label: string
+  attrs: Record<string, unknown>
+}
+
+export interface WMEdge {
+  src: string
+  dst: string
+  relation: string
+  attrs?: Record<string, unknown>
+}
+
+export interface WorldModelUpdatePayload {
+  nodes_upserted: WMNode[]
+  edges_upserted: WMEdge[]
+  nodes_removed: string[]
+}
+
+export type DecisionAction =
+  | 'tool_start' | 'tool_result' | 'thought'
+  | 'checkpoint_request' | 'checkpoint_resolved'
+  | 'llm_delta' | 'operator_replan' | 'command_exec'
+  | 'supervisor_route' | 'approval_required' | 'approval'
+  | 'node_yielded_to_operator'
+  | 'world_model_update'           // WS1
+  | 'world_model_readout'          // WS1
+  | 'chain_selected'               // WS2
+  | 'target_selected'              // WS2
+  | 'reflection'                   // WS2
+  | 'hypothesis_test'              // WS2
+  | 'objective_path'               // WS2
+  | 'scene_classified'             // WS3
+  | 'prior_intel_loaded'           // WS4
+  | string
 
 export interface TaskDetail extends TaskSummary {
   findings?: Finding[]
