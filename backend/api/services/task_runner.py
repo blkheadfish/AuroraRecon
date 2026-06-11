@@ -376,6 +376,21 @@ async def run_task(
                 except Exception:
                     pass
 
+            from backend.agents.abort_registry import check_abort
+            if check_abort(task_id):
+                logger.warning(f"[API] 任务 {task_id} 收到 abort 信号，立即终止")
+                if isinstance(raw_state, dict):
+                    try:
+                        state = PentestState(**raw_state)
+                        state.status = TaskStatus.ABORTED
+                        state.log("任务被紧急停止 (abort)")
+                    except Exception:
+                        pass
+                else:
+                    state = raw_state
+                    state.status = TaskStatus.ABORTED
+                break
+
             if isinstance(raw_state, dict):
                 try:
                     state = PentestState(**raw_state)

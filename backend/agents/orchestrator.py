@@ -2366,6 +2366,8 @@ async def node_human_approval(state: PentestState) -> PentestState:
       节点会直接把 approved 置为 True 并跳过人工等待。实际跳过发生在
       `build_graph` 的 `interrupt_before` 动态判定里,本节点只负责记录日志与
       推进状态。
+    - 当 state.autonomy_level=="autonomous" 时,对可逆动作自动放行;
+      不可逆动作(persistence/lateral_movement/scope 扩张)仍触发 checkpoint。
     - 否则保持原行为:LangGraph 在本节点前中断,前端 /approve 设置 approved
       后再恢复执行。
 
@@ -2376,6 +2378,18 @@ async def node_human_approval(state: PentestState) -> PentestState:
     state.current_phase = "awaiting_approval"
     _record_chain_visit(state, "awaiting_approval")
     exploitable = [f for f in state.findings if f.exploitable]
+
+    if state.autonomy_level == "autonomous":
+        from backend.agents.irreversible_gate import is_irreversible
+        irrev, irrev_reason = is_irreversible(
+            action="exploit_approval",
+            phase=state.current_phase,
+        )
+        if irrev:
+            state.log(f"autonomous: 不可逆动作需审批 ({irrev_reason})")
+        else:
+            state.approved = True
+            state.log(f"autonomous: 可逆动作自动放行 (exploit_approval)")
 
     if state.approved_once and not state.approved:
         state.approved = True
@@ -2775,6 +2789,9 @@ async def node_post_foothold_approval(state: PentestState) -> PentestState:
 
     Uses ``post_approved`` (independent of the first-gate ``approved``) so that
     the two interrupt_before gates never interfere with each other.
+
+    When ``autonomy_level=="autonomous"``, auto-approves reversible actions;
+    irreversible actions still trigger checkpoint.
     """
     state.current_phase = "post_foothold_approval"
     _record_chain_visit(state, "post_foothold_approval")
@@ -2784,6 +2801,16 @@ async def node_post_foothold_approval(state: PentestState) -> PentestState:
         state.post_approved = False
         state.log(f"[Plan] {skip_plan_reason}")
         return state
+
+    if state.autonomy_level == "autonomous":
+        from backend.agents.irreversible_gate import is_irreversible
+        next_phase = "privesc_attempt"
+        irrev, irrev_reason = is_irreversible(phase=next_phase)
+        if irrev:
+            state.log(f"autonomous: 不可逆动作需审批 ({irrev_reason})")
+        else:
+            state.post_approved = True
+            state.log(f"autonomous: 可逆动作自动放行 (post_foothold)")
 
     if state.post_approved_once and not state.post_approved:
         state.post_approved = True

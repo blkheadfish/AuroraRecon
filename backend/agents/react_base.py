@@ -364,10 +364,12 @@ def check_command_safety(
     guard: Any = None,
     confirmed_facts: Optional[dict] = None,
     failed_commands: Optional[list[str]] = None,
+    scope: Optional[list[str]] = None,
 ) -> CommandSafetyResult:
     """
     统一的执行前置检查链：
 
+      0. ``scope check`` —— 越界命令立即拒绝（在 guard/dangerous/dedup 之前）
       1. ``Guard.evaluate()`` —— 基于已确认事实/已失败命令拦截
       2. ``is_dangerous_command()`` —— 兜底硬规则
       3. 重复命令去重（按归一化空白后的串）
@@ -380,6 +382,16 @@ def check_command_safety(
             allowed=False, code="empty",
             reason="你返回了 execute 但 command 为空。请生成一条具体的命令。",
         )
+
+    if scope:
+        from backend.agents.scope_guard import check_scope
+        in_scope, reason = check_scope(cmd, scope)
+        if not in_scope:
+            return CommandSafetyResult(
+                allowed=False,
+                code="out_of_scope",
+                reason=f"命令目标超出授权范围: {reason}",
+            )
 
     if guard is not None:
         try:

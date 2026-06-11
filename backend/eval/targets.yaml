@@ -1,0 +1,11 @@
+# Eval harness targets — define local, reproducible, authorised vulhub / lab targets.
+# Each entry is run by the harness; the harness auto-sets auto_approve=True for eval only.
+# Fields:
+#   id                        unique id for --only filter
+#   base_url                  target URI to test
+#   expect_phase_reached      []  at least one of these phase keys must be in phase_visit_count
+#   expect_finding_name_contains  []  at least one finding name must contain this substring
+#   expect_finding_cve        []  at least one finding must list one of these CVEs
+#   expect_exploit_success    bool  if true, at least one ExploitResult.success must be True
+#   timeout_sec               int   per-target timeout (default: 600)
+targets: []

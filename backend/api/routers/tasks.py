@@ -745,6 +745,37 @@ async def _push_initial_plan_event(
         logger.warning(f"[create_task] 推送初始策略事件失败: {exc}")
 
 
+def _derive_authorized_scope(state, safety_intent):
+    """从 parsed_intent.targets + scope_note 推导 authorized_scope，写入 state。
+
+    只进不出原则：运行期新发现 host 不自动并入 scope（并入走 W0-T5/WS2 审批）。
+    """
+    if not safety_intent:
+        return
+    scope_entries: list[str] = []
+    targets = getattr(safety_intent, "targets", None) or []
+    for t in targets:
+        target_str = ""
+        if isinstance(t, dict):
+            target_str = (t.get("host") or t.get("ip") or t.get("target") or "").strip()
+        elif isinstance(t, str):
+            target_str = t.strip()
+        if target_str:
+            scope_entries.append(target_str)
+    parsed = state.parsed_intent or {}
+    extra_targets = parsed.get("targets", []) or []
+    for t in extra_targets:
+        target_str = ""
+        if isinstance(t, dict):
+            target_str = (t.get("host") or t.get("ip") or t.get("target") or "").strip()
+        elif isinstance(t, str):
+            target_str = t.strip()
+        if target_str and target_str not in scope_entries:
+            scope_entries.append(target_str)
+    if state.target_host and state.target_host not in scope_entries:
+        scope_entries.append(state.target_host)
+    state.authorized_scope = scope_entries
+
 
 @router.post("/tasks", response_model=TaskCreateResponse)
 async def create_task(req: CreateTaskRequest, request: Request):
@@ -926,6 +957,7 @@ async def create_task(req: CreateTaskRequest, request: Request):
         state,
         overrides={
             "auto_approve":        req.auto_approve,
+            "autonomy_level":      req.autonomy_level,
             "success_gate_level":  req.success_gate_level,
             "risk_budget":         req.risk_budget,
             "max_react_rounds":    req.max_react_rounds,
@@ -934,6 +966,9 @@ async def create_task(req: CreateTaskRequest, request: Request):
             "skill_weak_boost":    req.skill_weak_boost,
         },
     )
+
+    _derive_authorized_scope(state, safety_intent)
+
     sm.set(task_id, state)
 
     if sm.db_available:
@@ -1280,6 +1315,44 @@ async def cancel_task(task_id: str, request: Request):
         branch_id=state.active_branch_id or "",
     )
     return {"status": "cancelled", "task_id": task_id}
+
+
+@router.post("/tasks/{task_id}/abort")
+async def abort_task(task_id: str, request: Request):
+    """紧急停止任务——立即清场停容器，区别于优雅 /cancel。"""
+    sm = _get_sm()
+    state = sm.get(task_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    _enforce_task_owner(state, request, "abort_task")
+    if state.status not in (TaskStatus.RUNNING, TaskStatus.PENDING, TaskStatus.WAITING_USER, TaskStatus.AWAITING_APPROVAL):
+        raise HTTPException(status_code=400, detail="任务不在运行/等待状态")
+
+    from backend.agents.abort_registry import request_abort
+    reason = "用户紧急停止"
+    request_abort(task_id, reason=reason)
+
+    state.status = TaskStatus.ABORTED
+    state.error_msg = reason
+    state.log(f"任务被紧急停止 (abort): {reason}")
+
+    sm.cancel_bg_task(task_id)
+    await _stop_task_container(task_id)
+
+    if sm.db_available:
+        try:
+            from backend.db.database import save_task
+            await save_task(state)
+        except Exception:
+            pass
+
+    sm.mark_stopped(task_id)
+    await event_stream.publish(
+        task_id, type="done",
+        payload={"status": "aborted", "message": reason},
+        branch_id=state.active_branch_id or "",
+    )
+    return {"status": "aborted", "task_id": task_id}
 
 
 @router.delete("/tasks/{task_id}")

@@ -128,16 +128,30 @@ class PentestSafetyGate:
     def check(self, intent: ParsedIntent,
               authorization_token: Optional[str] = None,
               user_id: str = "") -> SafetyCheckResult:
-        """执行安全校验。"""
+        """执行安全校验。
+
+        令牌存在时仍跑 _check_blocklist (云 metadata 段 / 政府段 /
+        超大 CIDR),令牌只豁免「公网 IP 无授权」这一条 warning。
+        """
         if authorization_token:
+            blocked, block_reason = self._check_blocklist(intent)
+            if blocked:
+                self._audit_log("BLOCK", intent, block_reason, user_id,
+                                 authorization_token)
+                return SafetyCheckResult(
+                    passed=False,
+                    risk_level="blocked",
+                    block_reason=block_reason,
+                )
             logger.info(
                 f"[SafetyGate] 授权令牌通过: user={user_id}, "
-                f"token_prefix={authorization_token[:6]}***, targets={intent.targets}"
+                f"token_prefix={authorization_token[:6]}***, targets={intent.targets}, "
+                f"blocklist_still_enforced=yes"
             )
             return SafetyCheckResult(
                 passed=True,
                 risk_level="safe",
-                warnings=[f"已记录授权令牌: {authorization_token[:6]}***"],
+                warnings=[f"已记录授权令牌: {authorization_token[:6]}*** (审计用,黑名单仍强制执行)"],
             )
 
         if self._check_allowlist(intent):
@@ -186,7 +200,14 @@ class PentestSafetyGate:
                     return True
 
         if intent.scope_hint == "ctf_lab":
-            return True
+            if intent.targets:
+                all_private = all(
+                    _is_valid_ip(t) and _is_private_ip(t)
+                    for t in intent.targets
+                )
+                if all_private:
+                    return True
+            return False
 
         return False
 

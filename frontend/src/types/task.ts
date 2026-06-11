@@ -124,6 +124,8 @@ export interface TaskDetail extends TaskSummary {
   }[]
   subdomains?: string[]
   scope_note?: string
+  authorized_scope?: string[]
+  scope_violations?: { command: string; targets: string[]; ts: string }[]
   extra_hint?: string
   user_prompt?: string
   parsed_intent?: Record<string, unknown>

@@ -75,6 +75,7 @@ class TaskStatus(str, Enum):
 	WAITING_USER = "waiting_user"
 	COMPLETED = "completed"
 	FAILED = "failed"
+	ABORTED = "aborted"
 
 
 
@@ -567,6 +568,8 @@ class PentestState(BaseModel):
 	task_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
 	target: str = ""
 	target_os: str = "unknown"
+	authorized_scope: list[str] = Field(default_factory=list)
+	scope_violations: list[dict] = Field(default_factory=list)
 	scope_note: str = ""
 	extra_hint: str = ""
 	user_prompt: str = ""
@@ -577,6 +580,7 @@ class PentestState(BaseModel):
 	workflow_mode: WorkflowMode = "pentest_engineer"
 	chain_template_id: str = "web"
 	auto_approve: bool = False
+	autonomy_level: str = "manual"
 	success_gate_level: str = "strict"
 	risk_budget: int = 3
 	risk_budget_used: int = 0

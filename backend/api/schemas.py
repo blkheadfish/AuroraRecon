@@ -38,6 +38,7 @@ class CreateTaskRequest(BaseModel):
     user_confirmed_risks: list[str] = []
 
     auto_approve: Optional[bool] = None
+    autonomy_level: Optional[Literal["manual", "supervised", "autonomous"]] = None
     success_gate_level: Optional[Literal["strict", "medium", "lenient"]] = None
     risk_budget: Optional[int] = None
     max_react_rounds: Optional[int] = None
@@ -105,6 +106,7 @@ class TaskSummary(BaseModel):
     updated_at: str = ""
     workflow_mode: str = "pentest_engineer"
     auto_approve: bool = False
+    autonomy_level: str = "manual"
     chain_template_id: str = "web"
     chain_template: Optional[dict] = None
 
@@ -133,6 +135,8 @@ class TaskDetail(TaskSummary):
     target_os: str = "unknown"
     scope_note: str = ""
     error_msg: str = ""
+    authorized_scope: list = []
+    scope_violations: list = []
     open_ports: list = []
     os_info: dict = {}
     web_paths: list = []

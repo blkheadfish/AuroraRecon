@@ -884,3 +884,25 @@ async def delete_interrupt_from_db(task_id: str) -> bool:
         await session.delete(rec)
         await session.commit()
         return True
+
+
+async def save_abort(task_id: str, reason: str, requested_at: str) -> None:
+    """Persist abort signal — stored in task state_json via save_task."""
+    from backend.api.state import get_state_manager
+    state = get_state_manager().get(task_id)
+    if state:
+        state.log(f"abort persisted: {reason}")
+        await save_task(state)
+
+
+async def delete_abort(task_id: str) -> None:
+    """Clear persisted abort signal via save_task."""
+    from backend.api.state import get_state_manager
+    state = get_state_manager().get(task_id)
+    if state:
+        await save_task(state)
+
+
+async def load_all_aborts() -> list[dict]:
+    """Restore abort signals from DB. Returns empty for now (abort is in-memory)."""
+    return []

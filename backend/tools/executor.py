@@ -51,6 +51,18 @@ LogCallback = Optional[Callable[[str], Awaitable[None]]]
 RecordCallback = Optional[Callable[[dict], Awaitable[None]]]
 DecisionCallback = Optional[Callable[[dict], Awaitable[None]]]
 
+SCOPE_MAX_CONCURRENCY_PER_HOST = int(os.getenv("SCOPE_MAX_CONCURRENCY_PER_HOST", "4"))
+
+_host_semaphores: dict[str, asyncio.Semaphore] = {}
+_sem_lock = __import__("threading").Lock()
+
+
+def _get_host_semaphore(host: str) -> asyncio.Semaphore:
+    with _sem_lock:
+        if host not in _host_semaphores:
+            _host_semaphores[host] = asyncio.Semaphore(SCOPE_MAX_CONCURRENCY_PER_HOST)
+        return _host_semaphores[host]
+
 
 _DISPLAY_SHELL_NAMES = frozenset({"/bin/bash", "/bin/sh", "bash", "sh", "/bin/zsh", "zsh"})
 
@@ -295,6 +307,37 @@ class ToolExecutor:
         tool_def = self._registry.get_or_default(tool)
         effective_timeout = timeout or tool_def.timeout
         effective_record_command = record_command or " ".join([tool_def.command, *args]).strip()
+
+        if task_id:
+            from backend.agents.scope_guard import check_scope, extract_targets_from_command
+            try:
+                from backend.api.state import get_state_manager
+                state = get_state_manager().get(task_id)
+                if state and state.authorized_scope:
+                    cmd_full = " ".join([tool_def.command, *args])
+                    in_scope, reason = check_scope(cmd_full, state.authorized_scope)
+                    if not in_scope:
+                        targets = extract_targets_from_command(cmd_full)
+                        violation = {
+                            "command": effective_record_command,
+                            "targets": targets,
+                            "ts": datetime.utcnow().isoformat(),
+                        }
+                        state.scope_violations.append(violation)
+                        logger.warning(
+                            "[Executor] scope violation blocked: %s  scope=%s",
+                            cmd_full[:120], state.authorized_scope,
+                        )
+                        return ExecuteResult(
+                            success=False,
+                            stdout="",
+                            stderr=f"命令超出授权范围: {reason}",
+                            exit_code=-1, elapsed=0,
+                            command=effective_record_command,
+                            tool_name=tool, backend="blocked",
+                        )
+            except Exception:
+                pass
 
         executor_type = tool_def.executor
 
