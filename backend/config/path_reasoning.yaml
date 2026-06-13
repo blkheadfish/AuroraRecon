@@ -1,0 +1,23 @@
+# path_reasoning.yaml — 攻击路径推理权重配置 (WS2)
+#
+# 用途: rank_frontier() / chains() 评分参数, 可调可回归
+# 全部为正数浮点权重; 设为 0 即关掉该因子。
+
+frontier_scoring:
+  severity:
+    critical: 10.0
+    high: 7.0
+    medium: 4.0
+    low: 1.0
+    info: 0.5
+    unknown: 2.0
+  cve_bonus: 5.0
+  exploited_penalty: -10.0
+  leads_to_high_value: 8.0        # finding→cred→objective/host 有路径加分
+  skill_coverage: 4.0             # 有匹配 skill 加分
+  exploit_maturity:                # 利用成熟度加分
+    msf_module: 6.0
+    public_poc: 4.0
+    skill_registered: 3.0
+    kb_entry: 2.0
+  cost_penalty_per_step: -1.0     # 链上每多一跳减分

@@ -97,9 +97,58 @@ const DemoRenderer = defineComponent({
   },
 })
 
+const TargetSelectedRenderer = defineComponent({
+  name: 'TargetSelectedRenderer',
+  props: { item: { type: Object, default: () => ({}) } },
+  setup(props) {
+    const candidates = (props.item.candidates || []) as Array<Record<string, unknown>>
+    return () => [
+      props.item.chosen ? h('div', { class: 'thought-meta' }, [
+        h('span', { class: 'meta-label', style: 'color:#e06979' }, '选中'),
+        ` ${props.item.chosen}`,
+        props.item.chosen_reason ? h('span', { style: 'color:#9198a9;font-size:11px' }, ` — ${props.item.chosen_reason}`) : null,
+      ]) : null,
+      candidates.length ? h('div', { class: 'thought-meta', style: 'margin-top:4px' }, [
+        h('span', { class: 'meta-label' }, '候选'),
+        h('ol', { style: 'margin:2px 0;font-size:11px;color:#9198a9' },
+          candidates.map((c: Record<string, unknown>) =>
+            h('li', { key: String(c.node_id || '') }, [
+              h('span', { style: 'color:#58b8e0' }, String(c.label || '?')),
+              ` (${c.severity || '?'}, score=${c.score})`,
+              c.leads_to_high_value ? h('span', { style: 'color:#d9a84e' }, ' →高价值') : null,
+            ])
+          )
+        ),
+      ]) : null,
+    ]
+  },
+})
+
+const WorldModelReadoutRenderer = defineComponent({
+  name: 'WorldModelReadoutRenderer',
+  props: { item: { type: Object, default: () => ({}) } },
+  setup(props) {
+    const frontier = (props.item.frontier || []) as Array<{ id: string; label: string; score: number }>
+    const unreached = (props.item.unreached || []) as Array<{ id: string; label: string }>
+    return () => [
+      h('div', { class: 'thought-meta', style: 'color:#58b8e0' }, props.item.message || ''),
+      frontier.length ? h('details', { class: 'thought-expand' }, [
+        h('summary', `可利用前沿 (${frontier.length})`),
+        ...frontier.map((n) => h('div', { style: 'font-size:11px;padding:1px 0;color:#9198a9' }, `${n.label} (${n.score})`)),
+      ]) : null,
+      unreached.length ? h('details', { class: 'thought-expand' }, [
+        h('summary', `未触达高价值 (${unreached.length})`),
+        ...unreached.map((n) => h('div', { style: 'font-size:11px;padding:1px 0;color:#d9a84e' }, n.label)),
+      ]) : null,
+    ]
+  },
+})
+
 const decisionRenderers: Record<string, ReturnType<typeof defineComponent>> = {
   thought: DecisionThoughtRenderer,
   __demo_event: DemoRenderer,
+  target_selected: TargetSelectedRenderer,
+  world_model_readout: WorldModelReadoutRenderer,
 }
 
 function rendererFor(action: string): ReturnType<typeof defineComponent> | null {

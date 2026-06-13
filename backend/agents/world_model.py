@@ -1,17 +1,34 @@
 """
-world_model.py — 世界模型只读查询门面 (W1-T1)
+world_model.py — 世界模型只读查询门面 (W1-T1 + W2-T1 增强)
 
 为 attack_graph 提供结构化决策查询, 纯读、无副作用、可单测。
+W2-T1: rank_frontier 增强为多因子评分(严重度×通向高价值×skill覆盖×代价)。
 """
 
 from __future__ import annotations
 
+import os
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional, TYPE_CHECKING
+
+import yaml
 
 if TYPE_CHECKING:
 	from backend.agents.models import AttackGraph, PentestState
+
+
+def _load_scoring_config() -> dict[str, Any]:
+	cfg_path = Path(__file__).resolve().parent.parent / "config" / "path_reasoning.yaml"
+	if not cfg_path.exists():
+		return {}
+	try:
+		with open(cfg_path, "r") as fh:
+			raw = yaml.safe_load(fh) or {}
+		return raw.get("frontier_scoring", {})
+	except Exception:
+		return {}
 
 
 @dataclass
@@ -223,28 +240,113 @@ class WorldModelQuery:
 		return results
 
 	def rank_frontier(self) -> list[tuple[WMNode, float]]:
-		"""对 exploitable_frontier 评分排序, 高分在前。"""
+		"""对 exploitable_frontier 评分排序, 高分在前 (W2-T1 多因子增强)。"""
+		cfg = _load_scoring_config()
 		frontier = self.exploitable_frontier()
 		scored: list[tuple[WMNode, float]] = []
 		for n in frontier:
-			s = self._score_node(n)
+			s = self._score_node(n, cfg)
 			scored.append((n, s))
 		scored.sort(key=lambda x: x[1], reverse=True)
 		return scored
 
-	@staticmethod
-	def _score_node(wn: WMNode) -> float:
-		"""综合评分: severity 权重 + CVE 加分 + credential 关联加分。"""
+	def _score_node(self, wn: WMNode, cfg: dict[str, Any] | None = None) -> float:
+		"""多因子评分 (W2-T1): severity + CVE + 通向高价值 + skill 覆盖 + 代价。"""
+		if cfg is None:
+			cfg = _load_scoring_config()
 		score = 0.0
 		a = wn.attrs
-		sev = (a.get("severity") or "").lower()
-		sev_weights = {"critical": 10.0, "high": 7.0, "medium": 4.0, "low": 1.0, "info": 0.5}
-		score += sev_weights.get(sev, 2.0)
+		sev_cfg = cfg.get("severity", {})
+		sev = (a.get("severity") or "unknown").lower()
+		score += float(sev_cfg.get(sev, sev_cfg.get("unknown", 2.0)))
+
 		if a.get("cve"):
-			score += 5.0
+			score += float(cfg.get("cve_bonus", 5.0))
 		if a.get("exploited"):
-			score -= 10.0
+			score += float(cfg.get("exploited_penalty", -10.0))
+
+		if wn.id:
+			if self._leads_to_high_value(wn.id):
+				score += float(cfg.get("leads_to_high_value", 8.0))
+			maturity_score = self._exploit_maturity_score(wn, cfg)
+			score += maturity_score
+			if self._has_skill_coverage(wn):
+				score += float(cfg.get("skill_coverage", 4.0))
+			chain_depth = self._chain_depth(wn.id)
+			if chain_depth > 0:
+				score += chain_depth * float(cfg.get("cost_penalty_per_step", -1.0))
 		return score
+
+	def _leads_to_high_value(self, node_id: str) -> bool:
+		"""finding 节点是否经 yields/enables 边通向 unreached objective/credential。"""
+		out_edges = self._out_edges
+		node_map = self._node_map
+		visited: set[str] = set()
+		stack = [node_id]
+		while stack:
+			cur = stack.pop()
+			if cur in visited:
+				continue
+			visited.add(cur)
+			for e in out_edges.get(cur, []):
+				dst_node = node_map.get(e.dst)
+				if not dst_node:
+					continue
+				if dst_node.type in ("objective", "credential"):
+					attrs = self._to_wmnode(dst_node).attrs
+					if dst_node.type == "objective":
+						return True
+					if not attrs.get("validated"):
+						return True
+				if e.relation in ("yields", "enables", "pivots_to", "leads_to", "requires"):
+					stack.append(e.dst)
+		return False
+
+	def _exploit_maturity_score(self, wn: WMNode, cfg: dict[str, Any]) -> float:
+		"""根据 skill 注册/KB 覆盖评估利用成熟度加分。"""
+		maturity_cfg = cfg.get("exploit_maturity", {})
+		a = wn.attrs
+		score = 0.0
+		if a.get("kb_match"):
+			score += float(maturity_cfg.get("kb_entry", 2.0))
+		if a.get("skill_match"):
+			score += float(maturity_cfg.get("skill_registered", 3.0))
+		if a.get("has_public_poc"):
+			score += float(maturity_cfg.get("public_poc", 4.0))
+		if a.get("has_msf_module"):
+			score += float(maturity_cfg.get("msf_module", 6.0))
+		return score
+
+	def _has_skill_coverage(self, wn: WMNode) -> bool:
+		"""检查该 finding 是否有已注册的匹配 Skill。"""
+		a = wn.attrs
+		if a.get("skill_match"):
+			return True
+		cve = a.get("cve", "")
+		if cve:
+			for f in (self._state.findings or []):
+				if getattr(f, "cve", "") == cve and getattr(f, "skill_matched", False):
+					return True
+		return False
+
+	def _chain_depth(self, node_id: str) -> int:
+		"""从 finding 到 session/objective 的最短跳数, 用于代价扣分。"""
+		out_edges = self._out_edges
+		node_map = self._node_map
+		from collections import deque as _deque
+		q: _deque[tuple[str, int]] = _deque()
+		q.append((node_id, 0))
+		visited: set[str] = {node_id}
+		while q:
+			cur, dist = q.popleft()
+			nd = node_map.get(cur)
+			if nd and nd.type in ("session", "foothold", "objective"):
+				return dist
+			for e in out_edges.get(cur, []):
+				if e.dst not in visited:
+					visited.add(e.dst)
+					q.append((e.dst, dist + 1))
+		return 0
 
 
 class WorldModelWriter:

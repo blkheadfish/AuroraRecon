@@ -2308,8 +2308,13 @@ async def node_exploit_decision(state: PentestState) -> PentestState:
         state.log(f"LLM 分析 {len(exploitable)} 个漏洞的利用优先级...")
         try:
             from backend.agents.prompt_utils import attach_operator_guidance
+            from backend.agents.world_model import WorldModelQuery
             llm = LLMRouter()
-            prompt = _build_exploit_decision_prompt(state)
+
+            wm = state.world_model() if hasattr(state, "world_model") else WorldModelQuery(state.attack_graph, state)
+            ranked = wm.rank_frontier() if hasattr(wm, "rank_frontier") else []
+
+            prompt = _build_exploit_decision_prompt(state, ranked_frontier=ranked)
             prompt = attach_operator_guidance(prompt, state)
             decision = await llm.chat(prompt, response_format="json")
             decision_data = json.loads(decision)
@@ -2345,13 +2350,37 @@ async def node_exploit_decision(state: PentestState) -> PentestState:
                 plan_steps.append(
                     f"{'[利用]' if should else '[跳过]'} {vuln_id}: {reason[:80]}"
                 )
+
+            chosen_id = None
+            chosen_reason = ""
+            target_candidates: list[dict] = []
+            for n, score in ranked:
+                target_candidates.append({
+                    "vuln_id": n.id.replace("finding:", ""),
+                    "node_id": n.id,
+                    "type": n.type,
+                    "label": n.label,
+                    "severity": n.attrs.get("severity", ""),
+                    "score": round(score, 2),
+                    "leads_to_high_value": wm._leads_to_high_value(n.id) if hasattr(wm, "_leads_to_high_value") else None,
+                })
+
+            if targets_info:
+                top = targets_info[0]
+                chosen_id = top.get("vuln_id", "")
+                chosen_reason = top.get("reason", "")
+
             state.push_decision({
-                "action": "thought",
+                "action": "target_selected",
                 "phase": "exploit_decision",
                 "thinking": analysis or f"LLM 分析 {len(exploitable)} 个漏洞，保留 {remaining} 个可利用",
                 "purpose": "利用优先级决策",
                 "plan": plan_steps,
                 "message": f"LLM 决策: {remaining}/{len(exploitable)} 个漏洞将被利用",
+                "candidates": target_candidates[:6],
+                "chosen": chosen_id,
+                "chosen_reason": chosen_reason,
+                "score": round(ranked[0][1], 2) if ranked else None,
             })
         except Exception as e:
             state.log(f"LLM 决策异常（保留原始可利用标记）: {e}")
@@ -4523,7 +4552,7 @@ def _infer_os(ports: list[PortInfo], os_info: dict) -> str:
     return "unknown"
 
 
-def _build_exploit_decision_prompt(state: PentestState) -> str:
+def _build_exploit_decision_prompt(state: PentestState, ranked_frontier: list | None = None) -> str:
     from backend.llm.prompts.templates import EXPLOIT_DECISION
     findings_json = json.dumps(
         [f.model_dump() for f in state.findings if f.exploitable],
@@ -4543,6 +4572,15 @@ def _build_exploit_decision_prompt(state: PentestState) -> str:
         dir_intel_json=dir_intel_json,
     )
     extras: list[str] = []
+    if ranked_frontier:
+        frontier_lines: list[str] = []
+        for i, (node, score) in enumerate(ranked_frontier[:6]):
+            a = node.attrs
+            frontier_lines.append(
+                f"  {i+1}. {node.label} (severity={a.get('severity','?')}, "
+                f"score={score:.1f}, cve={a.get('cve','none')})"
+            )
+        extras.append("【世界模型可利用前沿评分 (WS2)】\n" + "\n".join(frontier_lines))
     if state.workflow_mode and state.workflow_mode != "standard":
         extras.append(f"任务模式: {state.workflow_mode}")
     if state.extra_hint:
