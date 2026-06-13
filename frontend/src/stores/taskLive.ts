@@ -214,6 +214,14 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
     }])
   })
 
+  registerDecisionHandler('reflection', (state, _taskId, de, _p) => {
+    mergeDecisionEvents(state, [{
+      ...de,
+      message: de.message || '失败归因已记录',
+      tone: 'warning',
+    }])
+  })
+
   function ensureState(taskId: string): TaskLiveState {
     if (!taskStateMap.value[taskId]) {
       taskStateMap.value[taskId] = {

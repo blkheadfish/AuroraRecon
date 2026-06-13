@@ -2610,6 +2610,22 @@ async def node_foothold_attempt(state: PentestState) -> PentestState:
         _sync_foothold_state(state)
         _enrich_finding_names_from_exploits(state)
         _normalize_and_dedupe_state_facts(state, source_node="foothold_attempt_post")
+        # ── W2-T3: 收集失败归因 ──
+        failed_results = [r for r in results if not r.success and getattr(r, "failure_reflection", None)]
+        for fr in failed_results:
+            ref = fr.failure_reflection
+            state.failure_hypotheses = (state.failure_hypotheses or [])
+            if not any(h.get("vuln_id") == ref.get("vuln_id") for h in state.failure_hypotheses):
+                state.failure_hypotheses.append(ref)
+                state.push_decision({
+                    "action": "reflection",
+                    "phase": "foothold_attempt",
+                    "thinking": f"失败归因: {ref.get('cause','unknown')}",
+                    "purpose": "失败归因 → 改策略",
+                    "message": f"{ref.get('vuln_name','?')}: {ref.get('cause','?')} → {ref.get('suggested_next','')}",
+                    "reflection": ref,
+                    "tone": "warning",
+                })
         try:
             after_snapshot = _snapshot_facts(state)
             _emit_replan_signals(

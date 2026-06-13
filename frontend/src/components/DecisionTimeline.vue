@@ -164,12 +164,29 @@ const ChainSelectedRenderer = defineComponent({
   },
 })
 
+const ReflectionRenderer = defineComponent({
+  name: 'ReflectionRenderer',
+  props: { item: { type: Object, default: () => ({}) } },
+  setup(props) {
+    const ref = (props.item.reflection || {}) as Record<string, unknown>
+    return () => h('div', { class: 'thought-meta', style: 'padding:4px 0' }, [
+      h('span', { style: 'color:#e06979' }, '失败归因: '),
+      h('span', { style: 'color:#9198a9' }, `${ref.cause || '?'}`),
+      ref.suggested_next ? h('div', { style: 'font-size:11px;color:#58b8e0;margin-top:2px' }, [
+        h('span', { style: 'color:#4ec9b0' }, '下一步: '),
+        ref.suggested_next,
+      ]) : null,
+    ])
+  },
+})
+
 const decisionRenderers: Record<string, ReturnType<typeof defineComponent>> = {
   thought: DecisionThoughtRenderer,
   __demo_event: DemoRenderer,
   target_selected: TargetSelectedRenderer,
   world_model_readout: WorldModelReadoutRenderer,
   chain_selected: ChainSelectedRenderer,
+  reflection: ReflectionRenderer,
 }
 
 function rendererFor(action: string): ReturnType<typeof defineComponent> | null {
