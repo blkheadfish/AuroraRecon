@@ -222,6 +222,14 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
     }])
   })
 
+  registerDecisionHandler('hypothesis_test', (state, _taskId, de, _p) => {
+    mergeDecisionEvents(state, [{
+      ...de,
+      message: de.message || '假设验证',
+      tone: 'info',
+    }])
+  })
+
   function ensureState(taskId: string): TaskLiveState {
     if (!taskStateMap.value[taskId]) {
       taskStateMap.value[taskId] = {

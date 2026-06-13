@@ -1118,6 +1118,26 @@ async def node_recon(state: PentestState) -> PentestState:
     state.dir_scan_strategy = _stringify_dict_keys(result.get("scan_strategy", {}))
     state.recon_hypotheses = result.get("recon_hypotheses", [])
 
+    # ── W2-T4: 假设驱动探索事件 ──
+    for h in state.recon_hypotheses[:5]:
+        status = h.get("status", "unverified")
+        conf = h.get("confidence", 0)
+        if status != "verified" and conf > 0:
+            state.push_decision({
+                "action": "hypothesis_test",
+                "phase": "recon",
+                "thinking": h.get("hypothesis", "")[:200],
+                "purpose": "假设驱动侦察",
+                "message": f"假设: {h.get('hypothesis','')[:80]} (conf={conf:.2f})",
+                "hypothesis": {
+                    "text": h.get("hypothesis", ""),
+                    "status": status,
+                    "confidence": conf,
+                    "category": h.get("category", ""),
+                },
+                "tone": "info",
+            })
+
     dir_cov = result.get("dir_coverage")
     if dir_cov:
         state.push_decision({
@@ -2946,6 +2966,24 @@ async def node_privesc_attempt(state: PentestState) -> PentestState:
         state.log("风险预算不足，跳过 privesc_attempt 阶段")
         return state
     state.log(f"攻链: 提权尝试 第 {state.privesc_attempt_count}/{state.max_privesc_rounds} 轮")
+    # ── W2-T4: 假设驱动提权 ──
+    for h in (state.privesc_hypotheses or [])[:5]:
+        status = h.get("status", "unverified")
+        if status != "verified":
+            state.push_decision({
+                "action": "hypothesis_test",
+                "phase": "privesc_attempt",
+                "thinking": h.get("hypothesis", "")[:200],
+                "purpose": "假设驱动提权",
+                "message": f"提权假设: {h.get('hypothesis','')[:80]}",
+                "hypothesis": {
+                    "text": h.get("hypothesis", ""),
+                    "status": status,
+                    "confidence": h.get("confidence", 0),
+                    "category": h.get("category", ""),
+                },
+                "tone": "info",
+            })
     try:
         agent = PostExploitAgent()
         async def _on_tool_log(line: str):
