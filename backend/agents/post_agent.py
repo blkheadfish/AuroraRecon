@@ -780,12 +780,16 @@ class PostExploitAgent:
         *,
         log_callback: LogCb = None,
         record_callback: RecordCb = None,
+        chain_priorities: list[dict] | None = None,
     ) -> dict[str, Any]:
         """Attempt lateral movement using discovered credentials and tools.
 
         Uses netexec / impacket-psexec / impacket-secretsdump / smbmap via
         ToolExecutor, with credential_store driving auto-detected targets.
         Targets discovered via arp / /etc/hosts from the compromised host.
+
+        (W2-T2) chain_priorities: 世界模型提供的横向链评分, 用于排序执行顺序。
+        优先尝试高评分链, 而非盲目全量穷举。
         """
         successful = [r for r in exploit_results if r.success]
         if not successful:
@@ -829,8 +833,33 @@ class PostExploitAgent:
             await self._log(log_callback, "[PostAgent] 横向移动跳过：未发现内网主机")
             return {"status": "ok", "lateral_hosts": [], "findings": findings}
 
+        # ── W2-T2: 按世界模型横向链评分排序执行顺序 ──
+        _sorted_creds = list(credential_store[:8])
+        _sorted_hosts = list(lateral_hosts[:6])
+        if chain_priorities:
+            _cp_map: dict[str, float] = {}
+            for cp in chain_priorities:
+                via = str(cp.get("via", ""))
+                target = str(cp.get("target", ""))
+                score = float(cp.get("score", 0))
+                if via:
+                    _cp_map[via] = max(_cp_map.get(via, 0), score)
+                tgt_host = target.replace("host:", "") if target.startswith("host:") else target
+                if tgt_host:
+                    _cp_map[f"host:{tgt_host}"] = max(_cp_map.get(f"host:{tgt_host}", 0), score)
+            def _cred_key(c: dict) -> float:
+                uid = f"cred:{c.get('user','')}@{c.get('source','')}"
+                return -(_cp_map.get(uid, 0) or _cp_map.get(f"{c.get('user','')}@", 0))
+            def _host_key(h: str) -> float:
+                return -(_cp_map.get(f"host:{h}", 0))
+            try:
+                _sorted_creds.sort(key=_cred_key)
+                _sorted_hosts.sort(key=_host_key)
+            except Exception:
+                pass
+
         lateral_successes: list[dict[str, Any]] = []
-        for cred in credential_store[:8]:
+        for cred in _sorted_creds:
             user = cred.get("user") or cred.get("pattern", "")
             password = cred.get("value") or cred.get("password", "")
             nt_hash = cred.get("nt_hash") or cred.get("nthash", "")
@@ -838,7 +867,7 @@ class PostExploitAgent:
             if not user:
                 continue
 
-            for host in lateral_hosts[:6]:
+            for host in _sorted_hosts:
                 if any(s["host"] == host for s in lateral_successes):
                     continue
 

@@ -3020,6 +3020,28 @@ async def node_lateral_movement(state: PentestState) -> PentestState:
         state.log("攻链: 无凭据且无立足点, 跳过横向移动")
         return state
     state.log("攻链: 横向移动")
+    chain_priorities: list[dict] = []
+    try:
+        from backend.agents.world_model import WorldModelQuery
+        wm = state.world_model() if hasattr(state, "world_model") else WorldModelQuery(state.attack_graph, state)
+        lc = wm.lateral_chains() if hasattr(wm, "lateral_chains") else []
+        chain_priorities = [
+            {"start": c.start, "via": c.via, "target": c.target, "score": round(c.score, 2), "reason": c.reason}
+            for c in lc[:8]
+        ]
+        if chain_priorities:
+            state.log(f"世界模型: {len(chain_priorities)} 条横向候选链")
+            state.push_decision({
+                "action": "chain_selected",
+                "phase": "lateral_movement",
+                "thinking": f"世界模型提供 {len(chain_priorities)} 条候选链",
+                "purpose": "横向选路",
+                "message": f"横向链: {chain_priorities[0]['reason'][:80]} (score={chain_priorities[0]['score']})" if chain_priorities else "",
+                "chains": chain_priorities,
+                "tone": "info",
+            })
+    except Exception:
+        pass
     try:
         agent = PostExploitAgent()
 
@@ -3036,6 +3058,7 @@ async def node_lateral_movement(state: PentestState) -> PentestState:
             task_id=state.task_id,
             log_callback=_on_tool_log,
             record_callback=_on_exec_record,
+            chain_priorities=chain_priorities,
         )
         state.lateral_results = res
         findings = res.get("findings", {})

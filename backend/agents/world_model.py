@@ -208,6 +208,7 @@ class WorldModelQuery:
 		逻辑: 对每个 exploitable finding, 找其连接的 credential 节点,
 		再找 credential 能 yield 的 session 或通向 objective 的路径。
 		"""
+		cfg = _load_scoring_config()
 		node_map = self._node_map
 		out_edges = self._out_edges
 		frontier = self.exploitable_frontier()
@@ -229,15 +230,108 @@ class WorldModelQuery:
 					if not dst_node:
 						continue
 					if dst_node.type in ("session", "foothold", "objective", "host"):
+						score = self._chain_score(
+							fn, cred_node, dst_node, cfg,
+						)
 						chain = WMChain(
 							start=fid,
 							via=cid,
 							target=dst_node.id,
-							score=self._score_node(fn),
+							score=score,
 							reason=f"finding {fn.label} → credential {cred_node.label} → {dst_node.type} {dst_node.label}",
 						)
 						results.append(chain)
 		return results
+
+	def lateral_chains(self) -> list[WMChain]:
+		"""从 session/foothold 经 credential 到新 host 的横向移动链 (W2-T2)。
+
+		找出: 立足点 → runs_on host → 该 host 上的 credential → pivots_to 新 host。
+		"""
+		cfg = _load_scoring_config()
+		node_map = self._node_map
+		out_edges = self._out_edges
+		session_ids: set[str] = set()
+		for n in self._graph.nodes:
+			if n.type in ("session", "foothold"):
+				session_ids.add(n.id)
+
+		results: list[WMChain] = []
+		for sid in session_ids:
+			session_node = self._to_wmnode(node_map[sid])
+			for e1 in out_edges.get(sid, []):
+				if e1.relation not in ("runs_on", "enables"):
+					continue
+				host_id = e1.dst
+				host_node = node_map.get(host_id)
+				if not host_node or host_node.type != "host":
+					continue
+				for e2 in out_edges.get(host_id, []):
+					if e2.relation != "yields":
+						continue
+					cred_node = node_map.get(e2.dst)
+					if not cred_node or cred_node.type != "credential":
+						continue
+					c_attrs = self._to_wmnode(cred_node).attrs
+					for e3 in out_edges.get(cred_node.id, []):
+						if e3.relation not in ("pivots_to", "enables"):
+							continue
+						target_node = node_map.get(e3.dst)
+						if not target_node or target_node.type != "host":
+							continue
+						if target_node.id == host_id:
+							continue
+						score = self._lateral_chain_score(
+							session_node, cred_node, target_node, cfg,
+						)
+						chain = WMChain(
+							start=sid,
+							via=cred_node.id,
+							target=target_node.id,
+							score=score,
+							reason=(
+								f"{session_node.label} → "
+								f"cred {c_attrs.get('username','?')}@{c_attrs.get('service','?')} → "
+								f"host {target_node.label}"
+							),
+						)
+						results.append(chain)
+		results.sort(key=lambda x: x.score, reverse=True)
+		return results
+
+	def _chain_score(
+		self, finding: WMNode, cred: Any, target: Any, cfg: dict[str, Any],
+	) -> float:
+		"""攻击链综合评分: finding 严重度 + 凭据有效性 + 目标价值。"""
+		score = self._score_node(finding, cfg)
+		c_attrs = self._to_wmnode(cred).attrs
+		if c_attrs.get("validated"):
+			score += 6.0
+		if c_attrs.get("has_secret"):
+			score += 3.0
+		t_attrs = self._to_wmnode(target).attrs
+		if target.type == "objective":
+			score += 10.0
+		elif target.type == "host":
+			score += 2.0
+		return score
+
+	def _lateral_chain_score(
+		self, session: WMNode, cred: Any, target: Any, cfg: dict[str, Any],
+	) -> float:
+		"""横向链评分: 凭据有效性 + 目标可达性。"""
+		score = 0.0
+		c_attrs = self._to_wmnode(cred).attrs
+		if c_attrs.get("validated"):
+			score += 8.0
+		elif c_attrs.get("has_secret"):
+			score += 4.0
+		if c_attrs.get("username"):
+			score += 1.0
+		s_attrs = session.attrs
+		if s_attrs.get("privilege") == "root":
+			score += 3.0
+		return score
 
 	def rank_frontier(self) -> list[tuple[WMNode, float]]:
 		"""对 exploitable_frontier 评分排序, 高分在前 (W2-T1 多因子增强)。"""

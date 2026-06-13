@@ -144,11 +144,32 @@ const WorldModelReadoutRenderer = defineComponent({
   },
 })
 
+const ChainSelectedRenderer = defineComponent({
+  name: 'ChainSelectedRenderer',
+  props: { item: { type: Object, default: () => ({}) } },
+  setup(props) {
+    const chains = (props.item.chains || []) as Array<{ start: string; via: string; target: string; score: number; reason: string }>
+    return () => [
+      h('div', { class: 'thought-meta', style: 'color:#58b8e0' }, props.item.message || ''),
+      chains.length ? h('details', { class: 'thought-expand' }, [
+        h('summary', `候选横向链 (${chains.length})`),
+        ...chains.map((c, i) =>
+          h('div', { style: 'font-size:11px;padding:2px 0;font-family:monospace', key: i }, [
+            h('span', { style: 'color:#d9a84e' }, `${c.score} `),
+            h('span', { style: 'color:#9198a9' }, c.reason),
+          ])
+        ),
+      ]) : null,
+    ]
+  },
+})
+
 const decisionRenderers: Record<string, ReturnType<typeof defineComponent>> = {
   thought: DecisionThoughtRenderer,
   __demo_event: DemoRenderer,
   target_selected: TargetSelectedRenderer,
   world_model_readout: WorldModelReadoutRenderer,
+  chain_selected: ChainSelectedRenderer,
 }
 
 function rendererFor(action: string): ReturnType<typeof defineComponent> | null {

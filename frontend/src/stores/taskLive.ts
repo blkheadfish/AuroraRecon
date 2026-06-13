@@ -206,6 +206,14 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
     mergeDecisionEvents(state, [{ ...de, tone: 'info' }])
   })
 
+  registerDecisionHandler('chain_selected', (state, _taskId, de, _p) => {
+    mergeDecisionEvents(state, [{
+      ...de,
+      message: de.message || '横向链已选择',
+      tone: 'info',
+    }])
+  })
+
   function ensureState(taskId: string): TaskLiveState {
     if (!taskStateMap.value[taskId]) {
       taskStateMap.value[taskId] = {
