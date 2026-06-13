@@ -236,6 +236,8 @@ const hasRefreshHandler = computed(() => {
 // 样式而无需改渲染主体。未知 type 走 DEFAULT_NODE_STYLE 兜底。
 const DEFAULT_NODE_STYLE = { color: '#888', symbol: 'circle', size: 36, label: '?' }
 
+const nodeTypeStyle = NODE_TYPE_META
+
 const NODE_TYPE_META = {
   host:        { color: '#58b8e0', symbol: 'circle',     size: 60, label: '主机' },
   service:     { color: '#4ec9b0', symbol: 'roundRect',  size: 48, label: '服务' },

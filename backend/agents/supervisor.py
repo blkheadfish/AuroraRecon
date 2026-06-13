@@ -253,9 +253,6 @@ def _rule_decide(state: PentestState) -> Optional[dict[str, Any]]:
     if not _has_visited(state, "recon"):
         return {"next": "recon", "reason": "first run", "rule": "phase.recon_first"}
 
-    if _has_visited(state, "recon") and _scene_has_no_attack_surface(state):
-        return {"next": "report", "reason": "recon 未发现任何开放端口或 Web 路径，无可攻击面", "rule": "guard.dead_end"}
-
     if state.open_ports and not _has_visited(state, "surface_enum"):
         return {"next": "surface_enum", "reason": "ports discovered, surface enumeration pending", "rule": "phase.surface_first"}
 
@@ -281,6 +278,9 @@ def _rule_decide(state: PentestState) -> Optional[dict[str, Any]]:
 
     if _no_new_facts(state, k=3):
         return {"next": "report", "reason": "连续 3 轮无新 fact，强制收敛", "rule": "guard.no_new_facts"}
+
+    if _has_visited(state, "recon") and _scene_has_no_attack_surface(state) and not _has_exploitable(state):
+        return {"next": "report", "reason": "recon 未发现任何开放端口或 Web 路径，无可攻击面", "rule": "guard.dead_end"}
 
     if not _has_visited(state, "objective_collect"):
         return {"next": "objective_collect", "reason": "收尾路径", "rule": "phase.objective_default"}

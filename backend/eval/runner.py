@@ -128,6 +128,9 @@ async def _main() -> None:
     args = parser.parse_args()
 
     all_targets = _load_targets(args.targets)
+    if not all_targets:
+        print(f"No targets found in {args.targets}")
+        return
     if args.only:
         all_targets = [t for t in all_targets if t.id == args.only]
         if not all_targets:

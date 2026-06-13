@@ -59,7 +59,7 @@
   </div>
 </template>
 
-<script setup>
+<script setup lang="ts">
 import { ref, watch, nextTick, onMounted, onBeforeUnmount, defineComponent, h } from 'vue'
 import { ArrowDown } from '@element-plus/icons-vue'
 import PayloadCodeBlock from '@/components/PayloadCodeBlock.vue'
