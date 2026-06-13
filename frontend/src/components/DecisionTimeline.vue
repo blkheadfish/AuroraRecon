@@ -190,12 +190,30 @@ const HypothesisTestRenderer = defineComponent({
     const statusColor = status === 'verified' ? '#3fb980' : status === 'failed' ? '#e06979' : '#d9a84e'
     return () => h('div', { class: 'thought-meta', style: 'padding:4px 0' }, [
       h('span', { style: 'color:#4ec9b0' }, '假设: '),
-      h('span', { style: 'color:#58b8e0' }, String(hyp.text || props.item.thinking || '')[:120]),
+      h('span', { style: 'color:#58b8e0' }, String(hyp.text || props.item.thinking || '').slice(0, 120)),
       h('div', { style: 'font-size:11px;margin-top:2px' }, [
         h('span', { style: `color:${statusColor}` }, `${status}`),
         h('span', { style: 'color:#9198a9;margin-left:4px' }, `conf=${confidence.toFixed(2)}`),
         hyp.category ? h('span', { style: 'color:#9198a9;margin-left:4px' }, `#${hyp.category}`) : null,
       ]),
+    ])
+  },
+})
+
+const ObjectivePathRenderer = defineComponent({
+  name: 'ObjectivePathRenderer',
+  props: { item: { type: Object, default: () => ({}) } },
+  setup(props) {
+    const path = (props.item.path || {}) as { nodes: string[]; gaps: string[] }
+    return () => h('div', { class: 'thought-meta', style: 'padding:4px 0' }, [
+      h('span', { style: 'color:#2d9d76' }, '目标路径: '),
+      h('span', { style: 'color:#9198a9;font-size:11px' }, `${(path.nodes || []).length} 节点`),
+      (path.gaps || []).length ? h('details', { class: 'thought-expand', style: 'margin-top:2px' }, [
+        h('summary', `缺口 (${path.gaps.length})`),
+        ...path.gaps.map((g: string, i: number) =>
+          h('div', { style: 'font-size:11px;color:#e06979;padding:1px 0', key: i }, g)
+        ),
+      ]) : h('span', { style: 'color:#3fb980;font-size:11px;margin-left:4px' }, '完整'),
     ])
   },
 })
@@ -208,6 +226,7 @@ const decisionRenderers: Record<string, ReturnType<typeof defineComponent>> = {
   chain_selected: ChainSelectedRenderer,
   reflection: ReflectionRenderer,
   hypothesis_test: HypothesisTestRenderer,
+  objective_path: ObjectivePathRenderer,
 }
 
 function rendererFor(action: string): ReturnType<typeof defineComponent> | null {

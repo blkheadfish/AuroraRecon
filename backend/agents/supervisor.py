@@ -300,6 +300,31 @@ def _rule_decide(state: PentestState) -> Optional[dict[str, Any]]:
                             "reason": f"世界模型: unreached credential {hv.label}",
                             "rule": "wm.unreached_credential",
                         }
+
+            # ── W2-T5: 目标路径推理 ──
+            paths = wm.paths_to_objective() if hasattr(wm, "paths_to_objective") else []
+            best_path = None
+            best_gap = None
+            for p in paths:
+                if p.gaps:
+                    best_path = p
+                    best_gap = p.gaps[0]
+                    break
+            if best_path and best_gap:
+                gap_parts = best_gap.split("→")
+                target_node_id = gap_parts[-1] if len(gap_parts) > 1 else ""
+                if "cred" in best_gap.lower() and _under_cap(state, "vuln_scan"):
+                    return {
+                        "next": "vuln_scan",
+                        "reason": f"目标路径缺口: {best_gap}",
+                        "rule": "wm.objective_gap",
+                    }
+                if "host" in best_gap.lower() and _has_visited(state, "foothold_attempt") and _under_cap(state, "lateral_movement"):
+                    return {
+                        "next": "lateral_movement",
+                        "reason": f"目标路径缺口(横向): {best_gap}",
+                        "rule": "wm.objective_gap_lateral",
+                    }
     except Exception:
         pass
 
@@ -398,6 +423,21 @@ async def node_supervisor(state: PentestState) -> PentestState:
                     for n in high_val[:5]
                 ],
             })
+
+            # ── W2-T5: 目标路径 readout ──
+            obj_paths = wm.paths_to_objective() if hasattr(wm, "paths_to_objective") else []
+            if obj_paths:
+                top = obj_paths[0]
+                gaps = top.gaps[:3] if top.gaps else []
+                state.push_decision({
+                    "action": "objective_path",
+                    "phase": "supervisor",
+                    "thinking": f"通向目标路径: {len(top.nodes)} 节点, {len(gaps)} 缺口",
+                    "purpose": "目标路径推理",
+                    "message": f"目标路径: {len(top.nodes)} 节点, 缺口={gaps[0] if gaps else 'none'}",
+                    "path": {"nodes": top.nodes, "gaps": gaps},
+                    "tone": "info",
+                })
     except Exception:
         pass
 

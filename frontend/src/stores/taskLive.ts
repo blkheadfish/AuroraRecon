@@ -230,6 +230,14 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
     }])
   })
 
+  registerDecisionHandler('objective_path', (state, _taskId, de, _p) => {
+    mergeDecisionEvents(state, [{
+      ...de,
+      message: de.message || '目标路径已计算',
+      tone: 'info',
+    }])
+  })
+
   function ensureState(taskId: string): TaskLiveState {
     if (!taskStateMap.value[taskId]) {
       taskStateMap.value[taskId] = {
