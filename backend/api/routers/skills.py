@@ -61,6 +61,44 @@ async def skills_stats():
 
 @router.get("/skills/{skill_id}/raw")
 async def get_skill_raw(skill_id: str, request: Request):
+
+
+@router.get("/skills/{skill_id}/stats")
+async def get_skill_stats(skill_id: str):
+    """返回指定 skill 的执行学习统计（分场景成功率等）。"""
+    try:
+        from backend.skills.execution_learner import get_learner
+        from backend.skills.registry import get_registry
+        learner = get_learner()
+        profile = learner.get_profile(skill_id)
+        if not profile:
+            registry = get_registry()
+            skill = registry.get_by_id(skill_id)
+            return {
+                "skill_id": skill_id,
+                "name": skill.name if skill else skill_id,
+                "total_runs": 0,
+                "success_rate": 0.0,
+                "scene_breakdown": {},
+                "fingerprint_breakdown": {},
+                "path_stats": {},
+                "message": "暂无执行记录",
+            }
+        return {
+            "skill_id": profile.skill_id,
+            "total_runs": profile.total_runs,
+            "successful_runs": profile.successful_runs,
+            "success_rate": profile.success_rate,
+            "avg_elapsed": profile.avg_elapsed,
+            "avg_commands": profile.avg_commands,
+            "avg_probes": profile.avg_probes,
+            "scene_breakdown": profile.scene_breakdown,
+            "fingerprint_breakdown": profile.fingerprint_breakdown,
+            "path_stats": profile.path_stats,
+            "priority_adjustments": profile.priority_adjustments,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
     try:
         owner_id, tenant_id = resolve_scope(request)
         scoped = await get_asset(
