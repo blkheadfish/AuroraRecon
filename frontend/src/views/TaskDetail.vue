@@ -15,7 +15,7 @@
         <div class="title-actions" v-if="task">
           <StatusBadge :status="task.status" size="large" />
           <span v-if="isRunning && elapsedSeconds > 0" class="elapsed-pill" title="本轮已运行时长">
-            <el-icon><Timer /></el-icon>
+            <el-icon><Clock /></el-icon>
             已运行 {{ elapsedText }}
           </span>
           <el-button plain @click="router.push(`/tasks/${taskId}/chat`)">
@@ -169,6 +169,17 @@
           <ReconPanel :task="task" />
         </el-tab-pane>
 
+        <el-tab-pane v-if="priorIntel" name="prior" lazy>
+          <template #label>
+            <span class="tab-label">
+              <el-icon><Clock /></el-icon>
+              历史先验
+              <el-badge v-if="priorIntel.source_task_count" :value="priorIntel.source_task_count" class="tab-badge" />
+            </span>
+          </template>
+          <PriorIntelPanel :intel="priorIntel" />
+        </el-tab-pane>
+
         <el-tab-pane label="原始数据" name="raw" lazy>
           <div v-if="rawLoading" class="raw-loading">正在加载完整任务状态...</div>
           <JsonViewer
@@ -210,6 +221,7 @@ const ReconPanel = defineAsyncComponent(() => import('@/components/ReconPanel.vu
 const JsonViewer = defineAsyncComponent(() => import('@/components/JsonViewer.vue'))
 const ReportPanel = defineAsyncComponent(() => import('@/components/ReportPanel.vue'))
 const AttackGraphView = defineAsyncComponent(() => import('@/components/AttackGraphView.vue'))
+const PriorIntelPanel = defineAsyncComponent(() => import('@/components/PriorIntelPanel.vue'))
 
 const route = useRoute()
 const router = useRouter()
@@ -272,6 +284,8 @@ const exploitableCount = computed(() => findings.value.filter((item) => item.exp
 // 攻击图（来自 backend state.attack_graph，反馈/监督模式下会填充节点和边）
 const attackGraph = computed(() => task.value?.attack_graph || { nodes: [], edges: [] })
 const attackGraphNodeCount = computed(() => attackGraph.value?.nodes?.length || 0)
+
+const priorIntel = computed(() => task.value?.prior_intel || null)
 
 const pendingCheckpoint = computed(() => state.value?.pendingCheckpoint || null)
 const checkpointSubmitting = computed(() => state.value?.checkpointState === 'submitting')

@@ -969,6 +969,26 @@ async def create_task(req: CreateTaskRequest, request: Request):
 
     _derive_authorized_scope(state, safety_intent)
 
+    # ── W4-T1: 跨 engagement 记忆 ──
+    if sm.db_available and tenant_id and effective_target:
+        try:
+            from backend.db.database import get_past_tasks_by_host
+            from backend.agents.engagement_memory import extract_prior_intel, inject_prior_into_state
+            past_rows = await get_past_tasks_by_host(
+                effective_target, tenant_id,
+                exclude_task_id=task_id, limit=10,
+            )
+            if past_rows:
+                prior = extract_prior_intel(past_rows)
+                if not prior.is_empty():
+                    inject_prior_into_state(state, prior)
+                    logger.info(
+                        f"[eng_memory] task={task_id} 注入历史先验: "
+                        f"{prior.source_task_count} 个过往任务"
+                    )
+        except Exception as e:
+            logger.warning(f"[eng_memory] 历史先验注入失败 (non-fatal): {e}")
+
     sm.set(task_id, state)
 
     if sm.db_available:

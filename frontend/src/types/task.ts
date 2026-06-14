@@ -150,6 +150,34 @@ export interface TaskDetail extends TaskSummary {
   pending_user_prompt?: string
   attack_graph?: AttackGraphPayload
   chain_template?: ChainTemplateInfo
+  prior_intel?: PriorIntelPayload
+}
+
+export interface PriorCredentialHint {
+  service: string
+  username: string
+  has_secret: boolean
+  source: string
+}
+
+export interface PriorIntelPayload {
+  known_services: {
+    host: string
+    port: number
+    service: string
+    version: string
+    banner: string
+  }[]
+  known_fingerprints: Record<string, string>
+  known_findings: {
+    vuln_id: string
+    name: string
+    severity: string
+    cve: string
+  }[]
+  credential_hints: PriorCredentialHint[]
+  source_task_count: number
+  source_task_ids: string[]
 }
 
 export interface TaskLogsPage {

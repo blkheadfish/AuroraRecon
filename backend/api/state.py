@@ -239,6 +239,7 @@ class TaskStateManager:
             "max_replan": state.max_replan,
             "supervisor_round": state.supervisor_round,
             "supervisor_history": list(state.supervisor_history or []),
+            "prior_intel": state.runtime_facts.get("prior_intel"),
         })
         for rec in base.get("tool_records", []):
             for field in ("stdout", "stderr"):
@@ -387,6 +388,7 @@ class TaskStateManager:
             "supervisor_history": list(state.supervisor_history or [])[-20:],
             "secondary_attack_count": state.secondary_attack_count,
             "max_secondary_attacks": state.max_secondary_attacks,
+            "prior_intel": state.runtime_facts.get("prior_intel"),
         })
         return base
 

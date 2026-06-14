@@ -137,6 +137,10 @@
           <span class="detail-label">发现来源</span>
           <span class="detail-value">{{ selected.discovered_by || '—' }}</span>
         </div>
+        <div class="detail-row" v-if="selected.facts?.source === 'prior' || selected.facts?.from_history === true">
+          <span class="detail-label">可信度</span>
+          <el-tag size="small" type="warning" effect="plain">⏳ 历史推断，待验证</el-tag>
+        </div>
         <div class="detail-row">
           <span class="detail-label">发现时间</span>
           <span class="detail-value mono">{{ formatTs(selected.discovered_at) }}</span>
@@ -525,18 +529,19 @@ const echartsNodes = computed(() => {
 
     const exploitable = Boolean(n.facts?.exploitable)
     const isSynth = n._origin === 'synth'
+    const isPrior = n.facts?.source === 'prior' || n.facts?.from_history === true
 
     return {
       id: n.id,
-      name: n.label || n.id,
+      name: (isPrior ? '⏳ ' : '') + (n.label || n.id),
       symbol: meta.symbol,
       symbolSize: size,
       category: n.type,
       itemStyle: {
         color,
-        borderColor: exploitable ? '#ffc857' : (isSynth ? 'rgba(255,255,255,0.18)' : 'transparent'),
-        borderWidth: exploitable ? 2 : (isSynth ? 1 : 0),
-        borderType: isSynth && !exploitable ? 'dashed' : 'solid',
+        borderColor: exploitable ? '#ffc857' : (isPrior ? '#c9a74e' : (isSynth ? 'rgba(255,255,255,0.18)' : 'transparent')),
+        borderWidth: exploitable ? 2 : (isPrior ? 2 : (isSynth ? 1 : 0)),
+        borderType: (isPrior || (isSynth && !exploitable)) ? 'dashed' : 'solid',
         shadowBlur: glow,
         shadowColor: glow ? color : 'transparent',
         opacity: isSynth ? 0.92 : 1,
@@ -548,7 +553,7 @@ const echartsNodes = computed(() => {
         formatter: (p) => truncateLabel(p.name),
         color: chartTheme.textColor(),
       },
-      _raw: { ...n, _severity: severity, _evidence: n.facts?.evidence || '' },
+      _raw: { ...n, _severity: severity, _evidence: n.facts?.evidence || '', _isPrior: isPrior },
     }
   })
 })
@@ -624,10 +629,13 @@ const option = computed(() => {
           const tgt = r.facts?.target
             ? `<div style="font-size:11px;margin-top:2px;color:#9ab4c0">target: ${escapeHtml(String(r.facts.target))}</div>`
             : ''
+          const priorNote = r._isPrior
+            ? `<div style="font-size:10px;margin-top:4px;padding:2px 6px;border-radius:3px;background:rgba(201,167,78,0.15);color:#c9a74e;display:inline-block">⏳ 历史推断，待验证</div>`
+            : ''
           return `
             <div style="font-weight:600;margin-bottom:4px">${escapeHtml(r.label || r.id)}${sevTag}${exp}</div>
             <div style="font-size:11px;color:#888">${typeLabel(r.type)} · ${escapeHtml(r.id)}</div>
-            ${cve}${tgt}
+            ${cve}${tgt}${priorNote}
             <div style="font-size:11px;margin-top:4px;color:#aaa">来源: ${escapeHtml(r.discovered_by || '—')}</div>
           `
         }
