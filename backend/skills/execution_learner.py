@@ -60,6 +60,12 @@ class SkillProfile:
     # 动态优先级调整: path_id → priority delta (负数=提前, 正数=延后)
     priority_adjustments: dict[str, int] = field(default_factory=dict)
 
+    # W4-T2: 场景维度细分 {scene → {total, success, rate}}
+    scene_breakdown: dict[str, dict[str, int | float]] = field(default_factory=dict)
+
+    # W4-T2: 指纹维度细分 {fingerprint_key → {total, success, rate}}
+    fingerprint_breakdown: dict[str, dict[str, int | float]] = field(default_factory=dict)
+
     last_updated: float = 0.0
 
 
@@ -138,6 +144,36 @@ class ExecutionLearner:
             rate = round(success / total, 3) if total else 0
             profile.path_stats[pid] = {"total": total, "success": success, "rate": rate}
 
+        # W4-T2: Scene-aware breakdown
+        scene_runs: dict[str, list[dict]] = defaultdict(list)
+        for r in runs:
+            sc = r.get("scene", "") or "unknown"
+            scene_runs[sc].append(r)
+        for sc, sruns in scene_runs.items():
+            total = len(sruns)
+            success = sum(1 for r in sruns if r.get("success"))
+            rate = round(success / total, 3) if total else 0
+            profile.scene_breakdown[sc] = {"total": total, "success": success, "rate": rate}
+
+        # W4-T2: Fingerprint-aware breakdown (by fingerprint key)
+        fp_runs: dict[str, list[dict]] = defaultdict(list)
+        for r in runs:
+            fp = r.get("fingerprint", "") or ""
+            if not fp:
+                continue
+            fp_parts = sorted(fp.lower().split(","))
+            for part in fp_parts:
+                part = part.strip()
+                if part:
+                    fp_runs[part].append(r)
+        for fpk, fruns in fp_runs.items():
+            if len(fruns) < 3:  # fingerprint信号样本更小才可信
+                continue
+            total = len(fruns)
+            success = sum(1 for r in fruns if r.get("success"))
+            rate = round(success / total, 3) if total else 0
+            profile.fingerprint_breakdown[fpk] = {"total": total, "success": success, "rate": rate}
+
         # Compute dynamic priority adjustments
         self._compute_adjustments(profile)
 
@@ -200,6 +236,35 @@ class ExecutionLearner:
             return {}
         return dict(profile.priority_adjustments)
 
+    def get_scene_success_rate(self, skill_id: str, scene: str) -> float:
+        """返回指定 skill 在特定场景下的成功率。
+
+        返回 -1.0 表示无数据。
+        """
+        profile = self._profiles.get(skill_id)
+        if not profile:
+            return -1.0
+        sb = profile.scene_breakdown.get(scene)
+        if not sb:
+            return -1.0
+        if sb["total"] < _MIN_SAMPLE_SIZE:
+            return -1.0
+        return sb["rate"]
+
+    def get_scene_bonus(self, skill_id: str, scene: str) -> int:
+        """返回场景自适应微调分（+1 到 +3），用于 registry.match 排名微调。
+
+        不会返回负数（惩罚），因为我们不降优先级，只提升已验证的。
+        """
+        rate = self.get_scene_success_rate(skill_id, scene)
+        if rate <= 0:
+            return 0
+        if rate >= 0.8:
+            return 3
+        if rate >= 0.5:
+            return 2
+        return 1
+
     def get_path_success_rate(self, skill_id: str, path_id: str) -> float:
         profile = self._profiles.get(skill_id)
         if not profile:
@@ -232,6 +297,14 @@ class ExecutionLearner:
                     for pid, stats in profile.path_stats.items()
                 },
                 "priority_adjustments": dict(profile.priority_adjustments),
+                "scene_breakdown": {
+                    sc: {k: v for k, v in stats.items()}
+                    for sc, stats in profile.scene_breakdown.items()
+                },
+                "fingerprint_breakdown": {
+                    fp: {k: v for k, v in stats.items()}
+                    for fp, stats in profile.fingerprint_breakdown.items()
+                },
                 "last_updated": profile.last_updated,
             }
 
@@ -269,6 +342,8 @@ class ExecutionLearner:
                 avg_probes=data.get("avg_probes", 0.0),
                 path_stats=data.get("path_stats", {}),
                 priority_adjustments=data.get("priority_adjustments", {}),
+                scene_breakdown=data.get("scene_breakdown", {}),
+                fingerprint_breakdown=data.get("fingerprint_breakdown", {}),
                 last_updated=data.get("last_updated", 0.0),
             )
             self._profiles[sid] = profile

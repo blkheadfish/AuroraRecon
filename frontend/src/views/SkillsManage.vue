@@ -62,6 +62,35 @@
           <div><b>路径数：</b>{{ selectedSkill.paths_count }}，<b>探测数：</b>{{ selectedSkill.probes_count }}</div>
           <div><b>来源：</b><code>{{ selectedSkill.source }}</code></div>
         </div>
+        <!-- W4-T2: 执行学习统计 -->
+        <div v-if="skillStats" class="skill-stats-section">
+          <h4 class="stats-title">执行学习统计</h4>
+          <div class="stats-summary">
+            <span>总执行 {{ skillStats.total_runs }} 次</span>
+            <span class="stats-sep">|</span>
+            <span>成功率 <b>{{ (skillStats.success_rate * 100).toFixed(0) }}%</b></span>
+          </div>
+          <div class="stats-block" v-if="sceneStatEntries.length">
+            <div class="stats-subtitle">分场景成功率</div>
+            <el-table :data="sceneStatEntries" size="small" max-height="200">
+              <el-table-column label="场景" width="140">
+                <template #default="{ row }">
+                  <el-tag size="small" :type="sceneTag(row[0])">{{ row[0] }}</el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column label="执行次数" width="100" align="center">
+                <template #default="{ row }">{{ row[1].total }}</template>
+              </el-table-column>
+              <el-table-column label="成功率" min-width="120" align="center">
+                <template #default="{ row }">
+                  <span :style="{ color: rateColor(row[1].rate) }">{{ (row[1].rate * 100).toFixed(0) }}%</span>
+                </template>
+              </el-table-column>
+            </el-table>
+          </div>
+          <div class="text-muted" v-else-if="skillStats.total_runs > 0">样本不足，暂无分场景统计</div>
+        </div>
+        <div v-else class="text-muted skill-stats-placeholder">暂无执行记录</div>
         <div class="drawer-actions">
           <el-button class="drawer-edit-btn" @click="openSkillEditor(selectedSkill)">编辑 YAML</el-button>
         </div>
@@ -115,6 +144,26 @@ const skillDrawerVisible = ref(false)
 const skillEditorVisible = ref(false)
 const saveSkillLoading = ref(false)
 const skillYamlDraft = ref('')
+const skillStats = ref(null)
+
+const sceneStatEntries = computed(() => {
+  if (!skillStats.value?.scene_breakdown) return []
+  return Object.entries(skillStats.value.scene_breakdown).sort((a, b) => b[1].rate - a[1].rate)
+})
+
+function sceneTag(scene) {
+  const s = String(scene || '').toLowerCase()
+  if (s === 'web') return 'primary'
+  if (s === 'intranet' || s === 'ad') return 'warning'
+  if (s === 'cloud') return 'info'
+  return ''
+}
+
+function rateColor(rate) {
+  if (rate >= 0.7) return '#48b97a'
+  if (rate >= 0.4) return '#d9a84e'
+  return '#e06979'
+}
 
 function shortSource(source) {
   if (!source) return '-'
@@ -192,12 +241,19 @@ async function reloadAllSkills() {
 async function openSkillDrawer(row) {
   selectedSkill.value = row
   selectedSkillRaw.value = ''
+  skillStats.value = null
   skillDrawerVisible.value = true
   try {
     const raw = await api.getSkillRaw(row.skill_id)
     selectedSkillRaw.value = raw.yaml || ''
   } catch (e) {
     selectedSkillRaw.value = `读取失败: ${e?.response?.data?.detail || e.message}`
+  }
+  // W4-T2: load execution stats
+  try {
+    skillStats.value = await api.getSkillStats(row.skill_id)
+  } catch {
+    skillStats.value = null
   }
 }
 
@@ -425,4 +481,33 @@ onMounted(async () => {
   .yaml-input :deep(.el-textarea__inner) { min-height: 300px !important; }
   .editor-preview { min-height: 300px; max-height: 300px; }
 }
+
+/* W4-T2: skill stats in drawer */
+.skill-stats-section {
+  margin-top: 16px;
+  padding: 12px;
+  background: var(--bg-base);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+.stats-title {
+  margin: 0 0 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.stats-summary {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-bottom: 10px;
+}
+.stats-sep { margin: 0 8px; color: var(--text-muted); }
+.stats-block { margin-top: 8px; }
+.stats-subtitle {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+.text-muted { color: var(--text-muted); font-size: 12px; }
+.skill-stats-placeholder { margin-top: 8px; }
 </style>

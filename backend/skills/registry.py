@@ -151,9 +151,10 @@ class SkillRegistry:
         min_score: Optional[int] = None,
         weak_signal_boost: Optional[int] = None,
         context_vars: Optional[dict[str, Any]] = None,
+        scene: str = "",
     ) -> Optional[Skill]:
         """
-        根据漏洞发现匹配最适用的 Skill(评分制 + mode 权重)。
+        根据漏洞发现匹配最适用的 Skill(评分制 + mode 权重 + 场景自适应微调)。
 
         匹配基于轻量 SkillMeta，命中后按需加载完整 Skill。
 
@@ -163,6 +164,7 @@ class SkillRegistry:
             weak_signal_boost: 任务显式指定的弱信号加权。
             context_vars: 当前上下文变量字典（如 auth_log_readable 等），供
               MatchRule.variable_present 条件使用。
+            scene: 当前攻击场景 (web/intranet/cloud)，用于场景自适应微调。
         """
         self.ensure_loaded()
 
@@ -177,12 +179,30 @@ class SkillRegistry:
         min_threshold = cfg["min_score"] if min_score is None else int(min_score)
         boost = cfg["weak_signal_boost"] if weak_signal_boost is None else int(weak_signal_boost)
 
+        # W4-T2: 场景自适应微调（从 learner 读分场景成功率）
+        scene_bonuses: dict[str, int] = {}
+        if scene:
+            try:
+                from backend.skills.execution_learner import get_learner
+                learner = get_learner()
+                scene_bonuses = {
+                    mid: learner.get_scene_bonus(mid, scene)
+                    for mid in {meta.skill_id for meta in self._metas}
+                }
+            except Exception:
+                pass
+
         scored: list[tuple[int, SkillMeta]] = []
 
         for meta in self._metas:
             score = self._score_skill(meta, finding, combined_fp, json_probe, context_vars)
             if score > 0 and boost and score < 60:
                 score += boost
+            # 场景自适应微调：不覆盖主信号，仅微调排序
+            if score > 0 and scene and meta.skill_id in scene_bonuses:
+                sbonus = scene_bonuses[meta.skill_id]
+                if sbonus:
+                    score += sbonus
             if score >= min_threshold:
                 scored.append((score, meta))
 
@@ -271,29 +291,19 @@ class SkillRegistry:
         return [s for m in self._metas if m.phase == phase and (s := self._resolve_full(m))]
 
     def reload(self) -> None:
-        """Atomic reload: reload metadata, inject learner adjustments, clear caches."""
+        """Atomic reload: reload metadata, clear caches, and refresh learner."""
         new_metas = load_skills_metadata()
-
-        # ---- NEW: inject execution learner adjustments ----
-        try:
-            from backend.skills.execution_learner import get_learner
-            learner = get_learner()
-            for meta in new_metas:
-                adjustments = learner.get_adaptive_priorities(meta.skill_id)
-                if adjustments:
-                    meta.dynamic_priority_adjustments = adjustments
-            logger.info(
-                "[SkillRegistry] 执行学习器: 注入 %d skills 的优先级调整",
-                sum(1 for m in new_metas if m.dynamic_priority_adjustments),
-            )
-        except Exception as e:
-            logger.debug("[SkillRegistry] 执行学习器加载跳过: %s", e)
-
         self._metas = new_metas
         self._skill_cache.clear()
         self._embeddings.clear()
         self._query_embed_cache.clear()
         self._embeddings_ready = False
+        # W4-T2: 刷新执行学习器
+        try:
+            from backend.skills.execution_learner import refresh_learner
+            refresh_learner()
+        except Exception as e:
+            logger.debug(f"[SkillRegistry] learner refresh skipped: {e}")
         self._loaded = True
         logger.info(f"[SkillRegistry] 重载完成，共 {len(new_metas)} 个 Skill")
 
@@ -321,8 +331,6 @@ class SkillRegistry:
                 parts.append(rule.service_is)
             if rule.evidence_contains:
                 parts.append(" ".join(rule.evidence_contains))
-            if rule.evidence_keywords:
-                parts.append(" ".join(rule.evidence_keywords))
         return " ".join(filter(None, parts))
 
     async def precompute_embeddings(self) -> None:
@@ -720,19 +728,6 @@ class SkillRegistry:
             if rule.evidence_contains:
                 if any(kw.lower() in ev_lower for kw in rule.evidence_contains):
                     rule_score += 10
-
-            if rule.evidence_regex:
-                import re as _re
-                if any(_re.search(pattern, evidence, _re.IGNORECASE)
-                       for pattern in rule.evidence_regex):
-                    rule_score += 15
-
-            if rule.evidence_keywords:
-                from backend.skills.models import MatchRule
-                ev_tokens = MatchRule._tokenize(evidence)
-                if any(MatchRule._tokens_match(ev_tokens, MatchRule._tokenize(kw))
-                       for kw in rule.evidence_keywords):
-                    rule_score += 12
 
             if rule.port_is and finding.port:
                 if finding.port in rule.port_is:

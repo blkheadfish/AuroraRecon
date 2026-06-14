@@ -119,6 +119,7 @@ export const api = {
     extraHint?: string
     userPrompt?: string
     workflowMode?: 'pentest_engineer' | 'ctf_expert'
+    chainMode?: 'linear' | 'feedback' | 'supervisor' | null
     autoApprove?: boolean | null
     successGateLevel?: 'strict' | 'medium' | 'lenient' | null
     riskBudget?: number | null
@@ -138,6 +139,7 @@ export const api = {
       extra_hint:            payload.extraHint ?? '',
       user_prompt:           payload.userPrompt ?? '',
       workflow_mode:         payload.workflowMode ?? 'pentest_engineer',
+      chain_mode:            payload.chainMode ?? null,
       auto_approve:          payload.autoApprove ?? null,
       success_gate_level:    payload.successGateLevel ?? null,
       risk_budget:           payload.riskBudget ?? null,
@@ -224,6 +226,13 @@ export const api = {
   }> => http.get('/skills'),
   getSkillRaw: (skillId: string): Promise<{ skill_id: string; source: string; yaml: string }> =>
     http.get(`/skills/${skillId}/raw`),
+  getSkillStats: (skillId: string): Promise<{
+    skill_id: string
+    total_runs: number
+    success_rate: number
+    scene_breakdown: Record<string, { total: number; success: number; rate: number }>
+    path_stats: Record<string, { total: number; success: number; rate: number }>
+  }> => http.get(`/skills/${skillId}/stats`),
   saveSkillRaw: (skillId: string, yamlContent: string): Promise<{ status: string; skill_id: string }> =>
     http.put(`/skills/${skillId}/raw`, { yaml: yamlContent }),
   reloadSkills: (): Promise<{ status: string; total: number }> =>

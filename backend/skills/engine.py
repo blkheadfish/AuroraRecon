@@ -87,6 +87,8 @@ class SkillEngine:
         confirmed_facts: Optional[dict] = None,
         prior_probe_variables: Optional[dict] = None,
         runtime_facts: Optional[dict] = None,
+        scene: str = "",
+        target_fingerprint: str = "",
     ) -> ExploitResult:
         """
         执行 Skill 完整流程，带全局超时保护。
@@ -118,20 +120,19 @@ class SkillEngine:
             )
 
         elapsed = round(time.monotonic() - t0, 2)
-        path_id = (result.session_info or {}).get("method", "").replace("skill:", "")
-        probe_count = len([r for r in result.command_records if r.get("purpose") == "probe"])
         persist_execution({
             "skill_id": skill.skill_id,
             "target": target_url,
             "success": result.success,
-            "path_id": path_id,
             "total_elapsed": elapsed,
             "commands_count": len(result.commands_run),
-            "probe_count": probe_count,
             "evidence_preview": (result.evidence or "")[:200],
             "workflow_mode": workflow_mode,
             "evidence_level": getattr(result, "exploit_level", ""),
             "rounds": len(result.command_records) if result.command_records else 0,
+            "scene": scene or "",
+            "fingerprint": target_fingerprint or "",
+            "path_id": getattr(result, "path_id", "") or "",
         })
         return result
 
@@ -185,7 +186,6 @@ class SkillEngine:
             php_runtime=dict((_rf.get("php") or php_runtime) or {}),
             runtime_facts=_rf,
             confirmed_facts=dict(confirmed_facts or {}),
-            _finding_evidence=finding.evidence or "",
         )
 
         if prior_probe_variables:
@@ -252,20 +252,6 @@ class SkillEngine:
         if known_passwords or known_users:
             ctx.variables.setdefault("has_known_creds", True)
 
-        # ---- NEW: inject references into context for deterministic paths ----
-        if skill.references:
-            ctx.variables.setdefault("has_references", True)
-            ctx.variables.setdefault("reference_count", str(len(skill.references)))
-            ctx.variables.setdefault("reference_files", ", ".join(skill.references.keys()))
-            # inject key reference content (truncated) as variables
-            for filename, content in skill.references.items():
-                base_name = filename.replace(".md", "").replace("-", "_").replace(" ", "_")
-                var_name = f"ref_{base_name}"
-                ctx.variables.setdefault(var_name, content[:3000])
-            logger.debug(
-                f"[SkillEngine] 注入 {len(skill.references)} 个 references 到上下文"
-            )
-
         logger.info(
             f"[SkillEngine] 开始执行 Skill: {skill.skill_id} "
             f"→ {target_url} (can_reverse={env_can_reverse})"
@@ -279,25 +265,6 @@ class SkillEngine:
         )
 
         sorted_paths = sorted(skill.exploit_paths, key=lambda p: p.priority)
-
-        # ---- NEW: apply execution learner priority adjustments ----
-        try:
-            from backend.skills.execution_learner import get_learner
-            learner = get_learner()
-            adjustments = learner.get_adaptive_priorities(skill.skill_id)
-            if adjustments:
-                def _adjusted_priority(p: ExploitPath) -> int:
-                    delta = adjustments.get(p.path_id, 0)
-                    return p.priority + delta
-
-                sorted_paths = sorted(skill.exploit_paths, key=_adjusted_priority)
-                logger.info(
-                    "[SkillEngine] 📚 执行学习: %d paths 优先级已调整: %s",
-                    len(adjustments),
-                    {k: f"{v:+d}" for k, v in adjustments.items()},
-                )
-        except Exception as e:
-            logger.debug("[SkillEngine] 执行学习器查询跳过: %s", e)
 
         # ---- NEW: selector-based adaptive path selection ----
         if skill.selector:
@@ -679,50 +646,6 @@ class SkillEngine:
             if success:
                 outcome = step.on_success
             else:
-                # ---- NEW: adaptive retry ----
-                retry_cfg = step.retry if hasattr(step, "retry") else None
-                retry_key = f"_retry_{step.id}"
-                retry_count = int(ctx.variables.get(retry_key, 0))
-                should_retry = False
-
-                if retry_cfg and retry_cfg.max_retries > 0 and retry_count < retry_cfg.max_retries:
-                    hint = retry_cfg.partial_success_hint
-                    combined = f"{exec_result.stdout} {exec_result.stderr}"
-                    if not hint or hint.lower() in combined.lower():
-                        # adjust parameter
-                        param = retry_cfg.adjust_param
-                        if param and param in ctx.variables:
-                            try:
-                                current_val = int(ctx.variables[param])
-                                amount = retry_cfg.adjust_amount
-                                direction = retry_cfg.adjust_direction
-                                if direction == "increment":
-                                    ctx.variables[param] = str(current_val + amount)
-                                elif direction == "decrement":
-                                    ctx.variables[param] = str(max(0, current_val - amount))
-                                elif direction == "both":
-                                    alt_key = f"{retry_key}_dir"
-                                    direction_flag = ctx.variables.get(alt_key, "inc")
-                                    if direction_flag == "inc":
-                                        ctx.variables[param] = str(current_val + amount)
-                                        ctx.variables[alt_key] = "dec"
-                                    else:
-                                        ctx.variables[param] = str(max(0, current_val - amount))
-                                        ctx.variables[alt_key] = "inc"
-                                else:
-                                    ctx.variables[param] = str(current_val + amount)
-                            except (ValueError, TypeError):
-                                pass
-                        ctx.variables[retry_key] = str(retry_count + 1)
-                        should_retry = True
-                        logger.info(
-                            f"[SkillEngine] 🔄 自适应重试 {step.id} "
-                            f"(#{retry_count + 1}/{retry_cfg.max_retries}), "
-                            f"调整 {retry_cfg.adjust_param}={ctx.variables.get(retry_cfg.adjust_param)}"
-                        )
-
-                if should_retry:
-                    continue  # re-execute same step with adjusted params
                 outcome = step.on_fail
 
             if outcome == "conclude_success":
