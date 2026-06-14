@@ -360,6 +360,7 @@ class ExploitResult(BaseModel):
 	commands_run: list[str] = Field(default_factory=list)
 	command_results: list[CommandExecutionRecord] = Field(default_factory=list)
 	command_records: list[CommandExecutionRecord] = Field(default_factory=list)
+	failure_reflection: Optional[dict] = None  # W2-T3
 
 	@field_validator("command_results", "command_records", mode="before")
 	@classmethod
@@ -673,6 +674,7 @@ class PentestState(BaseModel):
 	internal_network: dict[str, Any] = Field(default_factory=dict)
 
 	privesc_hypotheses: list[dict[str, Any]] = Field(default_factory=list)
+	failure_hypotheses: list[dict[str, Any]] = Field(default_factory=list)  # W2-T3
 	objective_status: dict[str, Any] = Field(default_factory=dict)
 	attack_next_steps: list[dict[str, Any]] = Field(default_factory=list)
 	privesc_attempt_count: int = 0

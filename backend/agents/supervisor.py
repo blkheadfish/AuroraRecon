@@ -276,6 +276,58 @@ def _rule_decide(state: PentestState) -> Optional[dict[str, Any]]:
         if not state.got_shell and state.foothold_status == "file_read" and state.secondary_attack_count < state.max_secondary_attacks:
             return {"next": "secondary_attack", "reason": "file_read 已确认，继续尝试 RCE", "rule": "phase.secondary"}
 
+    # ── W2-T1: 世界模型 tie-break ──
+    # 常规规则未命中时, 按 rank_frontier()/unreached_high_value() 路由,
+    # 仍受 SUPERVISOR_PHASES 白名单 + visit cap 约束。
+    try:
+        wm = state.world_model() if hasattr(state, "world_model") else None
+        if wm is not None:
+            ranked = wm.rank_frontier() if hasattr(wm, "rank_frontier") else []
+            if ranked and not _has_visited(state, "foothold_attempt"):
+                top_node, top_score = ranked[0]
+                if top_score > 2.0:
+                    return {
+                        "next": "exploit_decision" if not _has_visited(state, "exploit_decision") else "foothold_attempt",
+                        "reason": f"世界模型: top frontier {top_node.label} (score={top_score:.1f})",
+                        "rule": "wm.frontier",
+                    }
+            high_val = wm.unreached_high_value() if hasattr(wm, "unreached_high_value") else []
+            if high_val and _has_visited(state, "foothold_attempt"):
+                for hv in high_val:
+                    if hv.type == "credential" and _under_cap(state, "vuln_scan"):
+                        return {
+                            "next": "vuln_scan",
+                            "reason": f"世界模型: unreached credential {hv.label}",
+                            "rule": "wm.unreached_credential",
+                        }
+
+            # ── W2-T5: 目标路径推理 ──
+            paths = wm.paths_to_objective() if hasattr(wm, "paths_to_objective") else []
+            best_path = None
+            best_gap = None
+            for p in paths:
+                if p.gaps:
+                    best_path = p
+                    best_gap = p.gaps[0]
+                    break
+            if best_path and best_gap:
+                gap_parts = best_gap.split("→")
+                target_node_id = gap_parts[-1] if len(gap_parts) > 1 else ""
+                if "cred" in best_gap.lower() and _under_cap(state, "vuln_scan"):
+                    return {
+                        "next": "vuln_scan",
+                        "reason": f"目标路径缺口: {best_gap}",
+                        "rule": "wm.objective_gap",
+                    }
+                if "host" in best_gap.lower() and _has_visited(state, "foothold_attempt") and _under_cap(state, "lateral_movement"):
+                    return {
+                        "next": "lateral_movement",
+                        "reason": f"目标路径缺口(横向): {best_gap}",
+                        "rule": "wm.objective_gap_lateral",
+                    }
+    except Exception:
+        pass
+
     if _no_new_facts(state, k=3):
         return {"next": "report", "reason": "连续 3 轮无新 fact，强制收敛", "rule": "guard.no_new_facts"}
 
@@ -346,6 +398,48 @@ async def node_supervisor(state: PentestState) -> PentestState:
         getattr(state, "operator_plan", None) is not None
         and not _is_plan_consumed_by(state.operator_plan, "supervisor")
     )
+
+    # ── W2-T1: 世界模型 readout ──
+    try:
+        wm = state.world_model() if hasattr(state, "world_model") else None
+        if wm is not None:
+            frontier = wm.rank_frontier() if hasattr(wm, "rank_frontier") else []
+            high_val = wm.unreached_high_value() if hasattr(wm, "unreached_high_value") else []
+            state.push_decision({
+                "action": "world_model_readout",
+                "phase": "supervisor",
+                "thinking": f"frontier={len(frontier)}, unreached={len(high_val)}",
+                "purpose": "世界模型快照",
+                "message": (
+                    f"可利用前沿: {', '.join(f'{n.label}({s:.1f})' for n, s in frontier[:3])}"
+                    if frontier else "无可利用前沿"
+                ),
+                "frontier": [
+                    {"id": n.id, "label": n.label, "type": n.type, "score": round(s, 2)}
+                    for n, s in frontier[:5]
+                ],
+                "unreached": [
+                    {"id": n.id, "label": n.label, "type": n.type}
+                    for n in high_val[:5]
+                ],
+            })
+
+            # ── W2-T5: 目标路径 readout ──
+            obj_paths = wm.paths_to_objective() if hasattr(wm, "paths_to_objective") else []
+            if obj_paths:
+                top = obj_paths[0]
+                gaps = top.gaps[:3] if top.gaps else []
+                state.push_decision({
+                    "action": "objective_path",
+                    "phase": "supervisor",
+                    "thinking": f"通向目标路径: {len(top.nodes)} 节点, {len(gaps)} 缺口",
+                    "purpose": "目标路径推理",
+                    "message": f"目标路径: {len(top.nodes)} 节点, 缺口={gaps[0] if gaps else 'none'}",
+                    "path": {"nodes": top.nodes, "gaps": gaps},
+                    "tone": "info",
+                })
+    except Exception:
+        pass
 
     decision = _rule_decide(state)
     if decision is None:

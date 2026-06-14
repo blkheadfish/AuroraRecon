@@ -194,6 +194,50 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
     mergeDecisionEvents(state, [{ ...de, message: '[demo] 扩展点验证: 此 action 通过 registerDecisionHandler 插入, 未改 applyEvent 主体', tone: 'info' }])
   })
 
+  registerDecisionHandler('target_selected', (state, _taskId, de, _p) => {
+    mergeDecisionEvents(state, [{
+      ...de,
+      message: de.message || `选中目标: ${de.chosen || '?'}`,
+      tone: 'info',
+    }])
+  })
+
+  registerDecisionHandler('world_model_readout', (state, _taskId, de, _p) => {
+    mergeDecisionEvents(state, [{ ...de, tone: 'info' }])
+  })
+
+  registerDecisionHandler('chain_selected', (state, _taskId, de, _p) => {
+    mergeDecisionEvents(state, [{
+      ...de,
+      message: de.message || '横向链已选择',
+      tone: 'info',
+    }])
+  })
+
+  registerDecisionHandler('reflection', (state, _taskId, de, _p) => {
+    mergeDecisionEvents(state, [{
+      ...de,
+      message: de.message || '失败归因已记录',
+      tone: 'warning',
+    }])
+  })
+
+  registerDecisionHandler('hypothesis_test', (state, _taskId, de, _p) => {
+    mergeDecisionEvents(state, [{
+      ...de,
+      message: de.message || '假设验证',
+      tone: 'info',
+    }])
+  })
+
+  registerDecisionHandler('objective_path', (state, _taskId, de, _p) => {
+    mergeDecisionEvents(state, [{
+      ...de,
+      message: de.message || '目标路径已计算',
+      tone: 'info',
+    }])
+  })
+
   function ensureState(taskId: string): TaskLiveState {
     if (!taskStateMap.value[taskId]) {
       taskStateMap.value[taskId] = {

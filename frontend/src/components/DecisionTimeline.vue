@@ -97,9 +97,136 @@ const DemoRenderer = defineComponent({
   },
 })
 
+const TargetSelectedRenderer = defineComponent({
+  name: 'TargetSelectedRenderer',
+  props: { item: { type: Object, default: () => ({}) } },
+  setup(props) {
+    const candidates = (props.item.candidates || []) as Array<Record<string, unknown>>
+    return () => [
+      props.item.chosen ? h('div', { class: 'thought-meta' }, [
+        h('span', { class: 'meta-label', style: 'color:#e06979' }, '选中'),
+        ` ${props.item.chosen}`,
+        props.item.chosen_reason ? h('span', { style: 'color:#9198a9;font-size:11px' }, ` — ${props.item.chosen_reason}`) : null,
+      ]) : null,
+      candidates.length ? h('div', { class: 'thought-meta', style: 'margin-top:4px' }, [
+        h('span', { class: 'meta-label' }, '候选'),
+        h('ol', { style: 'margin:2px 0;font-size:11px;color:#9198a9' },
+          candidates.map((c: Record<string, unknown>) =>
+            h('li', { key: String(c.node_id || '') }, [
+              h('span', { style: 'color:#58b8e0' }, String(c.label || '?')),
+              ` (${c.severity || '?'}, score=${c.score})`,
+              c.leads_to_high_value ? h('span', { style: 'color:#d9a84e' }, ' →高价值') : null,
+            ])
+          )
+        ),
+      ]) : null,
+    ]
+  },
+})
+
+const WorldModelReadoutRenderer = defineComponent({
+  name: 'WorldModelReadoutRenderer',
+  props: { item: { type: Object, default: () => ({}) } },
+  setup(props) {
+    const frontier = (props.item.frontier || []) as Array<{ id: string; label: string; score: number }>
+    const unreached = (props.item.unreached || []) as Array<{ id: string; label: string }>
+    return () => [
+      h('div', { class: 'thought-meta', style: 'color:#58b8e0' }, props.item.message || ''),
+      frontier.length ? h('details', { class: 'thought-expand' }, [
+        h('summary', `可利用前沿 (${frontier.length})`),
+        ...frontier.map((n) => h('div', { style: 'font-size:11px;padding:1px 0;color:#9198a9' }, `${n.label} (${n.score})`)),
+      ]) : null,
+      unreached.length ? h('details', { class: 'thought-expand' }, [
+        h('summary', `未触达高价值 (${unreached.length})`),
+        ...unreached.map((n) => h('div', { style: 'font-size:11px;padding:1px 0;color:#d9a84e' }, n.label)),
+      ]) : null,
+    ]
+  },
+})
+
+const ChainSelectedRenderer = defineComponent({
+  name: 'ChainSelectedRenderer',
+  props: { item: { type: Object, default: () => ({}) } },
+  setup(props) {
+    const chains = (props.item.chains || []) as Array<{ start: string; via: string; target: string; score: number; reason: string }>
+    return () => [
+      h('div', { class: 'thought-meta', style: 'color:#58b8e0' }, props.item.message || ''),
+      chains.length ? h('details', { class: 'thought-expand' }, [
+        h('summary', `候选横向链 (${chains.length})`),
+        ...chains.map((c, i) =>
+          h('div', { style: 'font-size:11px;padding:2px 0;font-family:monospace', key: i }, [
+            h('span', { style: 'color:#d9a84e' }, `${c.score} `),
+            h('span', { style: 'color:#9198a9' }, c.reason),
+          ])
+        ),
+      ]) : null,
+    ]
+  },
+})
+
+const ReflectionRenderer = defineComponent({
+  name: 'ReflectionRenderer',
+  props: { item: { type: Object, default: () => ({}) } },
+  setup(props) {
+    const ref = (props.item.reflection || {}) as Record<string, unknown>
+    return () => h('div', { class: 'thought-meta', style: 'padding:4px 0' }, [
+      h('span', { style: 'color:#e06979' }, '失败归因: '),
+      h('span', { style: 'color:#9198a9' }, `${ref.cause || '?'}`),
+      ref.suggested_next ? h('div', { style: 'font-size:11px;color:#58b8e0;margin-top:2px' }, [
+        h('span', { style: 'color:#4ec9b0' }, '下一步: '),
+        ref.suggested_next,
+      ]) : null,
+    ])
+  },
+})
+
+const HypothesisTestRenderer = defineComponent({
+  name: 'HypothesisTestRenderer',
+  props: { item: { type: Object, default: () => ({}) } },
+  setup(props) {
+    const hyp = (props.item.hypothesis || {}) as Record<string, unknown>
+    const status = String(hyp.status || 'unverified')
+    const confidence = Number(hyp.confidence || 0)
+    const statusColor = status === 'verified' ? '#3fb980' : status === 'failed' ? '#e06979' : '#d9a84e'
+    return () => h('div', { class: 'thought-meta', style: 'padding:4px 0' }, [
+      h('span', { style: 'color:#4ec9b0' }, '假设: '),
+      h('span', { style: 'color:#58b8e0' }, String(hyp.text || props.item.thinking || '').slice(0, 120)),
+      h('div', { style: 'font-size:11px;margin-top:2px' }, [
+        h('span', { style: `color:${statusColor}` }, `${status}`),
+        h('span', { style: 'color:#9198a9;margin-left:4px' }, `conf=${confidence.toFixed(2)}`),
+        hyp.category ? h('span', { style: 'color:#9198a9;margin-left:4px' }, `#${hyp.category}`) : null,
+      ]),
+    ])
+  },
+})
+
+const ObjectivePathRenderer = defineComponent({
+  name: 'ObjectivePathRenderer',
+  props: { item: { type: Object, default: () => ({}) } },
+  setup(props) {
+    const path = (props.item.path || {}) as { nodes: string[]; gaps: string[] }
+    return () => h('div', { class: 'thought-meta', style: 'padding:4px 0' }, [
+      h('span', { style: 'color:#2d9d76' }, '目标路径: '),
+      h('span', { style: 'color:#9198a9;font-size:11px' }, `${(path.nodes || []).length} 节点`),
+      (path.gaps || []).length ? h('details', { class: 'thought-expand', style: 'margin-top:2px' }, [
+        h('summary', `缺口 (${path.gaps.length})`),
+        ...path.gaps.map((g: string, i: number) =>
+          h('div', { style: 'font-size:11px;color:#e06979;padding:1px 0', key: i }, g)
+        ),
+      ]) : h('span', { style: 'color:#3fb980;font-size:11px;margin-left:4px' }, '完整'),
+    ])
+  },
+})
+
 const decisionRenderers: Record<string, ReturnType<typeof defineComponent>> = {
   thought: DecisionThoughtRenderer,
   __demo_event: DemoRenderer,
+  target_selected: TargetSelectedRenderer,
+  world_model_readout: WorldModelReadoutRenderer,
+  chain_selected: ChainSelectedRenderer,
+  reflection: ReflectionRenderer,
+  hypothesis_test: HypothesisTestRenderer,
+  objective_path: ObjectivePathRenderer,
 }
 
 function rendererFor(action: string): ReturnType<typeof defineComponent> | null {

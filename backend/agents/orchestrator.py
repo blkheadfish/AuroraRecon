@@ -1118,6 +1118,26 @@ async def node_recon(state: PentestState) -> PentestState:
     state.dir_scan_strategy = _stringify_dict_keys(result.get("scan_strategy", {}))
     state.recon_hypotheses = result.get("recon_hypotheses", [])
 
+    # ── W2-T4: 假设驱动探索事件 ──
+    for h in state.recon_hypotheses[:5]:
+        status = h.get("status", "unverified")
+        conf = h.get("confidence", 0)
+        if status != "verified" and conf > 0:
+            state.push_decision({
+                "action": "hypothesis_test",
+                "phase": "recon",
+                "thinking": h.get("hypothesis", "")[:200],
+                "purpose": "假设驱动侦察",
+                "message": f"假设: {h.get('hypothesis','')[:80]} (conf={conf:.2f})",
+                "hypothesis": {
+                    "text": h.get("hypothesis", ""),
+                    "status": status,
+                    "confidence": conf,
+                    "category": h.get("category", ""),
+                },
+                "tone": "info",
+            })
+
     dir_cov = result.get("dir_coverage")
     if dir_cov:
         state.push_decision({
@@ -2308,8 +2328,13 @@ async def node_exploit_decision(state: PentestState) -> PentestState:
         state.log(f"LLM 分析 {len(exploitable)} 个漏洞的利用优先级...")
         try:
             from backend.agents.prompt_utils import attach_operator_guidance
+            from backend.agents.world_model import WorldModelQuery
             llm = LLMRouter()
-            prompt = _build_exploit_decision_prompt(state)
+
+            wm = state.world_model() if hasattr(state, "world_model") else WorldModelQuery(state.attack_graph, state)
+            ranked = wm.rank_frontier() if hasattr(wm, "rank_frontier") else []
+
+            prompt = _build_exploit_decision_prompt(state, ranked_frontier=ranked)
             prompt = attach_operator_guidance(prompt, state)
             decision = await llm.chat(prompt, response_format="json")
             decision_data = json.loads(decision)
@@ -2345,13 +2370,37 @@ async def node_exploit_decision(state: PentestState) -> PentestState:
                 plan_steps.append(
                     f"{'[利用]' if should else '[跳过]'} {vuln_id}: {reason[:80]}"
                 )
+
+            chosen_id = None
+            chosen_reason = ""
+            target_candidates: list[dict] = []
+            for n, score in ranked:
+                target_candidates.append({
+                    "vuln_id": n.id.replace("finding:", ""),
+                    "node_id": n.id,
+                    "type": n.type,
+                    "label": n.label,
+                    "severity": n.attrs.get("severity", ""),
+                    "score": round(score, 2),
+                    "leads_to_high_value": wm._leads_to_high_value(n.id) if hasattr(wm, "_leads_to_high_value") else None,
+                })
+
+            if targets_info:
+                top = targets_info[0]
+                chosen_id = top.get("vuln_id", "")
+                chosen_reason = top.get("reason", "")
+
             state.push_decision({
-                "action": "thought",
+                "action": "target_selected",
                 "phase": "exploit_decision",
                 "thinking": analysis or f"LLM 分析 {len(exploitable)} 个漏洞，保留 {remaining} 个可利用",
                 "purpose": "利用优先级决策",
                 "plan": plan_steps,
                 "message": f"LLM 决策: {remaining}/{len(exploitable)} 个漏洞将被利用",
+                "candidates": target_candidates[:6],
+                "chosen": chosen_id,
+                "chosen_reason": chosen_reason,
+                "score": round(ranked[0][1], 2) if ranked else None,
             })
         except Exception as e:
             state.log(f"LLM 决策异常（保留原始可利用标记）: {e}")
@@ -2581,6 +2630,22 @@ async def node_foothold_attempt(state: PentestState) -> PentestState:
         _sync_foothold_state(state)
         _enrich_finding_names_from_exploits(state)
         _normalize_and_dedupe_state_facts(state, source_node="foothold_attempt_post")
+        # ── W2-T3: 收集失败归因 ──
+        failed_results = [r for r in results if not r.success and getattr(r, "failure_reflection", None)]
+        for fr in failed_results:
+            ref = fr.failure_reflection
+            state.failure_hypotheses = (state.failure_hypotheses or [])
+            if not any(h.get("vuln_id") == ref.get("vuln_id") for h in state.failure_hypotheses):
+                state.failure_hypotheses.append(ref)
+                state.push_decision({
+                    "action": "reflection",
+                    "phase": "foothold_attempt",
+                    "thinking": f"失败归因: {ref.get('cause','unknown')}",
+                    "purpose": "失败归因 → 改策略",
+                    "message": f"{ref.get('vuln_name','?')}: {ref.get('cause','?')} → {ref.get('suggested_next','')}",
+                    "reflection": ref,
+                    "tone": "warning",
+                })
         try:
             after_snapshot = _snapshot_facts(state)
             _emit_replan_signals(
@@ -2901,6 +2966,24 @@ async def node_privesc_attempt(state: PentestState) -> PentestState:
         state.log("风险预算不足，跳过 privesc_attempt 阶段")
         return state
     state.log(f"攻链: 提权尝试 第 {state.privesc_attempt_count}/{state.max_privesc_rounds} 轮")
+    # ── W2-T4: 假设驱动提权 ──
+    for h in (state.privesc_hypotheses or [])[:5]:
+        status = h.get("status", "unverified")
+        if status != "verified":
+            state.push_decision({
+                "action": "hypothesis_test",
+                "phase": "privesc_attempt",
+                "thinking": h.get("hypothesis", "")[:200],
+                "purpose": "假设驱动提权",
+                "message": f"提权假设: {h.get('hypothesis','')[:80]}",
+                "hypothesis": {
+                    "text": h.get("hypothesis", ""),
+                    "status": status,
+                    "confidence": h.get("confidence", 0),
+                    "category": h.get("category", ""),
+                },
+                "tone": "info",
+            })
     try:
         agent = PostExploitAgent()
         async def _on_tool_log(line: str):
@@ -2991,6 +3074,28 @@ async def node_lateral_movement(state: PentestState) -> PentestState:
         state.log("攻链: 无凭据且无立足点, 跳过横向移动")
         return state
     state.log("攻链: 横向移动")
+    chain_priorities: list[dict] = []
+    try:
+        from backend.agents.world_model import WorldModelQuery
+        wm = state.world_model() if hasattr(state, "world_model") else WorldModelQuery(state.attack_graph, state)
+        lc = wm.lateral_chains() if hasattr(wm, "lateral_chains") else []
+        chain_priorities = [
+            {"start": c.start, "via": c.via, "target": c.target, "score": round(c.score, 2), "reason": c.reason}
+            for c in lc[:8]
+        ]
+        if chain_priorities:
+            state.log(f"世界模型: {len(chain_priorities)} 条横向候选链")
+            state.push_decision({
+                "action": "chain_selected",
+                "phase": "lateral_movement",
+                "thinking": f"世界模型提供 {len(chain_priorities)} 条候选链",
+                "purpose": "横向选路",
+                "message": f"横向链: {chain_priorities[0]['reason'][:80]} (score={chain_priorities[0]['score']})" if chain_priorities else "",
+                "chains": chain_priorities,
+                "tone": "info",
+            })
+    except Exception:
+        pass
     try:
         agent = PostExploitAgent()
 
@@ -3007,6 +3112,7 @@ async def node_lateral_movement(state: PentestState) -> PentestState:
             task_id=state.task_id,
             log_callback=_on_tool_log,
             record_callback=_on_exec_record,
+            chain_priorities=chain_priorities,
         )
         state.lateral_results = res
         findings = res.get("findings", {})
@@ -4624,7 +4730,7 @@ def _infer_os(ports: list[PortInfo], os_info: dict) -> str:
     return "unknown"
 
 
-def _build_exploit_decision_prompt(state: PentestState) -> str:
+def _build_exploit_decision_prompt(state: PentestState, ranked_frontier: list | None = None) -> str:
     from backend.llm.prompts.templates import EXPLOIT_DECISION
     findings_json = json.dumps(
         [f.model_dump() for f in state.findings if f.exploitable],
@@ -4644,6 +4750,15 @@ def _build_exploit_decision_prompt(state: PentestState) -> str:
         dir_intel_json=dir_intel_json,
     )
     extras: list[str] = []
+    if ranked_frontier:
+        frontier_lines: list[str] = []
+        for i, (node, score) in enumerate(ranked_frontier[:6]):
+            a = node.attrs
+            frontier_lines.append(
+                f"  {i+1}. {node.label} (severity={a.get('severity','?')}, "
+                f"score={score:.1f}, cve={a.get('cve','none')})"
+            )
+        extras.append("【世界模型可利用前沿评分 (WS2)】\n" + "\n".join(frontier_lines))
     if state.workflow_mode and state.workflow_mode != "standard":
         extras.append(f"任务模式: {state.workflow_mode}")
     if state.extra_hint:

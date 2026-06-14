@@ -216,6 +216,11 @@ const props = defineProps({
     type: Object,
     default: null,
   },
+  /** W2-T1: 当前选中的前沿节点 id, 高亮该节点。 */
+  selectedNodeId: {
+    type: String,
+    default: '',
+  },
 })
 
 defineEmits(['refresh'])
@@ -547,20 +552,21 @@ const echartsNodes = computed(() => {
     const exploitable = Boolean(n.facts?.exploitable)
     const isSynth = n._origin === 'synth'
     const isPrior = n.facts?.source === 'prior' || n.facts?.from_history === true
+    const isTargetSelected = props.selectedNodeId && n.id === props.selectedNodeId
 
     return {
       id: n.id,
       name: (isPrior ? '⏳ ' : '') + (n.label || n.id),
       symbol: meta.symbol,
-      symbolSize: size,
+      symbolSize: size + (isTargetSelected ? 8 : 0),
       category: n.type,
       itemStyle: {
         color,
-        borderColor: exploitable ? '#ffc857' : (isPrior ? '#c9a74e' : (isSynth ? 'rgba(255,255,255,0.18)' : 'transparent')),
-        borderWidth: exploitable ? 2 : (isPrior ? 2 : (isSynth ? 1 : 0)),
-        borderType: (isPrior || (isSynth && !exploitable)) ? 'dashed' : 'solid',
-        shadowBlur: glow,
-        shadowColor: glow ? color : 'transparent',
+        borderColor: isTargetSelected ? '#e06979' : (exploitable ? '#ffc857' : (isPrior ? '#c9a74e' : (isSynth ? 'rgba(255,255,255,0.18)' : 'transparent'))),
+        borderWidth: isTargetSelected ? 3 : (exploitable ? 2 : (isPrior ? 2 : (isSynth ? 1 : 0))),
+        borderType: (isPrior || (isSynth && !exploitable && !isTargetSelected)) ? 'dashed' : 'solid',
+        shadowBlur: isTargetSelected ? Math.max(glow, 18) : glow,
+        shadowColor: isTargetSelected ? '#e06979' : (glow ? color : 'transparent'),
         opacity: isSynth ? 0.92 : 1,
       },
       label: {
