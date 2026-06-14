@@ -49,6 +49,64 @@ async def reload_skills():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── W4-T3: Skill 草案管理 ────────────────────────────────────
+
+@router.get("/skills/drafts")
+async def list_skill_drafts():
+    """列出 .drafts/ 下所有待审核草案。"""
+    try:
+        from backend.skills.draft_synthesizer import list_drafts
+        return {"drafts": list_drafts()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/skills/drafts/{name}")
+async def get_skill_draft(name: str):
+    """获取单个草案详情（含 YAML）。"""
+    try:
+        from backend.skills.draft_synthesizer import get_draft
+        draft = get_draft(name)
+        if not draft:
+            raise HTTPException(status_code=404, detail=f"草案不存在: {name}")
+        return draft
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/skills/drafts/{name}/promote")
+async def promote_skill_draft(name: str):
+    """将草案转正到正式 skill 目录，并删除 draft 文件。"""
+    try:
+        from backend.skills.draft_synthesizer import promote_draft
+        dest = promote_draft(name)
+        if not dest:
+            raise HTTPException(status_code=404, detail=f"草案不存在或转正失败: {name}")
+        from backend.skills.registry import get_registry
+        get_registry().reload()
+        return {"status": "ok", "skill_id": name, "destination": str(dest)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/skills/drafts/{name}")
+async def delete_skill_draft(name: str):
+    """丢弃一个草案文件。"""
+    try:
+        from backend.skills.draft_synthesizer import delete_draft
+        if not delete_draft(name):
+            raise HTTPException(status_code=404, detail=f"草案不存在: {name}")
+        return {"status": "ok", "deleted": name}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/skills/stats")
 async def skills_stats():
     """Aggregated success-rate statistics from execution logs."""
