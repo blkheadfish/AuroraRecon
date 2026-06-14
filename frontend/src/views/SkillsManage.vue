@@ -53,6 +53,46 @@
       </el-collapse>
     </el-card>
 
+    <!-- W4-T3: 草案（待审核） -->
+    <el-card class="panel" v-if="drafts.length" style="margin-top: 16px">
+      <template #header>
+        <div class="card-header">
+          <span class="card-header-title">草案（待审核）</span>
+          <el-tag type="warning" size="small">{{ drafts.length }} 个</el-tag>
+        </div>
+      </template>
+      <el-table :data="drafts" size="small">
+        <el-table-column prop="skill_id" label="技能 ID" min-width="180" />
+        <el-table-column prop="name" label="名称" min-width="140" />
+        <el-table-column prop="category" label="分类" width="120">
+          <template #default="{ row }">
+            <el-tag size="small">{{ row.category }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="来源任务" width="140">
+          <template #default="{ row }">
+            <code class="source-path">{{ row.source_task_id?.slice(0, 12) || '—' }}</code>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="260" align="center">
+          <template #default="{ row }">
+            <div class="ops">
+              <el-button class="op-view" size="small" @click="previewDraft(row)">预览</el-button>
+              <el-button type="success" size="small" @click="promoteDraft(row)">转正</el-button>
+              <el-button type="danger" size="small" plain @click="discardDraft(row)">丢弃</el-button>
+            </div>
+          </template>
+        </el-table-column>
+      </el-table>
+    </el-card>
+
+    <el-dialog v-model="draftPreviewVisible" title="草案预览" width="60%" destroy-on-close>
+      <pre class="yaml-preview"><code class="hljs language-yaml" v-html="selectedDraftHighlighted"></code></pre>
+      <template #footer>
+        <el-button @click="draftPreviewVisible = false">关闭</el-button>
+      </template>
+    </el-dialog>
+
     <el-drawer v-model="skillDrawerVisible" title="技能详情" size="55%">
       <template v-if="selectedSkill">
         <div class="skill-meta">
@@ -116,14 +156,21 @@ const skillEditorVisible = ref(false)
 const saveSkillLoading = ref(false)
 const skillYamlDraft = ref('')
 
-function shortSource(source) {
-  if (!source) return '-'
-  const normalized = String(source).replaceAll('\\', '/')
-  const idx = normalized.lastIndexOf('/backend/skills/')
-  return idx >= 0 ? normalized.slice(idx + 1) : normalized
-}
+// W4-T3: 草案
+const drafts = ref([])
+const draftPreviewVisible = ref(false)
+const selectedDraft = ref(null)
 
-function escapeHtml(text) {
+const selectedDraftHighlighted = computed(() => {
+  if (!selectedDraft.value?.yaml) return ''
+  try {
+    return hljs.highlight(selectedDraft.value.yaml, { language: 'yaml' }).value
+  } catch {
+    return escapeHtml(selectedDraft.value.yaml)
+  }
+})
+
+function shortSource(source) {
   return String(text || '')
     .replaceAll('&', '&amp;')
     .replaceAll('<', '&lt;')
@@ -236,8 +283,47 @@ async function saveSkillYaml() {
   }
 }
 
+// ── W4-T3: 草案管理 ────────────────────────────────
+
+async function fetchDrafts() {
+  try {
+    const res = await api.getSkillDrafts()
+    drafts.value = res.drafts || []
+  } catch {
+    // 静默处理
+  }
+}
+
+function previewDraft(row) {
+  selectedDraft.value = row
+  draftPreviewVisible.value = true
+}
+
+async function promoteDraft(row) {
+  try {
+    await api.promoteSkillDraft(row.skill_id || row.filename)
+    ElMessage.success(`草案 ${row.name || row.skill_id} 已转正`)
+    await fetchDrafts()
+    await fetchSkills()
+    await api.reloadSkills()
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || e.message || '转正失败')
+  }
+}
+
+async function discardDraft(row) {
+  try {
+    await api.deleteSkillDraft(row.skill_id || row.filename)
+    ElMessage.success(`草案 ${row.name || row.skill_id} 已丢弃`)
+    await fetchDrafts()
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || e.message || '丢弃失败')
+  }
+}
+
 onMounted(async () => {
   await fetchSkills()
+  fetchDrafts()
 })
 </script>
 
@@ -425,4 +511,8 @@ onMounted(async () => {
   .yaml-input :deep(.el-textarea__inner) { min-height: 300px !important; }
   .editor-preview { min-height: 300px; max-height: 300px; }
 }
+
+/* W4-T3 */
+.card-header { display: flex; align-items: center; gap: 8px; }
+.card-header-title { font-size: 14px; font-weight: 600; color: var(--text-primary); }
 </style>

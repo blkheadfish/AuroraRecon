@@ -34,7 +34,6 @@ from backend.skills.models import (
     ParseRule,
     Probe,
     ProbeStep,
-    RetryConfig,
     Skill,
     SkillMeta,
     SuccessCriteria,
@@ -46,7 +45,8 @@ logger = logging.getLogger(__name__)
 SKILLS_DIR = Path(__file__).parent
 
 # 不扫描 YAML 的子目录（references 可在执行时加载）
-_SKIP_DIRS = {"scripts", "workflows", "templates", "examples"}
+# W4-T3: .drafts 目录包含待审核草案，不自动加载
+_SKIP_DIRS = {"scripts", "workflows", "templates", "examples", ".drafts"}
 
 
 def load_skills_metadata() -> list[SkillMeta]:
@@ -288,8 +288,6 @@ def _parse_match_rule(raw: dict) -> MatchRule:
         fingerprint_contains=_ensure_list(raw.get("fingerprint_contains", [])),
         cve_matches=_ensure_list(raw.get("cve_matches", [])),
         evidence_contains=_ensure_list(raw.get("evidence_contains", [])),
-        evidence_regex=_ensure_list(raw.get("evidence_regex", [])),
-        evidence_keywords=_ensure_list(raw.get("evidence_keywords", [])),
         json_probe_result=raw.get("json_probe_result", ""),
         service_is=raw.get("service_is", ""),
         port_is=_ensure_list(raw.get("port_is", [])),
@@ -365,15 +363,6 @@ def _parse_step(raw: dict) -> ExploitStep:
         exit_code=sc_raw.get("exit_code"),
     )
 
-    retry_raw = raw.get("retry") or {}
-    retry = RetryConfig(
-        max_retries=retry_raw.get("max_retries", 0),
-        adjust_param=retry_raw.get("adjust_param", ""),
-        adjust_amount=retry_raw.get("adjust_amount", 1),
-        adjust_direction=retry_raw.get("adjust_direction", "increment"),
-        partial_success_hint=retry_raw.get("partial_success_hint", ""),
-    )
-
     return ExploitStep(
         id=raw.get("id", ""),
         description=raw.get("description", ""),
@@ -384,7 +373,6 @@ def _parse_step(raw: dict) -> ExploitStep:
         on_success=raw.get("on_success", "next_step"),
         on_fail=raw.get("on_fail", "next_path"),
         evidence_capture=raw.get("evidence_capture", {}),
-        retry=retry,
     )
 
 

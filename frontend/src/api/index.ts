@@ -229,6 +229,22 @@ export const api = {
   reloadSkills: (): Promise<{ status: string; total: number }> =>
     http.post('/skills/reload'),
 
+  // W4-T3: Skill drafts
+  getSkillDrafts: (): Promise<{
+    drafts: Array<{
+      skill_id: string; name: string; category: string;
+      source_task_id: string; generated_at: string;
+      filename: string; filepath: string; yaml: string;
+    }>
+  }> => http.get('/skills/drafts'),
+  getSkillDraft: (name: string): Promise<{
+    skill_id: string; name: string; yaml: string; filename: string;
+  }> => http.get(`/skills/drafts/${name}`),
+  promoteSkillDraft: (name: string): Promise<{ status: string; skill_id: string; destination: string }> =>
+    http.post(`/skills/drafts/${name}/promote`),
+  deleteSkillDraft: (name: string): Promise<{ status: string; deleted: string }> =>
+    http.delete(`/skills/drafts/${name}`),
+
   getKnowledgeEntries: (): Promise<{
     entries: Array<{
       vuln_id: string

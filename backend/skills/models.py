@@ -129,15 +129,6 @@ class SkillEvent:
         return result
 
 
-@dataclass
-class RetryConfig:
-    max_retries: int = 0
-    adjust_param: str = ""
-    adjust_amount: int = 1
-    adjust_direction: str = "increment"
-    partial_success_hint: str = ""
-
-
 # ============================================================
 # 结构化探测结果（替代字符串正则 IPC）
 # ============================================================
@@ -459,8 +450,6 @@ class ExploitStep:
 
     evidence_capture: dict[str, str] = field(default_factory=dict)
 
-    retry: RetryConfig = field(default_factory=RetryConfig)
-
 
 @dataclass
 class ExploitPath:
@@ -507,13 +496,14 @@ class MatchRule:
 
     @staticmethod
     def _tokenize(text: str) -> set[str]:
-        return set(re.findall(r'[a-z0-9]{2,}', text.lower()))
+        import re as _re
+        return set(_re.findall(r'[a-z0-9]{2,}', text.lower()))
 
     @staticmethod
     def _tokens_match(evidence_tokens: set[str], keyword_tokens: set[str]) -> bool:
         if not keyword_tokens:
             return False
-        return keyword_tokens.issubset(evidence_tokens)
+        return bool(evidence_tokens & keyword_tokens)
 
     def matches(
         self,
@@ -545,20 +535,6 @@ class MatchRule:
         if self.evidence_contains:
             checks.append(
                 any(kw.lower() in ev_lower for kw in self.evidence_contains)
-            )
-
-        if self.evidence_regex:
-            checks.append(
-                any(re.search(pattern, evidence, re.IGNORECASE) for pattern in self.evidence_regex)
-            )
-
-        if self.evidence_keywords:
-            ev_tokens = self._tokenize(evidence)
-            checks.append(
-                any(
-                    self._tokens_match(ev_tokens, self._tokenize(kw))
-                    for kw in self.evidence_keywords
-                )
             )
 
         if self.json_probe_result:
@@ -656,9 +632,6 @@ class SkillMeta:
     phase: str = "foothold"
     match: MatchConfig = field(default_factory=MatchConfig)
     source_file: str = ""
-
-    # 跨 session 学习：执行反馈循环调整的路径优先级 {path_id: priority_delta}
-    dynamic_priority_adjustments: dict[str, int] = field(default_factory=dict)
 
 
 
