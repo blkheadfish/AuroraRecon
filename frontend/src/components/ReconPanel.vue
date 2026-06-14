@@ -176,6 +176,52 @@
           <code v-for="(d, i) in subdomains" :key="i" class="path-item subdomain">{{ d }}</code>
         </div>
       </div>
+
+      <!-- Internal / AD Enumeration Results -->
+      <div class="info-card mt-16" v-if="hasAdEnumResults">
+        <div class="card-title">
+          <el-icon><Connection /></el-icon>
+          内网/AD 枚举结果
+          <span class="count-badge">{{ adEnumTotal }}</span>
+        </div>
+
+        <div v-if="adShares.length" class="ad-sub-section">
+          <div class="ad-sub-title">SMB 共享</div>
+          <div class="ad-item-list">
+            <div v-for="s in adShares" :key="s.id" class="ad-item">
+              <span class="ad-item-label">{{ s.label }}</span>
+              <span v-if="s.permission" class="ad-item-perm" :class="permClass(s.permission)">
+                {{ s.permission }}
+              </span>
+            </div>
+          </div>
+        </div>
+
+        <div v-if="adDomainUsers.length" class="ad-sub-section">
+          <div class="ad-sub-title">域账户</div>
+          <div class="ad-item-list">
+            <code v-for="u in adDomainUsers" :key="u.id" class="ad-item-tag">{{ u.label }}</code>
+          </div>
+        </div>
+
+        <div v-if="adSpns.length" class="ad-sub-section">
+          <div class="ad-sub-title">Kerberos SPN</div>
+          <div class="ad-item-list">
+            <code v-for="s in adSpns" :key="s.id" class="ad-item-tag spn-tag">{{ s.label }}</code>
+          </div>
+        </div>
+
+        <div v-if="adCredentials.length" class="ad-sub-section">
+          <div class="ad-sub-title">凭据</div>
+          <div class="ad-item-list">
+            <div v-for="c in adCredentials" :key="c.id" class="ad-item">
+              <span class="ad-item-label">{{ c.label }}</span>
+              <span v-if="c.validated" class="ad-item-valid">已验</span>
+              <span v-else class="ad-item-pend">待验</span>
+            </div>
+          </div>
+        </div>
+      </div>
     </template>
   </div>
 </template>
@@ -304,6 +350,73 @@ function hasTooltip(data) {
 const isEmpty = computed(() =>
   !ports.value.length && !displayPaths.value.length && !subdomains.value.length
 )
+
+const adEnumNodes = computed(() => {
+  const nodes = props.task?.attack_graph?.nodes || []
+  return nodes.filter((n) => {
+    const facts = n.facts || {}
+    const type = n.type
+    const subtype = facts.subtype
+    return (
+      (type === 'loot' && subtype === 'share') ||
+      (type === 'credential' && (subtype === 'domain_user' || subtype === 'domain_group' || subtype === 'domain_computer')) ||
+      (type === 'credential' && (facts.service === 'smb' || facts.service === 'ldap' || facts.service === 'kerberos')) ||
+      (type === 'finding' && subtype === 'spn')
+    )
+  })
+})
+
+const adShares = computed(() =>
+  adEnumNodes.value.filter((n) => n.type === 'loot').map((n) => ({
+    id: n.id,
+    label: n.label || n.id,
+    permission: (n.facts || {}).permission || '',
+  }))
+)
+
+const adDomainUsers = computed(() =>
+  adEnumNodes.value.filter((n) => {
+    const facts = n.facts || {}
+    return n.type === 'credential' && (facts.subtype === 'domain_user' || facts.subtype === 'domain_group' || facts.subtype === 'domain_computer' || facts.domain)
+  }).map((n) => ({
+    id: n.id,
+    label: n.label || n.id,
+    type: n.type,
+  }))
+)
+
+const adSpns = computed(() =>
+  adEnumNodes.value.filter((n) => {
+    const facts = n.facts || {}
+    return n.type === 'finding' && facts.subtype === 'spn'
+  }).map((n) => ({
+    id: n.id,
+    label: n.label || n.id,
+  }))
+)
+
+const adCredentials = computed(() =>
+  adEnumNodes.value.filter((n) => {
+    const facts = n.facts || {}
+    return n.type === 'credential' && !facts.subtype && !facts.domain
+  }).map((n) => ({
+    id: n.id,
+    label: n.label || n.id,
+    validated: !!((n.facts || {}).validated),
+  }))
+)
+
+const adEnumTotal = computed(() => adEnumNodes.value.length)
+
+const hasAdEnumResults = computed(() => adEnumNodes.value.length > 0)
+
+function permClass(perm) {
+  const p = perm.toUpperCase()
+  if (p === 'READ') return 'perm-read'
+  if (p === 'WRITE') return 'perm-write'
+  if (p === 'NO ACCESS') return 'perm-noaccess'
+  return ''
+}
 </script>
 
 <style scoped>
@@ -668,5 +781,88 @@ const isEmpty = computed(() =>
 .tree-tooltip .tt-row {
   color: #ddd;
   margin-top: 2px;
+}
+
+/* ============ AD / Internal Enum (W3-T1) ============ */
+.ad-sub-section {
+  margin-bottom: 12px;
+}
+
+.ad-sub-title {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--accent-yellow);
+  margin-bottom: 6px;
+}
+
+.ad-item-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ad-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg-base);
+  border: 1px solid var(--border);
+  padding: 3px 8px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+}
+
+.ad-item-label {
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.ad-item-perm {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 0 5px;
+  border-radius: 3px;
+}
+
+.perm-read {
+  color: #48b97a;
+  background: rgba(72, 185, 122, 0.15);
+}
+
+.perm-write {
+  color: #e28a40;
+  background: rgba(226, 138, 64, 0.15);
+}
+
+.perm-noaccess {
+  color: var(--text-muted);
+  background: rgba(160, 160, 160, 0.1);
+}
+
+.ad-item-tag {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+  background: var(--bg-base);
+  border: 1px solid var(--border);
+  padding: 2px 7px;
+  border-radius: var(--radius-sm);
+}
+
+.ad-item-tag.spn-tag {
+  color: #c070e0;
+  border-color: rgba(192, 112, 224, 0.3);
+}
+
+.ad-item-valid {
+  font-size: 10px;
+  color: #48b97a;
+  font-weight: 600;
+}
+
+.ad-item-pend {
+  font-size: 10px;
+  color: var(--text-muted);
 }
 </style>

@@ -1133,3 +1133,96 @@ def attach_credential_to_graph(
         discovered_by=discovered_by,
     )
     return cid
+
+
+def write_network_enum_results(
+    state: PentestState,
+    phase: str,
+    enum_output: dict[str, Any],
+    host: str,
+    port: int,
+) -> None:
+    """Parse network enum results and write findings/credentials/shares to attack_graph (W3-T1).
+
+    Works directly with AttackGraph so it can be tested without orchestrator imports.
+    """
+    import re
+
+    g = state.attack_graph
+    svc_id = f"svc:{host}:{port}"
+    g.upsert_node(svc_id, type="service", label=f"{enum_output.get('service','?')}:{port}",
+                  facts={"port": port, "service": enum_output.get("service", "?"), "version": ""})
+    host_id = f"host:{host}"
+    g.add_edge(host_id, svc_id, relation="exposes")
+
+    stdout = "\n".join(enum_output.get("stdout_parts", []))
+
+    if phase == "smb_enum":
+        share_matches = re.findall(r"(\w+(?:\$\w*)?)\s+(READ|WRITE|NO ACCESS)", stdout, re.IGNORECASE)
+        for share_name, perm in share_matches:
+            share_id = f"share:{host}:{share_name}"
+            g.upsert_node(share_id, type="loot", label=f"\\\\{host}\\{share_name}",
+                          facts={"host": host, "name": share_name, "permission": perm.upper(), "subtype": "share"})
+            g.add_edge(svc_id, share_id, relation="exposes")
+
+        if re.search(r"Anonymous login|SMB_ACCESS_DONE|SMB_CRED_FOUND", stdout, re.IGNORECASE):
+            cred_id = f"cred:smb:{host}:anon"
+            g.upsert_node(cred_id, type="credential", label=f"anonymous@{host}:smb",
+                          facts={"service": "smb", "username": "anonymous", "has_secret": False, "validated": True})
+            g.add_edge(svc_id, cred_id, relation="discovers")
+
+        domain_match = re.search(r"Domain:\s*(\S+)", stdout)
+        if domain_match:
+            g.upsert_node(f"domain:{domain_match.group(1)}", type="credential",
+                          facts={"domain": domain_match.group(1), "subtype": "domain_user"}, label=f"Domain: {domain_match.group(1)}")
+
+        user_matches = re.findall(r"([\w.-]+)\\\\([\w.-]+)", stdout)
+        for _domain, _user in user_matches[:20]:
+            uid = f"user:{host}:{_user}"
+            g.upsert_node(uid, type="credential", facts={"username": _user, "domain": _domain, "subtype": "domain_user"},
+                          label=f"{_domain}\\{_user}")
+            g.add_edge(svc_id, uid, relation="discovers")
+
+    elif phase == "ldap_enum":
+        if re.search(r"LDAP_ANONYMOUS=true", stdout):
+            fid = f"finding:ldap:anon:{host}:{port}"
+            g.upsert_node(fid, type="finding", label=f"LDAP Anonymous Bind on {host}:{port}",
+                          facts={"cve": "", "severity": "medium", "exploitable": True, "exploited": False, "tool": "ldap-enum"})
+            g.add_edge(svc_id, fid, relation="discovers")
+
+        naming = re.search(r"LDAP_NAMING=(\S+)", stdout)
+        if naming:
+            domain = naming.group(1).split(",")[0].replace("DC=", "")
+            g.upsert_node(f"domain:{domain}", type="credential",
+                          facts={"domain": domain, "naming_context": naming.group(1), "subtype": "domain_user"}, label=f"Domain: {domain}")
+
+        user_count = re.search(r"LDAP_USER_COUNT=(\d+)", stdout)
+        group_count = re.search(r"LDAP_GROUP_COUNT=(\d+)", stdout)
+        if user_count or group_count:
+            uc = int(user_count.group(1)) if user_count else 0
+            gc = int(group_count.group(1)) if group_count else 0
+            g.upsert_node(f"finding:ldap:dump:{host}:{port}", type="finding",
+                          label=f"LDAP Dump: {uc} users, {gc} groups",
+                          facts={"cve": "", "severity": "medium", "exploitable": True, "exploited": False, "tool": "ldap-enum", "users": uc, "groups": gc})
+
+    elif phase == "kerberos_attack":
+        if re.search(r"ASREP_HASH_FOUND=true", stdout):
+            fid_asrep = f"finding:kerberos:asrep:{host}:{port}"
+            g.upsert_node(fid_asrep, type="finding", label=f"ASREPRoastable on {host}:{port}",
+                          facts={"cve": "", "severity": "high", "exploitable": True, "exploited": False, "tool": "kerberos-enum"})
+            g.add_edge(svc_id, fid_asrep, relation="discovers")
+            g.upsert_node(f"cred:kerberos:asrep:{host}", type="credential", label=f"ASREP Hash@{host}",
+                          facts={"service": "kerberos", "username": "?", "has_secret": True, "validated": False})
+            g.add_edge(fid_asrep, f"cred:kerberos:asrep:{host}", relation="enables")
+
+        if re.search(r"KERBEROAST_CANDIDATES_FOUND=true", stdout):
+            fid_kerb = f"finding:kerberos:kerberoast:{host}:{port}"
+            g.upsert_node(fid_kerb, type="finding", label=f"Kerberoastable on {host}:{port}",
+                          facts={"cve": "", "severity": "high", "exploitable": True, "exploited": False, "tool": "kerberos-enum"})
+            g.add_edge(svc_id, fid_kerb, relation="discovers")
+            spn_matches = re.findall(r"SPN[:\s]+([\w/-]+)", stdout)
+            for spn in spn_matches[:20]:
+                spn_id = f"spn:{host}:{spn}"
+                g.upsert_node(spn_id, type="finding", label=f"SPN: {spn}",
+                              facts={"host": host, "spn": spn, "subtype": "spn"})
+                g.add_edge(fid_kerb, spn_id, relation="leads_to")
