@@ -355,6 +355,53 @@ async def delete_task_from_db(task_id: str) -> bool:
         return False
 
 
+async def get_past_tasks_by_host(host_or_cidr: str, tenant_id: str, *, exclude_task_id: str = "", limit: int = 10) -> list:
+    """查询同租户下对同一 host/CIDR 的历史任务记录。
+
+    匹配策略：target 字段包含 host 或 host 的前缀（CIDR 前缀匹配）。
+    返回最近完成的/有 findings 的历史任务，最多 limit 条。
+    """
+    async with async_session() as session:
+        # 提取主机部分（去掉 scheme / port / path）
+        clean = host_or_cidr.strip()
+        if "://" in clean:
+            from urllib.parse import urlparse
+            clean = urlparse(clean).hostname or clean
+        if ":" in clean and "/" not in clean:
+            clean = clean.rsplit(":", 1)[0]
+
+        if not clean:
+            return []
+
+        like_host = f"%{clean}%"
+        # 取同租户下，target 匹配主机，且有 findings/fingerprints 的过往任务
+        sql = """
+            SELECT task_id, target, state_json, status, got_shell, findings_count
+            FROM tasks
+            WHERE tenant_id = :tenant_id
+              AND target LIKE :like_host
+              AND status IN ('completed', 'running', 'awaiting_approval', 'waiting_user')
+              AND findings_count > 0
+            ORDER BY created_at DESC
+            LIMIT :limit
+        """
+        result = await session.execute(
+            text(sql),
+            {"tenant_id": tenant_id, "like_host": like_host, "limit": limit},
+        )
+        rows = result.fetchall()
+
+        # 排除当前任务自身
+        filtered = []
+        for r in rows:
+            if exclude_task_id and r.task_id == exclude_task_id:
+                continue
+            filtered.append(r)
+            if len(filtered) >= limit:
+                break
+        return filtered
+
+
 async def get_task_stats() -> dict:
     """获取任务统计信息"""
     async with async_session() as session:
