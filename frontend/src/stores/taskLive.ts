@@ -12,6 +12,9 @@ import type {
   DecisionEvent,
   TaskBranch,
   TaskDetail,
+  WMEdge,
+  WMNode,
+  WorldModelUpdatePayload,
 } from '@/types/task'
 
 type ApprovalState = 'idle' | 'submitting' | 'submitted' | 'error'
@@ -83,6 +86,7 @@ interface TaskLiveState {
   activeBranchId: string
   maxBranchesPerTask: number
   branchFlashAt: number
+  worldGraph: { nodes: Record<string, WMNode>; edges: WMEdge[] }
   unsub?: () => void
   _everAttached: boolean
   /** phase_update 节流：100ms 内多次 patch 合并为一次 state.task 更新 */
@@ -90,11 +94,105 @@ interface TaskLiveState {
   _phasePatchTimer?: number | null
 }
 
+type DecisionHandler = (state: TaskLiveState, taskId: string, de: DecisionEvent, rawPayload: Record<string, unknown>) => void
+
+const _decisionHandlers = new Map<string, DecisionHandler>()
+
+export function registerDecisionHandler(action: string, handler: DecisionHandler): void {
+  _decisionHandlers.set(action, handler)
+}
+
 export const useTaskLiveStore = defineStore('taskLive', () => {
   const taskStateMap = ref<Record<string, TaskLiveState>>({})
   const taskListStore = useTaskListStore()
 
   const APPROVAL_PROTECTION_MS = 5000
+
+  function _applyWorldModelDelta(state: TaskLiveState, payload: WorldModelUpdatePayload) {
+    if (payload.nodes_upserted) {
+      for (const n of payload.nodes_upserted) {
+        state.worldGraph.nodes[n.id] = n
+      }
+    }
+    if (payload.nodes_removed) {
+      for (const id of payload.nodes_removed) {
+        delete state.worldGraph.nodes[id]
+      }
+    }
+    if (payload.edges_upserted) {
+      for (const e of payload.edges_upserted) {
+        const exists = state.worldGraph.edges.findIndex(
+          (x) => x.src === e.src && x.dst === e.dst && x.relation === e.relation,
+        )
+        if (exists >= 0) {
+          state.worldGraph.edges[exists] = e
+        } else {
+          state.worldGraph.edges.push(e)
+        }
+      }
+      state.worldGraph.edges = state.worldGraph.edges.slice()
+    }
+  }
+
+  function _fullGraphToWorldGraph(state: TaskLiveState, graph: { nodes: Array<{ id: string; type: string; label?: string; facts?: Record<string, unknown>; attrs?: Record<string, unknown> }>; edges: WMEdge[] }) {
+    const nodes: Record<string, WMNode> = {}
+    if (graph.nodes) {
+      for (const n of graph.nodes) {
+        nodes[n.id] = {
+          id: n.id,
+          type: n.type || '',
+          label: n.label || n.id,
+          attrs: { ...(n.facts || {}), ...(n.attrs || {}) },
+        }
+      }
+    }
+    state.worldGraph = { nodes, edges: graph.edges || [] }
+  }
+
+  registerDecisionHandler('llm_delta', (state, taskId, de, p) => {
+    const sid = (p.stream_id as string) || 'default'
+    const delta = (p.delta as string) || ''
+    if (!delta) return
+    const phase = (p.phase as string) || ''
+    const kind = (p.kind as string) || 'content'
+    const bufKey = `${taskId}::${sid}`
+    if (!_deltaBufs[bufKey]) {
+      _deltaBufs[bufKey] = { taskId, sid, phase, kind, text: '' }
+    }
+    _deltaBufs[bufKey].text += delta
+    _deltaBufs[bufKey].phase = phase || _deltaBufs[bufKey].phase
+    _deltaBufs[bufKey].kind = kind || _deltaBufs[bufKey].kind
+    if (!state.llmStreams[sid]) {
+      state.llmStreams[sid] = { streamId: sid, phase, kind, text: '', updatedAt: Date.now() }
+    }
+    _scheduleDeltaFlush()
+  })
+
+  registerDecisionHandler('tool_stream', (state, _taskId, de, p) => {
+    const sid = (p.stream_id as string) || 'default'
+    const line = (p.line as string) || ''
+    for (const ln of line.split('\n')) pushToolStreamLine(state, sid, ln)
+  })
+
+  registerDecisionHandler('checkpoint_request', (state, _taskId, de, _p) => {
+    mergeDecisionEvents(state, [de])
+    applyCheckpointRequest(state, de)
+  })
+
+  registerDecisionHandler('checkpoint_resolved', (state, _taskId, de, _p) => {
+    mergeDecisionEvents(state, [de])
+    applyCheckpointResolved(state, de)
+  })
+
+  registerDecisionHandler('world_model_update', (state, _taskId, de, p) => {
+    const payload = p as WorldModelUpdatePayload
+    _applyWorldModelDelta(state, payload)
+    mergeDecisionEvents(state, [de])
+  })
+
+  registerDecisionHandler('__demo_event', (state, _taskId, de, _p) => {
+    mergeDecisionEvents(state, [{ ...de, message: '[demo] 扩展点验证: 此 action 通过 registerDecisionHandler 插入, 未改 applyEvent 主体', tone: 'info' }])
+  })
 
   function ensureState(taskId: string): TaskLiveState {
     if (!taskStateMap.value[taskId]) {
@@ -121,6 +219,7 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
         activeBranchId: '',
         maxBranchesPerTask: 12,
         branchFlashAt: 0,
+        worldGraph: { nodes: {}, edges: [] },
         _everAttached: false,
         _phasePatchPending: undefined,
         _phasePatchTimer: null,
@@ -590,9 +689,10 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
           const p = (ev.payload || {}) as Record<string, unknown>
           const de = { id: String(ev.id || ''), timestamp: String(ev.ts || ''), ...p } as DecisionEvent
           dEvents.push(de)
-          const action = String(p.action || '')
-          if (action === 'checkpoint_request') applyCheckpointRequest(state, de)
-          if (action === 'checkpoint_resolved') applyCheckpointResolved(state, de)
+          const handler = _decisionHandlers.get(String(p.action || ''))
+          if (handler) {
+            handler(state, taskId, de, p)
+          }
         }
       }
       if (dEvents.length) {
@@ -635,37 +735,11 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
 
       const action = String(p.action || '')
 
-      if (action === 'llm_delta') {
-        const sid = (p.stream_id as string) || 'default'
-        const delta = (p.delta as string) || ''
-        if (!delta) return
-        const phase = (p.phase as string) || ''
-        const kind = (p.kind as string) || 'content'
-        // 批处理：合并 80ms 窗口内的 delta，减少 Vue 重渲染次数
-        const bufKey = `${taskId}::${sid}`
-        if (!_deltaBufs[bufKey]) {
-          _deltaBufs[bufKey] = { taskId, sid, phase, kind, text: '' }
-        }
-        _deltaBufs[bufKey].text += delta
-        _deltaBufs[bufKey].phase = phase || _deltaBufs[bufKey].phase
-        _deltaBufs[bufKey].kind = kind || _deltaBufs[bufKey].kind
-        // 首次创建 stream bubble 时同步初始化，避免 UI 闪现空 bubble
-        if (!state.llmStreams[sid]) {
-          state.llmStreams[sid] = { streamId: sid, phase, kind, text: '', updatedAt: Date.now() }
-        }
-        _scheduleDeltaFlush()
-      } else if (action === 'tool_stream') {
-        const sid = (p.stream_id as string) || 'default'
-        const line = (p.line as string) || ''
-        // 后端窗口合并后 line 可能是多行 \n 连接, 拆开保持每行一条渲染
-        for (const ln of line.split('\n')) pushToolStreamLine(state, sid, ln)
+      const handler = _decisionHandlers.get(action)
+      if (handler) {
+        handler(state, taskId, de, p)
       } else {
         mergeDecisionEvents(state, [de])
-        if (action === 'checkpoint_request') {
-          applyCheckpointRequest(state, de)
-        } else if (action === 'checkpoint_resolved') {
-          applyCheckpointResolved(state, de)
-        }
       }
       return
     }
@@ -699,6 +773,9 @@ export const useTaskLiveStore = defineStore('taskLive', () => {
       const p = (raw.payload || {}) as TaskDetail['attack_graph']
       if (state.task && p) {
         state.task = { ...state.task, attack_graph: p }
+      }
+      if (p) {
+        _fullGraphToWorldGraph(state, p)
       }
       return
     }

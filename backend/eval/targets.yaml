@@ -8,4 +8,15 @@
 #   expect_finding_cve        []  at least one finding must list one of these CVEs
 #   expect_exploit_success    bool  if true, at least one ExploitResult.success must be True
 #   timeout_sec               int   per-target timeout (default: 600)
-targets: []
+targets:
+  - id: fastjson_1224
+    base_url: "http://192.168.127.132:8090"
+    expect_phase_reached: ["exploit_decision"]
+    expect_finding_name_contains: ["fastjson"]
+    expect_exploit_success: true
+    timeout_sec: 900
+  - id: flask_ssti
+    base_url: "http://192.168.127.132:8000"
+    expect_finding_name_contains: ["ssti"]
+    expect_exploit_success: true
+    timeout_sec: 900

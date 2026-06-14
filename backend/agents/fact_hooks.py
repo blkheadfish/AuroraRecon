@@ -1058,10 +1058,10 @@ def _ag_credential_id(cred: dict[str, Any]) -> str:
 def attach_host_to_graph(state: PentestState, host: str, *, discovered_by: str = "") -> str:
     if not host:
         return ""
+    from backend.agents.world_model import WorldModelWriter
+    writer = WorldModelWriter(state)
     nid = _ag_host_id(host)
-    state.attack_graph.upsert_node(
-        nid, type="host", label=host, discovered_by=discovered_by,
-    )
+    writer.upsert_node("host", nid, attrs={"ip": host}, label=host, discovered_by=discovered_by)
     return nid
 
 
@@ -1076,16 +1076,17 @@ def attach_service_to_graph(
 ) -> str:
     if not host or not port:
         return ""
+    from backend.agents.world_model import WorldModelWriter
+    writer = WorldModelWriter(state)
     host_id = attach_host_to_graph(state, host, discovered_by=discovered_by)
     sid = _ag_service_id(host, port)
-    state.attack_graph.upsert_node(
-        sid,
-        type="service",
+    writer.upsert_node(
+        "service", sid,
+        attrs={"port": port, "service": service, "version": version},
         label=f"{service or 'service'}:{port}".strip(":"),
-        facts={"port": port, "service": service, "version": version},
         discovered_by=discovered_by,
     )
-    state.attack_graph.add_edge(host_id, sid, relation="exposes")
+    writer.add_edge(host_id, sid, "exposes")
     return sid
 
 
@@ -1095,26 +1096,10 @@ def attach_finding_to_graph(
     *,
     discovered_by: str = "vuln_scan",
 ) -> str:
-    fid = _ag_finding_id(finding.vuln_id)
-    state.attack_graph.upsert_node(
-        fid,
-        type="finding",
-        label=finding.name or finding.vuln_id,
-        facts={
-            "severity": finding.severity,
-            "cve": finding.cve or "",
-            "exploitable": finding.exploitable,
-            "tool": finding.tool,
-        },
-        discovered_by=discovered_by,
-    )
-    if finding.port:
-        host = (finding.target or "").split("/")[2].split(":")[0] if "://" in (finding.target or "") else ""
-        if not host:
-            host = (finding.target or "").split(":")[0]
-        if host:
-            sid = _ag_service_id(host, finding.port)
-            state.attack_graph.add_edge(sid, fid, relation="enables")
+    from backend.agents.world_model import WorldModelWriter
+    writer = WorldModelWriter(state)
+    fid = writer.add_finding(finding)
+    state.attack_graph.nodes[-1].discovered_by = discovered_by  # preserve caller info
     return fid
 
 
@@ -1124,12 +1109,8 @@ def attach_credential_to_graph(
     *,
     discovered_by: str = "exploit_agent",
 ) -> str:
-    cid = _ag_credential_id(cred)
-    state.attack_graph.upsert_node(
-        cid,
-        type="credential",
-        label=f"{cred.get('user') or '?'}@{cred.get('source') or '?'}",
-        facts=dict(cred),
-        discovered_by=discovered_by,
-    )
+    from backend.agents.world_model import WorldModelWriter
+    writer = WorldModelWriter(state)
+    cid = writer.add_credential(cred)
+    state.attack_graph.nodes[-1].discovered_by = discovered_by
     return cid

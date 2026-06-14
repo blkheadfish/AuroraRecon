@@ -17,10 +17,14 @@ def pytest_configure(config):
         "markers",
         "asyncio: mark test as async (runs via event loop fallback if pytest-asyncio absent)",
     )
+    config.addinivalue_line(
+        "markers",
+        "integration: mark test as integration (requires Redis/docker; skipped in default run)",
+    )
 
 
 try:
-    import pytest_asyncio
+    import pytest_asyncio  # noqa: F401
     _HAS_PYTEST_ASYNCIO = True
 except Exception:
     _HAS_PYTEST_ASYNCIO = False

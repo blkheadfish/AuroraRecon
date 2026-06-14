@@ -20,6 +20,7 @@ from backend.agents.models import PortInfo
 from backend.agents.vuln_agent import VulnAgent
 
 
+# ─── _extract_seed_users / _extract_seed_passwords ───────────
 
 def _vuln_with_seeds(creds: list[dict]) -> VulnAgent:
     agent = VulnAgent()
@@ -30,9 +31,9 @@ def _vuln_with_seeds(creds: list[dict]) -> VulnAgent:
 def test_extract_seed_passwords_dedup_and_strip():
     agent = _vuln_with_seeds([
         {"user": "wp", "value": "secret"},
-        {"user": "wp", "value": "secret"},
-        {"user": "admin", "password": "  another  "},
-        {"user": "x", "value": ""},
+        {"user": "wp", "value": "secret"},  # 重复
+        {"user": "admin", "password": "  another  "},  # password 字段 + 空白
+        {"user": "x", "value": ""},  # 空值忽略
     ])
     pwds = agent._extract_seed_passwords()
     assert pwds == ["secret", "another"]
@@ -42,15 +43,15 @@ def test_extract_seed_users_dedup():
     agent = _vuln_with_seeds([
         {"user": "wp", "value": "a"},
         {"username": "admin", "value": "b"},
-        {"user": "wp", "value": "c"},
-        {"value": "d"},
+        {"user": "wp", "value": "c"},  # 重复用户名
+        {"value": "d"},  # 无 user
     ])
     users = agent._extract_seed_users()
     assert users == ["wp", "admin"]
 
 
 def test_extract_seed_handles_garbage():
-    agent = _vuln_with_seeds([None, "not-a-dict", 42, {"user": "ok", "value": "v"}])
+    agent = _vuln_with_seeds([None, "not-a-dict", 42, {"user": "ok", "value": "v"}])  # type: ignore[list-item]
     assert agent._extract_seed_passwords() == ["v"]
     assert agent._extract_seed_users() == ["ok"]
 
@@ -61,6 +62,7 @@ def test_extract_seed_caps_at_30():
     assert len(agent._extract_seed_users()) == 30
 
 
+# ─── _synthesize_credential_replay_findings ──────────────────
 
 def _ports(*pairs: tuple[int, str]) -> list[PortInfo]:
     return [PortInfo(port=p, service=svc, state="open") for p, svc in pairs]
@@ -81,10 +83,12 @@ def test_synth_with_creds_and_ssh_port():
         "10.0.0.5",
         _ports((22, "ssh"), (3306, "mysql"), (80, "http")),
     )
+    # ssh + mysql 应有 finding，http 不应有
     assert len(out) == 2
     names = {f.name for f in out}
     assert any("SSH" in n for n in names)
     assert any("MYSQL" in n for n in names)
+    # 所有合成 finding 必须是 exploitable=True 且 tool="cred-replay"
     for f in out:
         assert f.exploitable is True
         assert f.tool == "cred-replay"
@@ -120,6 +124,7 @@ def test_synth_evidence_carries_seed_count():
     assert "seeds=3" in out[0].evidence
 
 
+# ─── _shell_quote_each ───────────────────────────────────────
 
 def test_shell_quote_each_basic():
     out = VulnAgent._shell_quote_each(["a", "b", "c"])
@@ -128,6 +133,7 @@ def test_shell_quote_each_basic():
 
 def test_shell_quote_each_handles_single_quote():
     out = VulnAgent._shell_quote_each(["it's", "fine"])
+    # bash-safe escape: 'it'\''s'
     assert "it'\\''s" in out
     assert out.startswith("'")
 
@@ -136,18 +142,22 @@ def test_shell_quote_each_empty():
     assert VulnAgent._shell_quote_each([]) == ""
 
 
+# ─── SkillEngine 注入 known_users_b64 / known_passwords_b64 ──
 
 def test_skill_engine_injects_known_creds_b64():
     """直接构造 SkillContext-like 调用路径。"""
-    from backend.skills.engine import SkillEngine
+    from backend.skills.engine import SkillEngine  # noqa: F401
 
     confirmed_facts = {
         "creds": [
             {"user": "wp", "value": "secret123", "source": "wp-config.php"},
             {"user": "admin", "password": "another"},
-            {"value": "passonly"},
+            {"value": "passonly"},  # 无 user 也算密码
         ],
     }
+    # 走"模拟 _execute_inner 注入逻辑"的最小可测试单元：直接调一段代码
+    # 无法 mock SkillEngine 全流程，但我们能直接调函数
+    # 这里 fallback 到测试 b64 编码正确性 + 占位符可还原
     pwds = []
     users = []
     pairs = []
@@ -169,18 +179,21 @@ def test_skill_engine_injects_known_creds_b64():
     assert decoded == "wp\nadmin"
 
 
+# ─── credential_replay.yaml 加载完整性 ──────────────────────
 
 def test_credential_replay_yaml_loads():
     from backend.skills.loader import load_skill
 
-    yaml_path = Path(__file__).parent.parent / "skills" / "credential" / "replay.yaml"
+    yaml_path = Path(__file__).parent.parent / "skills" / "credential" / "replay" / "skill.yaml"
     assert yaml_path.exists(), f"{yaml_path} not found"
 
     skill = load_skill(yaml_path)
     assert skill.skill_id == "credential_replay"
     assert skill.category == "credential"
     assert skill.phase == "foothold"
+    # 必须有匹配 cred-replay 的规则
     assert any("cred-replay" in (r.tool_is or "") for r in skill.match.rules)
+    # 必须包含 SSH/MySQL/SMB/FTP/Postgres 五条主路径 + LLM 兜底
     path_ids = {p.path_id for p in skill.exploit_paths}
     expected = {"ssh_replay", "mysql_replay", "ftp_replay", "smb_replay",
                 "postgres_replay", "llm_freeform"}
@@ -195,6 +208,7 @@ def test_score_skill_tool_is_beats_other_rules():
     registry = SkillRegistry()
     registry.ensure_loaded()
 
+    # 模拟 VulnAgent._synthesize_credential_replay_findings 产出的 finding
     cred_finding = VulnFinding(
         name="凭据复用机会 - SSH (22)",
         severity="high",
@@ -205,8 +219,8 @@ def test_score_skill_tool_is_beats_other_rules():
         tool="cred-replay",
     )
 
-    cred_replay = next((s for s in registry._skills if s.skill_id == "credential_replay"), None)
-    ssh_exploit = next((s for s in registry._skills if s.skill_id == "ssh_exploit"), None)
+    cred_replay = registry.get_by_id("credential_replay")
+    ssh_exploit = registry.get_by_id("ssh_exploit")
     assert cred_replay is not None, "credential_replay 未加载"
     assert ssh_exploit is not None, "ssh_exploit 未加载"
 
@@ -227,6 +241,7 @@ def test_score_skill_tool_is_no_match_returns_lower_score():
     registry = SkillRegistry()
     registry.ensure_loaded()
 
+    # 普通 ssh-service finding（非 cred-replay）
     plain_finding = VulnFinding(
         name="SSH Service",
         severity="low",
@@ -237,8 +252,9 @@ def test_score_skill_tool_is_no_match_returns_lower_score():
         tool="service-sweep",
     )
 
-    cred_replay = next((s for s in registry._skills if s.skill_id == "credential_replay"), None)
+    cred_replay = registry.get_by_id("credential_replay")
     assert cred_replay is not None
+    # 即使匹配了 service_is=ssh + port_is=[22]，也不应触达 +120 的 tool_is 加分
     score = SkillRegistry._score_skill(cred_replay, plain_finding, "", "")
     assert score < 120, f"非 cred-replay tool 不应触达 tool_is 加分，但 score={score}"
 
@@ -247,17 +263,19 @@ def test_credential_replay_yaml_skip_if_has_known_creds():
     """所有 exploit_path 都应通过 skip_if: {has_known_creds: false} 关掉自身。"""
     from backend.skills.loader import load_skill
 
-    yaml_path = Path(__file__).parent.parent / "skills" / "credential" / "replay.yaml"
+    yaml_path = Path(__file__).parent.parent / "skills" / "credential" / "replay" / "skill.yaml"
     skill = load_skill(yaml_path)
 
     real_paths = [p for p in skill.exploit_paths if p.path_id != "llm_freeform"]
     for path in real_paths:
+        # 如果不带 skip_if，无凭据时会跑出长时间超时
         skip_if = getattr(path, "skip_if", None) or {}
         assert skip_if.get("has_known_creds") is False, (
             f"path {path.path_id} 缺少 skip_if: {{has_known_creds: false}}"
         )
 
 
+# ─── 端到端：fact_sink → pending_seeds → orchestrator → cred-replay finding ─
 
 def test_e2e_lfi_creds_to_cred_replay_finding():
     """
@@ -287,6 +305,7 @@ def test_e2e_lfi_creds_to_cred_replay_finding():
     state.target_host = "10.10.10.10"
     state.open_ports = _ports((22, "ssh"), (3306, "mysql"), (80, "http"))
 
+    # Step 1: fact_sink 写凭据（模拟 ExploitAgent LFI 拿到 wp-config.php 密码）
     before = snapshot_facts(state)
     sink = make_fact_sink(state)
     sink({
@@ -295,30 +314,36 @@ def test_e2e_lfi_creds_to_cred_replay_finding():
             "creds": [{"user": "wp", "value": "secret123", "source": "wp-config.php"}],
         },
     })
+    # fact_sink 内部已经 push_pending_seed 了, 但保险起见再 push 一次（去重）
     push_pending_seed(state, "credentials", {"user": "wp", "value": "secret123"})
     after = snapshot_facts(state)
     emit_replan_signals(state, before=before, after=after, source_node="foothold_attempt")
 
+    # Step 2-3: 路由判定
     assert state.replan_signals.get("re_vuln_scan_for_creds", 0) >= 1
     nxt = edge_after_foothold_v2(state)
     assert nxt == "vuln_scan"
 
+    # Step 4-5: 模拟 node_vuln_scan 重入: VulnAgent 拿到 seeds → 合成 finding
+    # （我们直接调用合成方法，不跑全 vuln_scan）
     agent = VulnAgent()
     agent._seed_credentials = list(state.credential_store)
     cred_findings = agent._synthesize_credential_replay_findings(
         state.target_host, state.open_ports,
     )
 
+    # ssh + mysql 应有 finding，http 不应有
     assert len(cred_findings) == 2
     tools = {f.tool for f in cred_findings}
     assert tools == {"cred-replay"}
     ports_with_findings = {f.port for f in cred_findings}
     assert ports_with_findings == {22, 3306}
 
+    # Step 6: 注入 finding 后，SkillRegistry 应该把 credential_replay 排在最高分
     from backend.skills.registry import SkillRegistry
     registry = SkillRegistry()
     registry.ensure_loaded()
-    cred_replay = next((s for s in registry._skills if s.skill_id == "credential_replay"), None)
+    cred_replay = registry.get_by_id("credential_replay")
     assert cred_replay is not None
 
     ssh_replay_finding = next(f for f in cred_findings if f.port == 22)
@@ -326,13 +351,16 @@ def test_e2e_lfi_creds_to_cred_replay_finding():
     assert score >= 120, f"credential_replay 应至少拿 120 分，实际 {score}"
 
 
+# ─── VulnAgent.run seeds 入参兼容性 ──────────────────────────
 
 def test_vuln_agent_accepts_seeds_kwarg():
     """seeds 参数应能正确初始化 self._seed_credentials，无 seeds 时退回空列表。"""
     agent = VulnAgent()
+    # 直接验证 _seed_credentials 字段语义（不真的调 run，避免 mock 整条链）
     seeds = {"credentials": [{"user": "wp", "value": "x"}]}
     agent._seed_credentials = list(seeds["credentials"])
     assert agent._extract_seed_passwords() == ["x"]
+    # 无 seeds 时
     agent._seed_credentials = []
     assert agent._extract_seed_passwords() == []
     assert agent._synthesize_credential_replay_findings("x", _ports((22, "ssh"))) == []

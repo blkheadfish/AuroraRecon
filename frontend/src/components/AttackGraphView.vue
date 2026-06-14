@@ -16,7 +16,7 @@
           :class="{ 'is-disabled': hiddenTypes.has(t.type) }"
           @click="toggleType(t.type)"
         >
-          <span class="type-stat-icon" :style="{ background: NODE_TYPE_META[t.type]?.color || '#888' }" />
+          <span class="type-stat-icon" :style="{ background: (NODE_TYPE_META[t.type] || DEFAULT_NODE_STYLE).color }" />
           {{ typeLabel(t.type) }} · {{ t.count }}
         </el-tag>
         <el-tag
@@ -236,23 +236,37 @@ const hasRefreshHandler = computed(() => {
 })
 
 // ── 节点 / 关系视觉规范 ────────────────────────────────────
+// C7.3 扩展点: WS3 可往 NODE_TYPE_META / RELATION_META 追加 AD/云类型
+// 样式而无需改渲染主体。未知 type 走 DEFAULT_NODE_STYLE 兜底。
+const DEFAULT_NODE_STYLE = { color: '#888', symbol: 'circle', size: 36, label: '?' }
+
+const nodeTypeStyle = NODE_TYPE_META
+
 const NODE_TYPE_META = {
   host:        { color: '#58b8e0', symbol: 'circle',     size: 60, label: '主机' },
   service:     { color: '#4ec9b0', symbol: 'roundRect',  size: 48, label: '服务' },
+  web_endpoint:{ color: '#3fb980', symbol: 'roundRect',  size: 44, label: '端点' },
   finding:     { color: '#e06979', symbol: 'diamond',    size: 50, label: '漏洞' },
   credential:  { color: '#d9a84e', symbol: 'triangle',   size: 44, label: '凭据' },
   foothold:    { color: '#aea0d6', symbol: 'pin',        size: 54, label: '立足点' },
+  session:     { color: '#b08fd4', symbol: 'pin',        size: 50, label: '会话' },
   loot:        { color: '#7b8fd4', symbol: 'rect',       size: 40, label: '战利品' },
   objective:   { color: '#2d9d76', symbol: 'star',       size: 60, label: '目标' },
   path:        { color: '#9198a9', symbol: 'circle',     size: 32, label: '路径' },
+  pivot_point: { color: '#e0a050', symbol: 'diamond',    size: 46, label: '跳板' },
 }
 
 const RELATION_META = {
-  enables:    { color: '#e06979', dashed: false, label: '使能',   curveness: 0.10 },
-  leads_to:   { color: '#58b8e0', dashed: false, label: '导致',   curveness: 0.18 },
-  exposes:    { color: '#4ec9b0', dashed: true,  label: '暴露',   curveness: 0.08 },
-  consumes:   { color: '#d9a84e', dashed: false, label: '消费',   curveness: 0.14 },
-  discovers:  { color: '#aea0d6', dashed: true,  label: '发现',   curveness: 0.20 },
+  enables:       { color: '#e06979', dashed: false, label: '使能',      curveness: 0.10 },
+  leads_to:      { color: '#58b8e0', dashed: false, label: '导致',      curveness: 0.18 },
+  exposes:       { color: '#4ec9b0', dashed: true,  label: '暴露',      curveness: 0.08 },
+  consumes:      { color: '#d9a84e', dashed: false, label: '消费',      curveness: 0.14 },
+  discovers:     { color: '#aea0d6', dashed: true,  label: '发现',      curveness: 0.20 },
+  runs_on:       { color: '#58b8e0', dashed: false, label: '运行在',    curveness: 0.10 },
+  vulnerable_to: { color: '#e06979', dashed: false, label: '易受',      curveness: 0.12 },
+  yields:        { color: '#d9a84e', dashed: false, label: '产出',      curveness: 0.14 },
+  pivots_to:     { color: '#aea0d6', dashed: false, label: '跳转至',    curveness: 0.16 },
+  requires:      { color: '#9198a9', dashed: true,  label: '需要',      curveness: 0.18 },
 }
 
 const SEVERITY_META = {
@@ -263,18 +277,21 @@ const SEVERITY_META = {
   info:     { color: '#9198a9', label: '信息', sizeBoost: 0,  glow: 0  },
 }
 
-function typeLabel(t) { return NODE_TYPE_META[t]?.label || t }
+function typeLabel(t) { return (NODE_TYPE_META[t] || DEFAULT_NODE_STYLE).label }
 
 function typeTag(t) {
   switch (t) {
-    case 'host':       return ''
-    case 'service':    return 'success'
-    case 'finding':    return 'danger'
-    case 'credential': return 'warning'
-    case 'foothold':   return 'info'
-    case 'loot':       return 'info'
-    case 'objective':  return 'success'
-    default:           return ''
+    case 'host':         return ''
+    case 'service':      return 'success'
+    case 'web_endpoint': return 'success'
+    case 'finding':      return 'danger'
+    case 'credential':   return 'warning'
+    case 'foothold':     return 'info'
+    case 'session':      return 'info'
+    case 'loot':         return 'info'
+    case 'objective':    return 'success'
+    case 'pivot_point':  return 'warning'
+    default:             return ''
   }
 }
 
@@ -513,7 +530,7 @@ const emptyText = computed(() => {
 // ── 节点 / 边 → ECharts 数据 ──────────────────────────────
 const echartsNodes = computed(() => {
   return mergedNodes.value.map((n) => {
-    const meta = NODE_TYPE_META[n.type] || NODE_TYPE_META.path
+    const meta = NODE_TYPE_META[n.type] || DEFAULT_NODE_STYLE
     let color = meta.color
     let size = meta.size
     let glow = 0

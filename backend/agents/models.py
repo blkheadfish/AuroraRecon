@@ -449,29 +449,38 @@ def parse_target(raw: str) -> ParsedTarget:
 
 AttackNodeType = Literal[
 	"host", "service", "finding", "credential", "foothold", "loot",
-	"objective", "path",
+	"objective", "path", "web_endpoint", "session", "pivot_point",
 ]
 
 AttackEdgeRelation = Literal[
 	"enables", "leads_to", "exposes", "consumes", "discovers",
+	"runs_on", "vulnerable_to", "yields", "pivots_to", "requires",
 ]
 
 
 class AttackGraphNode(BaseModel):
-	"""一个攻击图节点（host/service/finding/credential 等）。"""
+	"""一个攻击图节点（host/service/finding/credential 等）。
+
+	type 为开放字符串（非封闭枚举）：WS3 可按需新增类型而无需改此模型。
+	"""
 	id: str
-	type: AttackNodeType
+	type: str = ""
 	label: str = ""
 	facts: dict[str, Any] = Field(default_factory=dict)
+	attrs: dict[str, Any] = Field(default_factory=dict)
 	discovered_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
 	discovered_by: str = ""
 
 
 class AttackGraphEdge(BaseModel):
-	"""攻击图边。"""
+	"""攻击图边。
+
+	relation 为开放字符串（非封闭枚举）：WS3 可按需新增关系而无需改此模型。
+	"""
 	src: str
 	dst: str
-	relation: AttackEdgeRelation = "leads_to"
+	relation: str = "leads_to"
+	attrs: dict[str, Any] = Field(default_factory=dict)
 	note: str = ""
 	created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
 
@@ -496,9 +505,10 @@ class AttackGraph(BaseModel):
 		self,
 		node_id: str,
 		*,
-		type: AttackNodeType,
+		type: str = "",
 		label: str = "",
 		facts: Optional[dict[str, Any]] = None,
+		attrs: Optional[dict[str, Any]] = None,
 		discovered_by: str = "",
 	) -> AttackGraphNode:
 		idx = self._index().get(node_id)
@@ -508,6 +518,10 @@ class AttackGraph(BaseModel):
 				merged = dict(existing.facts or {})
 				merged.update(facts)
 				existing.facts = merged
+			if attrs:
+				merged_a = dict(existing.attrs or {})
+				merged_a.update(attrs)
+				existing.attrs = merged_a
 			if label and not existing.label:
 				existing.label = label
 			if discovered_by and not existing.discovered_by:
@@ -527,7 +541,8 @@ class AttackGraph(BaseModel):
 				]
 		node = AttackGraphNode(
 			id=node_id, type=type, label=label or node_id,
-			facts=dict(facts or {}), discovered_by=discovered_by,
+			facts=dict(facts or {}), attrs=dict(attrs or {}),
+			discovered_by=discovered_by,
 		)
 		self.nodes.append(node)
 		return node
@@ -537,7 +552,8 @@ class AttackGraph(BaseModel):
 		src: str,
 		dst: str,
 		*,
-		relation: AttackEdgeRelation = "leads_to",
+		relation: str = "leads_to",
+		attrs: Optional[dict[str, Any]] = None,
 		note: str = "",
 	) -> Optional[AttackGraphEdge]:
 		if not src or not dst or src == dst:
@@ -553,7 +569,7 @@ class AttackGraph(BaseModel):
 					break
 			if drop_at is not None:
 				self.edges.pop(drop_at)
-		edge = AttackGraphEdge(src=src, dst=dst, relation=relation, note=note)
+		edge = AttackGraphEdge(src=src, dst=dst, relation=relation, attrs=dict(attrs or {}), note=note)
 		self.edges.append(edge)
 		return edge
 
@@ -727,6 +743,11 @@ class PentestState(BaseModel):
 
 	active_branch_id: str = ""
 	root_branch_id: str = ""
+
+	def world_model(self) -> "WorldModelQuery":
+		"""惰性构造 WorldModelQuery 只读门面。"""
+		from backend.agents.world_model import WorldModelQuery
+		return WorldModelQuery(self.attack_graph, self)
 
 	phase_log_seqs: list[int] = Field(default_factory=list)
 
