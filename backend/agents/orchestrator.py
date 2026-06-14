@@ -3107,18 +3107,101 @@ async def node_objective_collect(state: PentestState) -> PentestState:
 
 # ── 动态链模板 stub 节点 ─────────────────────────────────────────
 
+async def _run_network_skill(
+    state: PentestState,
+    phase: str,
+    port: int,
+    service: str,
+    skill_id_fallback: str,
+    log_label: str,
+    port_check_list: tuple[int, ...] = (),
+) -> Optional[dict]:
+    """Run a network skill via SkillEngine for enumeration phases (W3-T1).
+
+    Returns structured enum results dict, or None if skill not available.
+    Results are also written to the world model via WorldModelWriter.
+    """
+    from backend.agents.models import VulnFinding
+    from backend.skills.registry import get_registry
+    from backend.skills.engine import SkillEngine
+
+    registry = get_registry()
+    skill = registry.match_by_port(port, service, "")
+
+    if not skill and skill_id_fallback:
+        skill = registry.get_by_id(skill_id_fallback)
+
+    if not skill:
+        state.log(f"{log_label}: 未匹配到 Skill (port={port})")
+        return None
+
+    host = state.target_host or state.target
+    finding = VulnFinding(
+        name=f"{service.upper()} Service",
+        port=port,
+        target=f"{host}:{port}",
+        evidence="",
+        exploitable=False,
+        tool="network-enum",
+    )
+
+    async def _on_exec_record(record: dict):
+        _append_tool_record(state, record, default_phase=phase)
+
+    engine = SkillEngine()
+    result = await engine.execute(
+        skill=skill,
+        finding=finding,
+        target_url=f"http://{host}:{port}/",
+        target_os=state.target_os or "unknown",
+        task_id=state.task_id,
+        log_callback=lambda line: state.log(line),
+        workflow_mode=state.workflow_mode,
+    )
+
+    for rec in (result.command_records or []):
+        _on_exec_record(rec.model_dump() if hasattr(rec, "model_dump") else rec)
+
+    enum_output: dict[str, Any] = {"phase": phase, "skill_id": skill.skill_id, "port": port, "service": service, "success": result.success}
+    if result.evidence:
+        enum_output["evidence"] = str(result.evidence)[:2000]
+    if result.command_records:
+        for rec in result.command_records:
+            _d = rec.model_dump() if hasattr(rec, "model_dump") else rec
+            stdout = (_d.get("stdout") or "")[:3000]
+            if stdout:
+                enum_output.setdefault("stdout_parts", []).append(stdout)
+
+    try:
+        from backend.agents.fact_hooks import write_network_enum_results
+        write_network_enum_results(state, phase, enum_output, host, port)
+    except Exception:
+        state.log(f"{log_label}: 写入世界模型失败, 结果仅记录日志")
+
+    return enum_output
+
+
 async def node_smb_enum(state: PentestState) -> PentestState:
     state.current_phase = "smb_enum"
     _record_chain_visit(state, "smb_enum")
     if not _phase_in_template(state, "smb_enum"):
         state.log(f"[链模板] 跳过 smb_enum（模板={state.chain_template_id}）")
         return state
-    from backend.tools.executor import ToolExecutor
-    state.log("SMB 枚举: 使用 netexec/crackmapexec 探测 SMB 共享与签名")
+
+    host = state.target_host or state.target
+    smb_ports = [p for p in (state.open_ports or []) if hasattr(p, "port") and getattr(p, "port", 0) in (445, 139)]
+    if not smb_ports:
+        state.log("SMB 枚举: 未发现 SMB 开放端口 (139/445), 跳过")
+        return state
+
+    state.log("SMB 枚举: 经 Skill 引擎运行 smb_enum skill")
     try:
-        executor = ToolExecutor(state)
-        result = await executor.run("netexec", ["smb", state.target_host or state.target, "--shares"])
-        state.log(f"SMB 枚举完成: {result.stdout[:300] if result and result.stdout else '无结果'}"[:500])
+        result = await _run_network_skill(state, "smb_enum", 445, "smb", "smb_enum_exploit", "SMB 枚举")
+        if result:
+            evidence = result.get("evidence", "")
+            state.log(f"SMB 枚举完成: skill={result.get('skill_id')}, success={result.get('success')}, evidence_preview={evidence[:200]}"[:500])
+        else:
+            state.log("SMB 枚举: Skill 未匹配, 跳过（无可用 skill）")
     except Exception as e:
         state.log(f"SMB 枚举异常: {e}")
     return state
@@ -3130,12 +3213,21 @@ async def node_ldap_enum(state: PentestState) -> PentestState:
     if not _phase_in_template(state, "ldap_enum"):
         state.log(f"[链模板] 跳过 ldap_enum（模板={state.chain_template_id}）")
         return state
-    from backend.tools.executor import ToolExecutor
-    state.log("LDAP 枚举: 使用 ldapsearch 探测 AD 域信息")
+
+    host = state.target_host or state.target
+    ldap_ports = [p for p in (state.open_ports or []) if hasattr(p, "port") and getattr(p, "port", 0) in (389, 636, 3268, 3269)]
+    if not ldap_ports:
+        state.log("LDAP 枚举: 未发现 LDAP 开放端口 (389/636/3268), 跳过")
+        return state
+
+    state.log("LDAP 枚举: 经 Skill 引擎运行 ldap_exploit skill")
     try:
-        executor = ToolExecutor(state)
-        result = await executor.run("ldapsearch", ["-x", "-H", f"ldap://{state.target_host or state.target}", "-s", "base"])
-        state.log(f"LDAP 枚举完成: {result.stdout[:300] if result and result.stdout else '无结果'}"[:500])
+        result = await _run_network_skill(state, "ldap_enum", 389, "ldap", "ldap_exploit", "LDAP 枚举")
+        if result:
+            evidence = result.get("evidence", "")
+            state.log(f"LDAP 枚举完成: skill={result.get('skill_id')}, success={result.get('success')}, evidence_preview={evidence[:200]}"[:500])
+        else:
+            state.log("LDAP 枚举: Skill 未匹配, 跳过（无可用 skill）")
     except Exception as e:
         state.log(f"LDAP 枚举异常: {e}")
     return state
@@ -3147,12 +3239,21 @@ async def node_kerberos_attack(state: PentestState) -> PentestState:
     if not _phase_in_template(state, "kerberos_attack"):
         state.log(f"[链模板] 跳过 kerberos_attack（模板={state.chain_template_id}）")
         return state
-    from backend.tools.executor import ToolExecutor
-    state.log("Kerberos 攻击: AS-REP Roasting / Kerberoasting")
+
+    host = state.target_host or state.target
+    kdc_ports = [p for p in (state.open_ports or []) if hasattr(p, "port") and getattr(p, "port", 0) in (88, 464)]
+    if not kdc_ports:
+        state.log("Kerberos 攻击: 未发现 Kerberos 开放端口 (88/464), 跳过")
+        return state
+
+    state.log("Kerberos 攻击: 经 Skill 引擎运行 kerberos_exploit skill")
     try:
-        executor = ToolExecutor(state)
-        result = await executor.run("impacket-GetNPUsers", [f"{state.target_host or state.target}/", "-no-pass"])
-        state.log(f"Kerberos 攻击完成: {result.stdout[:300] if result and result.stdout else '无结果'}"[:500])
+        result = await _run_network_skill(state, "kerberos_attack", 88, "kerberos", "kerberos_exploit", "Kerberos 攻击")
+        if result:
+            evidence = result.get("evidence", "")
+            state.log(f"Kerberos 攻击完成: skill={result.get('skill_id')}, success={result.get('success')}, evidence_preview={evidence[:200]}"[:500])
+        else:
+            state.log("Kerberos 攻击: Skill 未匹配, 跳过（无可用 skill）")
     except Exception as e:
         state.log(f"Kerberos 攻击异常: {e}")
     return state
