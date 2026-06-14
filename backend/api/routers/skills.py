@@ -119,6 +119,37 @@ async def skills_stats():
 
 @router.get("/skills/{skill_id}/raw")
 async def get_skill_raw(skill_id: str, request: Request):
+    try:
+        owner_id, tenant_id = resolve_scope(request)
+        scoped = await get_asset(
+            asset_type="skill",
+            asset_key=skill_id,
+            owner_id=owner_id,
+            tenant_id=tenant_id,
+        )
+        if isinstance(scoped, dict) and scoped.get("yaml"):
+            return {
+                "skill_id": skill_id,
+                "source": f"tenant://{tenant_id}/{owner_id}/skill/{skill_id}",
+                "yaml": str(scoped.get("yaml") or ""),
+            }
+        from backend.skills.registry import get_registry
+        registry = get_registry()
+        skill = registry.get_by_id(skill_id)
+        if not skill:
+            raise HTTPException(status_code=404, detail=f"Skill 不存在: {skill_id}")
+        source_path = Path(skill.source_file)
+        if not source_path.exists():
+            raise HTTPException(status_code=404, detail=f"Skill 文件不存在: {skill.source_file}")
+        return {
+            "skill_id": skill.skill_id,
+            "source": str(source_path),
+            "yaml": source_path.read_text(encoding="utf-8"),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/skills/{skill_id}/stats")
@@ -155,37 +186,6 @@ async def get_skill_stats(skill_id: str):
             "path_stats": profile.path_stats,
             "priority_adjustments": profile.priority_adjustments,
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    try:
-        owner_id, tenant_id = resolve_scope(request)
-        scoped = await get_asset(
-            asset_type="skill",
-            asset_key=skill_id,
-            owner_id=owner_id,
-            tenant_id=tenant_id,
-        )
-        if isinstance(scoped, dict) and scoped.get("yaml"):
-            return {
-                "skill_id": skill_id,
-                "source": f"tenant://{tenant_id}/{owner_id}/skill/{skill_id}",
-                "yaml": str(scoped.get("yaml") or ""),
-            }
-        from backend.skills.registry import get_registry
-        registry = get_registry()
-        skill = registry.get_by_id(skill_id)
-        if not skill:
-            raise HTTPException(status_code=404, detail=f"Skill 不存在: {skill_id}")
-        source_path = Path(skill.source_file)
-        if not source_path.exists():
-            raise HTTPException(status_code=404, detail=f"Skill 文件不存在: {skill.source_file}")
-        return {
-            "skill_id": skill.skill_id,
-            "source": str(source_path),
-            "yaml": source_path.read_text(encoding="utf-8"),
-        }
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
