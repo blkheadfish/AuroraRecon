@@ -333,7 +333,6 @@ async function fetchSkills() {
   try {
     const res = await api.getSkills()
     skills.value = res.skills || []
-    if (res.total && !activeCategories.value.length) activeCategories.value = groupedSkills.value.map((g) => g.category)
     trackEvent('skills.list', { total: res.total })
   } catch { ElMessage.error('加载技能列表失败') }
   finally { skillsLoading.value = false }
@@ -442,8 +441,8 @@ onMounted(() => { fetchSkills(); fetchDrafts() })
 /* ── 折叠标题 ────────────────────────────── */
 .collapse-title { width: 100%; }
 .cat-header { display: flex; align-items: center; gap: 10px; }
-.cat-marker { width: 3px; height: 16px; border-radius: 2px; background: var(--cat-tone, var(--accent-blue)); }
-.cat-name { font-weight: 600; color: var(--text-primary); font-size: 14px; }
+.cat-marker { width: 4px; height: 18px; border-radius: 2px; background: var(--cat-tone, var(--accent-blue)); }
+.cat-name { font-weight: 600; color: var(--cat-tone, var(--text-primary)); font-size: 14px; }
 .cat-count { margin-left: 8px; }
 
 /* ── 技能列表 ────────────────────────────── */
