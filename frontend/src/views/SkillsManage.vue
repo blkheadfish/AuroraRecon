@@ -443,7 +443,14 @@ onMounted(() => { fetchSkills(); fetchDrafts() })
 .cat-header { display: flex; align-items: center; gap: 10px; }
 .cat-marker { width: 4px; height: 18px; border-radius: 2px; background: var(--cat-tone, var(--accent-blue)); }
 .cat-name { font-weight: 600; color: var(--cat-tone, var(--text-primary)); font-size: 14px; }
-.cat-count { margin-left: 8px; }
+.cat-count { margin-left: auto; }
+:deep(.cat-count.el-tag) {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  color: color-mix(in srgb, var(--text-primary) 88%, var(--cat-tone, var(--accent-blue)));
+  border-color: color-mix(in srgb, var(--cat-tone, var(--accent-blue)) 54%, var(--border));
+  background: color-mix(in srgb, var(--bg-base) 82%, transparent);
+}
 
 /* ── 技能列表 ────────────────────────────── */
 .skill-list { padding: 4px 0; }
