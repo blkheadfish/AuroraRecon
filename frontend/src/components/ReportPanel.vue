@@ -31,6 +31,10 @@
             <el-icon><Download /></el-icon>
             下载 .md
           </el-button>
+          <el-button size="small" @click="exportPdf" type="primary" plain>
+            <el-icon><Printer /></el-icon>
+            导出 PDF
+          </el-button>
         </div>
       </div>
 
@@ -210,6 +214,12 @@ function downloadMd() {
   URL.revokeObjectURL(url)
   trackEvent('report.download', { taskId: props.taskId, length: draft.value.length })
   ElMessage.success('报告已下载')
+}
+
+function exportPdf() {
+  trackEvent('report.export_pdf', { taskId: props.taskId })
+  ElMessage.info('正在准备打印，请在弹出的打印对话框中选择"另存为 PDF"')
+  setTimeout(() => window.print(), 100)
 }
 
 onMounted(() => {

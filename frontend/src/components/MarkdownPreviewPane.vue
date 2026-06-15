@@ -16,13 +16,40 @@ watch(
   async () => {
     await nextTick()
     injectCodeBlockHeaders()
+    processSeverityCallouts()
   },
 )
 
 onMounted(async () => {
   await nextTick()
   injectCodeBlockHeaders()
+  processSeverityCallouts()
 })
+
+function processSeverityCallouts() {
+  if (!previewRef.value) return
+  const blockquotes = previewRef.value.querySelectorAll('blockquote')
+  blockquotes.forEach((bq) => {
+    if (bq.dataset.severityProcessed) return
+    bq.dataset.severityProcessed = '1'
+    const text = (bq.textContent || '').toLowerCase()
+    if (text.includes('critical') || text.includes('严重') || text.includes('紧急')) {
+      bq.classList.add('callout-critical')
+    } else if (text.includes('high') || text.includes('高危') || text.includes('高风险')) {
+      bq.classList.add('callout-high')
+    } else if (text.includes('medium') || text.includes('中危') || text.includes('中风险')) {
+      bq.classList.add('callout-medium')
+    } else if (text.includes('low') || text.includes('低危') || text.includes('低风险')) {
+      bq.classList.add('callout-low')
+    } else if (text.includes('warn') || text.includes('caution') || text.includes('注意') || text.includes('警告')) {
+      bq.classList.add('callout-warning')
+    } else if (text.includes('info') || text.includes('note') || text.includes('提示') || text.includes('建议')) {
+      bq.classList.add('callout-info')
+    } else if (text.includes('success') || text.includes('修复') || text.includes('完成') || text.includes('通过')) {
+      bq.classList.add('callout-success')
+    }
+  })
+}
 
 function injectCodeBlockHeaders() {
   if (!previewRef.value) return
@@ -365,16 +392,58 @@ function injectCodeBlockHeaders() {
 /* ── Blockquotes ── */
 :deep(.markdown-body blockquote) {
   border-left: 3px solid var(--accent-blue);
-  padding: 6px 0 6px 14px;
+  padding: 8px 16px;
   margin: 12px 0;
   color: var(--text-secondary);
-  line-height: 1.8;
+  line-height: 1.7;
   background: color-mix(in srgb, var(--accent-blue) 4%, transparent);
   border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  font-size: 13px;
 }
 
 :deep(.markdown-body blockquote p) {
   margin: 4px 0;
+}
+
+:deep(.markdown-body blockquote.callout-critical) {
+  border-left-color: var(--accent-red);
+  background: color-mix(in srgb, var(--accent-red) 8%, transparent);
+}
+:deep(.markdown-body blockquote.callout-critical strong) {
+  color: var(--accent-red);
+}
+
+:deep(.markdown-body blockquote.callout-high) {
+  border-left-color: var(--accent-orange);
+  background: color-mix(in srgb, var(--accent-orange) 8%, transparent);
+}
+:deep(.markdown-body blockquote.callout-high strong) {
+  color: var(--accent-orange);
+}
+
+:deep(.markdown-body blockquote.callout-medium) {
+  border-left-color: var(--accent-yellow);
+  background: color-mix(in srgb, var(--accent-yellow) 8%, transparent);
+}
+
+:deep(.markdown-body blockquote.callout-low) {
+  border-left-color: var(--accent-blue);
+  background: color-mix(in srgb, var(--accent-blue) 8%, transparent);
+}
+
+:deep(.markdown-body blockquote.callout-warning) {
+  border-left-color: var(--accent-yellow);
+  background: color-mix(in srgb, var(--accent-yellow) 10%, transparent);
+}
+
+:deep(.markdown-body blockquote.callout-info) {
+  border-left-color: var(--accent-blue);
+  background: color-mix(in srgb, var(--accent-blue) 6%, transparent);
+}
+
+:deep(.markdown-body blockquote.callout-success) {
+  border-left-color: var(--accent-green);
+  background: color-mix(in srgb, var(--accent-green) 8%, transparent);
 }
 
 /* ── Details/Summary ── */

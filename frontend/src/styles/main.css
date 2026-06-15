@@ -674,3 +674,66 @@ code, kbd, samp, pre {
 .admin-shell .el-pagination .is-active {
     color: var(--accent-red) !important;
 }
+
+/* ── 打印 / 导出 PDF ──────────────────────────── */
+@media print {
+    html, body, #app {
+        background: #fff !important;
+        color: #000 !important;
+        font-size: 12px;
+    }
+
+    .el-aside, .el-menu, .topbar, .sidebar,
+    .graph-toolbar, .graph-actions, .graph-stats,
+    .timeline-wrap .jump-latest, .app-layout .sidebar,
+    .report-toolbar, .header-actions,
+    .el-button, .el-tag, .el-switch,
+    .code-block-header .copy-btn,
+    nav, footer, .no-print {
+        display: none !important;
+    }
+
+    .page-wrap { padding: 0 !important; }
+    .page-header { margin-bottom: 12px !important; }
+    .page-title { font-size: 24px !important; color: #000 !important; }
+
+    .markdown-body {
+        color: #000 !important;
+        font-size: 11px;
+        line-height: 1.6;
+    }
+    .markdown-body h1 { font-size: 20px !important; color: #000 !important; border-bottom-color: #ccc !important; }
+    .markdown-body h2 { font-size: 16px !important; color: #000 !important; border-bottom-color: #ddd !important; }
+    .markdown-body h3 { font-size: 14px !important; color: #000 !important; }
+    .markdown-body p { color: #333 !important; }
+    .markdown-body code { background: #f5f5f5 !important; color: #c7254e !important; border-color: #ddd !important; }
+    .markdown-body pre { background: #f5f5f5 !important; border-color: #ddd !important; box-shadow: none !important; page-break-inside: avoid; }
+    .markdown-body th { background: #eee !important; color: #000 !important; }
+    .markdown-body td { color: #333 !important; }
+    .markdown-body table { page-break-inside: avoid; }
+
+    .preview {
+        border: none !important;
+        background: #fff !important;
+        max-height: none !important;
+        overflow: visible !important;
+        padding: 0 !important;
+    }
+
+    .report-wrap { padding: 0 !important; }
+
+    .graph-canvas-wrap {
+        page-break-inside: avoid;
+        border: 1px solid #ddd !important;
+    }
+
+    .severity-critical, .severity-high, .severity-medium, .severity-low, .severity-info {
+        -webkit-print-color-adjust: exact !important;
+        print-color-adjust: exact !important;
+    }
+
+    @page {
+        size: A4;
+        margin: 18mm 16mm;
+    }
+}

@@ -8,6 +8,7 @@ import {
   Loading, UserFilled, CircleCheckFilled, CircleCloseFilled,
   Remove, RemoveFilled, ArrowDown, Lock, Clock,
   SwitchButton, Edit, Key, InfoFilled, Share,
+  Printer, Document, Download, Link,
 } from '@element-plus/icons-vue'
 import 'element-plus/dist/index.css'
 import 'vue-virtual-scroller/dist/vue-virtual-scroller.css'
@@ -26,6 +27,7 @@ const icons = {
   Loading, UserFilled, CircleCheckFilled, CircleCloseFilled,
   Remove, RemoveFilled, ArrowDown, Lock, Clock,
   SwitchButton, Edit, Key, InfoFilled, Share,
+  Printer, Document, Download, Link,
 }
 for (const [key, component] of Object.entries(icons)) {
   app.component(key, component)
