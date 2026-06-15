@@ -16,8 +16,8 @@
           :class="{ 'is-disabled': hiddenTypes.has(t.type) }"
           @click="toggleType(t.type)"
         >
-          <span class="type-stat-icon" :style="{ background: (NODE_TYPE_META[t.type] || DEFAULT_NODE_STYLE).color }" />
-          {{ typeLabel(t.type) }} · {{ t.count }}
+          <span class="type-stat-icon" :style="{ background: resolveMetaColor((NODE_TYPE_META[t.type] || DEFAULT_NODE_STYLE).color) }" />
+          {{ typeLabel(t.type) }} &middot; {{ t.count }}
         </el-tag>
         <el-tag
           v-if="severityStats.length"
@@ -25,10 +25,10 @@
           :key="`sev-${s.key}`"
           size="small"
           effect="dark"
-          :color="SEVERITY_META[s.key]?.color"
+          :color="resolveMetaColor(SEVERITY_META[s.key]?.color)"
           class="sev-stat"
         >
-          {{ SEVERITY_META[s.key]?.label || s.key }} · {{ s.count }}
+          {{ SEVERITY_META[s.key]?.label || s.key }} &middot; {{ s.count }}
         </el-tag>
       </div>
       <div class="graph-actions">
@@ -55,6 +55,7 @@
         <el-radio-group v-model="layoutMode" size="small">
           <el-radio-button value="force">力导向</el-radio-button>
           <el-radio-button value="circular">环形</el-radio-button>
+          <el-radio-button value="layered">分层</el-radio-button>
         </el-radio-group>
         <el-button size="small" plain @click="resetView">
           <el-icon><Refresh /></el-icon>
@@ -65,25 +66,47 @@
 
     <!-- ── 主画布 / 空状态 ─────────────────────────────────── -->
     <div v-if="!mergedNodes.length" class="graph-empty">
-      <el-empty :description="emptyText">
-        <template #image>
+      <div class="graph-empty-inner">
+        <div class="empty-icon-wrap">
           <el-icon class="empty-icon"><Share /></el-icon>
-        </template>
+        </div>
+        <p class="empty-text">{{ emptyText }}</p>
         <el-button size="small" plain @click="$emit('refresh')" v-if="hasRefreshHandler">
           重新拉取数据
         </el-button>
-      </el-empty>
+      </div>
     </div>
     <div v-else ref="canvasWrapRef" class="graph-canvas-wrap">
       <VChart
         v-if="chartReady"
         ref="chartRef"
-        :option="option"
+        :option="debouncedOption"
         :update-options="{ notMerge: false, lazyUpdate: true }"
         autoresize
         class="graph-canvas"
         @click="onNodeClick"
+        @finished="onChartFinished"
       />
+      <!-- 自定义图例面板 -->
+      <div v-if="!degrade" class="graph-legend-panel">
+        <div
+          v-for="t in nodeTypeStats"
+          :key="t.type"
+          class="legend-row"
+          :class="{ 'is-disabled': hiddenTypes.has(t.type) }"
+          @click="toggleType(t.type)"
+        >
+          <span class="legend-icon" :style="{ background: resolveMetaColor((NODE_TYPE_META[t.type] || DEFAULT_NODE_STYLE).color) }" />
+          <span class="legend-label">{{ typeLabel(t.type) }}</span>
+          <span class="legend-count">&times;{{ t.count }}</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Kill-chain 路径文字 ──────────────────────────────── -->
+    <div v-if="killChainPathText" class="kill-chain-caption">
+      <el-icon><Link /></el-icon>
+      <span>{{ killChainPathText }}</span>
     </div>
 
     <!-- ── 节点详情抽屉 ─────────────────────────────────────── -->
@@ -104,7 +127,7 @@
             v-if="selected._severity"
             size="small"
             effect="dark"
-            :color="SEVERITY_META[selected._severity]?.color"
+            :color="resolveMetaColor(SEVERITY_META[selected._severity]?.color)"
             class="detail-sev"
           >
             {{ SEVERITY_META[selected._severity]?.label || selected._severity }}
@@ -161,7 +184,7 @@
           <ul class="edge-list">
             <li v-for="(e, idx) in relatedEdges" :key="idx">
               <code>{{ e.src }}</code>
-              <span class="rel">— {{ RELATION_META[e.relation]?.label || e.relation }} →</span>
+              <span class="rel">— {{ (RELATION_META[e.relation] || {}).label || e.relation }} →</span>
               <code>{{ e.dst }}</code>
               <span v-if="e.note" class="note">{{ e.note }}</span>
             </li>
@@ -172,145 +195,186 @@
   </div>
 </template>
 
-<script setup>
-/**
- * AttackGraphView — 渲染后端 state.attack_graph (nodes/edges) 为力导向图。
- *
- * ── 重要：前端兜底合成 ──────────────────────────────────────────
- * 后端只在 `node_vuln_scan` 末尾调用 `attach_finding_to_graph`,
- * 而 exploit / post_foothold / 二次利用 / 信息泄露解析等阶段追加的
- * findings 不会进入 attack_graph（凭据 / loot / shell 同样存在盲区）。
- *
- * 因此组件接收完整 `task` 对象后，会按后端 ID 命名约定
- * (`host:`, `svc:`, `finding:`, `cred:`, `loot:`, `foothold:`,
- *  `objective:`) 把 task.findings / open_ports / credential_store /
- * loot_store / foothold_status / target 中缺失的节点合成补齐，
- * 并自动连边（host→service→finding→cred→foothold→loot→objective），
- * 同名节点天然以后端权威数据为准（先放后端、再 upsert 合成）。
- */
-import { computed, nextTick, onMounted, onUnmounted, ref, watch, getCurrentInstance } from 'vue'
+<script setup lang="ts">
+import { computed, nextTick, onMounted, onBeforeUnmount, ref, watch, getCurrentInstance } from 'vue'
 import VChart from 'vue-echarts'
 import { use } from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
-import { GraphChart } from 'echarts/charts'
+import { GraphChart, LinesChart } from 'echarts/charts'
 import {
   TitleComponent, TooltipComponent, LegendComponent,
 } from 'echarts/components'
-import { Search, Refresh, Share } from '@element-plus/icons-vue'
+import { Search, Refresh, Share, Link } from '@element-plus/icons-vue'
 import { useChartTheme } from '@/composables/useChartTheme'
+import { useTaskLiveStore } from '@/stores/taskLive'
+import {
+  NODE_TYPE_META, DEFAULT_NODE_STYLE, RELATION_META, SEVERITY_META,
+  typeLabel, typeTag, NODE_TYPE_COUNT_KEYS,
+  buildEchartsNodes, buildEchartsEdges, buildCategories,
+  computeNodeTypeStats, computeSeverityStats, buildTooltipFormatter,
+  useNodePinning, usePulseTimer,
+} from '@/composables/useAttackGraphOption'
 
-use([CanvasRenderer, GraphChart, TitleComponent, TooltipComponent, LegendComponent])
+use([CanvasRenderer, GraphChart, LinesChart, TitleComponent, TooltipComponent, LegendComponent])
 
 const props = defineProps({
-  /** 后端权威 attack_graph (nodes/edges)。 */
   graph: {
     type: Object,
     default: () => ({ nodes: [], edges: [] }),
   },
-  /**
-   * 完整任务对象 (TaskDetail). 用于在后端 attack_graph 未及时同步时
-   * 从 findings / open_ports / credential_store 等字段合成节点兜底。
-   * 不传则降级为只渲染 props.graph (向后兼容)。
-   */
   task: {
     type: Object,
     default: null,
   },
-  /** W2-T1: 当前选中的前沿节点 id, 高亮该节点。 */
   selectedNodeId: {
     type: String,
     default: '',
   },
 })
 
-defineEmits(['refresh'])
+defineEmits(['refresh', 'select'])
 
 const chartTheme = useChartTheme()
-const chartRef = ref(null)
+const taskLiveStore = useTaskLiveStore()
+const taskId = computed(() => props.task?.id || props.task?.task_id || '')
+const taskWorldGraph = computed(() => {
+  if (!taskId.value) return { nodes: {}, edges: [] }
+  const state = taskLiveStore.getLiveState(taskId.value)
+  return state?.worldGraph || { nodes: {}, edges: [] }
+})
+const chartRef = ref<any>(null)
 const layoutMode = ref('force')
 const drawerOpen = ref(false)
-const selected = ref(null)
+const selected = ref<any>(null)
 const searchText = ref('')
 const exploitableOnly = ref(false)
-const hiddenTypes = ref(new Set())
+const hiddenTypes = ref(new Set<string>())
 
 const hasRefreshHandler = computed(() => {
-  // 检查父组件是否监听了 refresh 事件
   const inst = getCurrentInstance()
   return Boolean(inst?.vnode?.props?.onRefresh)
 })
 
-// ── 节点 / 关系视觉规范 ────────────────────────────────────
-// C7.3 扩展点: WS3 可往 NODE_TYPE_META / RELATION_META 追加 AD/云类型
-// 样式而无需改渲染主体。未知 type 走 DEFAULT_NODE_STYLE 兜底。
-const DEFAULT_NODE_STYLE = { color: '#888', symbol: 'circle', size: 36, label: '?' }
+// ── 性能降级与动画偏好 ─────────────────────────────
+const prefersReducedMotion = ref(false)
+const degrade = computed(() => mergedNodes.value.length > 120)
 
-const nodeTypeStyle = NODE_TYPE_META
+// ── 节点状态追踪 ────────────────────────────────────
+const frontendNodeIds = ref(new Set<string>())
+const ownedNodeIds = ref(new Set<string>())
+const objectiveReachedIds = ref(new Set<string>())
+const highValueNodeIds = ref(new Set<string>())
+const pulseGeneration = ref(0)
 
-const NODE_TYPE_META = {
-  host:        { color: '#58b8e0', symbol: 'circle',     size: 60, label: '主机' },
-  service:     { color: '#4ec9b0', symbol: 'roundRect',  size: 48, label: '服务' },
-  web_endpoint:{ color: '#3fb980', symbol: 'roundRect',  size: 44, label: '端点' },
-  finding:     { color: '#e06979', symbol: 'diamond',    size: 50, label: '漏洞' },
-  credential:  { color: '#d9a84e', symbol: 'triangle',   size: 44, label: '凭据' },
-  foothold:    { color: '#aea0d6', symbol: 'pin',        size: 54, label: '立足点' },
-  session:     { color: '#b08fd4', symbol: 'pin',        size: 50, label: '会话' },
-  loot:        { color: '#7b8fd4', symbol: 'rect',       size: 40, label: '战利品' },
-  objective:   { color: '#2d9d76', symbol: 'star',       size: 60, label: '目标' },
-  path:        { color: '#9198a9', symbol: 'circle',     size: 32, label: '路径' },
-  pivot_point: { color: '#e0a050', symbol: 'diamond',    size: 46, label: '跳板' },
-}
-
-const RELATION_META = {
-  enables:       { color: '#e06979', dashed: false, label: '使能',      curveness: 0.10 },
-  leads_to:      { color: '#58b8e0', dashed: false, label: '导致',      curveness: 0.18 },
-  exposes:       { color: '#4ec9b0', dashed: true,  label: '暴露',      curveness: 0.08 },
-  consumes:      { color: '#d9a84e', dashed: false, label: '消费',      curveness: 0.14 },
-  discovers:     { color: '#aea0d6', dashed: true,  label: '发现',      curveness: 0.20 },
-  runs_on:       { color: '#58b8e0', dashed: false, label: '运行在',    curveness: 0.10 },
-  vulnerable_to: { color: '#e06979', dashed: false, label: '易受',      curveness: 0.12 },
-  yields:        { color: '#d9a84e', dashed: false, label: '产出',      curveness: 0.14 },
-  pivots_to:     { color: '#aea0d6', dashed: false, label: '跳转至',    curveness: 0.16 },
-  requires:      { color: '#9198a9', dashed: true,  label: '需要',      curveness: 0.18 },
-}
-
-const SEVERITY_META = {
-  critical: { color: '#cb2431', label: '严重', sizeBoost: 12, glow: 16 },
-  high:     { color: '#e06979', label: '高危', sizeBoost: 8,  glow: 12 },
-  medium:   { color: '#d9a84e', label: '中危', sizeBoost: 4,  glow: 6  },
-  low:      { color: '#7b8fd4', label: '低危', sizeBoost: 0,  glow: 0  },
-  info:     { color: '#9198a9', label: '信息', sizeBoost: 0,  glow: 0  },
-}
-
-function typeLabel(t) { return (NODE_TYPE_META[t] || DEFAULT_NODE_STYLE).label }
-
-function typeTag(t) {
-  switch (t) {
-    case 'host':         return ''
-    case 'service':      return 'success'
-    case 'web_endpoint': return 'success'
-    case 'finding':      return 'danger'
-    case 'credential':   return 'warning'
-    case 'foothold':     return 'info'
-    case 'session':      return 'info'
-    case 'loot':         return 'info'
-    case 'objective':    return 'success'
-    case 'pivot_point':  return 'warning'
-    default:             return ''
+function resolveMetaColor(token: string | undefined): string {
+  if (!token) return '#888'
+  if (token.startsWith('var(')) {
+    const name = token.slice(4, -1)
+    return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || '#888'
   }
+  return token
 }
 
-// ── 辅助：与后端保持一致的 ID 命名 ─────────────────────────
-function _hostId(host) { return host ? `host:${host}` : '' }
-function _svcId(host, port) { return host && port ? `svc:${host}:${port}` : '' }
-function _findingId(vid) { return vid ? `finding:${vid}` : '' }
-function _credId(cred) {
-  // 与后端 _ag_credential_id 同形：user|source|value 拼接做指纹
+// ── 世界模型监听（从 store 提取状态标注） ──────────
+watch(
+  taskWorldGraph,
+  (wg) => {
+    const frontier = new Set<string>()
+    const owned = new Set<string>()
+    const objective = new Set<string>()
+    const highValue = new Set<string>()
+
+    for (const [id, node] of Object.entries(wg?.nodes || {})) {
+      const attrs = (node as any).attrs || {}
+      if (attrs.frontier === true || attrs._frontier === true) frontier.add(id)
+      if (attrs.owned === true || attrs._owned === true) owned.add(id)
+      if (attrs.objective_reached === true || attrs._objective_reached === true) objective.add(id)
+      if (attrs.high_value === true || attrs._high_value === true) highValue.add(id)
+    }
+
+    frontendNodeIds.value = frontier
+    ownedNodeIds.value = owned
+    objectiveReachedIds.value = objective
+    highValueNodeIds.value = highValue
+  },
+  { deep: true },
+)
+
+// ── Kill-chain 路径计算 ────────────────────────────
+const killChainPath = computed(() => {
+  const wg = taskWorldGraph.value
+  if (!wg || !wg.nodes || !wg.edges) return { edgeIds: new Set<string>(), nodes: new Set<string>() }
+
+  const chainNodeIds = new Set<string>()
+  const chainEdgeIds = new Set<string>()
+
+  for (const [id, node] of Object.entries(wg.nodes)) {
+    const attrs = (node as any).attrs || {}
+    if (attrs._on_kill_chain === true || attrs._on_path === true || attrs.kill_chain === true) {
+      chainNodeIds.add(id)
+    }
+  }
+  for (const e of wg.edges) {
+    const attrs = (e as any).attrs || {}
+    if (attrs._on_kill_chain === true || attrs._on_path === true || attrs.kill_chain === true) {
+      chainEdgeIds.add(`${e.src}|${e.dst}|${e.relation}`)
+    }
+  }
+
+  if (chainNodeIds.size > 0 || chainEdgeIds.size > 0) {
+    return { edgeIds: chainEdgeIds, nodes: chainNodeIds }
+  }
+
+  const objectiveNodes = new Set<string>()
+  for (const [id, node] of Object.entries(wg.nodes)) {
+    const attrs = (node as any).attrs || {}
+    if (attrs.objective_reached === true || attrs._objective_reached === true || node.type === 'objective') {
+      objectiveNodes.add(id)
+    }
+  }
+
+  if (objectiveNodes.size > 0) {
+    for (const e of wg.edges) {
+      if (objectiveNodes.has(e.dst)) {
+        chainNodeIds.add(e.src)
+        chainNodeIds.add(e.dst)
+        chainEdgeIds.add(`${e.src}|${e.dst}|${e.relation}`)
+      }
+    }
+  }
+
+  return { edgeIds: chainEdgeIds, nodes: chainNodeIds }
+})
+
+const killChainPathText = computed(() => {
+  const kc = killChainPath.value
+  if (kc.nodes.size === 0) return ''
+  const wg = taskWorldGraph.value
+  const nodeLabels: string[] = []
+  for (const id of kc.nodes) {
+    const node = wg?.nodes?.[id]
+    if (node) nodeLabels.push(node.label || node.type)
+  }
+  if (nodeLabels.length === 0) return ''
+  let gaps = 0
+  for (const [, node] of Object.entries(wg?.nodes || {})) {
+    if (!kc.nodes.has(node.id) && ((node as any).attrs?.high_value || node.type === 'credential')) {
+      gaps++
+    }
+  }
+  const gapStr = gaps > 0 ? ` (缺 ${gaps} 个凭据)` : ''
+  return `\u{1f6e3}\ufe0f 已规划路径: ${nodeLabels.join(' \u2192 ')}${gapStr}`
+})
+
+// ── 辅助：与后端保持一致的 ID 命名 ─────────────────
+function _hostId(host: string) { return host ? `host:${host}` : '' }
+function _svcId(host: string, port: number | string) { return host && port ? `svc:${host}:${port}` : '' }
+function _findingId(vid: string) { return vid ? `finding:${vid}` : '' }
+function _credId(cred: any) {
   const user = cred?.user || cred?.username || ''
   const src  = cred?.source || ''
   const val  = cred?.value || cred?.password || ''
   const raw  = `${user}|${src}|${val}`
-  // 简单 fnv1a，足以前端去重
   let h = 0x811c9dc5
   for (let i = 0; i < raw.length; i++) {
     h ^= raw.charCodeAt(i)
@@ -318,12 +382,11 @@ function _credId(cred) {
   }
   return `cred:${h.toString(16)}`
 }
-function _lootId(loot, idx) {
+function _lootId(loot: any, idx: number) {
   const key = (typeof loot === 'string' ? loot : (loot?.path || loot?.name || `idx${idx}`))
   return `loot:${key}`
 }
-
-function _hostFromTarget(target) {
+function _hostFromTarget(target: string) {
   if (!target) return ''
   try {
     if (target.includes('://')) {
@@ -333,15 +396,12 @@ function _hostFromTarget(target) {
   return String(target).split(':')[0]
 }
 
-// ── 合成图：以后端 graph 为权威，task.* 兜底补齐 ───────────
-const _ORDER = ['host', 'service', 'finding', 'credential', 'foothold', 'loot', 'objective', 'path']
-
+// ── 合成图：以后端 graph 为权威，task.* 兜底补齐 ───
 const composedGraph = computed(() => {
-  const nodeMap = new Map() // id -> node
-  const edgeSet = new Set() // 去重 key: src|dst|relation
-  const edges = []
+  const nodeMap = new Map<string, any>()
+  const edgeSet = new Set<string>()
+  const edges: any[] = []
 
-  // 1. 后端权威节点 / 边先入
   for (const n of (props.graph?.nodes || [])) {
     if (!n?.id) continue
     nodeMap.set(n.id, { ...n, _origin: 'backend' })
@@ -354,7 +414,7 @@ const composedGraph = computed(() => {
     edges.push({ ...e, _origin: 'backend' })
   }
 
-  const upsert = (id, type, label, facts, discoveredBy) => {
+  const upsert = (id: string, type: string, label: string, facts: any, discoveredBy: string) => {
     if (!id) return
     if (nodeMap.has(id)) return
     nodeMap.set(id, {
@@ -367,7 +427,7 @@ const composedGraph = computed(() => {
       _origin: 'synth',
     })
   }
-  const addEdge = (src, dst, relation, note) => {
+  const addEdge = (src: string, dst: string, relation: string, note: string) => {
     if (!src || !dst || src === dst) return
     const key = `${src}|${dst}|${relation || 'leads_to'}`
     if (edgeSet.has(key)) return
@@ -375,14 +435,11 @@ const composedGraph = computed(() => {
     edges.push({ src, dst, relation: relation || 'leads_to', note: note || '', _origin: 'synth' })
   }
 
-  // 2. 从 task 兜底合成
   const t = props.task
   if (t) {
-    // 主机
     const host = _hostFromTarget(t.target_host || t.target)
     if (host) upsert(_hostId(host), 'host', host, { from: 'task.target' }, 'task_summary')
 
-    // 服务（端口）
     const ports = Array.isArray(t.open_ports) ? t.open_ports : []
     for (const p of ports) {
       if (!p?.port) continue
@@ -396,7 +453,6 @@ const composedGraph = computed(() => {
       addEdge(_hostId(host), svcId, 'exposes')
     }
 
-    // 漏洞 finding -> service / host
     const findings = Array.isArray(t.findings) ? t.findings : []
     for (const f of findings) {
       if (!f?.vuln_id) continue
@@ -414,7 +470,6 @@ const composedGraph = computed(() => {
         description: f.description || '',
       }, f.tool || 'finding_synth')
 
-      // 连边：service / host -> finding
       const fHost = _hostFromTarget(f.target) || host
       if (f.port && fHost) {
         const svcId = _svcId(fHost, f.port)
@@ -428,7 +483,6 @@ const composedGraph = computed(() => {
       }
     }
 
-    // 凭据
     const creds = Array.isArray(t.credential_store) ? t.credential_store : []
     for (const c of creds) {
       if (!c) continue
@@ -436,23 +490,17 @@ const composedGraph = computed(() => {
       const userPart = c.user || c.username || '?'
       const srcPart = c.source || '?'
       upsert(cid, 'credential', `${userPart}@${srcPart}`, c, 'credential_store')
-      // 凭据如果有命中的 finding（按 source 反查）尝试连边；保守起见只指向 host
       if (host) addEdge(_hostId(host), cid, 'discovers')
     }
 
-    // Foothold（如果拿到 shell）
     if (t.got_shell || t.foothold_status === 'established' || t.foothold_status === 'verified') {
       const fhId = `foothold:${host || 'unknown'}`
       upsert(fhId, 'foothold',
         host ? `Shell @ ${host}` : 'Shell',
-        {
-          status: t.foothold_status || 'established',
-          privilege_level: t.privilege_level || 'unknown',
-        },
+        { status: t.foothold_status || 'established', privilege_level: t.privilege_level || 'unknown' },
         'foothold_tracker',
       )
       if (host) addEdge(_hostId(host), fhId, 'leads_to')
-      // 把所有可利用的 finding 连到 foothold
       for (const f of findings) {
         if (f?.exploitable && f?.vuln_id) {
           addEdge(_findingId(f.vuln_id), fhId, 'leads_to')
@@ -460,18 +508,14 @@ const composedGraph = computed(() => {
       }
     }
 
-    // Loot
     const loots = Array.isArray(t.loot_store) ? t.loot_store : []
-    loots.forEach((l, i) => {
+    loots.forEach((l: any, i: number) => {
       const lid = _lootId(l, i)
-      const label = typeof l === 'string'
-        ? l
-        : (l?.path || l?.name || `loot-${i}`)
+      const label = typeof l === 'string' ? l : (l?.path || l?.name || `loot-${i}`)
       upsert(lid, 'loot', label, typeof l === 'object' ? l : { value: l }, 'loot_store')
       if (host) addEdge(`foothold:${host}`, lid, 'consumes')
     })
 
-    // 目标完成
     const obj = t.objective_status
     if (obj && (obj.flag_found || obj.objective_reached || obj.status === 'reached')) {
       const oid = `objective:${host || 'task'}`
@@ -480,30 +524,24 @@ const composedGraph = computed(() => {
     }
   }
 
-  return {
-    nodes: Array.from(nodeMap.values()),
-    edges,
-  }
+  return { nodes: Array.from(nodeMap.values()), edges }
 })
 
-// ── 显示过滤（搜索 / 类型隐藏 / 仅高危） ─────────────────
+// ── 显示过滤 ─────────────────────────────────────────
 const filteredGraph = computed(() => {
   const allNodes = composedGraph.value.nodes
   const allEdges = composedGraph.value.edges
   const q = searchText.value.trim().toLowerCase()
-  const visibleIds = new Set()
+  const visibleIds = new Set<string>()
 
   for (const n of allNodes) {
     if (hiddenTypes.value.has(n.type)) continue
     if (exploitableOnly.value) {
       const sev = n.facts?.severity
       const ok =
-        n.type === 'host' ||
-        n.type === 'foothold' ||
-        n.type === 'objective' ||
+        n.type === 'host' || n.type === 'foothold' || n.type === 'objective' ||
         (n.type === 'finding' && (n.facts?.exploitable || sev === 'critical' || sev === 'high')) ||
-        (n.type === 'credential') ||
-        (n.type === 'loot')
+        n.type === 'credential' || n.type === 'loot'
       if (!ok) continue
     }
     if (q) {
@@ -523,207 +561,251 @@ const mergedEdges = computed(() => filteredGraph.value.edges)
 
 const emptyText = computed(() => {
   const totalRaw = composedGraph.value.nodes.length
-  if (totalRaw === 0) {
-    return '尚未捕获攻击图节点（运行中节点出现新事实后会自动绘制）'
-  }
-  if (searchText.value || exploitableOnly.value || hiddenTypes.value.size) {
-    return '当前过滤条件下没有匹配节点，调整筛选试试'
-  }
+  if (totalRaw === 0) return '等待侦察数据…'
+  if (searchText.value || exploitableOnly.value || hiddenTypes.value.size) return '当前过滤条件下没有匹配节点，调整筛选试试'
   return '无可视化数据'
 })
 
-// ── 节点 / 边 → ECharts 数据 ──────────────────────────────
+// ── 节点 / 边 → ECharts 数据 ──────────────────────────
+const textColor = computed(() => chartTheme.textColor())
+const mutedColor = computed(() => chartTheme.mutedTextColor())
+const accentColor = computed(() => chartTheme.colors().cyan)
+
 const echartsNodes = computed(() => {
-  return mergedNodes.value.map((n) => {
-    const meta = NODE_TYPE_META[n.type] || DEFAULT_NODE_STYLE
-    let color = meta.color
-    let size = meta.size
-    let glow = 0
-    let severity = ''
-
-    if (n.type === 'finding') {
-      severity = String(n.facts?.severity || 'info').toLowerCase()
-      const sevMeta = SEVERITY_META[severity] || SEVERITY_META.info
-      color = sevMeta.color
-      size += sevMeta.sizeBoost
-      glow = sevMeta.glow
-    }
-
-    const exploitable = Boolean(n.facts?.exploitable)
-    const isSynth = n._origin === 'synth'
-    const isPrior = n.facts?.source === 'prior' || n.facts?.from_history === true
-    const isTargetSelected = props.selectedNodeId && n.id === props.selectedNodeId
-
-    return {
-      id: n.id,
-      name: (isPrior ? '⏳ ' : '') + (n.label || n.id),
-      symbol: meta.symbol,
-      symbolSize: size + (isTargetSelected ? 8 : 0),
-      category: n.type,
-      itemStyle: {
-        color,
-        borderColor: isTargetSelected ? '#e06979' : (exploitable ? '#ffc857' : (isPrior ? '#c9a74e' : (isSynth ? 'rgba(255,255,255,0.18)' : 'transparent'))),
-        borderWidth: isTargetSelected ? 3 : (exploitable ? 2 : (isPrior ? 2 : (isSynth ? 1 : 0))),
-        borderType: (isPrior || (isSynth && !exploitable && !isTargetSelected)) ? 'dashed' : 'solid',
-        shadowBlur: isTargetSelected ? Math.max(glow, 18) : glow,
-        shadowColor: isTargetSelected ? '#e06979' : (glow ? color : 'transparent'),
-        opacity: isSynth ? 0.92 : 1,
-      },
-      label: {
-        show: true,
-        position: 'right',
-        fontSize: 11,
-        formatter: (p) => truncateLabel(p.name),
-        color: chartTheme.textColor(),
-      },
-      _raw: { ...n, _severity: severity, _evidence: n.facts?.evidence || '', _isPrior: isPrior },
-    }
-  })
+  return buildEchartsNodes(
+    mergedNodes.value,
+    props.selectedNodeId,
+    frontendNodeIds.value,
+    ownedNodeIds.value,
+    objectiveReachedIds.value,
+    highValueNodeIds.value,
+    killChainPath.value.nodes,
+    degrade.value,
+    textColor.value,
+  )
 })
 
 const echartsLinks = computed(() => {
-  return mergedEdges.value.map((e) => {
-    const meta = RELATION_META[e.relation] || RELATION_META.leads_to
-    const isSynth = e._origin === 'synth'
-    return {
-      source: e.src,
-      target: e.dst,
-      lineStyle: {
-        color: meta.color,
-        type: meta.dashed || isSynth ? 'dashed' : 'solid',
-        width: 1.4,
-        opacity: isSynth ? 0.45 : 0.75,
-        curveness: meta.curveness ?? 0.12,
-      },
-      label: { show: false },
-      _raw: e,
+  return buildEchartsEdges(
+    mergedEdges.value,
+    killChainPath.value.edgeIds,
+    degrade.value,
+  )
+})
+
+const categories = computed(() => {
+  return NODE_TYPE_COUNT_KEYS
+    .filter((k) => NODE_TYPE_META[k])
+    .map((k) => ({
+      name: k,
+      itemStyle: { color: resolveMetaColor(NODE_TYPE_META[k]?.color) },
+    }))
+})
+
+const nodeTypeStats = computed(() => computeNodeTypeStats(composedGraph.value.nodes))
+const severityStats = computed(() => computeSeverityStats(composedGraph.value.nodes))
+
+// ── Kill-chain 流动线坐标 ─────────────────────────────
+const killChainLineCoords = ref<number[][][]>([])
+
+function updateKillChainCoords() {
+  const chart = chartRef.value
+  if (!chart) return
+  const kc = killChainPath.value
+  if (kc.edgeIds.size === 0) { killChainLineCoords.value = []; return }
+
+  try {
+    const option = chart.getOption?.()
+    const series = option?.series?.[0]
+    const graphNodes = series?.data || []
+    const graphLinks = series?.links || series?.edges || []
+
+    const nodePosMap: Record<string, [number, number]> = {}
+    for (const n of graphNodes) {
+      if (n.x !== undefined && n.y !== undefined) {
+        nodePosMap[n.id || n.name] = [n.x, n.y]
+      }
     }
-  })
-})
 
-const categories = computed(() =>
-  _ORDER.map((k) => ({
-    name: k,
-    itemStyle: { color: NODE_TYPE_META[k].color },
-  })),
-)
+    const coords: number[][][] = []
+    for (const link of graphLinks) {
+      const key = `${link.source || ''}|${link.target || ''}|${link._raw?.relation || ''}`
+      if (!kc.edgeIds.has(key)) continue
+      const srcPos = nodePosMap[link.source]
+      const dstPos = nodePosMap[link.target]
+      if (srcPos && dstPos) {
+        coords.push([srcPos, dstPos])
+      }
+    }
+    killChainLineCoords.value = coords
+  } catch { /* ignore */ }
+}
 
-const nodeTypeStats = computed(() => {
-  const counts = {}
-  for (const n of composedGraph.value.nodes) {
-    counts[n.type] = (counts[n.type] || 0) + 1
-  }
-  return _ORDER
-    .filter((k) => counts[k])
-    .map((type) => ({ type, count: counts[type] }))
-})
-
-const severityStats = computed(() => {
-  const counts = {}
-  for (const n of composedGraph.value.nodes) {
-    if (n.type !== 'finding') continue
-    const k = String(n.facts?.severity || 'info').toLowerCase()
-    counts[k] = (counts[k] || 0) + 1
-  }
-  return ['critical', 'high', 'medium', 'low', 'info']
-    .filter((k) => counts[k])
-    .map((key) => ({ key, count: counts[key] }))
-})
-
-const option = computed(() => {
+// ── ECharts option ───────────────────────────────────
+const rawOption = computed(() => {
+  void pulseGeneration.value
   const tip = chartTheme.tooltipStyle()
+  const tooltipFormatter = buildTooltipFormatter(
+    textColor.value, mutedColor.value, accentColor.value,
+    NODE_TYPE_META, RELATION_META, SEVERITY_META,
+  )
+
+  const series: any[] = [{
+    type: 'graph',
+    layout: layoutMode.value === 'circular' ? 'circular' : layoutMode.value === 'layered' ? 'force' : 'force',
+    force: layoutMode.value !== 'circular' ? {
+      repulsion: 240,
+      edgeLength: [70, 150],
+      gravity: 0.06,
+      friction: 0.16,
+      layoutAnimation: true,
+    } : undefined,
+    circular: layoutMode.value === 'circular' ? { rotateLabel: true } : undefined,
+    roam: true,
+    draggable: true,
+    focusNodeAdjacency: true,
+    edgeSymbol: ['none', 'arrow'],
+    edgeSymbolSize: [0, 8],
+    nodes: echartsNodes.value,
+    links: echartsLinks.value,
+    categories: categories.value,
+    emphasis: {
+      focus: 'adjacency',
+      scale: true,
+      lineStyle: { width: 4 },
+      itemStyle: { borderColor: accentColor.value, borderWidth: 2, shadowBlur: 16 },
+      label: { fontSize: 12, fontWeight: 'bold' },
+    },
+    lineStyle: { opacity: 0.7 },
+    animationDurationUpdate: 600,
+    animationEasingUpdate: 'cubicOut',
+  }]
+
+  if (killChainLineCoords.value.length > 0 && !degrade.value && !prefersReducedMotion.value) {
+    series.push({
+      type: 'lines',
+      coordinateSystem: 'none',
+      polyline: false,
+      effect: {
+        show: true,
+        period: 4,
+        trailLength: 0.4,
+        symbol: 'arrow',
+        symbolSize: 6,
+        color: resolveMetaColor('var(--accent-red)'),
+      },
+      lineStyle: { width: 0, opacity: 0 },
+      data: killChainLineCoords.value.map((c) => ({ coords: c })),
+    })
+  }
+
   return {
     backgroundColor: 'transparent',
     tooltip: {
       ...tip,
-      formatter: (p) => {
-        if (p.dataType === 'node') {
-          const r = p.data._raw
-          const sev = r._severity
-          const sevTag = sev
-            ? `<span style="display:inline-block;padding:0 6px;border-radius:3px;background:${SEVERITY_META[sev]?.color || '#666'};color:#fff;font-size:10px;margin-left:4px">${SEVERITY_META[sev]?.label || sev}</span>`
-            : ''
-          const exp = r.facts?.exploitable
-            ? `<span style="display:inline-block;padding:0 6px;border-radius:3px;background:#ffc857;color:#1d2128;font-size:10px;margin-left:4px">可利用</span>`
-            : ''
-          const cve = r.facts?.cve
-            ? `<div style="font-size:11px;margin-top:4px;color:#58b8e0">${escapeHtml(r.facts.cve)}</div>`
-            : ''
-          const tgt = r.facts?.target
-            ? `<div style="font-size:11px;margin-top:2px;color:#9ab4c0">target: ${escapeHtml(String(r.facts.target))}</div>`
-            : ''
-          const priorNote = r._isPrior
-            ? `<div style="font-size:10px;margin-top:4px;padding:2px 6px;border-radius:3px;background:rgba(201,167,78,0.15);color:#c9a74e;display:inline-block">⏳ 历史推断，待验证</div>`
-            : ''
-          return `
-            <div style="font-weight:600;margin-bottom:4px">${escapeHtml(r.label || r.id)}${sevTag}${exp}</div>
-            <div style="font-size:11px;color:#888">${typeLabel(r.type)} · ${escapeHtml(r.id)}</div>
-            ${cve}${tgt}${priorNote}
-            <div style="font-size:11px;margin-top:4px;color:#aaa">来源: ${escapeHtml(r.discovered_by || '—')}</div>
-          `
-        }
-        if (p.dataType === 'edge') {
-          const r = p.data._raw
-          const meta = RELATION_META[r.relation] || {}
-          return `
-            <div><code>${escapeHtml(r.src)}</code></div>
-            <div style="margin:2px 0;color:${meta.color || '#aaa'}">— ${meta.label || r.relation} →</div>
-            <div><code>${escapeHtml(r.dst)}</code></div>
-            ${r.note ? `<div style="font-size:11px;color:#888;margin-top:4px">${escapeHtml(r.note)}</div>` : ''}
-          `
-        }
-        return ''
-      },
+      enterable: true,
+      formatter: tooltipFormatter,
     },
     legend: [
       {
         data: categories.value
           .filter((c) => nodeTypeStats.value.some((s) => s.type === c.name))
           .map((c) => ({ name: c.name, itemStyle: c.itemStyle })),
-        textStyle: { color: chartTheme.textColor(), fontSize: 11 },
-        formatter: (name) => typeLabel(name),
+        textStyle: { color: textColor.value, fontSize: 11 },
+        formatter: (name: string) => typeLabel(name),
         bottom: 4,
         type: 'scroll',
       },
     ],
-    series: [
-      {
-        type: 'graph',
-        layout: layoutMode.value === 'circular' ? 'circular' : 'force',
-        force: layoutMode.value === 'force' ? {
-          repulsion: 260,
-          edgeLength: [70, 160],
-          gravity: 0.05,
-          friction: 0.55,
-          layoutAnimation: true,
-        } : undefined,
-        circular: layoutMode.value === 'circular' ? { rotateLabel: true } : undefined,
-        roam: true,
-        draggable: true,
-        focusNodeAdjacency: true,
-        edgeSymbol: ['none', 'arrow'],
-        edgeSymbolSize: [0, 8],
-        nodes: echartsNodes.value,
-        links: echartsLinks.value,
-        categories: categories.value,
-        emphasis: {
-          focus: 'adjacency',
-          scale: true,
-          lineStyle: { width: 2.5 },
-          itemStyle: { borderColor: chartTheme.colors().cyan, borderWidth: 2 },
-          label: { fontSize: 12, fontWeight: 'bold' },
-        },
-        lineStyle: { opacity: 0.7 },
-        animationDurationUpdate: 350,
-      },
-    ],
+    series,
   }
 })
+
+// ── Debounced option ──────────────────────────────────
+const debouncedOption = ref<any>(null)
+let _debounceTimer: ReturnType<typeof setTimeout> | null = null
+
+watch(rawOption, (newOpt) => {
+  if (_debounceTimer) clearTimeout(_debounceTimer)
+  _debounceTimer = setTimeout(() => {
+    debouncedOption.value = newOpt
+  }, 250)
+}, { deep: true, immediate: true })
+
+// ── 分层布局 fallback ────────────────────────────────
+watch(layoutMode, (mode) => {
+  if (mode === 'layered') {
+    nextTick(() => {
+      const chart = chartRef.value
+      if (!chart) return
+      try {
+        const nodes = mergedNodes.value
+        const phaseOrder: Record<string, number> = {
+          host: 0, service: 0, web_endpoint: 0,
+          finding: 1, credential: 1,
+          session: 2, foothold: 2,
+          loot: 3, objective: 3, pivot_point: 2,
+        }
+        const phaseOrderKeys = Object.keys(phaseOrder)
+        const maxPhase = Math.max(...Object.values(phaseOrder), 3)
+
+        chart.setOption({
+          series: [{
+            nodes: nodes.map((n, i) => {
+              const phase = phaseOrder[n.type] ?? 1
+              return {
+                id: n.id,
+                x: (phase / maxPhase) * 600 + 50,
+                y: (i % Math.max(1, Math.floor(nodes.length / (maxPhase + 1)))) * 80 + 60,
+                fixed: true,
+              }
+            }),
+          }],
+        }, { notMerge: true })
+      } catch { /* ignore */ }
+    })
+  }
+})
+
+// ── 节点钉位 ──────────────────────────────────────────
+const pinning = useNodePinning(chartRef, (nodeId: string, x: number, y: number) => {
+  const node = composedGraph.value.nodes.find((n) => n.id === nodeId)
+  if (node) {
+    node._pinned = true
+    node._x = x
+    node._y = y
+  }
+})
+
+function onChartFinished() {
+  pinning.onFinished()
+  updateKillChainCoords()
+}
+
+// ── 脉冲定时器（frontier / owned 呼吸）───────────────
+const pulseEnabled = computed(() => !degrade.value && !prefersReducedMotion.value)
+const pulseTimer = usePulseTimer(() => {
+  pulseGeneration.value += 1
+  const chart = chartRef.value
+  if (!chart) return
+
+  try {
+    const frontierNodes: any[] = []
+    const ownedNodes: any[] = []
+    for (const node of echartsNodes.value) {
+      if (frontendNodeIds.value.has(node.id)) frontierNodes.push({ id: node.id, itemStyle: { shadowBlur: pulseGeneration.value % 2 === 0 ? 24 : 12 } })
+      if (ownedNodeIds.value.has(node.id)) ownedNodes.push({ id: node.id, itemStyle: { shadowBlur: pulseGeneration.value % 2 === 0 ? 16 : 8, shadowColor: 'rgba(86,201,164,.5)' } })
+    }
+    if (frontierNodes.length > 0 || ownedNodes.length > 0) {
+      chart.setOption({ series: [{ nodes: [...frontierNodes, ...ownedNodes] }] }, { notMerge: false })
+    }
+  } catch { /* ignore */ }
+}, pulseEnabled)
 
 const relatedEdges = computed(() => {
   if (!selected.value) return []
   const id = selected.value.id
-  return composedGraph.value.edges.filter((e) => e.src === id || e.dst === id)
+  return composedGraph.value.edges.filter((e: any) => e.src === id || e.dst === id)
 })
 
 const drawerTitle = computed(() => {
@@ -731,14 +813,14 @@ const drawerTitle = computed(() => {
   return `${typeLabel(selected.value.type)}: ${selected.value.label || selected.value.id}`
 })
 
-function toggleType(t) {
+function toggleType(t: string) {
   const next = new Set(hiddenTypes.value)
   if (next.has(t)) next.delete(t)
   else next.add(t)
   hiddenTypes.value = next
 }
 
-function onNodeClick(p) {
+function onNodeClick(p: any) {
   if (p?.dataType === 'node' && p.data?._raw) {
     selected.value = p.data._raw
     drawerOpen.value = true
@@ -749,57 +831,37 @@ function resetView() {
   hiddenTypes.value = new Set()
   searchText.value = ''
   exploitableOnly.value = false
+  pinning.reset()
   if (chartRef.value && typeof chartRef.value.dispatchAction === 'function') {
     chartRef.value.dispatchAction({ type: 'restore' })
   }
 }
 
-function truncateLabel(s) {
-  if (!s) return ''
-  return s.length > 28 ? s.slice(0, 26) + '…' : s
-}
-
-function escapeHtml(s) {
-  return String(s ?? '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-}
-
-function formatTs(ts) {
+function formatTs(ts: string) {
   if (!ts) return '—'
   try {
     const d = new Date(ts)
     if (isNaN(d.getTime())) return ts
     return d.toLocaleString()
-  } catch {
-    return ts
-  }
+  } catch { return ts }
 }
 
-function pretty(obj) {
-  if (!obj || (typeof obj === 'object' && Object.keys(obj).length === 0)) {
-    return '(无)'
-  }
-  try {
-    return JSON.stringify(obj, null, 2)
-  } catch {
-    return String(obj)
-  }
+function pretty(obj: any) {
+  if (!obj || (typeof obj === 'object' && Object.keys(obj).length === 0)) return '(无)'
+  try { return JSON.stringify(obj, null, 2) } catch { return String(obj) }
 }
 
 watch(() => composedGraph.value.nodes.length, () => {
-  if (selected.value && !composedGraph.value.nodes.find((n) => n.id === selected.value.id)) {
+  if (selected.value && !composedGraph.value.nodes.find((n: any) => n.id === selected.value.id)) {
     drawerOpen.value = false
     selected.value = null
   }
 })
 
-// ── 延迟挂载 ECharts (lazy tab) ──────────────────────────
-const canvasWrapRef = ref(null)
+// ── 延迟挂载 ECharts ─────────────────────────────────
+const canvasWrapRef = ref<any>(null)
 const chartReady = ref(false)
-let _ro = null
+let _ro: ResizeObserver | null = null
 
 function _tryMountChart() {
   nextTick(() => {
@@ -811,11 +873,11 @@ function _tryMountChart() {
       return
     }
     if (_ro) _ro.disconnect()
-    _ro = new ResizeObserver(entries => {
+    _ro = new ResizeObserver((entries) => {
       const { width, height } = entries[0].contentRect
       if (width > 0 && height > 0) {
         chartReady.value = true
-        _ro.disconnect()
+        _ro!.disconnect()
       }
     })
     _ro.observe(el)
@@ -828,10 +890,19 @@ watch([() => mergedNodes.value.length, canvasWrapRef], ([len]) => {
 
 onMounted(() => {
   if (mergedNodes.value.length > 0) _tryMountChart()
+
+  try {
+    const mq = window.matchMedia('(prefers-reduced-motion: reduce)')
+    prefersReducedMotion.value = mq.matches
+    mq.addEventListener('change', (e) => { prefersReducedMotion.value = e.matches })
+  } catch { /* ignore */ }
+
+  pulseTimer.start()
 })
 
-onUnmounted(() => {
+onBeforeUnmount(() => {
   if (_ro) _ro.disconnect()
+  if (_debounceTimer) clearTimeout(_debounceTimer)
 })
 </script>
 
@@ -843,7 +914,6 @@ onUnmounted(() => {
   min-height: 540px;
 }
 
-/* ── 顶部工具栏 ──────────────────────────────────────────── */
 .graph-toolbar {
   display: flex;
   align-items: center;
@@ -864,7 +934,7 @@ onUnmounted(() => {
   font-variant-numeric: tabular-nums;
   cursor: pointer;
   user-select: none;
-  transition: opacity 0.18s ease, transform 0.12s ease;
+  transition: opacity var(--t-fast) var(--ease-out), transform var(--t-fast) var(--ease-out);
   display: inline-flex !important;
   align-items: center;
   gap: 5px;
@@ -898,29 +968,54 @@ onUnmounted(() => {
   width: 200px;
 }
 
-/* ── 空状态 ───────────────────────────────────────────────── */
+/* ── 空状态 ───────────────────────────────────────────── */
 .graph-empty {
   min-height: 380px;
   display: flex;
   align-items: center;
   justify-content: center;
 }
+
+.graph-empty-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+}
+
+.empty-icon-wrap {
+  width: 80px;
+  height: 80px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--text-muted) 10%, transparent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
 .empty-icon {
-  font-size: 64px;
-  color: var(--text-muted, #6e7681);
+  font-size: 36px;
+  color: var(--text-muted);
   opacity: 0.45;
 }
 
-/* ── 主画布 ──────────────────────────────────────────────── */
+.empty-text {
+  color: var(--text-secondary);
+  font-size: 13px;
+  margin: 0;
+}
+
+/* ── 主画布 ──────────────────────────────────────────── */
 .graph-canvas-wrap {
   flex: 1;
   min-height: 540px;
   border-radius: 8px;
   background:
-    radial-gradient(circle at 20% 20%, rgba(88, 184, 224, 0.06) 0%, transparent 60%),
-    radial-gradient(circle at 80% 80%, rgba(224, 105, 121, 0.05) 0%, transparent 55%),
-    var(--bg-soft, rgba(13, 17, 23, 0.55));
-  border: 1px solid var(--border-color, rgba(88, 184, 201, 0.12));
+    radial-gradient(circle at 50% 50%, rgba(56,139,253,.06), transparent 60%),
+    linear-gradient(var(--start-grid-line) 1px, transparent 1px) 0 0/32px 32px,
+    linear-gradient(90deg, var(--start-grid-line) 1px, transparent 1px) 0 0/32px 32px,
+    var(--bg-base);
+  border: 1px solid var(--border);
   position: relative;
   overflow: hidden;
 }
@@ -930,7 +1025,81 @@ onUnmounted(() => {
   height: 540px;
 }
 
-/* ── 抽屉详情 ───────────────────────────────────────────── */
+/* ── 自定义图例面板 ──────────────────────────────────── */
+.graph-legend-panel {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  background: rgba(22,27,34,.72);
+  border: 1px solid var(--start-panel-border);
+  backdrop-filter: blur(8px);
+  border-radius: 8px;
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  z-index: 10;
+  min-width: 130px;
+}
+
+.legend-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  user-select: none;
+  transition: opacity var(--t-fast) var(--ease-out);
+  padding: 2px 0;
+}
+.legend-row:hover {
+  opacity: 0.8;
+}
+.legend-row.is-disabled {
+  opacity: 0.36;
+  text-decoration: line-through;
+}
+
+.legend-icon {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  display: inline-block;
+  flex-shrink: 0;
+}
+
+.legend-label {
+  font-size: 11px;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+}
+
+.legend-count {
+  font-size: 10px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  margin-left: auto;
+}
+
+/* ── Kill-chain 路径说明 ─────────────────────────────── */
+.kill-chain-caption {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  background: color-mix(in srgb, var(--accent-red) 10%, var(--bg-surface));
+  border: 1px solid color-mix(in srgb, var(--accent-red) 25%, var(--border));
+  border-radius: var(--radius-md);
+  font-size: 12px;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+}
+
+.kill-chain-caption .el-icon {
+  color: var(--accent-red);
+}
+
+/* ── 抽屉详情 ───────────────────────────────────────── */
 .node-detail {
   display: flex;
   flex-direction: column;
@@ -948,20 +1117,20 @@ onUnmounted(() => {
 .detail-label {
   width: 72px;
   flex-shrink: 0;
-  color: var(--text-muted, #8b949e);
+  color: var(--text-muted);
   font-size: 12px;
 }
 
 .detail-value {
   font-size: 13px;
-  color: var(--text-primary, #d0d6dc);
+  color: var(--text-primary);
 }
 
 .detail-value.mono,
 .detail-code {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
-  background: rgba(88, 184, 201, 0.08);
+  background: color-mix(in srgb, var(--accent-blue) 8%, transparent);
   padding: 1px 6px;
   border-radius: 3px;
   word-break: break-all;
@@ -973,9 +1142,9 @@ onUnmounted(() => {
 }
 
 .cve-link {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
-  color: var(--accent-blue, #58b8e0);
+  color: var(--accent-blue);
   text-decoration: none;
 }
 .cve-link:hover { text-decoration: underline; }
@@ -988,7 +1157,7 @@ onUnmounted(() => {
 
 .detail-section-title {
   font-size: 12px;
-  color: var(--text-muted, #8b949e);
+  color: var(--text-muted);
   text-transform: uppercase;
   letter-spacing: 0.4px;
 }
@@ -999,17 +1168,17 @@ onUnmounted(() => {
   padding: 10px 12px;
   border-radius: 6px;
   font-size: 11.5px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: var(--font-mono);
   max-height: 240px;
   overflow: auto;
   margin: 0;
-  color: var(--text-secondary, #9ab4c0);
+  color: var(--text-secondary);
   white-space: pre-wrap;
   word-break: break-all;
 }
 
 .detail-evidence {
-  border-left: 3px solid var(--accent-red, #e06979);
+  border-left: 3px solid var(--accent-red);
 }
 
 .edge-list {
@@ -1028,25 +1197,40 @@ onUnmounted(() => {
   align-items: baseline;
   gap: 4px;
   padding: 6px 8px;
-  background: rgba(88, 184, 201, 0.05);
+  background: color-mix(in srgb, var(--accent-blue) 5%, transparent);
   border-radius: 4px;
 }
 
 .edge-list code {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: var(--font-mono);
   font-size: 11px;
   word-break: break-all;
 }
 
 .rel {
-  color: var(--text-muted, #8b949e);
+  color: var(--text-muted);
   font-size: 11px;
 }
 
 .note {
   width: 100%;
-  color: var(--text-muted, #8b949e);
+  color: var(--text-muted);
   font-size: 11px;
   font-style: italic;
+}
+
+/* ── prefers-reduced-motion ──────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  .graph-canvas-wrap {
+    background: var(--bg-base) !important;
+  }
+
+  .type-stat {
+    transition: none;
+  }
+
+  .graph-legend-panel {
+    backdrop-filter: none;
+  }
 }
 </style>

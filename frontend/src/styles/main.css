@@ -99,6 +99,17 @@
     --radius-md: 6px;
     --radius-lg: 12px;
 
+    /* ── 统一动效 token ──────────────────────────── */
+    --t-fast: 120ms;
+    --t-base: 220ms;
+    --t-slow: 420ms;
+    --ease-out: cubic-bezier(.16,1,.3,1);
+    --ease-inout: cubic-bezier(.65,0,.35,1);
+    --glow-blue: 0 0 12px rgba(88,184,224,.45);
+    --glow-green: 0 0 12px rgba(86,201,164,.45);
+    --glow-red: 0 0 14px rgba(224,105,121,.5);
+    --glow-gold: 0 0 18px rgba(217,168,78,.6);
+
     color-scheme: dark;
 }
 
