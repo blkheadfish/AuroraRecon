@@ -60,9 +60,9 @@
               class="bubble-anchor"
               :class="{ 'bubble-fork-anchored': forkAnchor && forkAnchor.id === msg.id }"
             >
-          <button
-            v-if="canForkFromMsg(msg)"
-            class="bubble-fork-btn"
+            <button
+              v-if="enableBranchUI && canForkFromMsg(msg)"
+              class="bubble-fork-btn"
             type="button"
             :title="forkAnchor && forkAnchor.id === msg.id
               ? '已锚定此处, 再次点击取消'
@@ -207,7 +207,7 @@
             </div>
 
             <div
-              v-if="msg.action === 'branch_forked' && msg.branchId && nav.siblingNavFor(msg.branchId)"
+              v-if="enableBranchUI && msg.action === 'branch_forked' && msg.branchId && nav.siblingNavFor(msg.branchId)"
               class="branch-navigator"
             >
               <button
@@ -283,7 +283,7 @@
     </main>
 
       <section class="composer" :class="{ 'composer-flash': composerFlashing }">
-        <div v-if="branches.length || nav.activeBranch" class="branch-status-band">
+        <div v-if="enableBranchUI && (branches.length || nav.activeBranch)" class="branch-status-band">
           <span class="band-icon">
             <el-icon><Share /></el-icon>
           </span>
@@ -345,7 +345,7 @@
           </span>
           <span class="composer-shortcut">Ctrl/Cmd + Enter 发送</span>
         </div>
-        <div v-if="forkAnchor" class="fork-anchor-band">
+        <div v-if="enableBranchUI && forkAnchor" class="fork-anchor-band">
           <el-icon><Share /></el-icon>
           <span class="fork-anchor-text">
             将在 <strong>{{ forkAnchor.label || forkAnchor.id }}</strong> 处分叉新分支
@@ -687,6 +687,7 @@ function handleRailJump(id) {
 // 把对应 decision_event 的 id + timestamp 暂存到这里, 下一次 sendMessage
 // 会把它们作为 ``from_event_id`` / ``from_event_ts`` 一并传给后端,
 // 让 BranchManager 走 ``find_checkpoint_at_or_before`` 选定 source checkpoint。
+const enableBranchUI = ref(false) // 临时禁用分支 UI
 const forkAnchor = ref(null)
 
 function setForkAnchor(eventId, timestamp, label) {
