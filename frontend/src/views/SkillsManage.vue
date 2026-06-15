@@ -108,56 +108,49 @@
         </el-card>
       </div>
 
-      <!-- 右侧: 文件编辑面板 -->
-      <div class="skills-right" v-if="editingFile">
-        <el-card class="panel editor-panel">
-          <template #header>
-            <div class="editor-header">
-              <div class="editor-header-left">
-                <el-tag size="small" :type="fileTagType(editingFile.filename)">
-                  {{ editingFile.filename }}
-                </el-tag>
-                <code class="editor-path">{{ editingFile.skill_id }} / {{ editingFile.path }}</code>
-              </div>
-              <div class="editor-header-right">
-                <el-button size="small" @click="closeEditor">
-                  <el-icon><Close /></el-icon>
-                </el-button>
-              </div>
-            </div>
-          </template>
-          <div class="editor-body" v-loading="fileLoading" v-if="editingFile">
-            <div class="editor-split">
-              <div class="editor-pane editor-edit-pane">
-                <div class="pane-label">编辑</div>
-                <el-input
-                  v-model="editingFile.content"
-                  type="textarea"
-                  class="editor-textarea"
-                  :rows="22"
-                  resize="vertical"
-                  placeholder="加载中..."
-                  @input="onEditorInput"
-                />
-              </div>
-              <div class="editor-pane editor-preview-pane">
-                <div class="pane-label">预览</div>
-                <pre class="editor-highlight"><code v-html="highlightedHtml" /></pre>
-              </div>
-            </div>
-          </div>
-          <div class="editor-footer">
-            <span v-if="fileDirty" class="dirty-tip">未保存</span>
-            <el-button type="primary" size="small" @click="saveFile" :loading="fileSaving">保存</el-button>
-          </div>
-        </el-card>
-      </div>
-      <div class="skills-right" v-else>
-        <div class="editor-placeholder">
-          <el-icon class="placeholder-icon"><Document /></el-icon>
-          <p>点击左侧目录树中的文件以查看 / 编辑</p>
+    <!-- ── 底部: 文件编辑器面板 ─────────────────────────── -->
+    <div class="editor-bottom" v-if="editingFile" :style="{ height: editorHeight + 'px' }">
+      <div class="editor-resize-handle" @mousedown="onResizeStart"></div>
+      <div class="editor-bottom-header">
+        <div class="editor-bottom-header-left">
+          <el-tag size="small" :type="fileTagType(editingFile.filename)">
+            {{ editingFile.filename }}
+          </el-tag>
+          <code class="editor-path">{{ editingFile.skill_id }} / {{ editingFile.path }}</code>
+        </div>
+        <div class="editor-bottom-header-right">
+          <span v-if="fileDirty" class="dirty-tip">未保存</span>
+          <el-button type="primary" size="small" @click="saveFile" :loading="fileSaving">保存</el-button>
+          <el-button size="small" @click="closeEditor">
+            <el-icon><Close /></el-icon>
+          </el-button>
         </div>
       </div>
+      <div class="editor-bottom-tabs">
+        <button
+          class="editor-tab"
+          :class="{ active: editorTab === 'edit' }"
+          @click="editorTab = 'edit'"
+        >编辑</button>
+        <button
+          class="editor-tab"
+          :class="{ active: editorTab === 'preview' }"
+          @click="editorTab = 'preview'"
+        >预览</button>
+      </div>
+      <div class="editor-bottom-body" v-loading="fileLoading">
+        <el-input
+          v-show="editorTab === 'edit'"
+          v-model="editingFile.content"
+          type="textarea"
+          class="editor-textarea editor-textarea-full"
+          resize="none"
+          placeholder="加载中..."
+          @input="onEditorInput"
+        />
+        <pre v-show="editorTab === 'preview'" class="editor-highlight editor-highlight-full"><code v-html="highlightedHtml" /></pre>
+      </div>
+    </div>
     </div>
 
     <!-- ── 旧版编辑弹窗 (skill.yaml) ──────────────────── -->
@@ -300,6 +293,25 @@ const fileLoading = ref(false)
 const fileSaving = ref(false)
 const fileDirty = ref(false)
 const activeFilePath = ref('')
+const editorTab = ref<'edit' | 'preview'>('edit')
+const editorHeight = ref(360)
+let _resizeStartY = 0
+let _resizeStartH = 0
+
+function onResizeStart(e: MouseEvent) {
+  _resizeStartY = e.clientY
+  _resizeStartH = editorHeight.value
+  document.addEventListener('mousemove', onResizeMove)
+  document.addEventListener('mouseup', onResizeEnd)
+}
+function onResizeMove(e: MouseEvent) {
+  const delta = _resizeStartY - e.clientY
+  editorHeight.value = Math.max(180, Math.min(700, _resizeStartH + delta))
+}
+function onResizeEnd() {
+  document.removeEventListener('mousemove', onResizeMove)
+  document.removeEventListener('mouseup', onResizeEnd)
+}
 
 const highlightedHtml = computed(() => {
   const file = editingFile.value
@@ -562,11 +574,7 @@ onMounted(() => {
 .header-actions { display: flex; gap: 8px; }
 
 /* ── 主布局 ──────────────────────────────── */
-.skills-layout { display: flex; gap: 16px; min-height: 600px; }
-.skills-left { flex: 1; min-width: 0; }
-.skills-right { width: 640px; flex-shrink: 0; }
-
-.panel { margin-bottom: 0; }
+.skills-layout { min-height: 400px; }
 
 /* ── 折叠标题 ────────────────────────────── */
 .collapse-title { width: 100%; }
@@ -622,85 +630,105 @@ onMounted(() => {
 :deep(.tree-node-name) { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 :deep(.tree-node-size) { font-size: 10px; color: var(--text-muted); flex-shrink: 0; }
 
-/* ── 编辑器面板 ──────────────────────────── */
-.editor-panel { height: 100%; display: flex; flex-direction: column; }
-.editor-panel :deep(.el-card__body) { flex: 1; display: flex; flex-direction: column; padding: 0; }
-
-.editor-header { display: flex; align-items: center; justify-content: space-between; width: 100%; }
-.editor-header-left { display: flex; align-items: center; gap: 8px; }
-.editor-path { font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); }
-
-.editor-body { padding: 12px; flex: 1; overflow: hidden; }
-
-.editor-split { display: flex; gap: 12px; height: 100%; }
-
-.editor-pane { flex: 1; min-width: 0; display: flex; flex-direction: column; }
-
-.pane-label {
-  font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--text-muted);
-  margin-bottom: 6px;
-  font-family: var(--font-mono);
+/* ── 底部编辑器面板 ────────────────────────── */
+.editor-bottom {
+  border-top: 2px solid var(--border);
+  background: var(--bg-surface);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  position: relative;
 }
 
-.editor-textarea { flex: 1; }
-.editor-textarea :deep(textarea) {
-  font-family: var(--font-mono);
+.editor-resize-handle {
+  position: absolute;
+  top: -4px;
+  left: 0;
+  right: 0;
+  height: 8px;
+  cursor: ns-resize;
+  z-index: 10;
+}
+.editor-resize-handle:hover { background: color-mix(in srgb, var(--accent-blue) 12%, transparent); }
+
+.editor-bottom-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border-muted);
+  gap: 8px;
+}
+.editor-bottom-header-left { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.editor-bottom-header-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.editor-path { font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.editor-bottom-tabs {
+  display: flex;
+  gap: 0;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--border-muted);
+  background: var(--bg-elevated);
+}
+
+.editor-tab {
+  padding: 6px 18px;
   font-size: 12px;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  transition: color var(--t-fast), border-color var(--t-fast);
+}
+.editor-tab:hover { color: var(--text-primary); }
+.editor-tab.active { color: var(--accent-blue); border-bottom-color: var(--accent-blue); }
+
+.editor-bottom-body {
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+}
+
+.editor-textarea-full {
+  height: 100%;
+  width: 100%;
+}
+.editor-textarea-full :deep(textarea) {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
   line-height: 1.6;
   background: var(--bg-base);
   color: var(--text-primary);
-  border-color: var(--border);
+  border: none;
+  border-radius: 0;
+  resize: none;
   height: 100% !important;
+  padding: 12px 16px;
 }
 
-.editor-highlight {
-  flex: 1;
+.editor-highlight-full {
   margin: 0;
-  padding: 12px 14px;
-  background: var(--hljs-bg);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  font-family: var(--font-mono);
-  font-size: 12px;
-  line-height: 1.6;
+  padding: 12px 16px;
+  height: 100%;
   overflow: auto;
+  background: var(--hljs-bg);
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.6;
   white-space: pre;
   color: var(--hljs-fg);
-  max-height: 520px;
+  border: none;
+  border-radius: 0;
 }
-
-.editor-highlight :deep(code) {
+.editor-highlight-full :deep(code) {
   font-family: inherit;
   font-size: inherit;
   background: transparent;
 }
 
-.editor-footer {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-  padding: 8px 16px;
-  border-top: 1px solid var(--border);
-}
-.dirty-tip { color: var(--accent-yellow); font-size: 12px; font-family: var(--font-mono); margin-right: auto; }
-
-.editor-placeholder {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  height: 400px;
-  color: var(--text-muted);
-  gap: 12px;
-  border: 1px dashed var(--border);
-  border-radius: var(--radius-lg);
-  background: var(--bg-surface);
-}
-.placeholder-icon { font-size: 48px; opacity: 0.3; }
+.dirty-tip { color: var(--accent-yellow); font-size: 12px; font-family: var(--font-mono); }
 
 /* ── 旧版抽屉 ────────────────────────────── */
 .drawer-header-row { display: flex; align-items: center; }
