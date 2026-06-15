@@ -277,7 +277,7 @@ function resolveMetaColor(token: string | undefined): string {
 
 // ── 世界模型监听（从 store 提取状态标注） ──────────
 watch(
-  taskWorldGraph,
+  () => taskWorldGraph.value,
   (wg) => {
     const frontier = new Set<string>()
     const owned = new Set<string>()
@@ -297,7 +297,6 @@ watch(
     objectiveReachedIds.value = objective
     highValueNodeIds.value = highValue
   },
-  { deep: true },
 )
 
 // ── Kill-chain 路径计算 ────────────────────────────
@@ -643,7 +642,6 @@ function updateKillChainCoords() {
 
 // ── ECharts option ───────────────────────────────────
 const rawOption = computed(() => {
-  void pulseGeneration.value
   const tip = chartTheme.tooltipStyle()
   const tooltipFormatter = buildTooltipFormatter(
     textColor.value, mutedColor.value, accentColor.value,
@@ -730,7 +728,7 @@ watch(rawOption, (newOpt) => {
   _debounceTimer = setTimeout(() => {
     debouncedOption.value = newOpt
   }, 250)
-}, { deep: true, immediate: true })
+}, { immediate: true })
 
 // ── 分层布局 fallback ────────────────────────────────
 watch(layoutMode, (mode) => {
@@ -788,6 +786,9 @@ const pulseTimer = usePulseTimer(() => {
   pulseGeneration.value += 1
   const chart = chartRef.value
   if (!chart) return
+  const fIds = frontendNodeIds.value
+  const oIds = ownedNodeIds.value
+  if (fIds.size === 0 && oIds.size === 0) return
 
   try {
     const frontierNodes: any[] = []

@@ -2,7 +2,7 @@
   <div v-if="hideSidebar" class="start-layout">
     <router-view v-slot="{ Component }">
       <transition name="fade-slide" mode="out-in">
-        <component :is="Component" />
+        <component :is="Component" :key="$route.fullPath" />
       </transition>
     </router-view>
   </div>
