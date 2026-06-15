@@ -324,7 +324,7 @@
               </div>
               <div class="branch-popover-tree">
                 <BranchTreeNode
-                  v-for="node in nav.branchRoots"
+                  v-for="node in nav.branchRoots.filter(n => n && n.branch_id)"
                   :key="node.branch_id"
                   :node="node"
                   :children-by-parent="nav.branchChildrenByParent"
