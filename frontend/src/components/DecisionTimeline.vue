@@ -1,5 +1,11 @@
 <template>
   <div class="timeline-wrap" ref="wrapRef" @scroll="onUserScroll">
+    <!-- ── 此刻在做什么 banner ─────────────────────────── -->
+    <div class="now-banner" :class="{ done: currentAction.startsWith('\u2713') }">
+      <span class="now-dot" :class="{ done: currentAction.startsWith('\u2713') }" />
+      <span class="now-text">{{ currentAction.startsWith('\u2713') ? 'Agent 状态：' : 'Agent 正在：' }}{{ currentAction }}</span>
+    </div>
+
     <el-timeline>
       <div class="timeline-list">
         <el-timeline-item
@@ -45,7 +51,7 @@
         <span class="bubble-phase">{{ bubble.phase }}</span>
         <span class="bubble-indicator">正在思考<span class="dots">...</span></span>
       </div>
-      <pre class="bubble-text">{{ bubble.text }}</pre>
+      <ThinkingTypewriter :text="bubble.text" class="bubble-text" />
     </div>
 
     <div ref="bottomAnchor" class="bottom-anchor" />
@@ -63,6 +69,7 @@
 import { ref, watch, nextTick, onMounted, onBeforeUnmount, defineComponent, h } from 'vue'
 import { ArrowDown } from '@element-plus/icons-vue'
 import PayloadCodeBlock from '@/components/PayloadCodeBlock.vue'
+import ThinkingTypewriter from '@/components/ThinkingTypewriter.vue'
 
 const DecisionThoughtRenderer = defineComponent({
   name: 'DecisionThoughtRenderer',
@@ -218,6 +225,23 @@ const ObjectivePathRenderer = defineComponent({
   },
 })
 
+const SceneClassifiedRenderer = defineComponent({
+  name: 'SceneClassifiedRenderer',
+  props: { item: { type: Object, default: () => ({}) } },
+  setup(props) {
+    const scene = String((props.item as any).scene || '')
+    const sceneLabel = {
+      web: 'Web 应用', intranet: '内网', ad: 'Active Directory', cloud: '云环境',
+      container: '容器', network: '网络', host: '主机',
+    } as Record<string, string>
+    return () => h('div', { class: 'scene-badge' }, [
+      h('span', { class: 'scene-dot' }),
+      h('span', { class: 'scene-label' }, sceneLabel[scene] || scene || '未知场景'),
+      h('span', { class: 'scene-meta' }, scene || ''),
+    ])
+  },
+})
+
 const decisionRenderers: Record<string, ReturnType<typeof defineComponent>> = {
   thought: DecisionThoughtRenderer,
   __demo_event: DemoRenderer,
@@ -227,6 +251,7 @@ const decisionRenderers: Record<string, ReturnType<typeof defineComponent>> = {
   reflection: ReflectionRenderer,
   hypothesis_test: HypothesisTestRenderer,
   objective_path: ObjectivePathRenderer,
+  scene_classified: SceneClassifiedRenderer,
 }
 
 function rendererFor(action: string): ReturnType<typeof defineComponent> | null {
@@ -242,19 +267,57 @@ const props = defineProps({
     type: Object,
     default: () => ({}),
   },
+  taskStatus: {
+    type: String,
+    default: '',
+  },
 })
 
 import { computed } from 'vue'
 
 const activeBubbles = computed(() => {
   const now = Date.now()
-  const result = {}
+  const result: Record<string, any> = {}
   for (const [sid, bubble] of Object.entries(props.llmStreams || {})) {
-    if (bubble && bubble.text && now - bubble.updatedAt < 60000) {
+    if (bubble && bubble.text && now - (bubble as any).updatedAt < 60000) {
       result[sid] = bubble
     }
   }
   return result
+})
+
+const actionLabels: Record<string, string> = {
+  thought: '推理分析',
+  target_selected: '选择攻击目标',
+  chain_selected: '规划攻击链',
+  reflection: '失败归因分析',
+  hypothesis_test: '验证假设',
+  objective_path: '计算目标路径',
+  scene_classified: '识别运行场景',
+  world_model_readout: '读取世界模型状态',
+  world_model_update: '更新世界模型',
+  llm_delta: 'LLM 推理',
+  checkpoint_request: '等待操作员确认',
+}
+
+const currentAction = computed(() => {
+  if (props.taskStatus === 'completed' || props.taskStatus === 'done') {
+    return '\u2713 \u5df2\u5b8c\u6210'
+  }
+  const items = props.items as any[]
+  if (items.length > 0) {
+    const latest = items[items.length - 1]
+    if (latest?.action && actionLabels[latest.action]) {
+      return actionLabels[latest.action]
+    }
+    if (latest?.title) return latest.title
+  }
+  const bubbleKeys = Object.keys(activeBubbles.value)
+  if (bubbleKeys.length > 0) {
+    const b = activeBubbles.value[bubbleKeys[0]]
+    return b?.phase ? `${b.phase}` : 'LLM 推理'
+  }
+  return '监控中'
 })
 
 const wrapRef = ref(null)
@@ -392,6 +455,91 @@ defineExpose({ scrollToItem })
   animation: timelineFadeIn 0.4s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
+/* ── 此刻在做什么 banner ──────────────────────── */
+.now-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  margin-bottom: 10px;
+  background: color-mix(in srgb, var(--accent-green) 8%, var(--bg-surface));
+  border: 1px solid color-mix(in srgb, var(--accent-green) 28%, var(--border));
+  border-radius: var(--radius-md);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  backdrop-filter: blur(6px);
+  transition: background var(--t-base) var(--ease-out), border-color var(--t-base) var(--ease-out);
+}
+.now-banner.done {
+  background: color-mix(in srgb, var(--text-muted) 6%, var(--bg-surface));
+  border-color: var(--border-muted);
+}
+
+.now-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent-green);
+  box-shadow: var(--glow-green);
+  animation: pulse-dot 1.4s ease-in-out infinite;
+}
+.now-dot.done {
+  background: var(--text-muted);
+  box-shadow: none;
+  animation: none;
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.6; transform: scale(1.3); }
+}
+
+.now-text {
+  font-size: 12px;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+}
+.now-banner.done .now-text {
+  color: var(--text-muted);
+}
+
+/* ── 场景识别 badge ──────────────────────────── */
+.scene-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--accent-green) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent-green) 28%, var(--border));
+  font-size: 11px;
+  font-family: var(--font-mono);
+  margin-top: 4px;
+}
+
+.scene-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent-green);
+}
+
+.scene-label {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.scene-meta {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .now-dot { animation: none; }
+  .timeline-fade-in { animation: none; }
+}
+
 .top-line {
   display: flex;
   justify-content: space-between;
@@ -414,8 +562,11 @@ defineExpose({ scrollToItem })
 }
 
 .thought-item {
-  border-left: 3px solid var(--el-color-primary);
+  border-left: 3px solid var(--accent-purple);
 }
+
+/* per-action phase stripe colors */
+.timeline-item:has(.scene-badge) { border-left: 3px solid var(--accent-green); }
 
 .thought-meta {
   font-size: 12px;
@@ -569,13 +720,8 @@ defineExpose({ scrollToItem })
 
 .bubble-text {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 11.5px;
   color: var(--text-secondary);
-  white-space: pre-wrap;
-  word-break: break-word;
-  max-height: 200px;
-  overflow-y: auto;
-  margin: 0;
-  line-height: 1.6;
+  line-height: 1.65;
 }
 </style>
