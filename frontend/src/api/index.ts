@@ -235,6 +235,15 @@ export const api = {
   }> => http.get(`/skills/${skillId}/stats`),
   saveSkillRaw: (skillId: string, yamlContent: string): Promise<{ status: string; skill_id: string }> =>
     http.put(`/skills/${skillId}/raw`, { yaml: yamlContent }),
+  getSkillTree: (skillId: string): Promise<{
+    skill_id: string; root: string;
+    tree: Array<{ name: string; type: string; path: string; ext?: string; size?: number; children?: any[] }>
+  }> => http.get(`/skills/${skillId}/tree`),
+  getSkillFile: (skillId: string, path: string): Promise<{
+    skill_id: string; path: string; filename: string; content: string
+  }> => http.get(`/skills/${skillId}/file`, { params: { path } }),
+  saveSkillFile: (skillId: string, path: string, content: string): Promise<{ status: string; skill_id: string; path: string }> =>
+    http.put(`/skills/${skillId}/file`, { yaml: content }, { params: { path } }),
   reloadSkills: (): Promise<{ status: string; total: number }> =>
     http.post('/skills/reload'),
 

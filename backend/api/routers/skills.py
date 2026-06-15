@@ -226,3 +226,110 @@ async def update_skill_raw(skill_id: str, req: SkillRawUpdateRequest, request: R
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Skill 目录树与文件读写 ─────────────────────────────────
+
+def _skill_source_dir(skill_id: str) -> Path | None:
+    """根据 skill_id 反查 skill 所在的目录路径。"""
+    from backend.skills.registry import get_registry
+    registry = get_registry()
+    skill = registry.get_by_id(skill_id)
+    if not skill or not skill.source_file:
+        return None
+    source = Path(skill.source_file)
+    if not source.exists():
+        return None
+    return source.parent if source.is_file() else source
+
+
+def _build_file_tree(dir_path: Path, rel: str = "") -> list[dict]:
+    """递归构建目录树，只包含文本类文件。"""
+    entries: list[dict] = []
+    try:
+        items = sorted(dir_path.iterdir(), key=lambda p: (p.is_file(), p.name))
+    except PermissionError:
+        return entries
+    for p in items:
+        if p.name.startswith(".") or p.name == "__pycache__":
+            continue
+        rp = f"{rel}/{p.name}" if rel else p.name
+        if p.is_dir():
+            children = _build_file_tree(p, rp)
+            if children or not any(True for _ in p.iterdir()):
+                entries.append({
+                    "name": p.name,
+                    "type": "directory",
+                    "path": rp,
+                    "children": children,
+                })
+        elif p.is_file():
+            ext = p.suffix.lower()
+            if ext in (".yaml", ".yml", ".md", ".py", ".txt", ".json", ".xml",
+                       ".sh", ".bat", ".ps1", ".cfg", ".ini", ".toml", ".conf",
+                       ".html", ".css", ".js", ".ts", ""):
+                try:
+                    size = p.stat().st_size
+                except OSError:
+                    size = 0
+                entries.append({
+                    "name": p.name,
+                    "type": "file",
+                    "path": rp,
+                    "ext": ext,
+                    "size": size,
+                })
+    return entries
+
+
+@router.get("/skills/{skill_id}/tree")
+async def get_skill_tree(skill_id: str):
+    """返回 skill 目录的文件树。"""
+    dir_path = _skill_source_dir(skill_id)
+    if not dir_path:
+        raise HTTPException(status_code=404, detail=f"Skill 目录不存在: {skill_id}")
+    return {
+        "skill_id": skill_id,
+        "root": dir_path.name,
+        "tree": _build_file_tree(dir_path),
+    }
+
+
+@router.get("/skills/{skill_id}/file")
+async def get_skill_file(skill_id: str, path: str = ""):
+    """读取 skill 目录下指定文件的内容（相对路径）。"""
+    dir_path = _skill_source_dir(skill_id)
+    if not dir_path:
+        raise HTTPException(status_code=404, detail=f"Skill 目录不存在: {skill_id}")
+    file_path = (dir_path / path).resolve()
+    if not str(file_path).startswith(str(dir_path.resolve())):
+        raise HTTPException(status_code=403, detail="路径越界")
+    if not file_path.is_file():
+        raise HTTPException(status_code=404, detail=f"文件不存在: {path}")
+    return {
+        "skill_id": skill_id,
+        "path": path,
+        "filename": file_path.name,
+        "content": file_path.read_text(encoding="utf-8"),
+    }
+
+
+@router.put("/skills/{skill_id}/file")
+async def update_skill_file(skill_id: str, path: str = "", req: SkillRawUpdateRequest = None):
+    """写入 skill 目录下指定文件（相对路径）。仅允许文本文件。"""
+    content = req.yaml if req else ""
+    dir_path = _skill_source_dir(skill_id)
+    if not dir_path:
+        raise HTTPException(status_code=404, detail=f"Skill 目录不存在: {skill_id}")
+    file_path = (dir_path / path).resolve()
+    if not str(file_path).startswith(str(dir_path.resolve())):
+        raise HTTPException(status_code=403, detail="路径越界")
+    ext = file_path.suffix.lower()
+    allowed = {".yaml", ".yml", ".md", ".py", ".txt", ".json", ".xml",
+               ".sh", ".bat", ".ps1", ".cfg", ".ini", ".toml", ".conf",
+               ".html", ".css", ".js", ".ts"}
+    if ext not in allowed:
+        raise HTTPException(status_code=400, detail=f"不支持的文件类型: {ext}")
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text(content, encoding="utf-8")
+    return {"status": "ok", "skill_id": skill_id, "path": path}
