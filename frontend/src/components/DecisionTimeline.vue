@@ -1,11 +1,5 @@
 <template>
   <div class="timeline-wrap" ref="wrapRef" @scroll="onUserScroll">
-    <!-- ── 此刻在做什么 banner ─────────────────────────── -->
-    <div class="now-banner" :class="{ done: currentAction.startsWith('\u2713') }">
-      <span class="now-dot" :class="{ done: currentAction.startsWith('\u2713') }" />
-      <span class="now-text">{{ currentAction.startsWith('\u2713') ? 'Agent 状态：' : 'Agent 正在：' }}{{ currentAction }}</span>
-    </div>
-
     <el-timeline>
       <div class="timeline-list">
         <el-timeline-item
@@ -51,7 +45,7 @@
         <span class="bubble-phase">{{ bubble.phase }}</span>
         <span class="bubble-indicator">正在思考<span class="dots">...</span></span>
       </div>
-      <ThinkingTypewriter :text="bubble.text" class="bubble-text" />
+      <pre class="bubble-text">{{ bubble.text }}</pre>
     </div>
 
     <div ref="bottomAnchor" class="bottom-anchor" />
@@ -69,7 +63,6 @@
 import { ref, watch, nextTick, onMounted, onBeforeUnmount, defineComponent, h } from 'vue'
 import { ArrowDown } from '@element-plus/icons-vue'
 import PayloadCodeBlock from '@/components/PayloadCodeBlock.vue'
-import ThinkingTypewriter from '@/components/ThinkingTypewriter.vue'
 
 const DecisionThoughtRenderer = defineComponent({
   name: 'DecisionThoughtRenderer',
@@ -225,23 +218,6 @@ const ObjectivePathRenderer = defineComponent({
   },
 })
 
-const SceneClassifiedRenderer = defineComponent({
-  name: 'SceneClassifiedRenderer',
-  props: { item: { type: Object, default: () => ({}) } },
-  setup(props) {
-    const scene = String((props.item as any).scene || '')
-    const sceneLabel = {
-      web: 'Web 应用', intranet: '内网', ad: 'Active Directory', cloud: '云环境',
-      container: '容器', network: '网络', host: '主机',
-    } as Record<string, string>
-    return () => h('div', { class: 'scene-badge' }, [
-      h('span', { class: 'scene-dot' }),
-      h('span', { class: 'scene-label' }, sceneLabel[scene] || scene || '未知场景'),
-      h('span', { class: 'scene-meta' }, scene || ''),
-    ])
-  },
-})
-
 const decisionRenderers: Record<string, ReturnType<typeof defineComponent>> = {
   thought: DecisionThoughtRenderer,
   __demo_event: DemoRenderer,
@@ -251,7 +227,6 @@ const decisionRenderers: Record<string, ReturnType<typeof defineComponent>> = {
   reflection: ReflectionRenderer,
   hypothesis_test: HypothesisTestRenderer,
   objective_path: ObjectivePathRenderer,
-  scene_classified: SceneClassifiedRenderer,
 }
 
 function rendererFor(action: string): ReturnType<typeof defineComponent> | null {
@@ -267,10 +242,6 @@ const props = defineProps({
     type: Object,
     default: () => ({}),
   },
-  taskStatus: {
-    type: String,
-    default: '',
-  },
 })
 
 import { computed } from 'vue'
@@ -284,40 +255,6 @@ const activeBubbles = computed(() => {
     }
   }
   return result
-})
-
-const actionLabels: Record<string, string> = {
-  thought: '推理分析',
-  target_selected: '选择攻击目标',
-  chain_selected: '规划攻击链',
-  reflection: '失败归因分析',
-  hypothesis_test: '验证假设',
-  objective_path: '计算目标路径',
-  scene_classified: '识别运行场景',
-  world_model_readout: '读取世界模型状态',
-  world_model_update: '更新世界模型',
-  llm_delta: 'LLM 推理',
-  checkpoint_request: '等待操作员确认',
-}
-
-const currentAction = computed(() => {
-  if (props.taskStatus === 'completed' || props.taskStatus === 'done') {
-    return '\u2713 \u5df2\u5b8c\u6210'
-  }
-  const items = props.items as any[]
-  if (items.length > 0) {
-    const latest = items[items.length - 1]
-    if (latest?.action && actionLabels[latest.action]) {
-      return actionLabels[latest.action]
-    }
-    if (latest?.title) return latest.title
-  }
-  const bubbleKeys = Object.keys(activeBubbles.value)
-  if (bubbleKeys.length > 0) {
-    const b = activeBubbles.value[bubbleKeys[0]]
-    return b?.phase ? `${b.phase}` : 'LLM 推理'
-  }
-  return '监控中'
 })
 
 const wrapRef = ref(null)

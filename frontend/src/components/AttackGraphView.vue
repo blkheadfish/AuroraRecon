@@ -200,7 +200,7 @@ import { computed, nextTick, onMounted, onBeforeUnmount, ref, watch, getCurrentI
 import VChart from 'vue-echarts'
 import { use } from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
-import { GraphChart, LinesChart } from 'echarts/charts'
+import { GraphChart } from 'echarts/charts'
 import {
   TitleComponent, TooltipComponent, LegendComponent,
 } from 'echarts/components'
@@ -215,7 +215,7 @@ import {
   useNodePinning, usePulseTimer,
 } from '@/composables/useAttackGraphOption'
 
-use([CanvasRenderer, GraphChart, LinesChart, TitleComponent, TooltipComponent, LegendComponent])
+use([CanvasRenderer, GraphChart, TitleComponent, TooltipComponent, LegendComponent])
 
 const props = defineProps({
   graph: {
@@ -678,24 +678,6 @@ const rawOption = computed(() => {
     animationDurationUpdate: 600,
     animationEasingUpdate: 'cubicOut',
   }]
-
-  if (killChainLineCoords.value.length > 0 && !degrade.value && !prefersReducedMotion.value) {
-    series.push({
-      type: 'lines',
-      coordinateSystem: 'none',
-      polyline: false,
-      effect: {
-        show: true,
-        period: 4,
-        trailLength: 0.4,
-        symbol: 'arrow',
-        symbolSize: 6,
-        color: resolveMetaColor('var(--accent-red)'),
-      },
-      lineStyle: { width: 0, opacity: 0 },
-      data: killChainLineCoords.value.map((c) => ({ coords: c })),
-    })
-  }
 
   return {
     backgroundColor: 'transparent',
