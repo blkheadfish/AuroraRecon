@@ -444,32 +444,20 @@ onMounted(async () => {
   width: 100%;
 }
 .cat-header {
-  width: 100%;
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 7px 10px;
-  border-radius: 10px;
-  border: 1px solid color-mix(in srgb, var(--cat-tone) 48%, var(--border));
-  background: linear-gradient(
-    90deg,
-    color-mix(in srgb, var(--cat-tone) 24%, var(--bg-elevated)),
-    color-mix(in srgb, var(--cat-tone) 7%, transparent)
-  );
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--cat-tone) 14%, transparent);
 }
 .cat-marker {
   width: 4px;
   height: 18px;
-  border-radius: 99px;
-  background: color-mix(in srgb, var(--cat-tone) 82%, #ffffff);
-  box-shadow: 0 0 8px color-mix(in srgb, var(--cat-tone) 36%, transparent);
+  border-radius: 2px;
+  background: var(--cat-tone, var(--accent-blue));
 }
 .cat-name {
-  color: var(--text-primary);
-  font-size: 15px;
-  letter-spacing: 0.02em;
-  font-weight: 700;
+  font-weight: 600;
+  color: var(--cat-tone, var(--text-primary));
+  font-size: 14px;
 }
 :deep(.cat-count.el-tag) {
   margin-left: auto;
