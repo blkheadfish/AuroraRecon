@@ -220,7 +220,7 @@ const selectedDraftHighlighted = computed(() => {
 })
 
 function shortSource(source) {
-  return String(text || '')
+  return String(source || '')
     .replaceAll('&', '&amp;')
     .replaceAll('<', '&lt;')
     .replaceAll('>', '&gt;')
