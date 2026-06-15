@@ -194,7 +194,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, defineComponent, h, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, defineComponent, h, nextTick, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { ArrowRight, ArrowDown, Close, Document, Loading } from '@element-plus/icons-vue'
 import hljs from 'highlight.js/lib/core'
@@ -294,7 +294,9 @@ const highlightedHtml = computed(() => {
   } catch { return file.content.replace(/</g, '&lt;').replace(/>/g, '&gt;') }
 })
 
-function onEditorInput() { fileDirty.value = true }
+function onEditorInput() {
+  fileDirty.value = editingFile.value?.content !== editingFile.value?._original
+}
 
 const drawerVisible = ref(false)
 const drawerYaml = ref('')
@@ -378,8 +380,8 @@ async function openFile(skillId: string, node: any) {
   drawerFileVisible.value = true
   try {
     const res = await api.getSkillFile(skillId, node.path)
-    editingFile.value.content = res.content
     editingFile.value._original = res.content
+    editingFile.value.content = res.content
     fileDirty.value = false
   } catch {
     ElMessage.error(`无法加载: ${node.path}`)
@@ -398,8 +400,6 @@ async function saveFile() {
   } catch { ElMessage.error(`保存失败`) }
   finally { fileSaving.value = false }
 }
-
-watch(() => editingFile.value?.content, () => { if (editingFile.value) fileDirty.value = true })
 
 // ── 旧版 YAML 编辑 ────────────────────────────────────
 async function openSkillDrawer(row: any) {
