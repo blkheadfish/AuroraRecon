@@ -443,7 +443,7 @@ onMounted(() => { fetchSkills(); fetchDrafts() })
 .cat-header { display: flex; align-items: center; gap: 10px; }
 .cat-marker { width: 4px; height: 18px; border-radius: 2px; background: var(--cat-tone, var(--accent-blue)); }
 .cat-name { font-weight: 600; color: var(--cat-tone, var(--text-primary)); font-size: 14px; }
-.cat-count { margin-left: auto; }
+.cat-count { margin-left: 8px; }
 :deep(.cat-count.el-tag) {
   font-family: var(--font-mono);
   font-weight: 700;
