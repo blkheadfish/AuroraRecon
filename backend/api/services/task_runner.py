@@ -123,6 +123,22 @@ async def _auto_resume_task(task_id: str) -> None:
         logger.error(f"[API] auto_resume {task_id} 失败: {e}", exc_info=True)
 
 
+async def _get_pending_gate_from_graph(task_id: str) -> str | None:
+    """Query LangGraph to find which interrupt_before node is actually pending."""
+    try:
+        orch = get_orchestrator()
+        await orch._ensure_graph()
+        config = {"configurable": {"thread_id": task_id}}
+        snapshot = await orch._graph.aget_state(config)
+        if snapshot and hasattr(snapshot, "next") and snapshot.next:
+            for n in snapshot.next:
+                if n in ("human_approval", "post_foothold_approval"):
+                    return n
+    except Exception:
+        pass
+    return None
+
+
 async def _handle_graph_interrupt(task_id: str, state: PentestState) -> bool:
     """检测 LangGraph interrupt_before 暂停并处理。
 
@@ -155,13 +171,20 @@ async def _handle_graph_interrupt(task_id: str, state: PentestState) -> bool:
     if not interrupted_phase:
         interrupted_phase = state.current_phase or "unknown"
 
-    if state.approved:
+    if interrupted_phase not in ("human_approval", "post_foothold_approval"):
+        real_gate = await _get_pending_gate_from_graph(task_id)
+        if real_gate:
+            interrupted_phase = real_gate
+
+    _GATE_PHASES = ("human_approval", "post_foothold_approval")
+
+    if state.approved and interrupted_phase in _GATE_PHASES:
         sm.set(task_id, state)
         state.log(f"✅ 审批已通过, 自动跳过 {interrupted_phase} 暂停门, 继续执行")
         asyncio.ensure_future(_auto_resume_task(task_id))
         return True
 
-    if state.auto_approve:
+    if state.auto_approve and interrupted_phase in _GATE_PHASES:
         state.approved = True
         state.post_approved = True
         sm.set(task_id, state)

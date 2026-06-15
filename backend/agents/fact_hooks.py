@@ -630,7 +630,7 @@ def apply_service_info_extraction(
     for m in matches:
         by_kind.setdefault(m.kind, []).append(m)
 
-    runtime_facts: dict[str, dict[str, Any]] = dict(state.runtime_facts or {})
+    runtime_facts: dict[str, Any] = dict(state.runtime_facts or {})
     for kind, match_list in by_kind.items():
         merged: dict[str, Any] = dict(runtime_facts.get(kind) or {})
         for m in match_list:

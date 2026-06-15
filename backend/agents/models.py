@@ -633,7 +633,7 @@ class PentestState(BaseModel):
 	dir_intel: dict = Field(default_factory=dict)
 	supplementary_dir_scan_done: bool = False
 
-	runtime_facts: dict[str, dict[str, Any]] = Field(default_factory=dict)
+	runtime_facts: dict[str, Any] = Field(default_factory=dict)
 	php_runtime: dict[str, Any] = Field(default_factory=dict)
 	confirmed_facts: dict[str, Any] = Field(default_factory=dict)
 	task_facts: dict[str, TaskFact] = Field(default_factory=dict)
