@@ -11,18 +11,18 @@ const KNOWN_COLORS: Record<string, string> = {
 }
 
 const PALETTE: string[] = [
-  '#8cb4d0',
-  '#7dbfa8',
-  '#c4a876',
-  '#c4967a',
-  '#b0a6cc',
-  '#82b8c4',
-  '#9ebf8e',
-  '#c9a8b8',
-  '#98b0b8',
-  '#b8a8c0',
-  '#b0b0a0',
-  '#90b8b0',
+  '#6baed4',
+  '#6bbf8b',
+  '#c4a658',
+  '#c98070',
+  '#9b8ec4',
+  '#68b8b0',
+  '#c080b0',
+  '#8cbf78',
+  '#889eb8',
+  '#bfa870',
+  '#90a8c0',
+  '#78b898',
 ]
 
 function normalizeCategory(category: unknown): string {
