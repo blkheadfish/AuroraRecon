@@ -324,7 +324,7 @@
               </div>
               <div class="branch-popover-tree">
                 <BranchTreeNode
-                  v-for="node in nav.branchRoots.filter(n => n && n.branch_id)"
+                  v-for="node in safeBranchRoots"
                   :key="node.branch_id"
                   :node="node"
                   :children-by-parent="nav.branchChildrenByParent"
@@ -766,6 +766,11 @@ const composerFlashing = computed(() => {
 })
 
 const nav = useBranchNavigator(taskId, branches, activeBranchId, maxBranchesPerTask)
+const safeBranchRoots = computed(() => {
+  const roots = nav.branchRoots
+  const arr = Array.isArray(roots) ? roots : (roots && typeof roots === 'object' && 'value' in roots ? roots.value : [])
+  return (arr || []).filter(n => n && n.branch_id)
+})
 function onBranchActivate(branchId: string) { nav.activateBranch(branchId) }
 function onBranchResume(branchId: string) { nav.resumeBranch(branchId) }
 function onBranchPause(branchId: string) { nav.pauseBranch(branchId) }
