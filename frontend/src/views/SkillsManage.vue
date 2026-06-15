@@ -126,15 +126,25 @@
               </div>
             </div>
           </template>
-          <div class="editor-body" v-loading="fileLoading">
-            <el-input
-              v-model="editingFile.content"
-              type="textarea"
-              class="editor-textarea"
-              :rows="25"
-              resize="vertical"
-              placeholder="加载中..."
-            />
+          <div class="editor-body" v-loading="fileLoading" v-if="editingFile">
+            <div class="editor-split">
+              <div class="editor-pane editor-edit-pane">
+                <div class="pane-label">编辑</div>
+                <el-input
+                  v-model="editingFile.content"
+                  type="textarea"
+                  class="editor-textarea"
+                  :rows="22"
+                  resize="vertical"
+                  placeholder="加载中..."
+                  @input="onEditorInput"
+                />
+              </div>
+              <div class="editor-pane editor-preview-pane">
+                <div class="pane-label">预览</div>
+                <pre class="editor-highlight"><code v-html="highlightedHtml" /></pre>
+              </div>
+            </div>
           </div>
           <div class="editor-footer">
             <span v-if="fileDirty" class="dirty-tip">未保存</span>
@@ -202,10 +212,27 @@
 import { computed, defineComponent, h, nextTick, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { ArrowRight, ArrowDown, Close, Document, Loading } from '@element-plus/icons-vue'
+import hljs from 'highlight.js/lib/core'
+import yaml from 'highlight.js/lib/languages/yaml'
+import markdown from 'highlight.js/lib/languages/markdown'
+import python from 'highlight.js/lib/languages/python'
+import bash from 'highlight.js/lib/languages/bash'
+import json from 'highlight.js/lib/languages/json'
+import xml from 'highlight.js/lib/languages/xml'
 import { api } from '@/api'
 import { trackEvent } from '@/metrics/tracker'
 import { resolveCategoryLabel } from '@/utils/categoryLabel'
 import { resolveCategoryColor } from '@/utils/categoryColor'
+
+hljs.registerLanguage('yaml', yaml)
+hljs.registerLanguage('yml', yaml)
+hljs.registerLanguage('markdown', markdown)
+hljs.registerLanguage('md', markdown)
+hljs.registerLanguage('python', python)
+hljs.registerLanguage('bash', bash)
+hljs.registerLanguage('json', json)
+hljs.registerLanguage('xml', xml)
+hljs.registerLanguage('html', xml)
 
 function categoryStyle(category: string) {
   return { '--cat-tone': resolveCategoryColor(category) }
@@ -273,6 +300,27 @@ const fileLoading = ref(false)
 const fileSaving = ref(false)
 const fileDirty = ref(false)
 const activeFilePath = ref('')
+
+const highlightedHtml = computed(() => {
+  const file = editingFile.value
+  if (!file || !file.content) return ''
+  const ext = (file.filename || '').split('.').pop()?.toLowerCase() || ''
+  const langMap: Record<string, string> = {
+    yaml: 'yaml', yml: 'yaml', md: 'markdown', py: 'python',
+    sh: 'bash', bash: 'bash', json: 'json', xml: 'xml', html: 'xml',
+  }
+  const lang = langMap[ext] || ''
+  try {
+    if (lang && hljs.getLanguage(lang)) {
+      return hljs.highlight(file.content, { language: lang }).value
+    }
+    return hljs.highlightAuto(file.content).value
+  } catch {
+    return file.content.replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  }
+})
+
+function onEditorInput() { fileDirty.value = true }
 
 const drawerVisible = ref(false)
 const drawerYaml = ref('')
@@ -516,7 +564,7 @@ onMounted(() => {
 /* ── 主布局 ──────────────────────────────── */
 .skills-layout { display: flex; gap: 16px; min-height: 600px; }
 .skills-left { flex: 1; min-width: 0; }
-.skills-right { width: 480px; flex-shrink: 0; }
+.skills-right { width: 640px; flex-shrink: 0; }
 
 .panel { margin-bottom: 0; }
 
@@ -582,7 +630,22 @@ onMounted(() => {
 .editor-header-left { display: flex; align-items: center; gap: 8px; }
 .editor-path { font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); }
 
-.editor-body { padding: 12px; flex: 1; }
+.editor-body { padding: 12px; flex: 1; overflow: hidden; }
+
+.editor-split { display: flex; gap: 12px; height: 100%; }
+
+.editor-pane { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+
+.pane-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+  font-family: var(--font-mono);
+}
+
+.editor-textarea { flex: 1; }
 .editor-textarea :deep(textarea) {
   font-family: var(--font-mono);
   font-size: 12px;
@@ -590,6 +653,29 @@ onMounted(() => {
   background: var(--bg-base);
   color: var(--text-primary);
   border-color: var(--border);
+  height: 100% !important;
+}
+
+.editor-highlight {
+  flex: 1;
+  margin: 0;
+  padding: 12px 14px;
+  background: var(--hljs-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow: auto;
+  white-space: pre;
+  color: var(--hljs-fg);
+  max-height: 520px;
+}
+
+.editor-highlight :deep(code) {
+  font-family: inherit;
+  font-size: inherit;
+  background: transparent;
 }
 
 .editor-footer {
