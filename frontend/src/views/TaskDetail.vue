@@ -53,24 +53,7 @@
       >查看建议</el-button>
     </div>
 
-    <div class="summary-grid" v-if="task">
-      <el-card class="summary-card">
-        <div class="summary-label">当前阶段</div>
-        <div class="summary-value">{{ phaseText(task.current_phase) }}</div>
-      </el-card>
-      <el-card class="summary-card">
-        <div class="summary-label">下一步动作</div>
-        <div class="summary-value">{{ nextAction }}</div>
-      </el-card>
-      <el-card class="summary-card">
-        <div class="summary-label">风险提示</div>
-        <div class="summary-value risk">{{ riskHint }}</div>
-      </el-card>
-      <el-card class="summary-card">
-        <div class="summary-label">关键证据</div>
-        <div class="summary-value evidence">{{ keyEvidence }}</div>
-      </el-card>
-    </div>
+    <MissionControl v-if="task" :task="task" :metrics-data="missionMetrics" />
 
     <PhaseTree
       v-if="task"
@@ -214,6 +197,7 @@ import PhaseTree from '@/components/PhaseTree.vue'
 import FindingsPanel from '@/components/FindingsPanel.vue'
 import DecisionTimeline from '@/components/DecisionTimeline.vue'
 import DecisionCheckpointCard from '@/components/DecisionCheckpointCard.vue'
+import MissionControl from '@/components/MissionControl.vue'
 
 // 重组件改为按需加载, 首屏不付出解析+实例化 cost。
 const LogTerminal = defineAsyncComponent(() => import('@/components/LogTerminal.vue'))
@@ -280,6 +264,15 @@ const approvalState = computed(() => state.value.approvalState)
 const approving = computed(() => approvalState.value === 'submitting')
 const showApprovalActions = computed(() => needsApproval.value && approvalState.value === 'idle')
 const exploitableCount = computed(() => findings.value.filter((item) => item.exploitable).length)
+
+const missionMetrics = computed(() => ({
+  hosts: 1,
+  services: task.value?.open_ports?.length || 0,
+  findings: findings.value.length,
+  exploited: exploitableCount.value,
+  credentials: task.value?.credential_store?.length || 0,
+  sessions: 0,
+}))
 
 // 攻击图（来自 backend state.attack_graph，反馈/监督模式下会填充节点和边）
 const attackGraph = computed(() => task.value?.attack_graph || { nodes: [], edges: [] })

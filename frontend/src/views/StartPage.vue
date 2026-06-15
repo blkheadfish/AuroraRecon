@@ -49,7 +49,7 @@
         <h1 class="title" aria-label="AuroraRecon">
           <span class="title-aurora">Aurora</span><span class="title-recon">Recon</span>
         </h1>
-        <p class="sub">自动化渗透测试工作台</p>
+        <p class="sub">自主推理 · 世界模型 · 自适应 Kill Chain</p>
         <div class="title-divider" aria-hidden="true"></div>
         <div class="start-cta">
           <el-button

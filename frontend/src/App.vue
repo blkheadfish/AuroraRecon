@@ -1,6 +1,10 @@
 <template>
   <div v-if="hideSidebar" class="start-layout">
-    <router-view />
+    <router-view v-slot="{ Component }">
+      <transition name="fade-slide" mode="out-in">
+        <component :is="Component" />
+      </transition>
+    </router-view>
   </div>
 
   <el-container v-else class="app-layout" :class="{ 'mobile-layout': isMobile }">
@@ -168,7 +172,11 @@
           </template>
         </el-dropdown>
       </div>
-      <router-view />
+      <router-view v-slot="{ Component }">
+        <transition name="fade-slide" mode="out-in">
+          <component :is="Component" />
+        </transition>
+      </router-view>
     </el-main>
   </el-container>
 </template>
@@ -670,5 +678,26 @@ onUnmounted(() => {
   font-size: 11px;
   opacity: 0.7;
   margin-top: 2px;
+}
+
+/* ── 路由切换过渡 ──────────────────────────── */
+.fade-slide-enter-active,
+.fade-slide-leave-active {
+  transition: opacity var(--t-base) var(--ease-out), transform var(--t-base) var(--ease-out);
+}
+.fade-slide-enter-from {
+  opacity: 0;
+  transform: translateY(8px);
+}
+.fade-slide-leave-to {
+  opacity: 0;
+  transform: translateY(-8px);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fade-slide-enter-active,
+  .fade-slide-leave-active {
+    transition: none;
+  }
 }
 </style>
