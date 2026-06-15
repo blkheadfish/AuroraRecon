@@ -143,14 +143,23 @@ async def _handle_graph_interrupt(task_id: str, state: PentestState) -> bool:
     sm = get_state_manager()
 
     visited = list(state.chain_visited or [])
-    last_visited = visited[-1] if visited else ""
     interrupted_phase = ""
-    for i, p in enumerate(_CHAIN_PHASE_ORDER):
-        if p == last_visited and i + 1 < len(_CHAIN_PHASE_ORDER):
-            interrupted_phase = _CHAIN_PHASE_ORDER[i + 1]
-            break
+    if state.next_phase in ("human_approval", "post_foothold_approval"):
+        interrupted_phase = state.next_phase
+    else:
+        last_visited = visited[-1] if visited else ""
+        for i, p in enumerate(_CHAIN_PHASE_ORDER):
+            if p == last_visited and i + 1 < len(_CHAIN_PHASE_ORDER):
+                interrupted_phase = _CHAIN_PHASE_ORDER[i + 1]
+                break
     if not interrupted_phase:
         interrupted_phase = state.current_phase or "unknown"
+
+    if state.approved:
+        sm.set(task_id, state)
+        state.log(f"✅ 审批已通过, 自动跳过 {interrupted_phase} 暂停门, 继续执行")
+        asyncio.ensure_future(_auto_resume_task(task_id))
+        return True
 
     if state.auto_approve:
         state.approved = True
@@ -160,10 +169,25 @@ async def _handle_graph_interrupt(task_id: str, state: PentestState) -> bool:
         asyncio.ensure_future(_auto_resume_task(task_id))
         return True
 
+    if interrupted_phase == "human_approval" and state.approved_once and not state.approved:
+        state.approved = True
+        sm.set(task_id, state)
+        state.log("✅ 反馈循环：审批已在前序轮次通过，自动跳过审批门")
+        asyncio.ensure_future(_auto_resume_task(task_id))
+        return True
+
+    if interrupted_phase == "post_foothold_approval" and state.post_approved_once and not state.post_approved:
+        state.post_approved = True
+        sm.set(task_id, state)
+        state.log("✅ 反馈循环：立足后审批已在前序轮次通过，自动跳过审批门")
+        asyncio.ensure_future(_auto_resume_task(task_id))
+        return True
+
     PHASE_LABELS: dict[str, str] = {
         "recon": "侦察", "surface_enum": "攻击面枚举", "intel_harvest": "情报收集",
         "vuln_scan": "漏洞扫描", "exploit_decision": "利用决策",
-        "awaiting_approval": "等待审批", "foothold_attempt": "立足点尝试",
+        "human_approval": "人工审批", "awaiting_approval": "等待审批",
+        "foothold_attempt": "立足点尝试",
         "secondary_attack": "二次攻击", "post_foothold_enum": "立足后枚举",
         "post_foothold_approval": "立足后确认", "internal_scan": "内网扫描",
         "privesc_attempt": "提权尝试", "lateral_movement": "横向移动",
