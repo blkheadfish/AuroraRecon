@@ -106,7 +106,6 @@ async function fetchTools() {
     totalTools.value = Number(overview.total_tools || 0)
     rawTools.value = overview.tools || []
     rawExecutors.value = overview.by_executor || {}
-    activeCategories.value = groupedCategories.value.map((item) => item.category)
     warnedOnce.value = false
   } catch (e) {
     totalTools.value = 0

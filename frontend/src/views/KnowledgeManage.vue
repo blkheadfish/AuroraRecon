@@ -218,7 +218,6 @@ async function fetchEntries() {
   try {
     const res = await api.getKnowledgeEntries()
     entries.value = res.entries || []
-    activeCategories.value = groupedEntries.value.map((g) => g.category)
   } catch (e) {
     ElMessage.error(e?.response?.data?.detail || e.message || '读取知识库列表失败')
   } finally {

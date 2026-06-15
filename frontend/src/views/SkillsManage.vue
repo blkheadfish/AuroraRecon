@@ -440,9 +440,23 @@ onMounted(() => { fetchSkills(); fetchDrafts() })
 
 /* ── 折叠标题 ────────────────────────────── */
 .collapse-title { width: 100%; }
-.cat-header { display: flex; align-items: center; gap: 10px; }
-.cat-marker { width: 4px; height: 18px; border-radius: 2px; background: var(--cat-tone, var(--accent-blue)); }
-.cat-name { font-weight: 600; color: var(--cat-tone, var(--text-primary)); font-size: 14px; }
+.cat-header {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--cat-tone, var(--accent-blue)) 48%, var(--border));
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--cat-tone, var(--accent-blue)) 24%, var(--bg-elevated)),
+    color-mix(in srgb, var(--cat-tone, var(--accent-blue)) 7%, transparent)
+  );
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--cat-tone, var(--accent-blue)) 14%, transparent);
+}
+.cat-marker { width: 4px; height: 18px; border-radius: 99px; background: var(--cat-tone, var(--accent-blue)); }
+.cat-name { font-weight: 600; color: var(--text-primary); font-size: 14px; }
 .cat-count { margin-left: 8px; }
 
 /* ── 技能列表 ────────────────────────────── */
