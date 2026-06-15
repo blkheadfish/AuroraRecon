@@ -1,10 +1,6 @@
 <template>
   <div v-if="hideSidebar" class="start-layout">
-    <router-view v-slot="{ Component }">
-      <transition name="fade-slide" mode="out-in">
-        <component :is="Component" :key="$route.fullPath" />
-      </transition>
-    </router-view>
+    <router-view />
   </div>
 
   <el-container v-else class="app-layout" :class="{ 'mobile-layout': isMobile }">
@@ -172,11 +168,7 @@
           </template>
         </el-dropdown>
       </div>
-      <router-view v-slot="{ Component }">
-        <transition name="fade-slide" mode="out-in">
-          <component :is="Component" />
-        </transition>
-      </router-view>
+      <router-view />
     </el-main>
   </el-container>
 </template>
