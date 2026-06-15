@@ -675,6 +675,29 @@ code, kbd, samp, pre {
     color: var(--accent-red) !important;
 }
 
+/* ── 全局 hover / focus 统一 ───────────────────── */
+a, button, .clickable, [role='button'],
+.el-menu-item, .el-dropdown-menu__item,
+.el-tabs__item, .el-pagination li,
+.type-stat, .legend-row {
+    transition: background var(--t-fast) var(--ease-out), color var(--t-fast) var(--ease-out), border-color var(--t-fast) var(--ease-out), opacity var(--t-fast) var(--ease-out);
+}
+
+*:focus-visible {
+    outline: 1px solid var(--accent-blue);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
+}
+
+@media (prefers-reduced-motion: reduce) {
+    a, button, .clickable, [role='button'],
+    .el-menu-item, .el-dropdown-menu__item,
+    .el-tabs__item, .el-pagination li,
+    .type-stat, .legend-row {
+        transition: none;
+    }
+}
+
 /* ── 打印 / 导出 PDF ──────────────────────────── */
 @media print {
     html, body, #app {
