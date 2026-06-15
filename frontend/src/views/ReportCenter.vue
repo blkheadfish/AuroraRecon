@@ -3,25 +3,31 @@
     <div class="page-header">
       <div>
         <h1 class="page-title">报告中心</h1>
-        <p class="page-sub">在线编辑 AI 生成报告并实时渲染预览</p>
+        <p class="page-sub" v-if="task">目标：{{ task.target }}</p>
       </div>
       <div class="header-actions">
         <el-button @click="router.push(`/tasks/${taskId}`)">返回任务详情</el-button>
       </div>
     </div>
 
-    <ReportPanel :task-id="taskId" />
+    <ReportPanel :task-id="taskId" :task="task" />
   </div>
 </template>
 
 <script setup>
-import { computed } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { api } from '@/api'
 import ReportPanel from '@/components/ReportPanel.vue'
 
 const route = useRoute()
 const router = useRouter()
 const taskId = computed(() => String(route.params.id || ''))
+const task = ref(null)
+
+onMounted(async () => {
+  try { task.value = await api.getTask(taskId.value) } catch { /* ignore */ }
+})
 </script>
 
 <style scoped>
