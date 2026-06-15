@@ -3525,32 +3525,79 @@ def _build_evidence_chain(state: PentestState) -> str:
             f"  {fact.fact_type}: {str(fact.value)[:150]} (source={fact.source})"
         )
 
+    parts.append("\n=== 工具执行日志 ===")
+    if state.phase_log:
+        from backend.report.generator import _filter_phase_log
+        filtered = _filter_phase_log(state.phase_log)
+        for line in filtered[-80:]:
+            parts.append(f"  {str(line)[:200]}")
+    else:
+        parts.append("  (无)")
+
     return "\n".join(parts)
 
 
 async def _llm_generate_report(state: PentestState, evidence_chain: str) -> dict | None:
-    """Call LLM to generate a structured report narrative from evidence."""
+    """Two-round LLM report generation: narrative first, then fix checklist."""
     try:
         from backend.llm.router import LLMRouter
-        from backend.llm.prompts.templates import REPORT_GENERATION
+        from backend.llm.prompts.templates import REPORT_GENERATION, FIX_CHECKLIST_ONLY
 
         llm = LLMRouter()
-        prompt = REPORT_GENERATION.format(
+
+        # Round 1: generate discovery + verification + exploitation narratives
+        narrative_prompt = REPORT_GENERATION.format(
             target=state.target_host or state.target,
             target_os=state.target_os,
             workflow_mode=state.workflow_mode,
             privilege_level=state.privilege_level or "unknown",
-            evidence_chain=evidence_chain[:12000],
+            evidence_chain=evidence_chain[:30000],
         )
-        response = await llm.chat(prompt, response_format="json", temperature=0.2, max_tokens=4096)
-        result = json.loads(response)
-        if "error" in result and "executive_summary" not in result:
-            logger.warning(f"[Report] LLM 报告生成返回错误: {result.get('error')}")
+        narrative_resp = await llm.chat(narrative_prompt, response_format="json", temperature=0.2, max_tokens=8192)
+        narrative = json.loads(narrative_resp)
+        if "error" in narrative and "executive_summary" not in narrative:
+            logger.warning(f"[Report] Round 1 LLM 报告生成错误: {narrative.get('error')}")
             return None
-        return result
+
+        # Round 2: generate detailed fix checklist based on consolidated findings
+        findings_summary = _build_findings_summary(state)
+        fix_prompt = FIX_CHECKLIST_ONLY.format(
+            target=state.target_host or state.target,
+            target_os=state.target_os,
+            findings_summary=findings_summary,
+        )
+        fix_resp = await llm.chat(fix_prompt, response_format="json", temperature=0.2, max_tokens=4096)
+        fix_data = json.loads(fix_resp)
+        if "fix_checklist" in fix_data and fix_data["fix_checklist"]:
+            narrative["fix_checklist"] = fix_data["fix_checklist"]
+
+        return narrative
     except Exception as e:
         logger.warning(f"[Report] LLM 报告生成失败，使用默认模板: {e}")
         return None
+
+
+def _build_findings_summary(state: PentestState) -> str:
+    """Build a compact findings summary for the fix checklist round."""
+    parts: list[str] = []
+    findings = sorted(
+        (state.findings or []),
+        key=lambda f: {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}.get(
+            getattr(f, "severity", "info"), 4
+        ),
+    )
+    for f in findings[:30]:
+        name = f.name
+        sev = getattr(f, "severity", "info")
+        cve = f.cve or "无"
+        exploitable = "已利用" if getattr(f, "exploitable", False) else "待验证"
+        desc = getattr(f, "description", "")[:120]
+        evidence = getattr(f, "evidence", "")[:120]
+        parts.append(
+            f"[{sev}] {name} | CVE={cve} | {exploitable} | "
+            f"描述={desc} | 证据={evidence}"
+        )
+    return "\n".join(parts)
 
 
 def _build_attack_timeline(state: PentestState) -> None:
