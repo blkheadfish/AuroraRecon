@@ -29,6 +29,7 @@ import yaml
 from backend.skills.models import (
     ExploitPath,
     ExploitStep,
+    LlmConfig,
     MatchConfig,
     MatchRule,
     ParseRule,
@@ -264,6 +265,7 @@ def load_skill(path: Path) -> Skill:
         remediation=raw.get("remediation", ""),
         source_file=str(path),
         selector=raw.get("selector"),
+        llm_config=_parse_llm_config(raw.get("llm", {})),
     )
 
     # 加载侧边 SKILL.md（AI 引导文档，可选）
@@ -271,6 +273,10 @@ def load_skill(path: Path) -> Skill:
     doc_path = skill_dir / "SKILL.md"
     if doc_path.exists():
         skill.doc = load_skill_doc(doc_path)
+
+    schema_warnings = validate_skill_schema(raw, path)
+    for w in schema_warnings:
+        logger.warning("[SkillLoader] Schema 警告 — %s: %s", skill.skill_id, w)
 
     _validate_variable_consistency(skill, path)
     return skill
@@ -383,6 +389,82 @@ def _ensure_list(value: Any) -> list:
     if isinstance(value, list):
         return value
     return [value]
+
+
+def _parse_llm_config(raw: dict) -> LlmConfig:
+    """解析 skill.yaml 中可选的 llm: 节"""
+    if not raw or not isinstance(raw, dict):
+        return LlmConfig()
+    return LlmConfig(
+        freeform_system_prompt=raw.get("freeform_system_prompt", ""),
+        max_rounds=int(raw.get("max_rounds", 5)),
+    )
+
+
+_REQUIRED_FIELDS = ["skill_id", "name", "category", "phase"]
+_CATEGORIES = {
+    "credential", "java_deserialization", "network", "persistence",
+    "privesc", "recon", "server_misconfig", "web_inject", "web_rce",
+}
+_PHASES = {"foothold", "privesc", "recon", "persistence", "post_exploit"}
+
+
+def validate_skill_schema(raw: dict, path: Path) -> list[str]:
+    """校验 skill.yaml 结构完整性，返回 warning 列表。
+
+    - 缺失必填字段 → 抛 ValueError
+    - 字段类型不对 / 建议值不在已知集合中 → warning
+    """
+    warnings: list[str] = []
+    if not raw or not isinstance(raw, dict):
+        raise ValueError(f"无效的 Skill YAML（不是字典）: {path}")
+
+    for field in _REQUIRED_FIELDS:
+        if not raw.get(field):
+            raise ValueError(f"缺失必填字段 '{field}': {path}")
+
+    category = raw.get("category", "")
+    if category not in _CATEGORIES:
+        warnings.append(
+            f"category '{category}' 不在已知分类中（{sorted(_CATEGORIES)}）"
+        )
+
+    phase = raw.get("phase", "")
+    if phase not in _PHASES:
+        warnings.append(
+            f"phase '{phase}' 不在已知阶段中（{sorted(_PHASES)}）"
+        )
+
+    match = raw.get("match")
+    if not match or not isinstance(match, dict):
+        warnings.append("未定义 match 节 — skill 将永远不会被自动匹配")
+    else:
+        rules = match.get("rules", [])
+        if not isinstance(rules, list) or len(rules) == 0:
+            warnings.append("match.rules 为空 — skill 将永远不会被自动匹配")
+
+    probes = raw.get("probes", [])
+    if not isinstance(probes, list) or len(probes) == 0:
+        warnings.append("未定义 probes — 没有探测阶段")
+
+    paths = raw.get("exploit_paths", [])
+    if not isinstance(paths, list) or len(paths) == 0:
+        warnings.append("未定义 exploit_paths — 没有利用路径")
+
+    if isinstance(paths, list):
+        for ep in paths:
+            if not isinstance(ep, dict):
+                continue
+            steps = ep.get("steps", [])
+            if not isinstance(steps, list) or len(steps) == 0:
+                mode = ep.get("mode", "")
+                if mode != "react_freeform":
+                    warnings.append(
+                        f"exploit_path '{ep.get('path_id', '?')}' 未定义 steps "
+                        f"且 mode 不是 react_freeform"
+                    )
+
+    return warnings
 
 
 def _validate_variable_consistency(skill: Skill, path: Path) -> None:

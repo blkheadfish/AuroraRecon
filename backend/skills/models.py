@@ -579,6 +579,17 @@ class MatchConfig:
     exclude: list[MatchRule] = field(default_factory=list)
 
 
+@dataclass
+class LlmConfig:
+    """Skill 级别的 LLM 配置。
+
+    skill.yaml 中可选的 llm: 节，覆盖 engine.py 中的通用兜底 prompt。
+    不填则全部使用默认值。
+    """
+    freeform_system_prompt: str = ""
+    max_rounds: int = 5
+
+
 
 @dataclass
 class Skill:
@@ -610,6 +621,9 @@ class Skill:
     # 自适应决策树：根据探测结果动态选择路径，替代 priority 瀑布
     # 格式: { "if": [{"condition": {...}, "then_path": "id"}...], "default": "id" }
     selector: Optional[dict] = None
+
+    # Skill 级别的 LLM 配置（覆盖 engine.py 默认 prompt）
+    llm_config: LlmConfig = field(default_factory=LlmConfig)
 
     # AI 引导文档（从 SKILL.md 加载，可选）
     doc: Any = field(default=None, repr=False)

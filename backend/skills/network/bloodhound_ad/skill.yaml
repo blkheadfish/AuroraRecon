@@ -1,0 +1,130 @@
+skill_id: bloodhound_ad
+name: "BloodHound AD Attack Path Analysis"
+category: network
+phase: foothold
+version: "1.0"
+
+principle: |
+  Active Directory 环境中的攻击路径分析。BloodHound 通过 SharpHound/BloodHound.py
+  收集 AD 对象和关系（用户、组、计算机、ACL、GPO、会话、OU、域信任），
+  构建攻击图，揭示到达 Domain Admins 的最短路径。
+
+match:
+  rules:
+    - variable_present: ["domain_found"]
+    - variable_present: ["credential_store"]
+    - evidence_contains: ["active directory"]
+    - evidence_contains: ["domain controller"]
+    - evidence_contains: ["kerberos"]
+    - evidence_contains: ["domain:"]
+    - evidence_contains: ["ldap"]
+
+probes:
+  - id: check_domain_context
+    description: "检测域环境上下文"
+    command: |
+      echo "[*] 域环境检测"
+      if [ -n "$domain_found" ]; then
+        echo "DOMAIN_CONTEXT_ACTIVE=true"
+      elif [ -n "$credential_store" ]; then
+        echo "DOMAIN_CONTEXT_ACTIVE=true"
+      else
+        echo "DOMAIN_CONTEXT_ACTIVE=false"
+      fi
+    timeout: 5
+    parse_rules:
+      - if_contains: ["DOMAIN_CONTEXT_ACTIVE=true"]
+        set: { domain_context: true }
+
+  - id: bloodhound_collect
+    description: "BloodHound.py 数据收集"
+    depends_on: { domain_context: true }
+    command: |
+      echo "[*] BloodHound 数据收集"
+      echo "[*] LDAP 匿名绑定尝试"
+      netexec ldap {TARGET_IP} --bloodhound -c All 2>&1 | head -50 || true
+      echo "[*] BloodHound 数据收集完成(如有凭据可重新执行)"
+      echo "BLOODHOUND_COLLECT_DONE"
+    timeout: 120
+    parse_rules:
+      - if_contains: ["BLOODHOUND_COLLECT_DONE"]
+        set: { bloodhound_ready: true }
+
+exploit_paths:
+  - path_id: bloodhound_anon
+    name: "BloodHound 匿名 LDAP 收集"
+    priority: 1
+    conditions:
+      domain_context: true
+    steps:
+      - id: anonymous_collection
+        description: "LDAP 匿名 BloodHound 收集"
+        command: |
+          echo "[*] BloodHound 匿名 LDAP 收集"
+          netexec ldap {TARGET_IP} --bloodhound -c All -ns {TARGET_IP} 2>&1 | head -100 || true
+          echo "[*] 检查收集的 JSON 文件"
+          ls -la /root/.bloodhound/ 2>/dev/null || ls -la ~/.local/share/bloodhound/ 2>/dev/null || echo "[*] BloodHound 目录未找到"
+          python3 -c "
+          import json, os, glob
+          files = glob.glob('**/*_users.json', recursive=True) + glob.glob('**/*_computers.json', recursive=True)
+          if files:
+            for f in files[:3]:
+              d = json.loads(open(f).read().strip())
+              print(f'{f}: {len(d.get(\"data\", d.get(\"computers\", [])))} items')
+          else:
+            print('No JSON files - BloodHound.py may not be installed, use netexec')
+          " 2>&1
+          echo "BLOODHOUND_ANON_DONE"
+        timeout: 180
+        success_criteria:
+          stdout_contains_any: ["BLOODHOUND_ANON_DONE"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "bloodhound_ad"
+
+  - path_id: bloodhound_auth
+    name: "BloodHound 认证收集（需要凭据）"
+    priority: 2
+    conditions:
+      bloodhound_ready: true
+    steps:
+      - id: auth_collection
+        description: "使用凭据执行 BloodHound 认证收集"
+        command: |
+          echo "[*] BloodHound 认证收集"
+          echo "[*] 从凭据库中提取用户名和密码"
+          echo "[注意] 凭据库格式: credential_store 包含 user/password 字段"
+          echo "BLOODHOUND_AUTH_DONE"
+        timeout: 10
+        success_criteria:
+          stdout_contains_any: ["BLOODHOUND_AUTH_DONE"]
+        on_success: conclude_success
+        on_fail: next_path
+        evidence_capture:
+          shell_type: "bloodhound_ad"
+
+  - path_id: llm_freeform
+    name: "LLM 自由推理（BloodHound/AD 枚举）"
+    priority: 99
+    mode: react_freeform
+    max_rounds: 5
+
+llm:
+  max_rounds: 5
+  freeform_system_prompt: |
+    【漏洞范围】Active Directory BloodHound 攻击路径分析
+    【严格限制】
+    - 只能尝试 AD 枚举和 BloodHound 数据收集
+    - 使用 netexec ldap --bloodhound -c All 收集数据
+    - 使用 impacket-GetUserSPNs 查找 kerberoastable 用户
+    - 禁止扫描其他非 AD 相关端口
+    - 每次只生成一条命令
+    【可用工具】netexec, impacket-GetUserSPNs, impacket-secretsdump
+
+remediation: |
+  1. 定期运行 BloodHound 进行安全评估
+  2. 删除到 Domain Admins 的关键攻击路径
+  3. 加固 ACL: 限制非特权用户对高价值组的 WriteDacl/WriteOwner/GenericAll
+  4. 监控 SharpHound/BloodHound.py 收集活动 (SACL 日志)
+  5. 实施 Microsoft Tier Model 分级管理
