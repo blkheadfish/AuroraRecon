@@ -1,79 +1,61 @@
-# AuroraRecon
+<p align="center">
+  <img src="img.png" alt="AuroraRecon Architecture" width="800">
+</p>
 
-基于大模型的自动化渗透测试系统
-项目核心是基于 LangGraph 的攻链编排，配合 Docker 工具沙箱、Skill 引擎、知识库检索与人工审批，实现从侦察到报告的闭环。
+<h1 align="center">AuroraRecon</h1>
 
-## 1) 架构总览
-![img.png](img.png)
+<p align="center">
+  <strong>LLM-Powered Autonomous Penetration Testing Agent</strong><br>
+  From Reconnaissance to Report — A Closed-Loop Kill-Chain Orchestrator
+</p>
 
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.11+-blue" alt="Python">
+  <img src="https://img.shields.io/badge/vue-3.4+-green" alt="Vue">
+  <img src="https://img.shields.io/badge/license-MIT-brightgreen" alt="License">
+  <img src="https://img.shields.io/badge/docker-required-blue" alt="Docker">
+</p>
 
-## 2) 核心特性
+---
 
-- **攻链优先编排**：流程不止“扫洞”，而是围绕立足点、提权与目标收集推进完整攻链。
-- **人工审批断点续跑**：在利用前强制进入 `awaiting_approval`，批准后无缝 `resume`。
-- **任务级容器隔离**：每个任务可复用独立 toolbox 容器，兼顾状态保留与并发隔离。
-- **结构化执行可观测**：命令、耗时、退出码、stdout/stderr 全链路入库并在前端可视化。
-- **Skill 引擎 + ReAct 兜底**：先走确定性利用路径，失败后进入 LLM 自由推理补偿。
-- **知识库混合检索**：关键词 + 语义向量（可降级），为利用决策提供上下文知识。
-- **报告中心在线编辑**：任务报告支持 Markdown 编辑与预览，便于二次修订输出。
+## Table of Contents
 
-## 3) 功能模块
+- [Architecture Overview](#architecture-overview)
+- [Quick Start](#quick-start)
+- [System Architecture](#system-architecture)
+- [Work Streams](#work-streams)
+- [Features](#features)
+- [Tech Stack](#tech-stack)
+- [API Reference](#api-reference)
+- [Configuration](#configuration)
+- [Project Structure](#project-structure)
+- [Development](#development)
+- [Compliance](#compliance)
 
-### 后端能力
+---
 
-- 任务生命周期：创建、执行、取消、删除、恢复、统计。
-- 实时推送：`/ws/{task_id}` 推送日志、决策事件、审批状态、完成态。
-- 指标总览：`/metrics/overview` 输出系统状态、工具分布、调用成功率等。
-- 配置管理：LLM、执行器、流程策略可通过 API 动态配置。
-- Skill/Knowledge 管理：支持在线读取、编辑、重载 YAML/JSON。
-- 持久化策略：优先 PostgreSQL/Redis/MinIO，不可用时自动降级到内存/本地。
+## Architecture Overview
 
-### 前端能力
+AuroraRecon is built around a **World Model (Attack Graph)** as its central decision hub. Five work streams orbit this hub, covering safety, world modeling, attack path reasoning, domain depth, and cross-engagement learning.
 
-- `StartPage`：启动页 + 系统简报（调用 metrics 聚合看板）。
-- `Dashboard`：系统、工具、调用分布与成功率可视化。
-- `TaskList`：筛选/批量操作/任务创建（含策略提示）。
-- `TaskDetail`：Mermaid 进度、审批卡片、决策时间线、实时日志、原始数据。
-- `DecisionView`：专注决策流 + 用户消息干预代理行为。
-- `ReportCenter`：报告在线编辑与预览。
-- `ToolsManage` / `SkillsManage` / `KnowledgeManage`：运营与知识维护界面。
-- `Settings` / `Profile`：系统配置、LLM 测试、用户资料管理。
+<p align="center">
+  <img src="img.png" alt="Architecture" width="800">
+</p>
 
-## 4) 支持工具（当前注册）
+**Core Pipeline**: User defines a target → System autonomously executes recon → vulnerability scanning → exploitation → post-exploitation (lateral movement, privilege escalation, persistence) → objective collection → AI-generated pentest report.
 
-> 工具由 `backend/tools/definitions/*.yaml` 注册，可按 YAML 扩展。
+---
 
-### Recon
-`nmap`, `masscan`, `gobuster`, `ffuf`, `subfinder`, `whatweb`, `httpx`, `wafw00f`, `dirb`, `sslscan`
+## Quick Start
 
-### Vuln Scan
-`nuclei`, `nikto`, `sqlmap`, `wpscan`
-
-### Exploit
-`jndi_fastjson`, `bcel_fastjson`, `hydra`, `medusa`, `john`, `hashcat`
-
-### General / Post Exploit
-`curl`, `wget`, `python3`, `java`, `socat`, `nc`, `enum4linux`, `smbclient`, `tcpdump`, `hping3`
-
-此外，toolbox 镜像内还预装了 `metasploit-framework`、`tshark`、`dnsrecon`、`arjun`、`paramspider` 等，可按需接入注册表。
-
-## 5) 技术栈
-
-- **Backend**: FastAPI, LangGraph, LangChain, SQLAlchemy Async, Redis, MinIO
-- **Frontend**: Vue 3, Vite, Pinia, Element Plus, Axios
-- **Runtime**: Docker, Docker Compose
-- **LLM Router**: DeepSeek / OpenAI / Anthropic（OpenAI-compatible 接口）
-
-## 6) 快速启动
-
-### 环境要求
+### Prerequisites
 
 - Python `>= 3.11`
 - Node.js `>= 18`
-- Docker / Docker Compose
-- 可用的 LLM API Key
+- Docker & Docker Compose
+- LLM API Key (DeepSeek / OpenAI-compatible)
 
-### Step 1. 构建工具箱镜像
+### Step 1 — Build Toolbox Image
 
 ```bash
 cd docker/toolbox
@@ -81,37 +63,31 @@ docker build -t pentest-toolbox:latest .
 cd ../..
 ```
 
-### Step 2. 配置环境变量
-
-Linux/macOS:
+### Step 2 — Configure Environment
 
 ```bash
 cp .env.example docker/.env
 ```
 
-Windows (PowerShell):
+Edit `docker/.env` and set at minimum:
 
-```powershell
-Copy-Item .env.example docker/.env
-```
+| Variable | Description |
+|----------|-------------|
+| `LLM_API_KEY` | Your LLM provider API key |
+| `LHOST` | Reverse shell callback IP |
+| `POSTGRES_PASSWORD` | Database password |
+| `MSF_PASSWORD` | Metasploit RPC password |
 
-至少修改 `docker/.env` 中的以下值：
-
-- `LLM_API_KEY`
-- `LHOST`（反弹连接地址）
-- `POSTGRES_PASSWORD` / `MSF_PASSWORD`（建议改默认）
-
-### Step 3. 启动后端服务栈
+### Step 3 — Start Backend Services
 
 ```bash
 cd docker
 docker compose up -d
 ```
 
-默认会启动：`api`、`postgres`、`redis`、`minio`、`msf`。  
-前端服务在 compose 中默认注释，建议开发时本地运行。
+Starts: `api` (FastAPI), `postgres` (PostgreSQL 16), `redis` (Redis 7), `minio` (object storage), `msf` (Metasploit RPC).
 
-### Step 4. 启动前端
+### Step 4 — Start Frontend
 
 ```bash
 cd frontend
@@ -119,84 +95,332 @@ npm install
 npm run dev
 ```
 
-默认访问：
+### Access Points
 
-- Frontend: [http://localhost:3000](http://localhost:3000)
-- API Docs: [http://localhost:8000/docs](http://localhost:8000/docs)
-- Health: [http://localhost:8000/health](http://localhost:8000/health)
-- MinIO Console: [http://localhost:9001](http://localhost:9001)
+| Service | URL |
+|---------|-----|
+| Frontend | `http://localhost:3000` |
+| API Docs (Swagger) | `http://localhost:8000/docs` |
+| Health Check | `http://localhost:8000/health` |
+| MinIO Console | `http://localhost:9001` |
 
-## 7) 本地开发（不走 API 容器）
+---
 
-后端：
+## System Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Frontend (Vue 3)                        │
+│  StartPage │ Dashboard │ TaskChat │ TaskDetail │ ReportCenter│
+│  Skills/Tools/Knowledge Management │ Admin Console           │
+├─────────────────────────────────────────────────────────────┤
+│              WebSocket (Redis Stream v2) + HTTP              │
+├─────────────────────────────────────────────────────────────┤
+│                    Backend (FastAPI)                         │
+│  ┌─────────┐  ┌──────────┐  ┌──────────┐  ┌─────────────┐  │
+│  │ Agents  │  │  Tools   │  │  Skills  │  │  Knowledge  │  │
+│  │ (Lang-  │  │ (Docker  │  │ (50+     │  │ (22 entries │  │
+│  │  Graph) │  │  sandbox)│  │  skills) │  │  + vectors) │  │
+│  └─────────┘  └──────────┘  └──────────┘  └─────────────┘  │
+├─────────────────────────────────────────────────────────────┤
+│              PostgreSQL │ Redis │ MinIO                     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Agent Orchestration (LangGraph)
+
+The orchestrator supports **3 execution modes**:
+
+| Mode | Description |
+|------|-------------|
+| **Linear DAG** | Fixed phase order: recon → vuln_scan → exploit → post → report |
+| **Feedback** | With back-edges for retry loops (failed exploits → alternative paths) |
+| **Supervisor** | Star topology with 31 deterministic routing rules + LLM fallback |
+
+Each phase is a LangGraph node. The supervisor routes between phases based on state, with human-in-the-loop approval gates before high-impact actions.
+
+### World Model (Attack Graph)
+
+The attack graph is a typed, queryable graph:
+
+**Node Types** (color-coded in frontend):
+
+| Type | Description | Examples |
+|------|-------------|----------|
+| `host` | Target host | IP/domain |
+| `service` | Network service | HTTP:80, SSH:22 |
+| `web_endpoint` | Web path/endpoint | /admin, /api |
+| `finding` | Vulnerability | CVE-2022-xxx |
+| `credential` | Discovered credential | user:pass@host |
+| `session` | Active shell/session | Meterpreter, SSH |
+| `loot` | Exfiltrated data | Hashes, DB dumps |
+| `objective` | Mission objective | Flag found |
+
+**Edge Relations**: `runs_on`, `exposes`, `vulnerable_to`, `yields`, `enables`, `leads_to`, `pivots_to`, `has_session_on`, `requires`, AD relations (member_of, admin_of, kerberoastable), cloud relations (assumes, can_read, can_write).
+
+**Query API**: `exploitable_frontier()`, `chains()`, `paths_to_objective()`, `rank_frontier()`.
+
+---
+
+## Work Streams
+
+AuroraRecon is organized around 5 engineering work streams:
+
+### WS0 — Autonomous Safety Foundation
+
+- **Scope Enforcement**: Per-command runtime validation against `authorized_scope` (CIDR/host whitelist)
+- **Safety Gate (3-tier)**: Blocklist (cloud metadata IPs, critical keywords) → Warnlist (large CIDRs) → Allowlist
+- **Irreversible Action Detection**: Persistence installation, user creation, scope expansion flagged for approval
+- **Kill Switch**: Immediate task termination + container cleanup via `POST /tasks/{id}/abort`
+- **Rate Limiting**: Token-based limiters on LLM calls, tool executions, MSF sessions
+
+### WS1 — World Model (Central Hub)
+
+- Structured attack graph with typed nodes and edges
+- Query/write API (`WorldModelQuery`, `WorldModelWriter`)
+- Real-time delta updates via WebSocket, rendered in ECharts force-directed graph
+- Kill-chain path highlighting with flow animation
+- Node pinning prevents layout jitter on updates
+
+### WS2 — Attack Path Reasoning
+
+- **Target Selection**: `rank_frontier()` scores exploitable nodes by severity, CVE presence, and path value
+- **Chain Composition**: Links vulnerabilities → credentials → lateral movement targets
+- **Failure Reflection**: Analyzes why exploits failed (WAF, version mismatch, environment) and adapts strategy
+- **Hypothesis-Driven**: Activates targeted hypothesis testing for uncertain findings
+
+### WS3 — Domain Depth
+
+- **Active Directory**: SMB/LDAP/Kerberos enumeration, BloodHound ingestion, Kerberoasting, DCSync
+- **Internal Network**: Service discovery, lateral movement (PsExec, WinRM, WMI, SSH hopping)
+- **Cloud**: IAM role enumeration, S3 bucket discovery, assume-role chaining
+- **Scene Classification**: Auto-detects environment type (Web/Intranet/AD/Cloud) for adaptive strategy
+
+### WS4 — Memory & Learning
+
+- **Cross-Engagement Memory**: Historical findings injected as `source=prior` hints (credential presence without plaintext)
+- **Skill Priority Learning**: Per-scene, per-skill success rate tracking with automatic weight adjustment
+- **Draft Skill Synthesis**: Successful exploit sequences auto-synthesized into `.drafts/` for human review
+
+---
+
+## Features
+
+### Core Capabilities
+
+- **Full Kill-Chain Execution**: Recon → Vuln Scan → Exploit → Post-Exploit → Report
+- **Real Post-Exploitation**: Lateral movement (SMB/WinRM/PSExec/SSH), privilege escalation (kernel exploits, SUID, sudo), persistence (cron, SSH keys, web shells, systemd), objective collection (flag search, credential harvesting, database dumps)
+- **Human-in-the-Loop**: Approval gates at exploitation and post-exploitation phases, checkpoint/resume, operator chat intervention mid-task, 3 autonomy levels (Manual / Supervised / Autonomous)
+
+### Skill Engine
+
+Deterministic exploit paths with LLM fallback:
+
+| Phase | Mechanism |
+|-------|-----------|
+| **Match** | Scoring by CVE (+100), keyword (+60), fingerprint (+20), JSON probe (+40), evidence (+10) |
+| **Probe** | Pre-exploitation environment checks (OS, version, architecture) |
+| **Execute** | Deterministic shell command steps — no LLM overhead |
+| **Fallback** | LLM ReAct loop with full context (skill principle + references + failed commands) |
+
+**50+ skills** across 12 categories: Java Deserialization, Web RCE, SQL Injection, Network Exploitation, Privilege Escalation, Credential Attacks, Persistence, Server Misconfig, SSTI, LFI/RFI, XSS, SSRF.
+
+### Real-Time Dashboard
+
+- **Live Attack Graph**: ECharts force-directed graph with kill-chain flow animation, node pinning, >120 node degradation
+- **Decision Timeline**: Per-action renderers (thought, target_selected, chain_selected, reflection, hypothesis_test), LLM typewriter streaming
+- **Log Terminal**: @xterm/xterm with virtual scrolling, frame-buffered rendering
+
+### Report Generation
+
+- Two-round LLM generation: narrative first (discovery + verification + exploitation), then fix checklist
+- Jinja2 markdown template with full structured data
+- Cover page with task metadata and executive summary
+- Online editing, PDF export, Markdown download
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|-------|-----------|
+| **Agent Framework** | LangGraph 0.2, LangChain 0.3 |
+| **API** | FastAPI 0.115, Uvicorn 0.30, WebSocket (Redis Stream v2) |
+| **Database** | PostgreSQL 16 (SQLAlchemy 2.0 async + asyncpg), Redis 7 |
+| **Storage** | MinIO (reports, artifacts) |
+| **LLM** | OpenAI-compatible API (DeepSeek, OpenAI, Anthropic) with failover |
+| **Frontend** | Vue 3.4, Vite 5, Pinia 2.1, Element Plus 2.7, TypeScript 6.0 |
+| **Charts** | ECharts 6.0, vue-echarts 8.0 |
+| **Terminal** | @xterm/xterm 6.0 |
+| **Testing** | pytest 8.3, pytest-asyncio 0.24 (54 backend test files), Vitest 4.1 (frontend) |
+| **DevOps** | Docker Compose, Nginx reverse proxy |
+| **Security** | Per-command scope guard, JWT auth, CORS middleware, RBAC (user/admin) |
+
+---
+
+## API Reference
+
+### Tasks
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/tasks` | Create new pentest task |
+| `GET` | `/tasks` | List all tasks |
+| `GET` | `/tasks/{id}` | Task detail with findings, ports, credentials |
+| `POST` | `/tasks/{id}/cancel` | Cancel running task |
+| `POST` | `/tasks/{id}/abort` | Immediate kill + container cleanup |
+| `POST` | `/tasks/{id}/approve` | Approve pending action |
+| `POST` | `/tasks/{id}/checkpoint/respond` | Respond to checkpoint (approve/modify/reject) |
+| `POST` | `/tasks/{id}/chat` | Inject operator message mid-task |
+| `POST` | `/tasks/{id}/resume` | Resume paused task |
+| `GET` | `/tasks/{id}/logs` | Paginated/streaming log access |
+| `GET` | `/tasks/{id}/branches` | Branch tree |
+
+### Real-Time
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `WS` | `/ws/{task_id}` | Redis Stream v2: logs, decision events, phase updates, approvals, branch events, done signal |
+
+### Skills
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/skills` | List all skills with metadata |
+| `GET` | `/skills/{id}/raw` | Get skill YAML content |
+| `PUT` | `/skills/{id}/raw` | Save skill YAML |
+| `GET` | `/skills/{id}/tree` | Directory tree (skill.yaml, SKILL.md, references/) |
+| `GET` | `/skills/{id}/file?path=` | Read any file in skill directory |
+| `PUT` | `/skills/{id}/file?path=` | Write any file in skill directory |
+| `POST` | `/skills/reload` | Reload skill registry from disk |
+| `GET` | `/skills/drafts` | List draft skills |
+| `POST` | `/skills/drafts/{name}/promote` | Promote draft to skill |
+
+### Knowledge Base
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/knowledge/entries` | List all KB entries |
+| `GET` | `/knowledge/{id}/raw` | Get entry JSON |
+| `PUT` | `/knowledge/{id}/raw` | Save entry JSON |
+| `POST` | `/knowledge/build` | Build KB (full or single entry) |
+| `POST` | `/knowledge/reload` | Reload KB from disk |
+
+### System
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/health` | Health check |
+| `GET` | `/metrics/overview` | System, tool, invocation, guard stats |
+
+---
+
+## Configuration
+
+Key environment variables (see `.env.example` for full list):
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `LLM_PROVIDER` | LLM provider | `deepseek` |
+| `LLM_API_KEY` | API key | *(required)* |
+| `LLM_MODEL` | Model name | `deepseek-v4-flash` |
+| `LLM_BASE_URL` | API base URL | `https://api.deepseek.com` |
+| `JWT_SECRET` | JWT signing key | auto-generated |
+| `DATABASE_URL` | PostgreSQL connection | `postgresql+asyncpg://...` |
+| `REDIS_URL` | Redis connection | `redis://localhost:6379/0` |
+| `MSF_PASSWORD` | Metasploit RPC | `pentest123` |
+| `LHOST` | Reverse shell IP | `127.0.0.1` |
+| `TOOLBOX_IMAGE` | Docker toolbox image | `pentest-toolbox:latest` |
+| `MAX_TOOL_TIMEOUT` | Max tool execution (s) | `360` |
+| `MAX_STAGE_RUNTIME` | Max phase runtime (s) | `900` |
+
+Safety config YAML files in `backend/config/`:
+- `safety_rules.yaml` — Blocklist/allowlist/warnlist rules
+- `detection_filter.yaml` — Service fingerprint filtering
+- `path_reasoning.yaml` — Frontier scoring weights
+
+---
+
+## Project Structure
+
+```
+AuroraRecon/
+├── backend/
+│   ├── agents/           # Orchestrator, supervisor, specialized agents (28 files)
+│   ├── api/              # FastAPI app, 11 routers, WebSocket, event stream
+│   ├── tools/            # Docker executor, tool registry (6 YAML definitions, 16 parsers)
+│   ├── skills/           # Skill engine, registry (50+ skills in 12 categories)
+│   ├── knowledge/        # Exploit KB (22 entries + embeddings), hybrid retrieval
+│   ├── llm/              # LLM router (failover chain), prompt templates
+│   ├── report/           # Jinja2 report generator, markdown template
+│   ├── db/               # PostgreSQL (SQLAlchemy async), Redis cache
+│   ├── config/           # Safety rules, detection filters, path weights
+│   ├── metrics/          # LLM call & tool execution metrics
+│   ├── storage/          # MinIO client
+│   └── tests/            # 54 pytest files
+├── frontend/
+│   └── src/
+│       ├── views/        # 16 user pages + 10 admin pages
+│       ├── components/   # 30 Vue 3 components
+│       ├── stores/       # Pinia stores (taskLive, taskList, auth, uiPrefs)
+│       ├── composables/  # 9 composables (chartTheme, attackGraphOption, etc.)
+│       ├── api/          # Axios HTTP + WebSocket
+│       ├── services/     # wsManager, eventStore (IndexedDB)
+│       ├── types/        # Full TypeScript type definitions (729 lines)
+│       └── router/       # Vue Router with role-based guards
+├── docker/
+│   ├── docker-compose.yml    # Full stack (api, postgres, redis, minio, msf)
+│   ├── api/Dockerfile        # Python API container
+│   ├── toolbox/Dockerfile    # Kali-based pentest toolbox (30+ tools)
+│   └── frontend/             # Multi-stage Node build → Nginx serve
+├── docs/                 # Architecture docs, project plan, speech script
+├── .env.example         # Environment template (56 lines)
+└── requirements.txt     # Python dependencies
+```
+
+---
+
+## Development
+
+### Backend (local)
 
 ```bash
 pip install -r requirements.txt
 uvicorn backend.api.main:app --reload --port 8000
 ```
 
-前端：
+### Frontend (local)
 
 ```bash
 cd frontend
 npm install
-npm run dev
+npm run dev        # Dev server on :3000, proxies /api + /ws to :8000
+npm run build      # Production build
+npm run test       # Vitest
+npm run lint       # ESLint
 ```
 
-`vite` 已将 `/api` 与 `/ws` 代理到 `http://localhost:8000`。
+### Running Tests
 
-## 8) 关键 API（节选）
+```bash
+# Backend
+cd backend
+pytest tests/ -v
 
-### 任务与执行
-
-- `POST /tasks`
-- `GET /tasks`
-- `GET /tasks/{task_id}`
-- `POST /tasks/{task_id}/cancel`
-- `POST /tasks/{task_id}/approve`
-- `WS /ws/{task_id}`
-
-### 指标与系统
-
-- `GET /health`
-- `GET /metrics/overview`
-
-### Skill / Knowledge
-
-- `GET /skills`
-- `PUT /skills/{skill_id}/raw`
-- `GET /knowledge/entries`
-- `PUT /knowledge/{vuln_id}/raw`
-
-## 9) 项目结构（精简）
-
-```text
-backend/
-  agents/         # 编排器与各阶段 Agent
-  api/            # FastAPI 入口与全部路由
-  tools/          # 执行器、注册表、工具定义 YAML
-  skills/         # Skill 模型、加载、匹配、执行引擎
-  knowledge/      # 知识库与检索器
-  report/         # Markdown 报告生成
-  db/             # PostgreSQL / Redis 持久化
-  storage/        # MinIO 客户端
-
-frontend/src/
-  views/          # 页面（任务、决策、报告、工具、技能、知识等）
-  components/     # 可视化与编辑组件
-  stores/         # Pinia 状态管理
-  api/            # Axios API 封装
-
-docker/
-  docker-compose.yml
-  api/
-  toolbox/
+# Frontend
+cd frontend
+npm run test
 ```
 
-## 10) 合规声明
+---
 
-本项目仅用于 **合法授权** 的安全测试场景（CTF、内网演练、授权渗透测试）。  
-禁止在未获授权的目标上使用本系统，使用者需自行承担合规责任。
+## Compliance
+
+This project is intended exclusively for **authorized security testing** — CTF competitions, internal red team exercises, and penetration tests with explicit written authorization.
+
+**Do not use on targets without proper authorization.** The system includes multiple safety mechanisms (scope enforcement, irreversible action detection, kill switch), but ultimate responsibility lies with the operator.
+
+---
 
 ## License
 
