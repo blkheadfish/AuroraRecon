@@ -6,6 +6,10 @@
 </p>
 
 <p align="center">
+  <strong>English</strong> | <a href="README-ZH.md">中文</a>
+</p>
+
+<p align="center">
   <img src="https://img.shields.io/badge/python-3.11+-blue" alt="Python">
   <img src="https://img.shields.io/badge/vue-3.4+-green" alt="Vue">
   <img src="https://img.shields.io/badge/license-MIT-brightgreen" alt="License">
@@ -31,66 +35,6 @@
 ## Architecture Overview
 
 AuroraRecon is built around a **World Model (Attack Graph)** as its central decision hub. Five work streams orbit this hub, covering safety, world modeling, attack path reasoning, domain depth, and cross-engagement learning.
-
-### Agent Orchestration (LangGraph)
-
-### Prerequisites
-
-- Python `>= 3.11`
-- Node.js `>= 18`
-- Docker & Docker Compose
-- LLM API Key (DeepSeek / OpenAI-compatible)
-
-### Step 1 — Build Toolbox Image
-
-```bash
-cd docker/toolbox
-docker build -t pentest-toolbox:latest .
-cd ../..
-```
-
-### Step 2 — Configure Environment
-
-```bash
-cp .env.example docker/.env
-```
-
-Edit `docker/.env` and set at minimum:
-
-| Variable | Description |
-|----------|-------------|
-| `LLM_API_KEY` | Your LLM provider API key |
-| `LHOST` | Reverse shell callback IP |
-| `POSTGRES_PASSWORD` | Database password |
-| `MSF_PASSWORD` | Metasploit RPC password |
-
-### Step 3 — Start Backend Services
-
-```bash
-cd docker
-docker compose up -d
-```
-
-Starts: `api` (FastAPI), `postgres` (PostgreSQL 16), `redis` (Redis 7), `minio` (object storage), `msf` (Metasploit RPC).
-
-### Step 4 — Start Frontend
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-### Access Points
-
-| Service | URL |
-|---------|-----|
-| Frontend | `http://localhost:3000` |
-| API Docs (Swagger) | `http://localhost:8000/docs` |
-| Health Check | `http://localhost:8000/health` |
-| MinIO Console | `http://localhost:9001` |
-
----
 
 ### Agent Orchestration (LangGraph)
 
@@ -166,6 +110,66 @@ AuroraRecon is organized around 5 engineering work streams:
 - **Cross-Engagement Memory**: Historical findings injected as `source=prior` hints (credential presence without plaintext)
 - **Skill Priority Learning**: Per-scene, per-skill success rate tracking with automatic weight adjustment
 - **Draft Skill Synthesis**: Successful exploit sequences auto-synthesized into `.drafts/` for human review
+
+---
+
+## Quick Start
+
+### Prerequisites
+
+- Python `>= 3.11`
+- Node.js `>= 18`
+- Docker & Docker Compose
+- LLM API Key (DeepSeek / OpenAI-compatible)
+
+### Step 1 — Build Toolbox Image
+
+```bash
+cd docker/toolbox
+docker build -t pentest-toolbox:latest .
+cd ../..
+```
+
+### Step 2 — Configure Environment
+
+```bash
+cp .env.example docker/.env
+```
+
+Edit `docker/.env` and set at minimum:
+
+| Variable | Description |
+|----------|-------------|
+| `LLM_API_KEY` | Your LLM provider API key |
+| `LHOST` | Reverse shell callback IP |
+| `POSTGRES_PASSWORD` | Database password |
+| `MSF_PASSWORD` | Metasploit RPC password |
+
+### Step 3 — Start Backend Services
+
+```bash
+cd docker
+docker compose up -d
+```
+
+Starts: `api` (FastAPI), `postgres` (PostgreSQL 16), `redis` (Redis 7), `minio` (object storage), `msf` (Metasploit RPC).
+
+### Step 4 — Start Frontend
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+### Access Points
+
+| Service | URL |
+|---------|-----|
+| Frontend | `http://localhost:3000` |
+| API Docs (Swagger) | `http://localhost:8000/docs` |
+| Health Check | `http://localhost:8000/health` |
+| MinIO Console | `http://localhost:9001` |
 
 ---
 
