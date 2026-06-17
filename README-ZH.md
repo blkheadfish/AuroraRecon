@@ -91,6 +91,11 @@ docker build -t pentest-toolbox:latest .
 cd ../..
 ```
 
+> **或者**直接导入预构建的镜像（跳过编译，推荐）：
+> ```bash
+> docker load -i docker/image.tar.gz
+> ```
+
 ### 第二步 — 配置环境变量
 
 ```bash
