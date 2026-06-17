@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="img.png" alt="AuroraRecon Architecture" width="800">
-</p>
-
 <h1 align="center">AuroraRecon</h1>
 
 <p align="center">
@@ -22,8 +18,6 @@
 
 - [Architecture Overview](#architecture-overview)
 - [Quick Start](#quick-start)
-- [System Architecture](#system-architecture)
-- [Work Streams](#work-streams)
 - [Features](#features)
 - [Tech Stack](#tech-stack)
 - [API Reference](#api-reference)
@@ -38,15 +32,7 @@
 
 AuroraRecon is built around a **World Model (Attack Graph)** as its central decision hub. Five work streams orbit this hub, covering safety, world modeling, attack path reasoning, domain depth, and cross-engagement learning.
 
-<p align="center">
-  <img src="img.png" alt="Architecture" width="800">
-</p>
-
-**Core Pipeline**: User defines a target → System autonomously executes recon → vulnerability scanning → exploitation → post-exploitation (lateral movement, privilege escalation, persistence) → objective collection → AI-generated pentest report.
-
----
-
-## Quick Start
+### Agent Orchestration (LangGraph)
 
 ### Prerequisites
 
@@ -105,27 +91,6 @@ npm run dev
 | MinIO Console | `http://localhost:9001` |
 
 ---
-
-## System Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      Frontend (Vue 3)                        │
-│  StartPage │ Dashboard │ TaskChat │ TaskDetail │ ReportCenter│
-│  Skills/Tools/Knowledge Management │ Admin Console           │
-├─────────────────────────────────────────────────────────────┤
-│              WebSocket (Redis Stream v2) + HTTP              │
-├─────────────────────────────────────────────────────────────┤
-│                    Backend (FastAPI)                         │
-│  ┌─────────┐  ┌──────────┐  ┌──────────┐  ┌─────────────┐  │
-│  │ Agents  │  │  Tools   │  │  Skills  │  │  Knowledge  │  │
-│  │ (Lang-  │  │ (Docker  │  │ (50+     │  │ (22 entries │  │
-│  │  Graph) │  │  sandbox)│  │  skills) │  │  + vectors) │  │
-│  └─────────┘  └──────────┘  └──────────┘  └─────────────┘  │
-├─────────────────────────────────────────────────────────────┤
-│              PostgreSQL │ Redis │ MinIO                     │
-└─────────────────────────────────────────────────────────────┘
-```
 
 ### Agent Orchestration (LangGraph)
 
