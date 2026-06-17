@@ -1,4 +1,6 @@
-<h1 align="center">AuroraRecon</h1>
+<p align="center">
+  <img src="assets/logo.png" alt="Aurora Recon" width="100%">
+</p>
 
 <p align="center">
   <strong>基于大模型的自主渗透测试智能体</strong><br>

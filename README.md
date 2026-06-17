@@ -1,5 +1,6 @@
-<h1 align="center">AuroraRecon</h1>
-
+<p align="center">
+  <img src="assets/logo.png" alt="Aurora Recon" width="100%">
+</p>
 <p align="center">
   <strong>LLM-Powered Autonomous Penetration Testing Agent</strong><br>
   From Reconnaissance to Report — A Closed-Loop Kill-Chain Orchestrator
