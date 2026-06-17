@@ -829,51 +829,49 @@ class SkillEngine:
             f"[SkillEngine] 📤 发布事件: type={event.event_type}, "
             f"targets={target_ids}, id={event.event_id}"
         )
+    @staticmethod
+    def _build_freeform_system_prompt(skill: Skill, finding: VulnFinding) -> str:
+        """构建 LLM 兜底的 system prompt。
 
+        优先使用 skill.yaml 中 llm.freeform_system_prompt 的自定义 prompt，
+        否则回退到 engine 级别的通用默认 prompt。
+        """
+        from backend.llm.prompts.react_prompts import REACT_TOOL_MANIFEST
 
-def _build_freeform_system_prompt(skill: Skill, finding: VulnFinding) -> str:
-    """构建 LLM 兜底的 system prompt。
+        custom = skill.llm_config.freeform_system_prompt.strip() if skill.llm_config else ""
+        if custom:
+            return (
+                f"你是一名资深渗透测试工程师，正在合法授权的 CTF 靶场中测试。\n"
+                f"你正在利用的漏洞是：{skill.name}（{finding.name}）。\n\n"
+                f"{REACT_TOOL_MANIFEST}\n\n"
+                f"{custom}\n\n"
+                f"返回严格 JSON（不含 markdown）：\n"
+                '{"action":"execute","command":"...","purpose":"..."}\n'
+                '或 {"action":"conclude_success","evidence":"...","current_user":"..."}\n'
+                '或 {"action":"conclude_fail","reason":"..."}\n'
+            )
 
-    优先使用 skill.yaml 中 llm.freeform_system_prompt 的自定义 prompt，
-    否则回退到 engine 级别的通用默认 prompt。
-    """
-    from backend.llm.prompts.react_prompts import REACT_TOOL_MANIFEST
-
-    custom = skill.llm_config.freeform_system_prompt.strip() if skill.llm_config else ""
-    if custom:
         return (
             f"你是一名资深渗透测试工程师，正在合法授权的 CTF 靶场中测试。\n"
             f"你正在利用的漏洞是：{skill.name}（{finding.name}）。\n\n"
             f"{REACT_TOOL_MANIFEST}\n\n"
-            f"{custom}\n\n"
+            f"【严格限制】\n"
+            f"- 你只能尝试与 {skill.name} 相关的利用方法\n"
+            f"- 禁止尝试其他类型的漏洞（如目标是 Shiro 就不要试 ThinkPHP/Struts/SSTI）\n"
+            f"- 禁止做端口扫描、目录爆破等侦察操作（已经完成了）\n"
+            f"- 每次只生成一条命令\n"
+            f"- 如果你认为该漏洞在当前环境下无法利用，直接 conclude_fail\n"
+            f"- 【重要】用 python3 -c 写 subprocess 时，ysoserial/ysuserial 输出是二进制，"
+            f"subprocess.run() 不要加 text=True，用 capture_output=True 即可\n\n"
+            f"【判定标准】\n"
+            f"- 只有 id/whoami 命令返回了 uid= 或用户名才算 RCE 成功\n"
+            f"- HTTP 200 不等于 RCE\n"
+            f"- 读取到文件内容不等于 RCE\n\n"
             f"返回严格 JSON（不含 markdown）：\n"
             '{"action":"execute","command":"...","purpose":"..."}\n'
             '或 {"action":"conclude_success","evidence":"...","current_user":"..."}\n'
             '或 {"action":"conclude_fail","reason":"..."}\n'
         )
-
-    return (
-        f"你是一名资深渗透测试工程师，正在合法授权的 CTF 靶场中测试。\n"
-        f"你正在利用的漏洞是：{skill.name}（{finding.name}）。\n\n"
-        f"{REACT_TOOL_MANIFEST}\n\n"
-        f"【严格限制】\n"
-        f"- 你只能尝试与 {skill.name} 相关的利用方法\n"
-        f"- 禁止尝试其他类型的漏洞（如目标是 Shiro 就不要试 ThinkPHP/Struts/SSTI）\n"
-        f"- 禁止做端口扫描、目录爆破等侦察操作（已经完成了）\n"
-        f"- 每次只生成一条命令\n"
-        f"- 如果你认为该漏洞在当前环境下无法利用，直接 conclude_fail\n"
-        f"- 【重要】用 python3 -c 写 subprocess 时，ysoserial/ysuserial 输出是二进制，"
-        f"subprocess.run() 不要加 text=True，用 capture_output=True 即可\n\n"
-        f"【判定标准】\n"
-        f"- 只有 id/whoami 命令返回了 uid= 或用户名才算 RCE 成功\n"
-        f"- HTTP 200 不等于 RCE\n"
-        f"- 读取到文件内容不等于 RCE\n\n"
-        f"返回严格 JSON（不含 markdown）：\n"
-        '{"action":"execute","command":"...","purpose":"..."}\n'
-        '或 {"action":"conclude_success","evidence":"...","current_user":"..."}\n'
-        '或 {"action":"conclude_fail","reason":"..."}\n'
-    )
-
 
     async def _react_freeform(
         self,
@@ -942,7 +940,7 @@ def _build_freeform_system_prompt(skill: Skill, finding: VulnFinding) -> str:
             f"## 扫描证据\n{finding.evidence[:2000]}\n"
         )
 
-        system_prompt = _build_freeform_system_prompt(skill, finding)
+        system_prompt = self._build_freeform_system_prompt(skill, finding)
 
         conversation = [
             {"role": "user", "content": (
