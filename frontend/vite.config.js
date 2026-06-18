@@ -14,6 +14,17 @@ export default defineConfig({
 	resolve: {
 		alias: { '@': path.resolve(__dirname, 'src') },
 	},
+	build: {
+		rollupOptions: {
+			output: {
+				manualChunks: {
+					vendor: ['vue', 'pinia', 'vue-router'],
+					element: ['element-plus', '@element-plus/icons-vue'],
+					echarts: ['echarts', 'vue-echarts'],
+				},
+			},
+		},
+	},
 	server: {
 		port: 3000,
 		proxy: {
